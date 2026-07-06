@@ -96,11 +96,16 @@ Annotated tree (excludes `node_modules/`, `.git/`):
 │       ├── 20260701220655_init/migration.sql   # Single migration: full schema (all tables/enums).
 │       └── migration_lock.toml    # Prisma migration provider lock (postgresql).
 └── src/
-    ├── index.ts                   # Express app: cors + json, GET /health, GET /auth/me, error handler, listen.
+    ├── index.ts                   # Express app: cors + json, /health, /auth/me, /setup router, AppError-aware error handler, listen.
     ├── lib/
-    │   └── prisma.ts              # Shared PrismaClient singleton (globalThis-cached for dev hot-reload).
-    └── middleware/
-        └── requireAuth.ts         # JWKS/ES256 Bearer-token verification; attaches req.user; 401 on failure.
+    │   ├── prisma.ts              # Shared PrismaClient singleton (globalThis-cached for dev hot-reload).
+    │   └── app-error.ts           # Typed AppError (statusCode + message) mapped by the error handler.
+    ├── middleware/
+    │   └── requireAuth.ts         # JWKS/ES256 Bearer-token verification; attaches req.user; 401 on failure.
+    ├── services/
+    │   └── setup.service.ts       # Setup Wizard business logic + all DB access (behind ISetupService — Phase 2 OCP seam).
+    └── routes/
+        └── setup.ts               # Thin /setup routes: validate → call SetupService → respond; all requireAuth.
 ```
 
 Note: there is **no compiled build step yet** — the app runs TypeScript directly
@@ -111,8 +116,9 @@ via `tsx` (`npm run dev` / `npm start`). `tsc` is used only for typechecking
 
 ### Database & Schema
 
-Locked Prisma schema (`prisma/schema.prisma`), 19 models. Two migrations applied
-(`20260701220655_init`, `20260706211550_remove-round-technician-id`).
+Locked Prisma schema (`prisma/schema.prisma`), 19 models. Three migrations applied
+(`20260701220655_init`, `20260706211550_remove-round-technician-id`,
+`20260706220349_add_setup_completed`).
 
 - **Profile** — public-schema mirror of Supabase `auth.users`; `supabaseUserId`
   (unique) is the join key; `role` (ADMIN/MANAGER/TECHNICIAN, required); `name`.
@@ -152,7 +158,7 @@ Locked Prisma schema (`prisma/schema.prisma`), 19 models. Two migrations applied
 - **ActivityLog** — timestamped audit-log entries (System Activity Log).
 - **BusinessSettings** — single config row, DB-guarded singleton via
   `uniqueId @unique @default("singleton")`; business profile, working days,
-  currency, bank details (Json).
+  currency, bank details (Json), `setupCompleted` flag (Setup Wizard).
 
 **Open question status:** OQ#1–#12 from the original `designFindings.md` audit are
 resolved (OQ#8 → **`Property.roundId` nullable**: declining assignment still
@@ -208,6 +214,27 @@ Pending/Deferred — see below.
 - **`GET /auth/me`** — protected by `requireAuth`. Looks up the `Profile` by
   `req.user.supabaseUserId` and returns it (404 if none). **Temporary** route to
   verify the end-to-end auth chain; to be replaced by real domain routes.
+- **Setup Wizard (`/setup/*`, all `requireAuth`)** — first real domain surface,
+  implementing Screen 6 (8-step wizard). Architecture (OCP/SOLID): **all logic +
+  DB access live in `src/services/setup.service.ts`** behind the `ISetupService`
+  interface; routes (`src/routes/setup.ts`) are thin (validate → call service →
+  respond). Every service method takes `profileId` first — the **Phase 2
+  multi-tenancy seam** (unused for scoping in Phase 1's single tenant). Endpoints:
+  - `GET /setup/status` → per-step completion (**derived**, not stored) +
+    `setupCompleted` + `allRequiredComplete`. Step 1 = `businessName` set; 3 =
+    ≥1 Service; 4 = `defaultCycleLength` set; 6 = ≥1 Technician; 7 = ≥1
+    ServiceArea; 8 = ≥1 `ACTIVE` Round. Steps 2 & 5 are always `{deferred:true}`.
+  - `POST /setup/step/1` (Business Profile → upsert singleton), `step/3`
+    (create/replace Service catalogue), `step/4` (Round Settings), `step/6`
+    (create invite-pending Technicians, `profileId=null`), `step/7` (ServiceAreas),
+    `step/8` (first Round, `status=ACTIVE`). `GET` variants return existing rows.
+  - `GET/POST /setup/step/2` & `/step/5` → deferred stubs (Payment / SMS), no DB.
+  - `POST /setup/complete` → `SetupService.completeSetup()`: **409** if already
+    complete, **400** listing missing required steps, else sets
+    `setupCompleted=true` and returns the status.
+  - Every mutating step route calls `assertSetupIncomplete` first (throws typed
+    **`AppError` 403** once setup is complete). `AppError` (`src/lib/app-error.ts`)
+    is mapped to `{ error, statusCode }` by the centralised error handler.
 
 ## Verified Working
 
@@ -225,12 +252,25 @@ Each item was actually run and observed:
   Method: `curl` (no Authorization header).
 - [x] **JWKS endpoint reachable & ES256.** Method: `curl` the well-known URL →
   returns an `alg: ES256`, `kty: EC`, P-256 key with a `kid`.
+- [x] **Setup Wizard: `tsc --noEmit` → 0 and `prisma db seed` → clean** (with the
+  new `setupCompleted` column / migration `20260706220349`).
+- [x] **`/setup/*` mounted + auth-protected.** Method: `curl` with no token →
+  `GET /setup/status` and `POST /setup/step/1` both `401 {error:"Unauthorized"}`.
+- [x] **SetupService logic (driven directly against the live DB — no JWT).** On a
+  simulated fresh tenant: `getStatus` → all required steps incomplete (2/5
+  deferred); `saveBusinessProfile` → step 1 flips `complete`; `completeSetup` with
+  only step 1 → `AppError 400` listing missing steps (3,4,6,7,8). DB restored via
+  re-seed afterwards.
 
 **Not yet verified (do not assume working):**
 
 - [ ] `GET /auth/me` with a **real valid ES256 token** (full positive auth path:
   token → verified claims → Profile returned). Needs a Supabase-issued JWT from
   the frontend.
+- [ ] `/setup/*` **over HTTP with a real token** (the authenticated request path).
+  The route+auth layer is proven (401 without token) and the service logic is
+  proven directly against the DB, but the two haven't been exercised together via
+  an authenticated HTTP call — needs a Supabase JWT (no anon key / test user here).
 - [ ] The `handle_new_user` **trigger actually creating a Profile on a real
   signup** (no real signup has been exercised end-to-end here).
 - [ ] Any behavior of the trigger's `name`/`role` logic (SQL not in repo).

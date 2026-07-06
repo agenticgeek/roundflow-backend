@@ -1,0 +1,248 @@
+import { NextFunction, Request, Response, Router } from "express";
+import { requireAuth } from "../middleware/requireAuth";
+import { AppError } from "../lib/app-error";
+import {
+  setupService,
+  BusinessProfileInput,
+  RoundSettingsInput,
+  ServiceInput,
+  TechnicianInput,
+  ServiceAreaInput,
+  FirstRoundInput,
+} from "../services/setup.service";
+
+export const setupRouter = Router();
+setupRouter.use(requireAuth);
+
+// ---- helpers -------------------------------------------------------------
+
+// Forward async errors to the centralised error handler (Express 4 doesn't
+// auto-catch rejected promises).
+type Handler = (req: Request, res: Response) => Promise<unknown>;
+const h =
+  (fn: Handler) => (req: Request, res: Response, next: NextFunction) =>
+    fn(req, res).catch(next);
+
+const profileIdOf = (req: Request): string => req.user!.supabaseUserId;
+
+function asObject(body: unknown): Record<string, unknown> {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw new AppError(400, "Request body must be a JSON object.");
+  }
+  return body as Record<string, unknown>;
+}
+
+// Accept either a raw array body or `{ [key]: [...] }`.
+function asArray<T>(body: unknown, key: string): T[] {
+  if (Array.isArray(body)) return body as T[];
+  if (body && typeof body === "object" && Array.isArray((body as any)[key])) {
+    return (body as any)[key] as T[];
+  }
+  throw new AppError(400, `Expected an array (raw, or under "${key}").`);
+}
+
+function requireString(v: unknown, field: string): string {
+  if (typeof v !== "string" || v.trim() === "") {
+    throw new AppError(400, `"${field}" is required and must be a non-empty string.`);
+  }
+  return v;
+}
+
+function requireNumber(v: unknown, field: string): number {
+  if (typeof v !== "number" || !Number.isFinite(v)) {
+    throw new AppError(400, `"${field}" is required and must be a number.`);
+  }
+  return v;
+}
+
+const STEP2_DEFERRED = {
+  status: "deferred",
+  reason: "Payment setup is configured separately",
+} as const;
+const STEP5_DEFERRED = {
+  status: "deferred",
+  reason: "SMS templates are managed via GHL",
+} as const;
+
+// ---- status --------------------------------------------------------------
+
+setupRouter.get(
+  "/status",
+  h(async (req, res) => {
+    res.json(await setupService.getStatus(profileIdOf(req)));
+  })
+);
+
+// ---- Step 1: Business Profile --------------------------------------------
+
+setupRouter.post(
+  "/step/1",
+  h(async (req, res) => {
+    const profileId = profileIdOf(req);
+    await setupService.assertSetupIncomplete(profileId);
+    const body = asObject(req.body);
+    requireString(body.businessName, "businessName");
+    const input: BusinessProfileInput = {
+      businessName: body.businessName as string,
+      phone: body.phone as string | undefined,
+      email: body.email as string | undefined,
+      companyNumber: body.companyNumber as string | undefined,
+      vatRegistered:
+        typeof body.vatRegistered === "boolean" ? body.vatRegistered : undefined,
+      vatRegistration: body.vatRegistration as string | undefined,
+      defaultWorkingDays: Array.isArray(body.defaultWorkingDays)
+        ? (body.defaultWorkingDays as string[])
+        : undefined,
+      timezone: body.timezone as string | undefined,
+      currency: body.currency as string | undefined,
+    };
+    res.json(await setupService.saveBusinessProfile(profileId, input));
+  })
+);
+
+// ---- Step 2: Payment Setup (deferred) ------------------------------------
+
+setupRouter.get("/step/2", h(async (_req, res) => res.json(STEP2_DEFERRED)));
+setupRouter.post(
+  "/step/2",
+  h(async (req, res) => {
+    await setupService.assertSetupIncomplete(profileIdOf(req));
+    res.json(STEP2_DEFERRED); // deferred stub — no DB write
+  })
+);
+
+// ---- Step 3: Service Catalogue -------------------------------------------
+
+setupRouter.get(
+  "/step/3",
+  h(async (req, res) => {
+    res.json(await setupService.getServices(profileIdOf(req)));
+  })
+);
+setupRouter.post(
+  "/step/3",
+  h(async (req, res) => {
+    const profileId = profileIdOf(req);
+    await setupService.assertSetupIncomplete(profileId);
+    const raw = asArray<Record<string, unknown>>(req.body, "services");
+    const input: ServiceInput[] = raw.map((s, i) => ({
+      name: requireString(s.name, `services[${i}].name`),
+      category: s.category as string | undefined,
+      description: s.description as string | undefined,
+      defaultPrice: requireNumber(s.defaultPrice, `services[${i}].defaultPrice`),
+      active: typeof s.active === "boolean" ? s.active : undefined,
+    }));
+    res.json(await setupService.saveServices(profileId, input));
+  })
+);
+
+// ---- Step 4: Round Settings ----------------------------------------------
+
+setupRouter.post(
+  "/step/4",
+  h(async (req, res) => {
+    const profileId = profileIdOf(req);
+    await setupService.assertSetupIncomplete(profileId);
+    const body = asObject(req.body);
+    const input: RoundSettingsInput = {
+      defaultCycleLength: requireNumber(body.defaultCycleLength, "defaultCycleLength"),
+      defaultWorkingDays: Array.isArray(body.defaultWorkingDays)
+        ? (body.defaultWorkingDays as string[])
+        : undefined,
+    };
+    res.json(await setupService.saveRoundSettings(profileId, input));
+  })
+);
+
+// ---- Step 5: SMS Templates (deferred) ------------------------------------
+
+setupRouter.get("/step/5", h(async (_req, res) => res.json(STEP5_DEFERRED)));
+setupRouter.post(
+  "/step/5",
+  h(async (req, res) => {
+    await setupService.assertSetupIncomplete(profileIdOf(req));
+    res.json(STEP5_DEFERRED); // deferred stub — no DB write
+  })
+);
+
+// ---- Step 6: Technicians (invite-pending) --------------------------------
+
+setupRouter.get(
+  "/step/6",
+  h(async (req, res) => {
+    res.json(await setupService.getTechnicians(profileIdOf(req)));
+  })
+);
+setupRouter.post(
+  "/step/6",
+  h(async (req, res) => {
+    const profileId = profileIdOf(req);
+    await setupService.assertSetupIncomplete(profileId);
+    const raw = asArray<Record<string, unknown>>(req.body, "technicians");
+    const input: TechnicianInput[] = raw.map((t) => ({
+      role: t.role as string | undefined,
+      phone: t.phone as string | undefined,
+      active: typeof t.active === "boolean" ? t.active : undefined,
+    }));
+    res.json(await setupService.createTechnicians(profileId, input));
+  })
+);
+
+// ---- Step 7: Service Areas -----------------------------------------------
+
+setupRouter.get(
+  "/step/7",
+  h(async (req, res) => {
+    res.json(await setupService.getServiceAreas(profileIdOf(req)));
+  })
+);
+setupRouter.post(
+  "/step/7",
+  h(async (req, res) => {
+    const profileId = profileIdOf(req);
+    await setupService.assertSetupIncomplete(profileId);
+    const raw = asArray<Record<string, unknown>>(req.body, "serviceAreas");
+    const input: ServiceAreaInput[] = raw.map((a, i) => ({
+      name: requireString(a.name, `serviceAreas[${i}].name`),
+      postcodeSector: a.postcodeSector as string | undefined,
+      isDefault: typeof a.isDefault === "boolean" ? a.isDefault : undefined,
+    }));
+    res.json(await setupService.createServiceAreas(profileId, input));
+  })
+);
+
+// ---- Step 8: First Round (ACTIVE) ----------------------------------------
+
+setupRouter.get(
+  "/step/8",
+  h(async (req, res) => {
+    res.json(await setupService.getActiveRounds(profileIdOf(req)));
+  })
+);
+setupRouter.post(
+  "/step/8",
+  h(async (req, res) => {
+    const profileId = profileIdOf(req);
+    await setupService.assertSetupIncomplete(profileId);
+    const body = asObject(req.body);
+    const input: FirstRoundInput = {
+      name: requireString(body.name, "name"),
+      defaultDay: body.defaultDay as string | undefined,
+      frequency: body.frequency as string | undefined,
+      serviceAreaId: body.serviceAreaId as string | undefined,
+    };
+    res.json(await setupService.createFirstRound(profileId, input));
+  })
+);
+
+// ---- Complete ------------------------------------------------------------
+// Not guarded by assertSetupIncomplete: completing when already complete must
+// return 409 (the service throws it), not the 403 that assert would raise.
+setupRouter.post(
+  "/complete",
+  h(async (req, res) => {
+    const profileId = profileIdOf(req);
+    await setupService.completeSetup(profileId);
+    res.json(await setupService.getStatus(profileId));
+  })
+);

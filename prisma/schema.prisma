@@ -412,5 +412,6 @@ model BusinessSettings {
   currency           String?
   defaultCycleLength Int? // Round Settings (Setup step 4) — days
   bankDetails        Json? // Payment Setup BACS/bank (Setup step 2)
+  setupCompleted     Boolean  @default(false) // true once the Setup Wizard is finished
   updatedAt          DateTime @updatedAt
 }

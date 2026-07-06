@@ -3,6 +3,8 @@ import express, { NextFunction, Request, Response } from "express";
 import cors from "cors";
 import { prisma } from "./lib/prisma";
 import { requireAuth } from "./middleware/requireAuth";
+import { AppError } from "./lib/app-error";
+import { setupRouter } from "./routes/setup";
 
 const app = express();
 
@@ -36,9 +38,15 @@ app.get(
   }
 );
 
+app.use("/setup", setupRouter);
+
 // Centralised error handler. Must be last and take 4 args so Express treats it
 // as error-handling middleware. Route handlers forward errors via next(err).
+// Typed AppErrors carry their own status + message; anything else is a 500.
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  if (err instanceof AppError) {
+    return res.status(err.statusCode).json({ error: err.message });
+  }
   console.error(err);
   res.status(500).json({ error: "Internal Server Error" });
 });

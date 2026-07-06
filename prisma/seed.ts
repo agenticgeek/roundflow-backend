@@ -28,6 +28,7 @@ async function main() {
       currency: "GBP",
       defaultCycleLength: 28, // days (4-week cycle)
       bankDetails: { sortCode: "00-00-00", accountNumber: "00000000" },
+      setupCompleted: false, // seed leaves the wizard incomplete
     },
   });
 
