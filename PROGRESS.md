@@ -1,8 +1,11 @@
 # RoundFlow Backend — Progress Log
 
-> Living document. Last updated: 2026-07-03 · Branch: `dev` · HEAD: `2abb18d`
+> Living document. Last updated: 2026-07-07 · Branch: `dev` · HEAD: `2abb18d`
 > Written by reading the codebase directly. If a claim isn't backed by code or a
 > run, it's flagged as unverified. Update this file as the backend grows.
+> **2026-07-07:** `docs/designFindings.md` re-audited (admin design update + new
+> RoundFlow Technician mobile app). See **Schema Decisions & Implications
+> (2026-07-07 Design Update)** below. No schema or code has changed yet.
 
 ## Project Overview
 
@@ -147,10 +150,16 @@ Locked Prisma schema (`prisma/schema.prisma`), 19 models. One migration applied
   `uniqueId @unique @default("singleton")`; business profile, working days,
   currency, bank details (Json).
 
-**Open question status:** All 12 wireframe open questions from `designFindings.md`
-are resolved. OQ#8 ("Assign Property Now?" decline path) was resolved as
-**`Property.roundId` nullable** — declining assignment still creates/saves the
-property in an unassigned state (no round), assignable later; not auto-queued.
+**Open question status:** OQ#1–#12 from the original `designFindings.md` audit are
+resolved (OQ#8 → **`Property.roundId` nullable**: declining assignment still
+creates/saves the property unassigned, assignable later, not auto-queued). The
+**2026-07-07 design update** adds **OQ#13** (technician "unable to attend"
+self-mark trigger — unresolved) plus mobile OQs MOB-1/2/3. See **Schema Decisions
+& Implications (2026-07-07 Design Update)** below.
+
+**Note:** the schema descriptions above reflect the **current** committed schema.
+The 2026-07-07 update includes a **decision to remove `Round.technicianId`** (not
+yet applied) — see below.
 
 ### Infrastructure
 
@@ -265,6 +274,51 @@ Mobile Completion → Payments):
 9. Cross-cutting: Complaints workflow, Messaging (GHL), Reports/ActivityLog,
    Settings.
 
+## Schema Decisions & Implications — 2026-07-07 Design Update
+
+Context: `docs/designFindings.md` was re-audited after a design update — five admin
+changes (multi-technician rounds, technician job-status, technician reassignment,
+Add Round quick action, add-properties-to-existing-rounds) plus a **new mobile app**
+(RoundFlow Technician / "B2C"). **Nothing in `prisma/schema.prisma` or
+`prisma/seed.ts` has changed yet** — this records decisions + the review queue
+before we touch the schema.
+
+### Decisions made (Approved — not yet implemented)
+
+1. **Per-occurrence assignment → Option A (derived; no new model).** An
+   "occurrence" is simply the group of `Visit`s sharing a `Round` + cycle date. The
+   3-step assignment wizard (Select Technicians → Allocate Jobs → Review) sets
+   **`Visit.technicianId` per job when visits are generated**. **No
+   `RoundOccurrence` model for Phase 1.** Rationale: `Visit`s already are the
+   per-date instances, and per-job technician is exactly what "manually divide the N
+   jobs between them" needs.
+2. **Remove `Round.technicianId` (single FK).** With assignment now per-`Visit`, a
+   single technician on `Round` is misleading and must not be the source of truth
+   for "who does this round." Remove it. A round's "assigned technicians" becomes
+   **derived** from the distinct `Visit.technicianId` values across its current
+   occurrence. **Seed impact:** the seed's `Round` row currently sets `technicianId`
+   — when implemented, set it to `null` / drop that field usage.
+
+### Schema implication review queue (from Step 4)
+
+| # | Implication | Status | Note |
+|---|-------------|--------|------|
+| 1 | `Round.technicianId` single FK → many-to-many join table | **Rejected** | Superseded by Decision 2 — remove it; per-`Visit` is source of truth. No join table added. |
+| 2 | `RoundOccurrence` entity (per-occurrence assignment) | **Deferred** | Decision 1: derived (Option A) for Phase 1. Revisit only if per-occurrence divergence later needs first-class modelling. |
+| 3 | Manual job division via existing `Visit.technicianId` | **Approved (no change)** | Mechanism already exists; set at visit generation. Add app-level rule: a visit's technician ∈ the round's assigned set. |
+| 4 | Technician **availability** status (Available / Unavailable / On-leave + date) | **Pending** | `Technician` has only `active: Boolean`. Needs an availability enum + leave date/range. Drives reassignment; ties to OQ#13. |
+| 5 | Technician **invite/onboarding** entity (invite code) | **Pending** | Mobile invite-code + Complete Profile. `Technician.profileId` nullable models "invited"; no invite-token entity. Decide: `Invitation` model vs. Supabase invite flow. |
+| 6 | **Notifications** feed entity | **Pending** | Mobile Notifications screen (schedule / round / payment). No notification entity (`ActivityLog` is an admin audit log). Likely lands with the mobile build. |
+| 7 | **Skip reason** enum | **Pending** | Mobile SkipSheet: Not home / No access / Customer refused / Unsafe conditions / Other. Currently `Visit.skipReason` is a free `String`. |
+| 8 | Access-issue description → `Issue.note` | **Approved (no change)** | Mobile AccessIssueSheet maps to existing `Issue` (type `ACCESS_PROBLEM` + `note`). Confirm the action creates an `Issue`. |
+| 9 | Per-round **assignment history** | **Pending** | Screen 30 "Recent Activity / Assignment History". `ActivityLog` exists but is unlinked. Decide extend vs. dedicated table. |
+| 10 | Cash payment → `Payment.method = CASH` | **Approved (no change)** | Already supported. |
+
+**Sequencing when we build:** apply Decision 2 (remove `Round.technicianId`) + the
+seed fix first; then resolve Pending #4 (availability), since it drives the
+reassignment flow. Items #5 / #6 / #9 likely land with the mobile + notifications
+work; #7 is a cheap enum swap.
+
 ## Decisions Pending
 
 - **GHL automation trigger mechanism** — how the backend fires GHL
@@ -281,3 +335,7 @@ Mobile Completion → Payments):
   claim (`authenticated`), not the app role (ADMIN/MANAGER/TECHNICIAN, which
   lives on `Profile`). Decide whether protected routes read the app role from
   `Profile` per request (current implicit approach) or via custom JWT claims.
+- **Schema items from the 2026-07-07 design update** — technician availability
+  status (#4), invite entity (#5), notifications feed (#6), skip-reason enum (#7),
+  assignment history (#9). Full status table in **Schema Decisions & Implications
+  — 2026-07-07 Design Update** above.

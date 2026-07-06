@@ -1,6 +1,7 @@
 # Design Findings — Unofficial WC Wireframes ("Rough" Page)
 
 > Inspected via figma-desktop MCP · Node 401:943 · 2026-06-30
+> **Updated 2026-07-07** — admin file `RoundFlow-Admin` (Page 1, node `0:1`) re-audited for 5 design changes; new **Mobile App (RoundFlow Technician / B2C)** file audited. See the **Mobile App** and **Design Update Log** sections at the end. Note: screenshots could not be captured this pass (figma-desktop MCP served only the active tab); details below are extracted from frame metadata/text.
 
 ---
 
@@ -111,6 +112,7 @@ Add Round · Bulk Message · Add One-Off Job
 - Stats bar: Total Stops, Round Value, Estimated Duration, Completion %, Payment Holds (amber), Issues (red with badge)
 - Weekly calendar grid (Mon–Fri columns, week rows for the cycle period)
 - Round cards on calendar: round name, status dot (green=Completed, blue=In-progress), stops count, value, technician name + status
+- **⟳ Update (2026-07-07):** a round can now carry **multiple technicians** (job division is manual — see Screen 30). A round is now assigned **per occurrence** (per recurrence), not once-and-fixed. When a technician becomes unavailable or a recurrence comes due without an assignee, an **alert banner** appears above the stats bar — *"N properties have upcoming recurrences requiring technician assignment"* with a **Review Now** button → *Upcoming Property Recurrences* modal (M14).
 
 **Interactions:** Round card click → same Calendar View with `?round=X` query param applied (see Screen 11). Technician dropdown → multi-select filter (see Dropdowns). Area dropdown filters calendar.
 
@@ -161,6 +163,7 @@ Add Round · Bulk Message · Add One-Off Job
 - Mini stat tiles: Completed (green), Skipped (amber), Issues (red)
 - Quick Actions: Reassign Technician, Push Missed Jobs
 - Jobs list: Property name, address, status badge (Completed / Scheduled / In Progress / Skipped), issue flags (Payment Hold, Gate locked)
+- **⟳ Update (2026-07-07):** *Reassign Technician* now opens a modal (M15) — *"Reassign remaining jobs from [tech] to another tech"*, target-technician selector, note field (*"Add a note about this reassignment…"*), *"Notify new technician of reassignment"* checkbox, **Reassign Jobs** button. Technicians on a round are not fixed and can be changed after creation (see Screen 30).
 
 ---
 
@@ -296,6 +299,7 @@ Add Round · Bulk Message · Add One-Off Job
 - Assigned Rounds list (within card): round name, stop count, status badge, value
 - Contact info row: phone, email, service areas
 - Send Message / View Details action buttons
+- **⟳ Update (2026-07-07):** technician cards/table now show an **App Status** column with an availability state — **Active** vs **Unavailable** (e.g. *"On leave 14 July 2026 — N jobs require reassignment"*). Marking a technician Unavailable flags their upcoming recurring jobs for reassignment (surfaced on Round Planner banner + Screen 30). Status pills observed: `● In Progress`, `✓ Active`, `Unavailable`. See change #2 in the Design Update Log and Open Question #13.
 
 ---
 
@@ -331,6 +335,43 @@ Add Round · Bulk Message · Add One-Off Job
 ### 29. Edit Technician  
 **Section:** `/Technicians` · Node `737:9645`  
 **Purpose:** Edit an existing technician's details and assignments.
+
+---
+
+### 30. Round & Technician Assignment *(NEW — 2026-07-07)*  
+**Section:** `Round & Technician Assignment` · Node `936:64543`  
+**Purpose:** Manage which technician(s) are assigned to each round, per occurrence — the home of **multi-technician rounds** (change #1) and **reassignment** (change #3). Covers the operational gap the old single `technician` field couldn't express.  
+**Sub-screens (6 states in the section):**
+- **Overview** — header KPIs: Total Rounds, Assigned, Unassigned. Table columns: **Round Name · Day · Assigned Technicians** (avatar chips, e.g. "J James", "S Sarah") **· Count · Status · Actions** (Manage / view). Confirms a round can list **more than one** assigned technician with a count.
+- **Overview — Empty State** — "No rounds found / Try adjusting your filters or add a new round" + **Add Round**.
+- **Overview — No Results** — "No results match your search" + Clear all filters.
+- **Round Details** (e.g. Alnwick Monday / Morpeth Wednesday) — Scheduled Day, Total Stops, Estimated Duration, **Field Technician** (with "Assigned: <date>"), per-technician actions **Replace · Remove · + Add Technician**, and **Recent Activity / Assignment History** (e.g. "James assigned to Alnwick Monday · 2 days ago", "Round created", "Schedule confirmed").
+- **Technician Details** (e.g. James) — availability status (**Available**), Assigned Rounds count, Weekly Hours, list of rounds ("Monday · 5 stops · 6.5 hrs" / View Round), **+ Assign to Round**, and an **Upcoming Schedule** (Mon Alnwick / Tue Off / Wed Morpeth…).
+
+**Multi-technician assignment wizard (3 steps)** — invoked when assigning 2+ technicians to a round occurrence:
+1. **Select Technicians** — *"Choose two or more technicians for this occurrence."* Search technicians by name; checkbox list (name · role e.g. "Field Technician" · availability e.g. "Available"); "N selected"; **Continue to Allocation →**.
+2. **Allocate Jobs** — *"Select two or more technicians and manually divide the N jobs between them."* Manual per-job allocation to each technician (**job division is manual**). (An auto **"Distribute Jobs Evenly"** proposal — "even distribution … based on estimated duration and current workload balance" with "Apply Distribution" — was seen only in the file's **Trash**; treat as considered-but-cut unless confirmed.)
+3. **Review & Confirm**.
+
+**Interactions / warnings:** editing an in-progress occurrence warns *"This occurrence is currently in progress. Changing assignments may affect technicians who are already working on their allocated jobs…"*; rolling an assignment to the next occurrence warns *"Jobs or technician availability may have changed since the previous occurrence."*  
+**Note:** the section is `hidden="true"` on canvas (a design/spec cluster), so treat as the intended model rather than a finalised route; some states also appear in the "Assigning multiple technicians to a round Flow" storyboard (`968:39312`) and the "Assigning technicians after every reoccurence of a property" storyboard (`975:35743`).
+
+---
+
+### 31. Assign Property to Round *(NEW — 2026-07-07)*  
+**Section:** part of Add Property flow / standalone · Nodes `938:22027`+ ("Assign Property to Round"), `854:29024`–`854:29376`  
+**Purpose:** Decide how a property is placed into a round — resolves **Open Question #8** and is the entry point for **multi-technician** placement (change #1) and **adding a property to a round** (change #5).  
+**Elements:**
+- Vertical stepper (labelled "Step 1 of 7" within the Add Property wizard context).
+- Header: "Assign Property to Round" / *"Assign the property in whichever round you want."*
+- **Round** selector + **Round Day** selector (e.g. Alnwick / Thursday).
+- Assignment choice (two cards):
+  - **One technician for all jobs** — *"Assign a single technician who will be responsible for completing all N jobs."*
+  - **Multiple technicians with manual job allocation** — *"Select two or more technicians and manually divide the N jobs between them"* → routes into the 3-step allocation wizard (Screen 30).
+- **Assign & Save** (assign now) **or Save & Assign Later** — *"Property will be saved as unassigned. You can assign it to a round from the customer record at any time."*
+- Success states: **Success: Assigned** / **Success: Unassigned**; unassigned → **Customer Detail: Unassigned**.
+
+**Interactions:** "Save & Assign Later" → property persisted with no round (unassigned), assignable later from the customer record. Choosing "Multiple technicians…" → Select Technicians → Allocate Jobs → Review & Confirm.
 
 ---
 
@@ -415,7 +456,9 @@ Add Round · Bulk Message · Add One-Off Job
 **Step 1 — Property Details:**
 - Customer Name, Property Name (optional), Phone Number, Email (optional), Full Address, Postcode, Service Area dropdown, Property Type dropdown
 - Back / Continue (Step 1 of 7)  
-*Step 1 doubles as customer creation — no separate Add Customer flow exists. Subsequent steps cover service assignment, round assignment, payment setup, schedule, confirmation, and "Assign Property to Round" sub-flow (⚠️ TBD: behaviour when declining "Assign Property Now?" prompt is unresolved — see Open Questions #8).*
+*Step 1 doubles as customer creation — no separate Add Customer flow exists. Subsequent steps cover service assignment, round assignment, payment setup, schedule, confirmation, and the "Assign Property to Round" sub-flow (now a distinct, fully-designed screen — see Screen 31).*
+
+***⟳ Update (2026-07-07):** the "Assign Property to Round" step is now fully designed (Screen 31), **resolving Open Question #8**. The final step offers **Assign to a Round Now** vs **Save & Assign Later**; "Save & Assign Later" saves the property **unassigned** (*"Property will be saved as unassigned. You can assign it to a round from the customer record at any time"*), producing a **Customer Detail: Unassigned** state (matches the schema's nullable `Property.roundId`). Within "Assign Now", the admin chooses **One technician for all jobs** or **Multiple technicians with manual job allocation** (Screen 30/31). New frames observed: `854:28979`–`854:29376` (Step 4/5 Notes & Risk, Assign Decision, Assign Now empty/filled, Success: Assigned, Assign Later selected, Success: Unassigned, Customer Detail: Unassigned).*
 
 ---
 
@@ -466,6 +509,28 @@ Add Round · Bulk Message · Add One-Off Job
 **Triggered from:** Technicians list/detail  
 **Frames:** `734:15646` (labelled "Modal")  
 **Elements:** Confirmation dialog for deleting/removing a technician.
+
+---
+
+### M14 — Upcoming Property Recurrences *(NEW — 2026-07-07)*  
+**Triggered from:** Round Planner alert banner ("N properties have upcoming recurrences requiring technician assignment") > **Review Now**  
+**Section:** `975:35743` ("Assigning technicians after every reoccurence of a property")  
+**Purpose:** Per-occurrence (re)assignment — supports change #3. Because a round is assigned per recurrence, upcoming recurrences can be **Unassigned** and need a technician before dispatch.  
+**Elements:**
+- Title: "Upcoming Property Recurrences" + *"The following properties have recurrences due soon and need a technician assigned."*
+- Property rows: property address, `customer · round` (e.g. "John Smith · Alnwick Monday"), **next recurrence date** (e.g. "21 Jul 2026"), **frequency** (e.g. "Every 4 weeks" / "Every 6 weeks"), status **Unassigned**, **Assign** button per row.
+
+---
+
+### M15 — Reassign Technician *(NEW — 2026-07-07)*  
+**Triggered from:** Today's Work > Round Details Panel > **Reassign Technician** (Screen 13)  
+**Frames:** in `/Today-s-Work` section (~`936:25925`)  
+**Purpose:** Move remaining jobs from one technician to another mid-day — supports change #3.  
+**Elements:**
+- *"Reassign remaining jobs from [tech] to another tech"* + target-technician selector.
+- Note field: *"Add a note about this reassignment…"*
+- Checkbox: *"Notify new technician of reassignment"*.
+- **Reassign Jobs** (confirm) / Cancel.
 
 ---
 
@@ -543,7 +608,7 @@ These are **not user-facing screens** — exclude from implementation scope.
 
 7. ~~**Reports — "Tech Manage View All"**~~ — **Resolved.** Route is `/reports/technicians`, not under `/technicians`.
 
-8. ⚠️ **TBD — "Assign Property Now?"** screen (442:11619): A full-screen prompt appearing within the Add Property flow, then transitioning to a Dashboard state (442:9643). Decline path behaviour is unresolved — does declining skip assignment entirely or queue it for later?
+8. ~~**TBD — "Assign Property Now?"**~~ — **Resolved (2026-07-07).** The flow is now fully designed as **Screen 31 (Assign Property to Round)**. Declining = **Save & Assign Later** → the property is **created and saved unassigned** (no round), assignable later from the customer record (**Customer Detail: Unassigned**). Not auto-queued. Matches the schema's nullable `Property.roundId`.
 
 9. ~~**Download Confirmation**~~ — **Resolved.** Single confirmation state (M11) reused in two contexts; the two frames are not distinct states.
 
@@ -552,3 +617,69 @@ These are **not user-facing screens** — exclude from implementation scope.
 11. ~~**"Add Round" flow step count ambiguity**~~ — **Resolved.** Each numbered frame is a distinct wizard step (7 steps total). Step 2 is a single long scrollable step, not a separate screen.
 
 12. ~~**Cycle vs. period terminology**~~ — **Resolved.** "Cycle" is used consistently throughout the UI; "Period" does not appear anywhere.
+
+13. ⚠️ **TBD (2026-07-07) — Technician "unable to attend" self-mark trigger (change #2).** The admin surfaces a technician **availability status** (Available / **Unavailable** / "On leave <date> — N jobs require reassignment", Screen 25/30) which flags upcoming recurring jobs for reassignment. The mobile app offers only a **per-visit Skip** (reasons: Not home / No access / Customer refused / Unsafe conditions / Other) — *not* a "mark myself unavailable for this round/occurrence" action. **No distinct screen was found where a technician self-marks unable to attend a whole recurring job.** Unresolved: is availability admin-set only, or is there a technician-facing action not yet designed? (See Mobile Open Question MOB-2.)
+
+---
+
+## Mobile App (RoundFlow Technician / B2C)
+
+> Audited 2026-07-07 via figma-desktop MCP · file `RoundFlow-B2C` · Page 1 (`0:1`). ~20 phone screens + 6 bottom sheets on a single page. Screenshots unavailable this pass; extracted from frame metadata/text.
+
+### Overview
+**App:** RoundFlow **Technician** (the login reads "RoundFlow Technician"). Despite the `RoundFlow-B2C` filename, the content is **technician-facing** — daily job list, per-property visit execution, photo capture, cash collection, skip/access-issue reporting. No customer-facing screens were observed (see MOB-1). This is the mobile counterpart to the admin's Today's Work / Round Planner / Customer Detail.
+
+### Screens
+1. **Login** (`login-screen`, section `10:3016`) — "RoundFlow Technician / Sign in to view your jobs"; Email, Password, Forgot password?, **Sign in**; "Have an invitation code? **Enter code**"; footer "Account issues? Call the office on 01665 123 456".
+2. **Invitation Code** (`invitation-code-screen`) — enter an invite code. Technician onboarding is **invite-based** (matches admin "invited" technicians / nullable `Technician.profileId`).
+3. **Forgot Password** (`forgot-password-screen`) — "Reset Password / Enter your email address and we'll send you a reset link"; **Send Reset Link**; "Check your inbox for the reset instructions."
+4. **Complete Your Profile** (`complete-profile-screen`) — "Complete Your Profile" (after accepting an invite).
+5. **Today / Job List** (`TodayScreen`, `4:117`) — date; "Good morning, [name]"; **Today's round** card (round name e.g. "Alnwick Monday", "Assigned to you · N properties", progress "2/5", "Currently in progress"); property list (customer name, address, status); "All properties".
+6. **Notifications** (`10:2923`) — Schedule update ("Alan Watts (property 5) moved from tomorrow to today"), Round confirmed ("Alnwick Monday dispatched for today"), Round ready, Payment collected ("Direct debit confirmed for …"); timestamps.
+7. **Property Details** (several states, e.g. `5:605`, `10:3116`, `10:3026`) — "Property N of 5", customer name + address, **StatusBadge** (Ready / In progress / Completed), **Open directions**; **Safety note** (red risk box); **Access notes** (incl. gate code, e.g. "Gate code: 7734#"); **Service details** (Service e.g. "Full exterior window clean", Price, Payment method e.g. "direct debit", Last clean); **Start visit**.
+8. **Active Visit** (`ActiveVisitScreen`, `5:750`+) — property details + notes; **Payment note** ("Cash payment due — £52. Confirm receipt before leaving"); **Photos** (before/after, "Photos are optional"); **Add note for office** ("Internal — not visible to customer"); actions: **Record cash payment (£X due) · Skip property · Report access problem · Mark property complete**.
+9. **Property Complete** (`10:2862`) — "Property complete"; next-property preview; **Go to next property** / **View round overview**.
+
+### Modals (bottom sheets)
+- **PhotoSheet** — capture before/after photo.
+- **NoteSheet** — add internal "note for office".
+- **CashSheet** — "Confirm you have received £X in cash from the customer" · **Confirm £X received in cash** / Cancel.
+- **SkipSheet** — "Skipping [customer]. Select a reason": **Not home · No access · Customer refused · Unsafe conditions · Other** · **Confirm skip**.
+- **AccessIssueSheet** — **Description \*** ("What prevented access?") · submit.
+- **CompleteConfirmSheet** — "Complete this property?" · Customer / Service / Price · "Completing this visit will notify the customer…" · **Confirm completion** / Not yet.
+
+### Correspondence to admin screens (same data, different interface)
+- Today's round + property list ↔ admin **Round** + **Visits** (Today's Work / Round Planner).
+- Property Details ↔ **Customer Detail** (Overview / Service Plan / Notes & Risk / access + risk notes).
+- Skip / Complete / cash actions ↔ **Visit.status** + **Payment**.
+- Notifications (schedule change / round confirmed) ↔ admin dispatch + reassignment (M14/M15, Round Planner).
+
+### Backend requirements implied (not all in current schema)
+- **Invite-code onboarding** for technicians (invite token → Complete Profile → Supabase user → Profile role TECHNICIAN linked to Technician). Token/invite entity **not modelled**.
+- **Skip reason** enum (Not home / No access / Customer refused / Unsafe conditions / Other) — currently `Visit.skipReason` is a free `String`.
+- **Access issue** description — `Issue` exists, but a captured free-text "what prevented access?" field is implied.
+- **Cash payment confirmation** ("received in cash") ↔ `Payment.method = CASH` (exists).
+- **Notifications feed** (schedule updates, round confirmed, payment collected) — **not modelled** (no notification entity).
+- Before/after **Photos** per visit — modelled (`Photo`).
+
+### Open Questions (mobile)
+- **MOB-1:** Is the `B2C` filename intentional? All observed content is technician-facing; confirm no separate customer app is expected here.
+- **MOB-2:** Where does a technician mark "unable to attend" a whole round/occurrence (change #2)? Only per-visit Skip exists in mobile; admin shows an availability status. Self-mark trigger unresolved (see Open Question #13).
+- **MOB-3:** Notifications — push vs in-app only? Backend feed/entity undefined.
+
+---
+
+## Design Update Log
+
+**2026-07-07 — Admin re-audit (`RoundFlow-Admin`, Page 1 `0:1`) + new Mobile audit (`RoundFlow-B2C`).**
+Original audit was **2026-06-30** on the "Rough" page (node `401:943`), which still exists as a second page in the admin file. Changes captured:
+
+- **#1 Multi-technician rounds** — a round can carry **multiple technicians**; **job division is manual**. New **Screen 30 (Round & Technician Assignment)** (Overview table with "Assigned Technicians" + Count; Round Details with Replace / Remove / **+ Add Technician**) and **Screen 31 (Assign Property to Round)** (choice: *One technician for all jobs* vs *Multiple technicians with manual job allocation*). 3-step wizard: **Select Technicians → Allocate Jobs → Review & Confirm**. Storyboard: `968:39312`.
+- **#2 Technician job status** — **Screen 25** now has an **App Status** (Active / **Unavailable**, "On leave <date> — N jobs require reassignment"); mobile has per-visit **Skip** reasons. Self-mark trigger for a whole round is **unresolved** (Open Question #13 / MOB-2).
+- **#3 Technician reassignment on existing rounds** — **M15 (Reassign Technician modal)** from Today's Work (Screen 13); **Screen 30** Replace / Remove / + Add Technician; **M14 (Upcoming Property Recurrences)** — assignment is **per occurrence**, so recurrences can be Unassigned and need assigning. Storyboard: `975:35743`.
+- **#4 Add Round quick action** — confirmed as a **sidebar Quick Action** ("Add Round", alongside Bulk Message / Add One-Off Job) and a **"+ Add Round"** button on Round Planner; both open the **CreateRoundModal** 5-step wizard (Round Details · Assign Area · Add Properties · Assign Technician · Review & Save). Section `936:57646`.
+- **#5 Add properties to existing rounds** — **Add Round → Step 3 "Add Properties"** (search existing, or **Add New Property Inline**: Address, Customer name, Postcode, Price £); and **Screen 31** places an existing/new property into a round after creation.
+- **Open Question #8 resolved** (Assign Property Now decline → Save & Assign Later → unassigned property).
+- **New Mobile App section** added (RoundFlow Technician / B2C).
+
+**Method note:** screenshots could not be captured (figma-desktop MCP served only the active tab during this pass); all details were extracted from frame metadata/text. Frame IDs cited inline for re-verification.
