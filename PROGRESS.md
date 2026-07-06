@@ -261,19 +261,24 @@ Each item was actually run and observed:
   deferred); `saveBusinessProfile` → step 1 flips `complete`; `completeSetup` with
   only step 1 → `AppError 400` listing missing steps (3,4,6,7,8). DB restored via
   re-seed afterwards.
+- [x] **`GET /auth/me` with a real ES256 token → 200 + Profile.** Method: Supabase
+  password-grant token → `curl /auth/me -H "Authorization: Bearer <token>"` →
+  returned `{ supabaseUserId, role: "ADMIN", name, ... }`. Confirms the full
+  positive auth path: token → JWKS/ES256 verify → `req.user` → Profile lookup.
+- [x] **`handle_new_user` trigger creates the Profile on signup — behaviour
+  confirmed.** The real user's Profile exists with **`role = ADMIN`** and **`name`
+  = the email local-part** (`maazk101103` from `maazk101103@gmail.com`). So the
+  trigger assigns role ADMIN and derives the name from the email prefix. *(The
+  trigger SQL itself is still not version-controlled — see Known Placeholders /
+  Decisions Pending.)*
 
 **Not yet verified (do not assume working):**
 
-- [ ] `GET /auth/me` with a **real valid ES256 token** (full positive auth path:
-  token → verified claims → Profile returned). Needs a Supabase-issued JWT from
-  the frontend.
-- [ ] `/setup/*` **over HTTP with a real token** (the authenticated request path).
-  The route+auth layer is proven (401 without token) and the service logic is
-  proven directly against the DB, but the two haven't been exercised together via
-  an authenticated HTTP call — needs a Supabase JWT (no anon key / test user here).
-- [ ] The `handle_new_user` **trigger actually creating a Profile on a real
-  signup** (no real signup has been exercised end-to-end here).
-- [ ] Any behavior of the trigger's `name`/`role` logic (SQL not in repo).
+- [ ] `/setup/*` **over HTTP with a real token** — the shared `requireAuth` layer
+  is now proven with a real token (via `/auth/me`), but the specific setup
+  endpoints haven't yet been exercised over HTTP with a token (their service logic
+  is proven directly against the DB). See `docs/API_SETUP.md` for the contract to
+  test against.
 
 ## Known Placeholders / Dev-Only Items
 
