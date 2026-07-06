@@ -200,8 +200,6 @@ model Round {
   status        RoundStatus        @default(DRAFT) // DRAFT during wizard, ACTIVE on save
   serviceAreaId String?
   serviceArea   ServiceArea?       @relation(fields: [serviceAreaId], references: [id]) // step 2
-  technicianId  String?
-  technician    Technician?        @relation(fields: [technicianId], references: [id]) // step 4
   properties    Property[]
   visits        Visit[]
   createdAt     DateTime           @default(now())
@@ -217,8 +215,7 @@ model Technician {
   active       Boolean                 @default(true)
   avatarUrl    String?
   serviceAreas TechnicianServiceArea[]
-  rounds       Round[]
-  visits       Visit[]
+  visits       Visit[] // per-job assignment — the source of truth for "who does this round"
   messages     Message[]
   complaints   Complaint[]
   createdAt    DateTime                @default(now())

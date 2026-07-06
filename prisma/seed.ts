@@ -83,7 +83,8 @@ async function main() {
     },
   });
 
-  // 5. One DRAFT round in Alnwick, assigned to the seed technician.
+  // 5. One DRAFT round in Alnwick. Technician assignment is now per-Visit
+  //    (Round.technicianId was removed); a round has no direct technician FK.
   const round = await prisma.round.upsert({
     where: { id: "seed-round-1" },
     update: {},
@@ -95,7 +96,6 @@ async function main() {
       description: "Seed round for local development.",
       status: RoundStatus.DRAFT,
       serviceAreaId: alnwick.id,
-      technicianId: technician.id,
     },
   });
 

@@ -5,7 +5,9 @@
 > run, it's flagged as unverified. Update this file as the backend grows.
 > **2026-07-07:** `docs/designFindings.md` re-audited (admin design update + new
 > RoundFlow Technician mobile app). See **Schema Decisions & Implications
-> (2026-07-07 Design Update)** below. No schema or code has changed yet.
+> (2026-07-07 Design Update)** below. **Decision 2 (remove `Round.technicianId`)
+> is implemented** — migration `20260706211550_remove-round-technician-id`; other
+> schema items remain Pending/Deferred.
 
 ## Project Overview
 
@@ -109,8 +111,8 @@ via `tsx` (`npm run dev` / `npm start`). `tsc` is used only for typechecking
 
 ### Database & Schema
 
-Locked Prisma schema (`prisma/schema.prisma`), 19 models. One migration applied
-(`20260701220655_init`).
+Locked Prisma schema (`prisma/schema.prisma`), 19 models. Two migrations applied
+(`20260701220655_init`, `20260706211550_remove-round-technician-id`).
 
 - **Profile** — public-schema mirror of Supabase `auth.users`; `supabaseUserId`
   (unique) is the join key; `role` (ADMIN/MANAGER/TECHNICIAN, required); `name`.
@@ -122,7 +124,9 @@ Locked Prisma schema (`prisma/schema.prisma`), 19 models. One migration applied
   `cleanMethod`, `paymentMethod`, `nextDueDate`, `lastCompleted` (frequency lives
   on Round, not here).
 - **Round** — geographic cluster + cadence unit; `name`, `defaultDay`,
-  `frequency`, `status` (DRAFT/ACTIVE/ARCHIVED); optional ServiceArea + Technician.
+  `frequency`, `status` (DRAFT/ACTIVE/ARCHIVED); optional ServiceArea. **No
+  technician FK** — "who does this round" is derived from per-`Visit.technicianId`
+  (Decision 2, migration `20260706211550`).
 - **Technician** — field operative; `profileId` **nullable** (null = invited, not
   yet accepted); operational `role` (e.g. Senior/Trainee — not the auth role),
   `phone`, `active`.
@@ -157,9 +161,9 @@ creates/saves the property unassigned, assignable later, not auto-queued). The
 self-mark trigger — unresolved) plus mobile OQs MOB-1/2/3. See **Schema Decisions
 & Implications (2026-07-07 Design Update)** below.
 
-**Note:** the schema descriptions above reflect the **current** committed schema.
-The 2026-07-07 update includes a **decision to remove `Round.technicianId`** (not
-yet applied) — see below.
+**Note:** the 2026-07-07 update's **Decision 2 (remove `Round.technicianId`) is
+applied** (migration `20260706211550`). Other schema items from that update remain
+Pending/Deferred — see below.
 
 ### Infrastructure
 
@@ -283,27 +287,27 @@ Add Round quick action, add-properties-to-existing-rounds) plus a **new mobile a
 `prisma/seed.ts` has changed yet** — this records decisions + the review queue
 before we touch the schema.
 
-### Decisions made (Approved — not yet implemented)
+### Decisions made (Approved)
 
-1. **Per-occurrence assignment → Option A (derived; no new model).** An
-   "occurrence" is simply the group of `Visit`s sharing a `Round` + cycle date. The
-   3-step assignment wizard (Select Technicians → Allocate Jobs → Review) sets
-   **`Visit.technicianId` per job when visits are generated**. **No
-   `RoundOccurrence` model for Phase 1.** Rationale: `Visit`s already are the
-   per-date instances, and per-job technician is exactly what "manually divide the N
-   jobs between them" needs.
-2. **Remove `Round.technicianId` (single FK).** With assignment now per-`Visit`, a
-   single technician on `Round` is misleading and must not be the source of truth
-   for "who does this round." Remove it. A round's "assigned technicians" becomes
+1. **Per-occurrence assignment → Option A (derived; no new model).** *(No schema
+   change — applies at visit-generation build time.)* An "occurrence" is simply the
+   group of `Visit`s sharing a `Round` + cycle date. The 3-step assignment wizard
+   (Select Technicians → Allocate Jobs → Review) sets **`Visit.technicianId` per job
+   when visits are generated**. **No `RoundOccurrence` model for Phase 1.**
+   Rationale: `Visit`s already are the per-date instances, and per-job technician is
+   exactly what "manually divide the N jobs between them" needs.
+2. **Remove `Round.technicianId` (single FK).** ✅ **IMPLEMENTED 2026-07-07** —
+   migration `20260706211550_remove-round-technician-id` drops the column + FK
+   constraint. With assignment now per-`Visit`, a round's "assigned technicians" is
    **derived** from the distinct `Visit.technicianId` values across its current
-   occurrence. **Seed impact:** the seed's `Round` row currently sets `technicianId`
-   — when implemented, set it to `null` / drop that field usage.
+   occurrence. Also removed the now-dangling `Technician.rounds` back-relation; the
+   seed's `Round` upsert no longer sets `technicianId`.
 
 ### Schema implication review queue (from Step 4)
 
 | # | Implication | Status | Note |
 |---|-------------|--------|------|
-| 1 | `Round.technicianId` single FK → many-to-many join table | **Rejected** | Superseded by Decision 2 — remove it; per-`Visit` is source of truth. No join table added. |
+| 1 | `Round.technicianId` single FK → many-to-many join table | **Rejected** | m2m superseded by Decision 2. ✅ Column + FK **removed** (migration `20260706211550`); `Technician.rounds` back-relation dropped; seed updated. |
 | 2 | `RoundOccurrence` entity (per-occurrence assignment) | **Deferred** | Decision 1: derived (Option A) for Phase 1. Revisit only if per-occurrence divergence later needs first-class modelling. |
 | 3 | Manual job division via existing `Visit.technicianId` | **Approved (no change)** | Mechanism already exists; set at visit generation. Add app-level rule: a visit's technician ∈ the round's assigned set. |
 | 4 | Technician **availability** status (Available / Unavailable / On-leave + date) | **Pending** | `Technician` has only `active: Boolean`. Needs an availability enum + leave date/range. Drives reassignment; ties to OQ#13. |
