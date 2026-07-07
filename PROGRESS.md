@@ -37,6 +37,19 @@
 > stay Phase-1 stubs), and `name` added to `TechnicianInput`/`saveTechnicians`.
 > **Tier 2 (wizard steps 9–11: Add Property, Assign Technicians, Activate/Generate
 > Visits) deferred to milestones M2/M3/M4 — no endpoints built.**
+> **2026-07-08 (Auth re-audit):** Re-audited the Figma `Login/signup` section — the
+> 5 auth screens were rebuilt on Page 1; updated `docs/designFindings.md` Screens 1–5
+> node IDs (old `658/681:xxxx` → `936:617xx/620xx`) + fields, and added an **Auth Flows**
+> section. **Magic-link flow confirmed** for both signup confirmation and password
+> reset → **OTP (Screen 4) deferred** (not built in Phase 1). Signup now collects
+> **Full name** (`raw_user_meta_data.full_name` → `Profile.name`) and **Company name**
+> (`raw_user_meta_data.company_name` → `BusinessSettings.businessName`). Wrote
+> **`docs/sql/handle_new_user_v2.sql`** (trigger v2 — seeds `businessName` from
+> `company_name` on first signup, only if unset) — **run in Supabase and verified
+> live 2026-07-08** (`pg_get_functiondef` confirms the v2 body; `on_auth_user_created`
+> bound to `auth.users`). ROADMAP M0 updated (FE-M0-02/03 magic-link; new FE-M0-06 Google OAuth +
+> `/auth/callback`, FE-M0-07 signup email UX, FE-M0-08 auth guards, BE-M0-08 run
+> trigger v2). No `/auth/callback` yet — it's a **frontend** route.
 
 ## Project Overview
 

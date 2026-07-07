@@ -53,13 +53,17 @@ Two locked assignment rules run through the scheduling milestones (see
 - [x] **[BE-M0-05]** Prisma client singleton + idempotent dev seed. `labels: backend, infra`
 - [x] **[BE-M0-06]** Build pipeline (`clean → typecheck → emit dist`) + `start:prod`. `labels: backend, infra`
 - [x] **[BE-M0-07]** OpenAPI spec (`swagger.ts`) served at `/docs` + `/openapi.json`. `labels: backend, docs`
+- [x] **[BE-M0-08]** Update `handle_new_user` trigger — ran `docs/sql/handle_new_user_v2.sql` in Supabase (**applied + verified live 2026-07-08**): writes `company_name` metadata → `BusinessSettings.businessName` on first signup (only if unset). **Manual Supabase SQL step, not a Prisma migration.** `labels: backend, auth`
 
 ### Frontend tickets
 - [ ] **[FE-M0-01]** Scaffold frontend (Vite + React + TS) + Supabase JS client + env config. `labels: frontend, infra`
-- [ ] **[FE-M0-02]** Auth screens — Login + Sign Up via Supabase (email/password + Continue with Google) (Screen 1, Screen 2). `labels: frontend, auth`
-- [ ] **[FE-M0-03]** Password reset flow — Forgot / OTP / Reset via Supabase (Screen 3, Screen 4, Screen 5). `labels: frontend, auth`
+- [ ] **[FE-M0-02]** Auth screens — Login + Sign Up via Supabase (email/password + Continue with Google). Sign Up passes **Full name** + **Company name** as user metadata; email confirmation via **magic link** (Screen 1, Screen 2). `labels: frontend, auth`
+- [ ] **[FE-M0-03]** Password reset flow — Forgot + Reset via Supabase **magic link** (`resetPasswordForEmail` → link → `/reset-password` route → `updateUser({ password })`). **OTP (Screen 4) deferred — not built in Phase 1** (magic link used instead) (Screen 3, Screen 5). `labels: frontend, auth`
 - [ ] **[FE-M0-04]** App shell + protected routing + left-sidebar nav (Dashboard · Round Planner · Today's Work · Customers · Debt/Payment · Reports · Complaints · Settings · Technicians). `labels: frontend, infra`
 - [ ] **[FE-M0-05]** API client wrapper — attach Supabase Bearer token; handle 401 + token refresh. `labels: frontend, infra`
+- [ ] **[FE-M0-06]** Google OAuth — "Continue with Google" on login + signup (`signInWithOAuth({ provider: 'google' })`); **`/auth/callback`** route calling `exchangeCodeForSession()`. `labels: frontend, auth`
+- [ ] **[FE-M0-07]** Post-signup email confirmation UX — show "Check your email for a confirmation link" after Sign Up; handle the magic-link redirect back into the app. `labels: frontend, auth`
+- [ ] **[FE-M0-08]** Auth redirect guards — protected-route wrapper: unauthenticated → `/login`; authenticated user on an auth screen → `/dashboard`. `labels: frontend, auth`
 
 ### Definition of Done
 - Schema migrated to Supabase; `requireAuth` + `/auth/me` verified with a real ES256 token; `/health` 200; `npm run build` + `/docs` served; `npm audit` 0 vulnerabilities.

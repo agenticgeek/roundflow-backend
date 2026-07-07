@@ -25,43 +25,67 @@ Add Round · Bulk Message · Add One-Off Job
 
 ## Screens
 
-### 1. Login  
-**Section:** `Login/signup` · Node `658:7746`  
+### 1. Login *(re-audited 2026-07-08)*  
+**Section:** `Login/signup` · Node `936:61788` (`login-screen`) · original Rough node `658:7746`  
 **Purpose:** Authentication entry point for returning users.  
 **Layout:** Split — dark left panel (brand marketing) + white right panel (form).  
 **Elements:**
-- Left: RoundFlow logo, headline "Manage your rounds. Empower your team.", 3 feature bullets (Live GPS tracking, Automated scheduling, Instant payments)
-- Right: Log in / Sign up tab toggle, Work email input, Password input, Remember me checkbox, Forgot password link, Sign in button, "Continue with Google" OAuth button, Sign up link
+- Left: RoundFlow logo (new "R" mark), headline "Manage your rounds. Empower your team.", subtitle "Track jobs, technicians, payments and complaints — all in one place.", 3 feature bullets (Live GPS tracking, Automated scheduling, Instant payments), "© 2024 RoundFlow Ltd." footer
+- Right: "Welcome back / Sign in to your RoundFlow account"; **Log in / Sign up** tab toggle; **Work email**; **Password**; **Remember me** checkbox; **Forgot password?** link; **Sign in** button; "or" divider; **Continue with Google** button; "Don't have an account? **Sign up**" link
 
-**Interactions:** Tab toggle switches between login and signup form. Forgot password → dedicated screen.
+**Interactions:** Tab toggle switches Login ⇄ Sign Up (Screen 2). **Forgot password?** → Screen 3. **Continue with Google** → Google OAuth (`supabase.auth.signInWithOAuth({ provider: 'google' })`). **Sign up** → Screen 2. Email/password → `supabase.auth.signInWithPassword`. See **Auth Flows** below.
 
 ---
 
-### 2. Sign Up  
-**Section:** `Login/signup` · Node `658:7808`  
+### 2. Sign Up *(re-audited 2026-07-08)*  
+**Section:** `Login/signup` · Node `936:61853` (`signup-screen`) · original Rough node `658:7808`  
 **Purpose:** New user account registration.  
-**Elements:** Same split layout. Name, work email, password, confirm password fields + Sign up CTA.
+**Layout:** Same split layout as Login.  
+**Elements (right panel):** "Get started free / Create your RoundFlow account"; Log in / Sign up tab toggle; **Full name**; **Work email**; **Company name**; **Password**; **Confirm Password**; "By signing up you agree to our **Terms** & **Privacy Policy**"; **Create account** button; "or" → **Continue with Google**; "Already have an account? **Log in**" link.  
+**Metadata mapping:** **Full name → `raw_user_meta_data.full_name`**, **Company name → `raw_user_meta_data.company_name`** (passed on `supabase.auth.signUp`). The `handle_new_user` trigger reads `full_name` → `Profile.name` and `company_name` → `BusinessSettings.businessName` (see **Auth Flows** + `docs/sql/handle_new_user_v2.sql`).  
+**Interactions:** **Create account** → Supabase sends a **magic-link confirmation email** → user clicks → into app. **Continue with Google** → Google OAuth. **Log in** → Screen 1.
 
 ---
 
-### 3. Forgot Password  
-**Section:** `Login/signup` · Node `681:8108`  
+### 3. Forgot Password *(re-audited 2026-07-08)*  
+**Section:** `Login/signup` · Node `936:61929` (`forgot-password`) · original Rough node `681:8108`  
 **Purpose:** Password reset request.  
-**Elements:** Email input, Send Reset Link button, Back to login link.
+**Elements:** **← Back to log in** link; "Forgot password? / Enter your work email and we'll send you a reset link."; **Work email** input; **Send reset link** button; "Didn't receive an email? Check your spam folder or **resend**" helper.  
+**Flow note:** Submitting calls `supabase.auth.resetPasswordForEmail(email, { redirectTo: <app>/reset-password })` → Supabase sends a **magic link** (NOT an OTP code) → user clicks → Screen 5. **← Back to log in** → Screen 1.
 
 ---
 
-### 4. OTP Verification  
-**Section:** `Login/signup` · Node `681:8150`  
-**Purpose:** 6-digit code verification step in password reset flow.  
-**Elements:** 6-box OTP input, Resend code link, Verify button.
+### 4. OTP Verification — ⚠️ DEFERRED (not in the Phase 1 flow)  
+**Section:** `Login/signup` · Node `936:61974` (`otp-verification`) · original Rough node `681:8150`  
+**Status:** **Deferred — not built in Phase 1.** Both password reset and signup confirmation use a **magic link**, not a 6-digit OTP, so this screen is **skipped entirely**. Kept in the design for a potential future OTP flow.  
+**Elements (reference only):** "← Back"; "Check your email / We sent a 6-digit code to {email}. Enter it below to continue."; 6-box OTP input; **"Code expires in mm:ss"** countdown; **Verify code** button; "Didn't receive a code? **Resend code**".
 
 ---
 
-### 5. Reset Password  
-**Section:** `Login/signup` · Node `681:8203`  
-**Purpose:** New password entry after OTP confirmed.  
-**Elements:** New password + confirm password inputs, Reset Password button.
+### 5. Reset Password *(re-audited 2026-07-08)*  
+**Section:** `Login/signup` · Node `936:62030` (`reset-password`) · original Rough node `681:8203`  
+**Purpose:** Set a new password after clicking the reset magic link.  
+**Elements:** "← Back"; "Set new password / Your new password must be at least 8 characters and include a number." (**password rule**); **New password** with **show/hide eye toggle**; **password strength indicator** (Weak / Fair / Good / Strong); **Confirm password** with eye toggle; **Reset password** button; "You'll be redirected to log in after reset." note.  
+**Flow:** User arrives via the **magic link** from Screen 3 (route `/reset-password`, recovery session active) → `supabase.auth.updateUser({ password })` → redirected to Login (Screen 1).
+
+---
+
+### Auth Flows *(NEW — 2026-07-08)*
+Auth is handled by **Supabase Auth** (frontend + Supabase); this backend only **verifies** the ES256 JWT (`requireAuth`) and reads the Profile created by the `handle_new_user` trigger. It issues no tokens and exposes no login/signup endpoints.
+
+**1. Sign Up (email/password)**
+`signup-screen` → `supabase.auth.signUp({ email, password, options: { data: { full_name, company_name } } })` → Supabase sends a **magic-link confirmation email** → user clicks → session established → into the app. On the `auth.users` insert, the **`handle_new_user` trigger** creates the `Profile` (role `ADMIN`, `name` = `full_name`) and sets `BusinessSettings.businessName` = `company_name` **only if not already set** (see `docs/sql/handle_new_user_v2.sql`).
+
+**2. Login (email/password)**
+`login-screen` → `supabase.auth.signInWithPassword({ email, password })` → session → into the app.
+
+**3. Password reset**
+`forgot-password` → `supabase.auth.resetPasswordForEmail(email, { redirectTo: '<app>/reset-password' })` → Supabase sends a **reset magic link** → user clicks → lands on `/reset-password` (Screen 5) with a recovery session → `supabase.auth.updateUser({ password })` → redirected to Login. **The OTP screen (4) is skipped.**
+
+**4. Google OAuth**
+"Continue with Google" (login/signup) → `supabase.auth.signInWithOAuth({ provider: 'google' })` → Supabase handles the Google redirect → returns to the frontend **`/auth/callback`** route → `supabase.auth.exchangeCodeForSession()` → session → into the app. First-time OAuth users also hit `handle_new_user` (Profile created; `company_name` absent → `businessName` untouched).
+
+**Backend involvement:** none are backend HTTP endpoints. The backend only (a) verifies the Bearer JWT per request (`requireAuth`), and (b) relies on the `handle_new_user` Postgres trigger for Profile / BusinessSettings seeding. **`/auth/callback` is a frontend route.**
 
 ---
 
