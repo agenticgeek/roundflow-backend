@@ -86,9 +86,10 @@ Annotated tree (excludes `node_modules/`, `.git/`):
 ├── docs/
 │   ├── RoundFlow_Context_and_Roadmap_v1.md   # Active project brief: what RoundFlow is, phased roadmap.
 │   └── designFindings.md          # Source of truth for screens/flows (Figma wireframe audit).
-├── package.json                   # Deps + scripts (dev/start/seed/prisma:*). Prisma seed config.
+├── package.json                   # Deps + scripts (dev/start/build/typecheck/clean/start:prod/seed/prisma:*).
 ├── package-lock.json              # Lockfile.
-├── tsconfig.json                  # TS config: Node16 module/resolution, strict, noEmit-style typecheck.
+├── tsconfig.json                  # Base TS config (Node16, strict); drives typecheck over src/ + prisma/.
+├── tsconfig.build.json            # Production build config: emits only src/ → dist/ (rootDir src, entry dist/index.js).
 ├── prisma/
 │   ├── schema.prisma              # 19 models + enums; datasource (url + directUrl); prisma-client-js generator.
 │   ├── seed.ts                    # Idempotent dev seed (BusinessSettings, admin Profile, Technician, 2 areas, 1 round).
@@ -108,9 +109,13 @@ Annotated tree (excludes `node_modules/`, `.git/`):
         └── setup.ts               # Thin /setup routes: validate → call SetupService → respond; all requireAuth.
 ```
 
-Note: there is **no compiled build step yet** — the app runs TypeScript directly
-via `tsx` (`npm run dev` / `npm start`). `tsc` is used only for typechecking
-(`tsc --noEmit`). `tsconfig.json` sets `outDir: dist` but no `build` script emits.
+Build & run: dev runs TypeScript directly via `tsx` (`npm run dev` / `npm start`).
+A production **build pipeline** now exists: `npm run build` = `clean` (`rm -rf
+dist`) → `typecheck` (`tsc --noEmit`, covers `src/` + `prisma/`) → emit `src/` to
+`dist/` via `tsconfig.build.json` (`rootDir: src`, so the entry is `dist/index.js`;
+the seed is not compiled into the build). `npm run start:prod` runs
+`node dist/index.js`. `npm run typecheck` / `npm run clean` are available
+standalone. `dist/` is gitignored.
 
 ## What's Built
 
@@ -271,6 +276,10 @@ Each item was actually run and observed:
   trigger assigns role ADMIN and derives the name from the email prefix. *(The
   trigger SQL itself is still not version-controlled — see Known Placeholders /
   Decisions Pending.)*
+- [x] **Production build works.** `npm run build` (clean → typecheck → emit) →
+  `dist/index.js` (+ `lib`/`middleware`/`routes`/`services`); `node dist/index.js`
+  boots and `GET /health` → 200. Method: `npm run build`, then `node dist/index.js`
+  + `curl`.
 
 **Not yet verified (do not assume working):**
 
@@ -291,8 +300,9 @@ Each item was actually run and observed:
   origin(s) before production.
 - **`handle_new_user` trigger is not version-controlled** — capture it as a SQL
   migration so it's reproducible across environments.
-- **No production build/runtime** — runs via `tsx` (dev). No `dist` build,
-  process manager, health/readiness for a real deploy, or structured logging yet.
+- **No production runtime hardening** — a `dist/` build now exists (`npm run
+  build` → `npm run start:prod`), but there's still no process manager,
+  deploy-grade health/readiness, or structured logging yet.
 - **Error handler returns generic 500s** — fine for now; no error typing/logging
   strategy.
 - **`.env` contains `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`** that no backend

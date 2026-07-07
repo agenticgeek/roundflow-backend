@@ -1,0 +1,14 @@
+{
+  // Production build config. Extends the base tsconfig but emits ONLY the
+  // application source (src/) to dist/, with src as the root so the entry point
+  // is dist/index.js. The base tsconfig.json still governs `tsc --noEmit`
+  // typechecking, which additionally covers prisma/ (seed). The build script
+  // runs the full typecheck first, then this config emits.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "noEmit": false
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "prisma"]
+}
