@@ -198,7 +198,7 @@ setupRouter.post(
       phone: t.phone as string | undefined,
       active: typeof t.active === "boolean" ? t.active : undefined,
     }));
-    res.json(await setupService.createTechnicians(profileId, input));
+    res.json(await setupService.saveTechnicians(profileId, input));
   })
 );
 
@@ -221,7 +221,7 @@ setupRouter.post(
       postcodeSector: a.postcodeSector as string | undefined,
       isDefault: typeof a.isDefault === "boolean" ? a.isDefault : undefined,
     }));
-    res.json(await setupService.createServiceAreas(profileId, input));
+    res.json(await setupService.saveServiceAreas(profileId, input));
   })
 );
 
@@ -245,7 +245,7 @@ setupRouter.post(
       frequency: body.frequency as string | undefined,
       serviceAreaId: body.serviceAreaId as string | undefined,
     };
-    res.json(await setupService.createFirstRound(profileId, input));
+    res.json(await setupService.saveFirstRound(profileId, input));
   })
 );
 

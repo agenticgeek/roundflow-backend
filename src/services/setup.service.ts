@@ -102,19 +102,19 @@ export interface ISetupService {
   ): Promise<BusinessSettings>;
 
   getTechnicians(profileId: string): Promise<Technician[]>;
-  createTechnicians(
+  saveTechnicians(
     profileId: string,
     input: TechnicianInput[]
   ): Promise<Technician[]>;
 
   getServiceAreas(profileId: string): Promise<ServiceArea[]>;
-  createServiceAreas(
+  saveServiceAreas(
     profileId: string,
     input: ServiceAreaInput[]
   ): Promise<ServiceArea[]>;
 
   getActiveRounds(profileId: string): Promise<Round[]>;
-  createFirstRound(profileId: string, input: FirstRoundInput): Promise<Round>;
+  saveFirstRound(profileId: string, input: FirstRoundInput): Promise<Round>;
 }
 
 const SINGLETON = { uniqueId: "singleton" } as const;
@@ -281,39 +281,57 @@ class SetupService implements ISetupService {
     return prisma.technician.findMany({ orderBy: { createdAt: "asc" } });
   }
 
-  async createTechnicians(
+  async saveTechnicians(
     _profileId: string,
     input: TechnicianInput[]
   ): Promise<Technician[]> {
-    // Each technician is invite-pending: profileId = null. Name/email arrive
-    // when the invite is accepted (Profile + auth.users), so are not stored here.
-    await prisma.technician.createMany({
-      data: input.map((t) => ({
-        profileId: null,
-        role: t.role ?? null,
-        phone: t.phone ?? null,
-        active: t.active ?? true,
-      })),
+    // Replace semantics — re-posting step 6 must not append duplicates. Delete
+    // only the invite-pending technicians (profileId = null); technicians who
+    // have accepted an invite (real profileId) are never touched. Then recreate
+    // from the input. Each created technician is invite-pending (profileId = null;
+    // name/email arrive when the invite is accepted).
+    return prisma.$transaction(async (tx) => {
+      await tx.technician.deleteMany({ where: { profileId: null } });
+      if (input.length > 0) {
+        await tx.technician.createMany({
+          data: input.map((t) => ({
+            profileId: null,
+            role: t.role ?? null,
+            phone: t.phone ?? null,
+            active: t.active ?? true,
+          })),
+        });
+      }
+      return tx.technician.findMany({ orderBy: { createdAt: "asc" } });
     });
-    return prisma.technician.findMany({ orderBy: { createdAt: "asc" } });
   }
 
   async getServiceAreas(_profileId: string): Promise<ServiceArea[]> {
     return prisma.serviceArea.findMany({ orderBy: { createdAt: "asc" } });
   }
 
-  async createServiceAreas(
+  async saveServiceAreas(
     _profileId: string,
     input: ServiceAreaInput[]
   ): Promise<ServiceArea[]> {
-    await prisma.serviceArea.createMany({
-      data: input.map((a) => ({
-        name: a.name,
-        postcodeSector: a.postcodeSector ?? null,
-        isDefault: a.isDefault ?? false,
-      })),
+    // Replace the whole set — re-posting step 7 must not append duplicates.
+    // Safe within the wizard: Rounds/Properties that reference ServiceArea are
+    // created after step 7, and only once setup is complete —
+    // assertSetupIncomplete blocks this POST after completion, so no live FK
+    // reference to a deleted area can exist here.
+    return prisma.$transaction(async (tx) => {
+      await tx.serviceArea.deleteMany({});
+      if (input.length > 0) {
+        await tx.serviceArea.createMany({
+          data: input.map((a) => ({
+            name: a.name,
+            postcodeSector: a.postcodeSector ?? null,
+            isDefault: a.isDefault ?? false,
+          })),
+        });
+      }
+      return tx.serviceArea.findMany({ orderBy: { createdAt: "asc" } });
     });
-    return prisma.serviceArea.findMany({ orderBy: { createdAt: "asc" } });
   }
 
   async getActiveRounds(_profileId: string): Promise<Round[]> {
@@ -323,7 +341,7 @@ class SetupService implements ISetupService {
     });
   }
 
-  async createFirstRound(
+  async saveFirstRound(
     _profileId: string,
     input: FirstRoundInput
   ): Promise<Round> {
@@ -347,14 +365,26 @@ class SetupService implements ISetupService {
         throw new AppError(400, `serviceAreaId not found: ${input.serviceAreaId}`);
       }
     }
+
+    const data = {
+      name: input.name,
+      defaultDay: (input.defaultDay as DayOfWeek) ?? null,
+      frequency: (input.frequency as CleaningFrequency) ?? null,
+      serviceAreaId: input.serviceAreaId ?? null,
+    };
+
+    // Upsert the single setup round — re-posting step 8 must update the existing
+    // ACTIVE round, not create a second. If an ACTIVE round exists, update it;
+    // otherwise create it (the first round → ACTIVE).
+    const existing = await prisma.round.findFirst({
+      where: { status: RoundStatus.ACTIVE },
+      orderBy: { createdAt: "asc" },
+    });
+    if (existing) {
+      return prisma.round.update({ where: { id: existing.id }, data });
+    }
     return prisma.round.create({
-      data: {
-        name: input.name,
-        defaultDay: (input.defaultDay as DayOfWeek) ?? null,
-        frequency: (input.frequency as CleaningFrequency) ?? null,
-        serviceAreaId: input.serviceAreaId ?? null,
-        status: RoundStatus.ACTIVE, // this is the first round → ACTIVE
-      },
+      data: { ...data, status: RoundStatus.ACTIVE },
     });
   }
 }

@@ -685,8 +685,9 @@ const paths: OpenAPIV3.PathsObject = {
     },
     post: {
       tags: ["Setup"],
-      summary: "Step 6 — create invite-pending technician(s)",
-      description: "Each created technician has profileId = null (invite-pending).",
+      summary: "Step 6 — save invite-pending technician(s)",
+      description:
+        "REPLACES all invite-pending technicians (profileId = null) with the posted list — send the full list you want to keep (re-posting is safe; it does not append duplicates). Technicians who have accepted an invite (real profileId) are never affected. Each created technician is invite-pending (profileId = null).",
       requestBody: jsonBody(arrayOrWrapped("TechnicianInput", "technicians")),
       responses: {
         "200": jsonResponse("All technicians.", { type: "array", items: ref("Technician") }),
@@ -708,7 +709,9 @@ const paths: OpenAPIV3.PathsObject = {
     },
     post: {
       tags: ["Setup"],
-      summary: "Step 7 — create service area(s)",
+      summary: "Step 7 — save service area(s)",
+      description:
+        "REPLACES all service areas with the posted list — send the full list you want to keep (re-posting is safe; it does not append duplicates).",
       requestBody: jsonBody(arrayOrWrapped("ServiceAreaInput", "serviceAreas")),
       responses: {
         "200": jsonResponse("All service areas.", {
@@ -734,9 +737,9 @@ const paths: OpenAPIV3.PathsObject = {
     },
     post: {
       tags: ["Setup"],
-      summary: "Step 8 — create the first round (ACTIVE)",
+      summary: "Step 8 — save the first round (ACTIVE)",
       description:
-        "Creates a Round with status ACTIVE. `name` required; `defaultDay`/`frequency` validated against their enums; `serviceAreaId` (if given) must exist.",
+        "Creates OR updates the single setup round (upsert) — re-posting updates the existing ACTIVE round rather than creating a second. The round is ACTIVE. `name` required; `defaultDay`/`frequency` validated against their enums; `serviceAreaId` (if given) must exist.",
       requestBody: jsonBody(ref("FirstRoundInput")),
       responses: {
         "200": jsonResponse("The created round.", ref("Round")),
