@@ -88,6 +88,11 @@ export interface ISetupService {
     input: BusinessProfileInput
   ): Promise<BusinessSettings>;
 
+  // Reads the BusinessSettings singleton — backs GET /setup/step/1 and step/4
+  // (Business Profile + Round Settings live on the same row). Stays open after
+  // setup completes so the Settings screens can reuse it.
+  getBusinessSettings(profileId: string): Promise<BusinessSettings | null>;
+
   getServices(profileId: string): Promise<Service[]>;
   saveServices(profileId: string, input: ServiceInput[]): Promise<Service[]>;
 
@@ -216,6 +221,10 @@ class SetupService implements ISetupService {
       update: data,
       create: { ...SINGLETON, ...data },
     });
+  }
+
+  async getBusinessSettings(_profileId: string): Promise<BusinessSettings | null> {
+    return this.getSettings();
   }
 
   async getServices(_profileId: string): Promise<Service[]> {

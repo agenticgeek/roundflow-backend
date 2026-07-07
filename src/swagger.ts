@@ -565,6 +565,16 @@ const paths: OpenAPIV3.PathsObject = {
 
   // ---- Setup: Step 1 — Business Profile ----
   "/setup/step/1": {
+    get: {
+      tags: ["Setup"],
+      summary: "Step 1 — get Business Profile",
+      description:
+        "Returns the BusinessSettings singleton (or null if not yet created). Open after setup completes — the Settings screens reuse it.",
+      responses: {
+        "200": jsonResponse("BusinessSettings (or null).", nullableRef("BusinessSettings")),
+        "401": ERR[401],
+      },
+    },
     post: {
       tags: ["Setup"],
       summary: "Step 1 — Business Profile",
@@ -624,6 +634,16 @@ const paths: OpenAPIV3.PathsObject = {
 
   // ---- Setup: Step 4 — Round Settings ----
   "/setup/step/4": {
+    get: {
+      tags: ["Setup"],
+      summary: "Step 4 — get Round Settings",
+      description:
+        "Returns the BusinessSettings singleton (same row as step 1; read `defaultCycleLength` / `defaultWorkingDays`). Open after setup completes.",
+      responses: {
+        "200": jsonResponse("BusinessSettings (or null).", nullableRef("BusinessSettings")),
+        "401": ERR[401],
+      },
+    },
     post: {
       tags: ["Setup"],
       summary: "Step 4 — Round Settings",

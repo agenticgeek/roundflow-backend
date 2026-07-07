@@ -75,6 +75,12 @@ setupRouter.get(
 
 // ---- Step 1: Business Profile --------------------------------------------
 
+setupRouter.get(
+  "/step/1",
+  h(async (req, res) => {
+    res.json(await setupService.getBusinessSettings(profileIdOf(req)));
+  })
+);
 setupRouter.post(
   "/step/1",
   h(async (req, res) => {
@@ -138,6 +144,14 @@ setupRouter.post(
 
 // ---- Step 4: Round Settings ----------------------------------------------
 
+setupRouter.get(
+  "/step/4",
+  h(async (req, res) => {
+    // Same BusinessSettings singleton as step 1; the frontend reads the
+    // round-settings fields (defaultCycleLength / defaultWorkingDays) from it.
+    res.json(await setupService.getBusinessSettings(profileIdOf(req)));
+  })
+);
 setupRouter.post(
   "/step/4",
   h(async (req, res) => {
