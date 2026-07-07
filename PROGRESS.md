@@ -25,6 +25,18 @@
 > (`PaymentTiming?`) / `gocardlessConnected` / `stripeConnected`, and new enum
 > `PaymentTiming { COLLECT_AFTER_VISIT, COLLECT_BEFORE_VISIT, COLLECT_ON_DATE }`.
 > Additive only; seed unchanged (all new fields nullable/defaulted); `tsc` + seed clean.
+> **2026-07-08 (Setup re-audit):** Full re-audit of the Figma `/Setup` section (34
+> frames) found the wizard has grown to a **12-step** flow (an older 7-step cut and a
+> newer 12-step cut coexist; we build against 12) — `docs/designFindings.md` Screen 6
+> rewritten with real frame IDs. **Key finding: step 2 (Payment Setup) is a full
+> screen, not a stub** — it collects `paymentRule`, `debtHoldEnabled`, `vatInInvoices`,
+> `gocardlessConnected`, `stripeConnected` at first-run; and step 6 collects
+> Technician **Full Name**. **Reversed Settings Decision 3** (step 2 now real).
+> **Tier 1 fixes applied:** real `GET/POST /setup/step/2` (`savePaymentSetup`/
+> `getPaymentSetup`; step-2 completeness = `paymentRule != null`; connect toggles
+> stay Phase-1 stubs), and `name` added to `TechnicianInput`/`saveTechnicians`.
+> **Tier 2 (wizard steps 9–11: Add Property, Assign Technicians, Activate/Generate
+> Visits) deferred to milestones M2/M3/M4 — no endpoints built.**
 
 ## Project Overview
 

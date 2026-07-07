@@ -65,23 +65,33 @@ Add Round · Bulk Message · Add One-Off Job
 
 ---
 
-### 6. Setup Wizard (Onboarding)  
-**Section:** `/Setup` · Primary node `401:19250`  
+### 6. Setup Wizard (Onboarding) *(re-audited 2026-07-08 — now 12 steps)*  
+**Section:** `/Setup` · section node `936:44567` · **34 frames** (29 "Setup" + Edit Changes + Edit/Add Service modals) · original primary `401:19250`  
 **Purpose:** First-run multi-step wizard to configure the business before using the app.  
-**Layout:** Full-screen (no sidebar nav), horizontal step indicator at top showing 8 steps.
+**Layout:** Full-screen (no sidebar nav), horizontal step indicator at top.
 
-**Steps:**
-1. **Business Profile** — Business Name, Phone, Email, Service Area (optional), Company Number, VAT Registration, VAT Registered Y/N, Default Working Days, Timezone, Currency
-2. **Payment Setup** — GoCardless integration, BACS/bank details
-3. **Service Catalogue** — Add services (type, price, description)
-4. **Round Settings** — Default cycle length, visit frequency options
-5. **SMS/WhatsApp Templates** — Pre-built message templates for reminders, weather delays, etc.
-6. **Technician Management** — Add technicians with name, role, contact
-7. **Service Area** — Geographic areas served
-8. **Assign Round** — Assign the first round to a technician
+> ⚠️ **Design inconsistency (mid-refactor):** the file contains **two coexisting cuts** — an older **7-step** version (some frames still footer "Step X of 7") and a newer **12-step** version (header stepper runs to "12 Review & Launch"). Minor label bleed is also present (e.g. an "Add Area" button opening a service modal, a stray "Mobile Number *" in unrelated forms). **We build against the 12-step cut.** A confirmed canonical step list from the designer is still pending.
 
-**Navigation:** Back / Continue buttons, "Step N of 8" — stepper and footer are now consistent.  
-**26 frames** in this section cover each step's default + error/alternate states plus Edit Changes sub-flow.
+**Steps (12-step cut — authoritative):**
+
+| # | Step | Content | Frame(s) | Backend |
+|---|------|---------|----------|---------|
+| 1 | **Business Profile** | Business Name\*, Phone\*, Email\*, Service Area (opt), Company Number (opt), VAT Registration (opt) | `936:44568` / `44681` / `44815` | ✅ `POST /setup/step/1` |
+| 2 | **Payment Setup** | GoCardless + Stripe *Connect* (stub); **Default Payment Rule**; **VAT Applicable** toggle; **Debt Hold Enabled** toggle | `936:44953` | ✅ **real** `POST /setup/step/2` — persists `paymentRule`, `debtHoldEnabled`, `vatInInvoices`, `gocardlessConnected`, `stripeConnected` (connect = stub) |
+| 3 | **Service Catalogue** | Add/search/filter services (All · Window Cleaning · Exterior Cleaning · Gutter & Fascia · Specialist), Active/Inactive, Edit/Add Service modals | `936:48147` / `48399` / `48714` / `49050` | ✅ `POST /setup/step/3` (full replace) |
+| 4 | **Round Settings** | Default Recurring Cycle (Week/2/3/4-week), **Default Clean Methods** (Traditional/Water-fed Pole), **Auto-Generate Visits** toggle | `936:45071` / `45157` / `45264` | ⚠️ partial — `POST /setup/step/4` covers cycle + working days; clean-method + auto-gen not yet persisted (P1-nice) |
+| 5 | **SMS/WhatsApp Templates** | Templates list (Pre-Clean Reminder, Payment Reminder, Payment Failed, Access Issue Follow-up, Job Completed, Weather Delay), `{{merge}}` vars | `936:45371` | 🟡 deferred stub (GHL owns messaging — Settings Decision 4) |
+| 6 | **Technician Management** | Add New Technician: **Full Name\***, **Mobile Number\***, Role, Default Area; table Phone/Role/Round/App Status | `936:45492` / `45575` / `45675` / `45778` | ✅ `POST /setup/step/6` (**now accepts `name`**) |
+| 7 | **Service Area** | Add New Area: name, postcode sector, default; area cards | `936:45881` | ✅ `POST /setup/step/7` (full replace) |
+| 8 | **Assign Round** (Area→Round) | Round Name, Service Area Name, Post Code Sector, Round Day of Week, Add Round; Linked Rounds | `936:45976` / `46053` / `46155` | ✅ `POST /setup/step/8` (basic first round) |
+| 9 | **Add Property** | Multi-substep: Property Details (Customer/Property, address) · Service Plan (frequency, price, VAT, payment method) · Scheduling (Start Date, Preferred Day) · Risk & Notes · Assign Property to Round | `936:46253` / `46371` · `46514` · `46601` · `46673` · `46743` / `46813` | 🔴 **designed but deferred to milestone M2 — backend endpoint does not yet exist** |
+| 10 | **Assign Technicians to Rounds** | Total Rounds / Technicians / Unassigned; Round Assignments table (Round / Area / Properties / Assigned Technician) — multi-tech | `936:47259` / `47453` / `47665` · `47853` (Edit Changes) | 🔴 **designed but deferred to milestone M3 — backend endpoint does not yet exist** |
+| 11 | **Activate System & Generate Visits** | Generate Visits (All Rounds / Selected Rounds), First Cycle Start Date, Frequency/Cycle → *Generate Visits & Activate* | `936:47044` / `47141` | 🔴 **designed but deferred to milestone M4 — backend endpoint does not yet exist** |
+| 12 | **Review & Launch** | Setup Progress checklist (Business profile · GoCardless connected · Stripe configured · SMS templates · Technicians · Service areas · Round settings), Ready to Launch, What happens next | `936:46888` | ✅ `POST /setup/complete` |
+
+**Navigation:** Back / Continue; footer step counter (inconsistent — see warning above). **Steps 9–11 are designed but deferred to milestones M2 / M3 / M4 respectively; their backend endpoints do not yet exist.** Setup completion (`/setup/complete`) gates on the built steps only.
+
+**Superseded:** the earlier **8-step** description (Business Profile · Payment Setup · Service Catalogue · Round Settings · SMS · Technicians · Service Area · Assign Round, "Step N of 8") reflected the older cut and is **no longer authoritative**.
 
 ---
 

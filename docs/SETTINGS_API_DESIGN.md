@@ -158,7 +158,7 @@ Legend: **[P1-req]** goes in the next migration · **[P1-nice]** Phase 1 if time
 
 1. **Cycle representation** — Keep `defaultCycleLength` as **`Int` days**. The UI maps the week options to days (Week → 7, 2-week → 14, 3-week → 21, 4-week → 28). **No new field.**
 2. **Payment provider connect** — **Stub for Phase 1.** Add `gocardlessConnected Boolean @default(false)` and `stripeConnected Boolean @default(false)` to `BusinessSettings`. **No `PaymentProviderConnection` model yet.** Real OAuth is deferred to Phase 2 / GHL.
-3. **Payment Setup — wizard step 2 vs. Settings** — **Settings-only.** Wizard **step 2 stays a deferred stub**; payment configuration is exposed exclusively through the Settings → Payment Setup screen (32).
+3. **Payment Setup — real in both the wizard (step 2) and Settings.** *(Reversed 2026-07-08 after the Setup wizard re-audit: step 2 in Figma — frame `936:44953` — is a full screen identical to Settings Screen 32, not a stub, and its Review checklist gates on "GoCardless connected".)* The **connect actions** (GoCardless / Stripe) remain **Phase-1 stubs** (boolean flip, no real OAuth). **Step 2 persists:** `paymentRule`, `debtHoldEnabled`, `vatInInvoices`, `gocardlessConnected`, `stripeConnected`.
 4. **SMS Templates** — **Pure deferral.** No `MessageTemplate` table is created. `GET /settings/message-templates` returns `{ status: "deferred", source: "ghl" }`. Build when GHL integration begins.
 5. **Delete guards** — **Block with `409` if referenced. No soft-delete in Phase 1.**
    - `DELETE /settings/services/:id` → **409** if any `ServicePlan` or `Visit` references the service.
