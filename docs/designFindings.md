@@ -270,22 +270,36 @@ Add Round · Bulk Message · Add One-Off Job
 
 ---
 
-### 23. Settings — Business Profile  
-**Section:** `/Settings` · Node `401:18286`  
-**Purpose:** Global business configuration, first sub-section of Settings.  
-**Layout:** Two-column — left: settings nav, right: content panel.  
-**Left nav items:** Business Profile · Payment Setup · Round Settings · SMS Templates · Technician Mgmt · Service Areas · Service Catalogue  
-**Business Profile fields:** Business Name, Phone, Email, Service Area, Default Working Days (toggle buttons), Timezone dropdown, Currency dropdown. Edit / Save Changes buttons.
+### 23. Settings — Business Profile *(re-audited 2026-07-08)*  
+**Section:** `/Settings` · section node `936:42196` · frame `936:42197` (original Rough node `401:18286`)  
+**Purpose:** Global business configuration — the **first of seven** Settings sub-sections.  
+**Layout:** Two-column — left: settings nav (7 items), right: content panel. Header: *"Settings / Manage business rules, payments, technicians, messages, and round preferences anytime."*  
+**Settings sub-screens** — each nav item is a **distinct panel** (all under `/Settings`):
+| Nav item | Screen | Frame |
+|----------|--------|-------|
+| Business Profile | **23** (this) | `936:42197` |
+| Payment Setup | **32** *(NEW)* | `936:42318` |
+| Round Settings | **33** *(NEW)* | `936:42443` |
+| SMS Templates | **34** *(NEW)* | `936:42550` |
+| Technician Mgmt | **35** *(NEW)* | `936:42673` |
+| Service Areas | **36** *(NEW)* | `936:42784` |
+| Service Catalogue | **24** | `936:42893` |
+
+**Business Profile fields:** Business Name \*, Business Phone \*, Business Email \*, Service Area \* (e.g. "Northumberland"), Default Working Days (Mon–Sun toggle buttons), Timezone dropdown (e.g. "Europe/London (GMT)"), Currency dropdown. **Edit** / **Save Changes** buttons.
 
 ---
 
-### 24. Settings — Service Catalogue  
-**Section:** `/Settings` · Node `440:1889`  
-**Purpose:** Manage the list of services offered (price + active/inactive toggle).  
+### 24. Settings — Service Catalogue *(re-audited 2026-07-08)*  
+**Section:** `/Settings` · frame `936:42893` (original Rough node `440:1889`)  
+**Purpose:** Manage the list of services offered — name, category, description, default price, active/default toggles. *"Add Services you will provide to the customer/property."*  
 **Elements:**
-- + Add Area button
-- Services table: Service name + category tags (Default, Window Cleaning, Gutter & Fascia, Exterior Cleaning, Specialist), description, Default Price, Active toggle, Edit / Delete actions
-- Save Changes button
+- **+ Add Area** button (top-right) — label reads "Add Area" but opens the **Add New Service** modal (M16); likely a design label slip.
+- Services table columns: **Service** (name + description) · **Category badge** · **Default Price** (£) · **Active** toggle · row actions **Edit** (→ M17) / **Delete** (→ delete confirmation).
+- Category badges observed: **Default** · **Window Cleaning** · **Gutter & Fascia** · **Exterior Cleaning** · **Specialist**.
+- Example rows: Windows Only (Default · Window Cleaning · £12.00) · Conservatory Roof (£35.00) · Gutter Cleaning (Gutter & Fascia · £55.00) · Fascia & Soffits (£45.00) · Pressure Washing (Exterior Cleaning · £80.00) · Render Cleaning (£120.00) · Roof Cleaning (Specialist · £200.00, inactive) · Graffiti Removal (£150.00, inactive).
+- **Save Changes** button; a "Changes saved successfully" toast (M12) appears on save.
+
+**Modals:** **Add New Service** (M16), **Edit Service** (M17).
 
 ---
 
@@ -373,6 +387,73 @@ Add Round · Bulk Message · Add One-Off Job
 - Success states: **Success: Assigned** / **Success: Unassigned**; unassigned → **Customer Detail: Unassigned**.
 
 **Interactions:** "Save & Assign Later" → property persisted with no round (unassigned), assignable later from the customer record. Choosing "Multiple technicians…" → Select Technicians → Allocate Jobs → Review & Confirm.
+
+---
+
+### 32. Settings — Payment Setup *(NEW — 2026-07-08)*  
+**Section:** `/Settings` · frame `936:42318`  
+**Purpose:** Connect payment providers and set default payment rules. *"Connect your payment providers."*  
+**Elements:**
+- **GoCardless** card — "Direct Debit collections", status **Not Connected**, **Connect GoCardless** button.
+- **Stripe** card — "Payment links and card payments", **Connect Stripe** button.
+- **Default Payment Settings:**
+  - **Default Payment Rule** — e.g. "Collect after Visit" (dropdown).
+  - **VAT Applicable** — toggle, "Include VAT in invoices by default".
+  - **Debt Hold Enabled** — toggle, "Block service if payment is overdue".
+- **Edit** / **Save Changes**.
+
+**Note:** this is the full design for Setup Wizard **Step 2 (Payment Setup)**, which is a *deferred stub* in the backend for Phase 1.
+
+---
+
+### 33. Settings — Round Settings *(NEW — 2026-07-08)*  
+**Section:** `/Settings` · frame `936:42443`  
+**Purpose:** Configure default cleaning-round preferences. *"Configure your cleaning round preferences."*  
+**Elements:**
+- **Default Recurring Cycle** — options **Week · 2-week · 3-week · 4-week**.
+- **Default Clean Methods** — **Traditional** · **Water-fed Pole**.
+- **Auto-Generate Visits** — toggle, "Automatically create visits based on schedule".
+- **Pre-Clean Reminder Timing** — "Reminders are sent at 7 PM the evening prior to the scheduled clean." + a time-of-day picker (e.g. 7:00 PM), "Set the time of day reminders are sent to customers."
+- **Edit** / **Save Changes**.
+
+**Note:** maps to Setup Wizard **Step 4 (Round Settings)** — default cycle length + working days.
+
+---
+
+### 34. Settings — SMS / WhatsApp Templates *(NEW — 2026-07-08)*  
+**Section:** `/Settings` · frame `936:42550`  
+**Purpose:** Manage pre-built customer message templates. *"Configure your customer messaging templates."*  
+**Elements:**
+- **Templates list**, each with a channel badge (**SMS** / **WhatsApp**): **Pre-Clean Reminder** (SMS) · **Payment Reminder** · **Payment Failed** · **Access Issue Follow-up** · **Job Completed** (WhatsApp) · **Weather Delay**.
+- Message bodies use merge variables, e.g. `{{customer_name}}`, `{{amount_owed}}`.
+- Per-template **Preview** / **Edit**; an editor ("SMS Message") shows a rendered example (e.g. "Hi John Smith, your window clean is scheduled for …").
+- **Save Changes**.
+
+**Note:** full design for Setup Wizard **Step 5 (SMS Templates)**, a *deferred stub* in the backend (templates managed via GHL).
+
+---
+
+### 35. Settings — Technician Management *(NEW — 2026-07-08)*  
+**Section:** `/Settings` · frame `936:42673`  
+**Purpose:** Add team members and assign areas — the Settings-panel view of technicians (complements the standalone `/Technicians` Screens 25–29). *"Add your team members and assign areas."*  
+**Elements:**
+- **Add Technician** → **Add New Technician** inline form: **Full Name \***, **Mobile Number \***, **Role**, **Default Area** (dropdown), **Cancel**.
+- Technician table columns: **Phone · Role · App Status · Actions**. Example row: Mark Thompson · mark@example.com · 07123 456789 · Lead Technician · Alnwick · **Active**.
+- **Save Changes**.
+
+**Note:** overlaps `/Technicians` (Screens 25–29). This form collects **Full Name** at add-time — but the invite-pending `Technician` schema only carries name once the invite is accepted (via Supabase Auth). Reconcile: does Settings create a named technician directly, or an invite? (See Open Question #13 / MOB-2 context and the invite-entity schema item.)
+
+---
+
+### 36. Settings — Service Areas *(NEW — 2026-07-08)*  
+**Section:** `/Settings` · frame `936:42784`  
+**Purpose:** Define service areas and postcodes. *"Define your service areas and postcode."*  
+**Elements:**
+- **Add New Area** inline form: **Full Name \***, **Default Area** toggle, **Add Area** / **Cancel**.
+- Area cards: area name, postcode sector (e.g. **Alnwick / NE66**), description ("Main town center and surrounding areas"), **Linked Rounds** (e.g. Alnwick Monday, Alnwick Wednesday) shown read-only.
+- **Save Changes**.
+
+**Note:** maps to Setup Wizard **Step 7 (Service Areas)**. Surfaces the round↔area linkage.
 
 ---
 
@@ -536,6 +617,22 @@ Add Round · Bulk Message · Add One-Off Job
 
 ---
 
+### M16 — Add New Service *(NEW — 2026-07-08)*  
+**Triggered from:** Settings → Service Catalogue → **+ Add Area** button (Screen 24)  
+**Frame:** `936:43855`  
+**Purpose:** Create a custom service that can be added to jobs.  
+**Elements:** **Service Name** (e.g. "Pressure Washing"), **Description** (optional), **Default Price (£)**, **Category** dropdown (`ServiceCategory`), **Active** toggle ("Available to add to jobs"), **Default** toggle ("Pre selected on new jobs"). **Cancel** / **Add Service**.
+
+---
+
+### M17 — Edit Service *(NEW — 2026-07-08)*  
+**Triggered from:** Settings → Service Catalogue → row **Edit** (Screen 24)  
+**Frame:** `936:43544`  
+**Purpose:** Update the details for an existing service.  
+**Elements:** Same fields as M16, pre-filled (Service Name, Description, Default Price, Category, Active, Default toggles). **Cancel** / **Save Changes**.
+
+---
+
 ## Dropdowns & Components
 
 ### D1 — Technician Filter Dropdown (Round Planner)  
@@ -685,3 +782,17 @@ Original audit was **2026-06-30** on the "Rough" page (node `401:943`), which st
 - **New Mobile App section** added (RoundFlow Technician / B2C).
 
 **Method note:** screenshots could not be captured (figma-desktop MCP served only the active tab during this pass); all details were extracted from frame metadata/text. Frame IDs cited inline for re-verification.
+
+**2026-07-08 — `/Settings` section full audit (node `936:42196`).**
+The Settings area was under-documented (only Screens 23 & 24). The `/Settings`
+section actually contains **seven** distinct sub-screens (one per left-nav item)
+plus service modals. Captured this pass — **Business Profile (23)**, **Payment
+Setup (32, NEW)**, **Round Settings (33, NEW)**, **SMS/WhatsApp Templates (34,
+NEW)**, **Technician Management (35, NEW)**, **Service Areas (36, NEW)**,
+**Service Catalogue (24)** — plus **Add New Service (M16, NEW)** and **Edit
+Service (M17, NEW)** modals and a "Changes saved successfully" toast (M12).
+Screens 23 & 24 expanded; 32–36 and M16/M17 added. Node IDs are Page-1
+(`936:4xxxx`). Screenshots of the Add/Edit Service modals and the Service
+Catalogue were captured this pass (admin file was the active tab). The seven
+sub-screens are grouped via the cross-reference index in Screen 23 rather than a
+separate top-level section, to keep the existing screen numbering intact.

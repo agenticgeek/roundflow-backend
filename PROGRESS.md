@@ -16,6 +16,15 @@
 > `docs/ROADMAP.md` into a Linear-ready backend+frontend ticket structure. Schema
 > re-verified to support both rules (no `Round.technicianId`; `Visit.technicianId`
 > per-job; no `defaultTechnicianId`/auto-assignment field anywhere).
+> **2026-07-08:** Audited the full `/Settings` section in Figma (7 sub-screens, not
+> 2) → expanded `docs/designFindings.md` (Screens 23/24 + new 32–36, modals M16/M17).
+> Wrote **`docs/SETTINGS_API_DESIGN.md`** (Settings API design + Phase-classified
+> schema needs + GHL/Phase-2 coupling risks + 6 approved Decisions). Applied the
+> **P1-req migration `20260707223107_settings_schema_p1`** — `Technician.name`
+> (nullable admin label), `BusinessSettings.debtHoldEnabled` / `paymentRule`
+> (`PaymentTiming?`) / `gocardlessConnected` / `stripeConnected`, and new enum
+> `PaymentTiming { COLLECT_AFTER_VISIT, COLLECT_BEFORE_VISIT, COLLECT_ON_DATE }`.
+> Additive only; seed unchanged (all new fields nullable/defaulted); `tsc` + seed clean.
 
 ## Project Overview
 

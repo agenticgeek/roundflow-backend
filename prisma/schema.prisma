@@ -210,6 +210,7 @@ model Technician {
   id           String                  @id @default(cuid())
   profileId    String?                 @unique // null = invited but not yet accepted (name/email come from Profile + auth.users)
   profile      Profile?                @relation(fields: [profileId], references: [id])
+  name         String? // admin display label ("invited as…"); nullable — never required, never identity. Profile.name wins once invite accepted.
   role         String? // operational role e.g. Senior / Trainee — NOT the auth role
   phone        String?
   active       Boolean                 @default(true)
@@ -398,6 +399,12 @@ model ActivityLog {
   createdAt DateTime @default(now())
 }
 
+enum PaymentTiming {
+  COLLECT_AFTER_VISIT
+  COLLECT_BEFORE_VISIT
+  COLLECT_ON_DATE
+}
+
 model BusinessSettings {
   id                 String   @id @default(cuid())
   uniqueId           String   @unique @default("singleton") // DB-level singleton guard: only one row can exist
@@ -411,7 +418,11 @@ model BusinessSettings {
   timezone           String?
   currency           String?
   defaultCycleLength Int? // Round Settings (Setup step 4) — days
-  bankDetails        Json? // Payment Setup BACS/bank (Setup step 2)
-  setupCompleted     Boolean  @default(false) // true once the Setup Wizard is finished
-  updatedAt          DateTime @updatedAt
+  bankDetails         Json? // Payment Setup BACS/bank (Setup step 2)
+  paymentRule         PaymentTiming? // drives payment collection trigger
+  debtHoldEnabled     Boolean        @default(false) // gates payment-hold visit generation
+  gocardlessConnected Boolean        @default(false)
+  stripeConnected     Boolean        @default(false)
+  setupCompleted      Boolean        @default(false) // true once the Setup Wizard is finished
+  updatedAt           DateTime       @updatedAt
 }
