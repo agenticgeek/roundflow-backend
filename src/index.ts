@@ -1,10 +1,12 @@
 import "dotenv/config";
 import express, { NextFunction, Request, Response } from "express";
 import cors from "cors";
+import swaggerUi from "swagger-ui-express";
 import { prisma } from "./lib/prisma";
 import { requireAuth } from "./middleware/requireAuth";
 import { AppError } from "./lib/app-error";
 import { setupRouter } from "./routes/setup";
+import { openApiDocument } from "./swagger";
 
 const app = express();
 
@@ -39,6 +41,12 @@ app.get(
 );
 
 app.use("/setup", setupRouter);
+
+// API docs (public) — interactive UI at /docs, raw spec at /openapi.json.
+app.get("/openapi.json", (_req: Request, res: Response) => {
+  res.json(openApiDocument);
+});
+app.use("/docs", swaggerUi.serve, swaggerUi.setup(openApiDocument));
 
 // Centralised error handler. Must be last and take 4 args so Express treats it
 // as error-handling middleware. Route handlers forward errors via next(err).
