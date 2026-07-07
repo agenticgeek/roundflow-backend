@@ -237,10 +237,18 @@ Pending/Deferred — see below.
     `setupCompleted` + `allRequiredComplete`. Step 1 = `businessName` set; 3 =
     ≥1 Service; 4 = `defaultCycleLength` set; 6 = ≥1 Technician; 7 = ≥1
     ServiceArea; 8 = ≥1 `ACTIVE` Round. Steps 2 & 5 are always `{deferred:true}`.
-  - `POST /setup/step/1` (Business Profile → upsert singleton), `step/3`
-    (create/replace Service catalogue), `step/4` (Round Settings), `step/6`
-    (create invite-pending Technicians, `profileId=null`), `step/7` (ServiceAreas),
-    `step/8` (first Round, `status=ACTIVE`). `GET` variants return existing rows.
+  - `POST /setup/step/1` (Business Profile → **upsert** singleton), `step/3`
+    (Service catalogue → **replace**: delete-then-recreate in a `$transaction`),
+    `step/4` (Round Settings → **upsert** singleton), `step/6` (invite-pending
+    Technicians, `profileId=null` → **replace invite-pending only**: deletes
+    `profileId IS NULL` then recreates in a `$transaction` — accepted technicians
+    are never touched), `step/7` (ServiceAreas → **replace**: delete-then-recreate
+    in a `$transaction`), `step/8` (first Round, `status=ACTIVE` → **upsert** the
+    single ACTIVE round). Every step POST is **idempotent / re-edit safe** — a
+    second POST replaces or updates, never appends. Service methods renamed to
+    match: `saveTechnicians` (was `createTechnicians`), `saveServiceAreas` (was
+    `createServiceAreas`), `saveFirstRound` (was `createFirstRound`). `GET`
+    variants return existing rows.
   - `GET/POST /setup/step/2` & `/step/5` → deferred stubs (Payment / SMS), no DB.
   - `POST /setup/complete` → `SetupService.completeSetup()`: **409** if already
     complete, **400** listing missing required steps, else sets
@@ -288,6 +296,12 @@ Each item was actually run and observed:
   `dist/index.js` (+ `lib`/`middleware`/`routes`/`services`); `node dist/index.js`
   boots and `GET /health` → 200. Method: `npm run build`, then `node dist/index.js`
   + `curl`.
+- [x] **Setup steps 6/7/8 re-edit safety.** Driven directly against the live DB: a
+  second `saveTechnicians` / `saveServiceAreas` / `saveFirstRound` **replaces (6/7)
+  or updates (8)**, never appends — save techs `[A,B]` then `[C]` → accepted + `[C]`
+  (total 2, not 4); save areas `[X,Y]` then `[Z]` → `[Z]` only; two `saveFirstRound`
+  calls keep a **single ACTIVE round** (same id, fields updated). Accepted
+  technicians (real `profileId`) preserved. DB restored via re-seed afterwards.
 
 **Not yet verified (do not assume working):**
 
