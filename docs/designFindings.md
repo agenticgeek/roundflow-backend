@@ -341,6 +341,7 @@ Add Round · Bulk Message · Add One-Off Job
 ### 30. Round & Technician Assignment *(NEW — 2026-07-07)*  
 **Section:** `Round & Technician Assignment` · Node `936:64543`  
 **Purpose:** Manage which technician(s) are assigned to each round, per occurrence — the home of **multi-technician rounds** (change #1) and **reassignment** (change #3). Covers the operational gap the old single `technician` field couldn't express.  
+**Rule:** A single round **can have more than one technician assigned simultaneously**. Job division within the round is done **manually by the admin** — each job is allocated to a technician per-`Visit` (via the 3-step Select → Allocate → Review wizard below); there is **no automatic split**.  
 **Sub-screens (6 states in the section):**
 - **Overview** — header KPIs: Total Rounds, Assigned, Unassigned. Table columns: **Round Name · Day · Assigned Technicians** (avatar chips, e.g. "J James", "S Sarah") **· Count · Status · Actions** (Manage / view). Confirms a round can list **more than one** assigned technician with a count.
 - **Overview — Empty State** — "No rounds found / Try adjusting your filters or add a new round" + **Add Round**.
@@ -516,6 +517,7 @@ Add Round · Bulk Message · Add One-Off Job
 **Triggered from:** Round Planner alert banner ("N properties have upcoming recurrences requiring technician assignment") > **Review Now**  
 **Section:** `975:35743` ("Assigning technicians after every reoccurence of a property")  
 **Purpose:** Per-occurrence (re)assignment — supports change #3. Because a round is assigned per recurrence, upcoming recurrences can be **Unassigned** and need a technician before dispatch.  
+**Rule:** Technician assignment is **per occurrence** and **manual**. Each new recurrence of a property's visit **starts unassigned** — the previous occurrence's technician is **not auto-inherited**. The admin must **explicitly assign** each new occurrence (via this modal or Screen 30) before dispatch. (Rolling a prior assignment forward is itself a *deliberate* admin action, shown with a review warning — see Screen 30; visit generation never auto-assigns.)  
 **Elements:**
 - Title: "Upcoming Property Recurrences" + *"The following properties have recurrences due soon and need a technician assigned."*
 - Property rows: property address, `customer · round` (e.g. "John Smith · Alnwick Monday"), **next recurrence date** (e.g. "21 Jul 2026"), **frequency** (e.g. "Every 4 weeks" / "Every 6 weeks"), status **Unassigned**, **Assign** button per row.
@@ -676,7 +678,7 @@ Original audit was **2026-06-30** on the "Rough" page (node `401:943`), which st
 
 - **#1 Multi-technician rounds** — a round can carry **multiple technicians**; **job division is manual**. New **Screen 30 (Round & Technician Assignment)** (Overview table with "Assigned Technicians" + Count; Round Details with Replace / Remove / **+ Add Technician**) and **Screen 31 (Assign Property to Round)** (choice: *One technician for all jobs* vs *Multiple technicians with manual job allocation*). 3-step wizard: **Select Technicians → Allocate Jobs → Review & Confirm**. Storyboard: `968:39312`.
 - **#2 Technician job status** — **Screen 25** now has an **App Status** (Active / **Unavailable**, "On leave <date> — N jobs require reassignment"); mobile has per-visit **Skip** reasons. Self-mark trigger for a whole round is **unresolved** (Open Question #13 / MOB-2).
-- **#3 Technician reassignment on existing rounds** — **M15 (Reassign Technician modal)** from Today's Work (Screen 13); **Screen 30** Replace / Remove / + Add Technician; **M14 (Upcoming Property Recurrences)** — assignment is **per occurrence**, so recurrences can be Unassigned and need assigning. Storyboard: `975:35743`.
+- **#3 Technician reassignment on existing rounds** — **M15 (Reassign Technician modal)** from Today's Work (Screen 13); **Screen 30** Replace / Remove / + Add Technician; **M14 (Upcoming Property Recurrences)** — assignment is **per occurrence**, so recurrences can be Unassigned and need assigning. **Rule:** each new occurrence **starts unassigned**; technicians are assigned **per occurrence** and are **not auto-inherited** from the previous occurrence (deliberate admin action required before dispatch). Storyboard: `975:35743`.
 - **#4 Add Round quick action** — confirmed as a **sidebar Quick Action** ("Add Round", alongside Bulk Message / Add One-Off Job) and a **"+ Add Round"** button on Round Planner; both open the **CreateRoundModal** 5-step wizard (Round Details · Assign Area · Add Properties · Assign Technician · Review & Save). Section `936:57646`.
 - **#5 Add properties to existing rounds** — **Add Round → Step 3 "Add Properties"** (search existing, or **Add New Property Inline**: Address, Customer name, Postcode, Price £); and **Screen 31** places an existing/new property into a round after creation.
 - **Open Question #8 resolved** (Assign Property Now decline → Save & Assign Later → unassigned property).

@@ -302,6 +302,42 @@ raises an interactive confirmation that the non-TTY environment can't answer, so
 that migration was produced via `migrate diff` → `migrate deploy`. The
 `handle_new_user` Supabase trigger is **not** in migration history (a known gap).*
 
+### 3.4 Technician Assignment Model (multi-tech + per-occurrence)
+Two assignment rules — **multi-technician rounds** and **per-occurrence manual
+assignment** (`designFindings.md` Screen 30 **Rule** / M14 **Rule**; SRS
+FR-ROUND-9/10) — are implemented **entirely at the `Visit` level**. No dedicated
+occurrence entity exists.
+
+**Why no `RoundOccurrence` model (Phase 1 decision — deferred).** An "occurrence"
+is simply the set of `Visit`s that share a `Round` + a cycle date. `Visit`s are
+already the per-date instances, so a separate occurrence entity would be
+redundant in Phase 1. It is **deferred** (revisit only if per-occurrence
+attributes ever need to diverge from the derived set). Consequently `Round` has
+**no technician FK** — it was removed (migration `20260706211550`).
+
+**How multi-technician assignment works (Visit level).** A round has no single
+technician column; "who does this round" is **derived** from the distinct
+`Visit.technicianId` values across the round's current occurrence. Assigning 2+
+technicians = the admin setting `Visit.technicianId` **per job**, manually
+dividing the jobs (the 3-step Select Technicians → Allocate Jobs → Review wizard,
+Screen 30). There is no automatic split.
+
+**How per-recurrence assignment is surfaced.** Visit generation creates each new
+occurrence's `Visit`s with **`technicianId = null`** (the column default) — every
+recurrence **starts unassigned**, and generation **does not copy** the previous
+occurrence's technician forward. Unassigned upcoming recurrences are surfaced to
+the admin via the **Upcoming Property Recurrences** modal (M14, reached from the
+Round Planner alert banner); the admin then **explicitly assigns** technicians,
+which **sets `Visit.technicianId` per job**. (An admin may deliberately roll a
+prior assignment forward — still a manual action, shown with a review warning —
+but generation never auto-inherits.)
+
+**Enforcement note.** These are **business-logic rules** enforced by the
+(not-yet-built) visit-generation and assignment code, **not DB constraints**. The
+schema *supports* them (no `defaultTechnicianId` anywhere; new `Visit.technicianId`
+defaults to null) but does not itself enforce "must be manually assigned" — that
+lives in the service layer.
+
 ---
 
 ## 4. Auth Design

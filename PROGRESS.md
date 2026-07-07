@@ -1,6 +1,6 @@
 # RoundFlow Backend — Progress Log
 
-> Living document. Last updated: 2026-07-07 · Branch: `dev` · HEAD: `2abb18d`
+> Living document. Last updated: 2026-07-08 · Branch: `dev` · HEAD: `2abb18d`
 > Written by reading the codebase directly. If a claim isn't backed by code or a
 > run, it's flagged as unverified. Update this file as the backend grows.
 > **2026-07-07:** `docs/designFindings.md` re-audited (admin design update + new
@@ -8,6 +8,14 @@
 > (2026-07-07 Design Update)** below. **Decision 2 (remove `Round.technicianId`)
 > is implemented** — migration `20260706211550_remove-round-technician-id`; other
 > schema items remain Pending/Deferred.
+> **2026-07-08:** Verified/updated the doc set for the two assignment rules —
+> **multi-technician rounds** and **per-occurrence manual assignment** (each new
+> recurrence starts unassigned, not auto-inherited). Added explicit **Rule:** lines
+> to `docs/designFindings.md` (Screen 30 + M14 + Design Update Log), FR-ROUND-9/10
+> to `docs/SRS.md`, and §3.4 (Technician Assignment Model) to `docs/SDS.md`; rewrote
+> `docs/ROADMAP.md` into a Linear-ready backend+frontend ticket structure. Schema
+> re-verified to support both rules (no `Round.technicianId`; `Visit.technicianId`
+> per-job; no `defaultTechnicianId`/auto-assignment field anywhere).
 
 ## Project Overview
 

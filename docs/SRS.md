@@ -170,6 +170,8 @@ completion is **derived**, not stored; a `setupCompleted` flag gates the wizard.
 | FR-ROUND-6 | **Assign Property to Round** SHALL let the admin choose **One technician for all jobs** vs **Multiple technicians with manual job allocation**, or **Save & Assign Later** (unassigned). | Screen 31 | Must |
 | FR-ROUND-7 | Existing rounds MAY have **properties added** after creation (Add Round Step 3 "Add Properties" — search existing or add inline; and Screen 31). | Design Update #5 | Should |
 | FR-ROUND-8 | When a recurrence comes due without an assignee (or a technician is unavailable), surface an **alert banner** → **Upcoming Property Recurrences** modal listing unassigned recurrences with per-row Assign. | Screen 8 update; M14 | Should |
+| FR-ROUND-9 | A round MAY have **multiple technicians assigned simultaneously**. Job division between technicians is performed **manually by the admin** (per-`Visit` allocation via the 3-step Select → Allocate → Review wizard); there is **no automatic split**. | Screen 30 **Rule** | Must |
+| FR-ROUND-10 | Technician assignment is **per-occurrence, not inherited**: each new recurrence of a property's visit **starts unassigned** and requires **explicit admin assignment** before dispatch. The previous occurrence's technician is **not auto-carried** by visit generation. | M14 **Rule**; Screen 30 | Must |
 
 ### FR-VISIT — Visit Generation & Today's Work
 | ID | Requirement | Source | Priority |
