@@ -263,7 +263,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       complete: { type: "boolean" },
       deferred: {
         type: "boolean",
-        description: "True for steps 2 & 5 (Payment Setup, SMS Templates).",
+        description: "True for step 5 (SMS Templates). Step 2 (Payment Setup) is now a real step.",
       },
     },
   },
@@ -275,7 +275,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       setupCompleted: { type: "boolean" },
       allRequiredComplete: {
         type: "boolean",
-        description: "True when every non-deferred step (1,3,4,6,7,8) is complete.",
+        description: "True when every non-deferred step (1,2,3,4,6,7,8) is complete.",
       },
       steps: { type: "array", items: ref("StepStatus") },
     },
@@ -284,7 +284,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       allRequiredComplete: false,
       steps: [
         { step: 1, complete: false, deferred: false },
-        { step: 2, complete: false, deferred: true },
+        { step: 2, complete: false, deferred: false },
         { step: 3, complete: false, deferred: false },
         { step: 4, complete: false, deferred: false },
         { step: 5, complete: false, deferred: true },
@@ -384,6 +384,24 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     example: { defaultCycleLength: 28 },
   },
 
+  PaymentSetupInput: {
+    type: "object",
+    description:
+      "Setup step 2 (Payment Setup). All fields optional. Connect toggles are Phase-1 stubs (booleans; no real OAuth).",
+    properties: {
+      paymentRule: {
+        type: "string",
+        enum: ["COLLECT_AFTER_VISIT", "COLLECT_BEFORE_VISIT", "COLLECT_ON_DATE"],
+        description: "Default payment collection rule.",
+      },
+      debtHoldEnabled: { type: "boolean", description: "Block service if payment is overdue." },
+      vatInInvoices: { type: "boolean", description: "Include VAT in invoices by default." },
+      gocardlessConnected: { type: "boolean", description: "GoCardless connection flag (Phase-1 stub)." },
+      stripeConnected: { type: "boolean", description: "Stripe connection flag (Phase-1 stub)." },
+    },
+    example: { paymentRule: "COLLECT_AFTER_VISIT", debtHoldEnabled: true, vatInInvoices: true },
+  },
+
   ServiceInput: {
     type: "object",
     required: ["name", "defaultPrice"],
@@ -406,11 +424,16 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     type: "object",
     description: "Creates an invite-pending technician (profileId = null).",
     properties: {
+      name: {
+        type: "string",
+        description:
+          "Admin display label ('invited as…'); persisted to Technician.name. Profile.name wins once the invite is accepted.",
+      },
       role: { type: "string" },
       phone: { type: "string" },
       active: { type: "boolean" },
     },
-    example: { role: "Senior", phone: "+44 7700 900111" },
+    example: { name: "James Fisher", role: "Senior", phone: "+44 7700 900111" },
   },
 
   ServiceAreaInput: {
@@ -555,7 +578,7 @@ const paths: OpenAPIV3.PathsObject = {
       tags: ["Setup"],
       summary: "Setup progress",
       description:
-        "Per-step completion (derived, not stored) plus `setupCompleted` and `allRequiredComplete`. Required steps: 1,3,4,6,7,8. Steps 2 & 5 are always deferred.",
+        "Per-step completion (derived, not stored) plus `setupCompleted` and `allRequiredComplete`. Required steps: 1,2,3,4,6,7,8. Only step 5 (SMS Templates) is deferred.",
       responses: {
         "200": jsonResponse("Current setup status.", ref("SetupStatus")),
         "401": ERR[401],
@@ -589,18 +612,30 @@ const paths: OpenAPIV3.PathsObject = {
     },
   },
 
-  // ---- Setup: Step 2 — Payment Setup (deferred) ----
+  // ---- Setup: Step 2 — Payment Setup ----
   "/setup/step/2": {
     get: {
       tags: ["Setup"],
-      summary: "Step 2 — Payment Setup (deferred)",
-      responses: { "200": jsonResponse("Deferred stub.", ref("DeferredStub")) },
+      summary: "Step 2 — get Payment Setup",
+      description:
+        "Returns the BusinessSettings singleton (read `paymentRule`, `debtHoldEnabled`, `vatInInvoices`, `gocardlessConnected`, `stripeConnected`). Open after setup completes.",
+      responses: {
+        "200": jsonResponse("BusinessSettings (or null).", nullableRef("BusinessSettings")),
+        "401": ERR[401],
+      },
     },
     post: {
       tags: ["Setup"],
-      summary: "Step 2 — Payment Setup (deferred, no-op)",
-      description: "Deferred stub — performs no DB write.",
-      responses: deferredResponses(),
+      summary: "Step 2 — Payment Setup",
+      description:
+        "Upserts payment configuration on the BusinessSettings singleton. All fields optional; step 2 counts as complete once `paymentRule` is set. The GoCardless/Stripe connect actions are **Phase-1 stubs** (`gocardlessConnected`/`stripeConnected` are plain booleans — no real OAuth yet).",
+      requestBody: jsonBody(ref("PaymentSetupInput")),
+      responses: {
+        "200": jsonResponse("The updated BusinessSettings.", ref("BusinessSettings")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+      },
     },
   },
 

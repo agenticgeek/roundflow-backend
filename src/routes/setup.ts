@@ -1,9 +1,11 @@
 import { NextFunction, Request, Response, Router } from "express";
+import { PaymentTiming } from "@prisma/client";
 import { requireAuth } from "../middleware/requireAuth";
 import { AppError } from "../lib/app-error";
 import {
   setupService,
   BusinessProfileInput,
+  PaymentSetupInput,
   RoundSettingsInput,
   ServiceInput,
   TechnicianInput,
@@ -55,10 +57,6 @@ function requireNumber(v: unknown, field: string): number {
   return v;
 }
 
-const STEP2_DEFERRED = {
-  status: "deferred",
-  reason: "Payment setup is configured separately",
-} as const;
 const STEP5_DEFERRED = {
   status: "deferred",
   reason: "SMS templates are managed via GHL",
@@ -106,14 +104,44 @@ setupRouter.post(
   })
 );
 
-// ---- Step 2: Payment Setup (deferred) ------------------------------------
+// ---- Step 2: Payment Setup -----------------------------------------------
+// Real step (not a stub). Persists payment rules + VAT/debt-hold toggles to the
+// BusinessSettings singleton. Connect toggles (gocardless/stripe) are Phase-1
+// booleans — no real OAuth yet.
 
-setupRouter.get("/step/2", h(async (_req, res) => res.json(STEP2_DEFERRED)));
+setupRouter.get(
+  "/step/2",
+  h(async (req, res) => {
+    res.json(await setupService.getPaymentSetup(profileIdOf(req)));
+  })
+);
 setupRouter.post(
   "/step/2",
   h(async (req, res) => {
-    await setupService.assertSetupIncomplete(profileIdOf(req));
-    res.json(STEP2_DEFERRED); // deferred stub — no DB write
+    const profileId = profileIdOf(req);
+    await setupService.assertSetupIncomplete(profileId);
+    const body = asObject(req.body);
+
+    let paymentRule: PaymentTiming | undefined;
+    if (body.paymentRule != null) {
+      if (!(Object.values(PaymentTiming) as string[]).includes(body.paymentRule as string)) {
+        throw new AppError(400, `Invalid paymentRule: ${String(body.paymentRule)}`);
+      }
+      paymentRule = body.paymentRule as PaymentTiming;
+    }
+
+    const input: PaymentSetupInput = {
+      paymentRule,
+      debtHoldEnabled:
+        typeof body.debtHoldEnabled === "boolean" ? body.debtHoldEnabled : undefined,
+      vatInInvoices:
+        typeof body.vatInInvoices === "boolean" ? body.vatInInvoices : undefined,
+      gocardlessConnected:
+        typeof body.gocardlessConnected === "boolean" ? body.gocardlessConnected : undefined,
+      stripeConnected:
+        typeof body.stripeConnected === "boolean" ? body.stripeConnected : undefined,
+    };
+    res.json(await setupService.savePaymentSetup(profileId, input));
   })
 );
 
@@ -194,6 +222,7 @@ setupRouter.post(
     await setupService.assertSetupIncomplete(profileId);
     const raw = asArray<Record<string, unknown>>(req.body, "technicians");
     const input: TechnicianInput[] = raw.map((t) => ({
+      name: t.name as string | undefined,
       role: t.role as string | undefined,
       phone: t.phone as string | undefined,
       active: typeof t.active === "boolean" ? t.active : undefined,

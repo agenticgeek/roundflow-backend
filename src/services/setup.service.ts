@@ -3,6 +3,7 @@ import {
   DayOfWeek,
   CleaningFrequency,
   RoundStatus,
+  PaymentTiming,
 } from "@prisma/client";
 import type {
   BusinessSettings,
@@ -47,6 +48,14 @@ export interface RoundSettingsInput {
   defaultWorkingDays?: string[];
 }
 
+export interface PaymentSetupInput {
+  paymentRule?: PaymentTiming | null;
+  debtHoldEnabled?: boolean;
+  vatInInvoices?: boolean;
+  gocardlessConnected?: boolean;
+  stripeConnected?: boolean;
+}
+
 export interface ServiceInput {
   name: string;
   category?: string;
@@ -56,6 +65,7 @@ export interface ServiceInput {
 }
 
 export interface TechnicianInput {
+  name?: string | null; // admin display label — persisted to Technician.name
   role?: string | null;
   phone?: string | null;
   active?: boolean;
@@ -99,6 +109,14 @@ export interface ISetupService {
   saveRoundSettings(
     profileId: string,
     input: RoundSettingsInput
+  ): Promise<BusinessSettings>;
+
+  // Payment Setup (Setup step 2 — real, not a stub). Same BusinessSettings
+  // singleton; connect toggles are Phase-1 stubs (booleans, no real OAuth).
+  getPaymentSetup(profileId: string): Promise<BusinessSettings | null>;
+  savePaymentSetup(
+    profileId: string,
+    input: PaymentSetupInput
   ): Promise<BusinessSettings>;
 
   getTechnicians(profileId: string): Promise<Technician[]>;
@@ -151,7 +169,7 @@ class SetupService implements ISetupService {
 
     const steps: StepStatus[] = [
       step(1, settings?.businessName != null), // Business Profile
-      step(2, false, true), // Payment Setup — deferred
+      step(2, settings?.paymentRule != null), // Payment Setup (real — complete once a payment rule is set)
       step(3, serviceCount > 0), // Service Catalogue
       step(4, settings?.defaultCycleLength != null), // Round Settings
       step(5, false, true), // SMS Templates — deferred
@@ -277,6 +295,30 @@ class SetupService implements ISetupService {
     });
   }
 
+  async getPaymentSetup(_profileId: string): Promise<BusinessSettings | null> {
+    return this.getSettings();
+  }
+
+  async savePaymentSetup(
+    _profileId: string,
+    input: PaymentSetupInput
+  ): Promise<BusinessSettings> {
+    // Same singleton upsert as saveBusinessProfile. Connect toggles
+    // (gocardless/stripe) are Phase-1 stubs — booleans only, no real OAuth.
+    const data = {
+      paymentRule: input.paymentRule,
+      debtHoldEnabled: input.debtHoldEnabled,
+      vatInInvoices: input.vatInInvoices,
+      gocardlessConnected: input.gocardlessConnected,
+      stripeConnected: input.stripeConnected,
+    };
+    return prisma.businessSettings.upsert({
+      where: SINGLETON,
+      update: data,
+      create: { ...SINGLETON, ...data },
+    });
+  }
+
   async getTechnicians(_profileId: string): Promise<Technician[]> {
     return prisma.technician.findMany({ orderBy: { createdAt: "asc" } });
   }
@@ -296,6 +338,7 @@ class SetupService implements ISetupService {
         await tx.technician.createMany({
           data: input.map((t) => ({
             profileId: null,
+            name: t.name ?? null,
             role: t.role ?? null,
             phone: t.phone ?? null,
             active: t.active ?? true,

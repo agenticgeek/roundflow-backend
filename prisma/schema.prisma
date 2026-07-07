@@ -421,6 +421,7 @@ model BusinessSettings {
   bankDetails         Json? // Payment Setup BACS/bank (Setup step 2)
   paymentRule         PaymentTiming? // drives payment collection trigger
   debtHoldEnabled     Boolean        @default(false) // gates payment-hold visit generation
+  vatInInvoices       Boolean        @default(false) // Setup step 2 "VAT Applicable" — include VAT in invoices by default
   gocardlessConnected Boolean        @default(false)
   stripeConnected     Boolean        @default(false)
   setupCompleted      Boolean        @default(false) // true once the Setup Wizard is finished
