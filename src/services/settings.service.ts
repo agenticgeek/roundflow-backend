@@ -107,6 +107,9 @@ export interface DeferredStub {
 // implementation (one that resolves a tenant from profileId and scopes every
 // query) without any route changes. Every method takes profileId first.
 export interface ISettingsService {
+  // Guard — mutating Settings operations require setup to be complete.
+  assertSetupComplete(profileId: string): Promise<void>;
+
   // Business Profile
   getBusinessProfile(profileId: string): Promise<BusinessSettings | null>;
   updateBusinessProfile(
@@ -217,6 +220,20 @@ class SettingsService implements ISettingsService {
       update: data,
       create: { ...SINGLETON, ...data },
     });
+  }
+
+  // ---- guard ----
+
+  /** Mutating Settings endpoints require setup to be complete. Reads the
+   *  singleton via the existing getSettings() seam (no extra findUnique). */
+  async assertSetupComplete(_profileId: string): Promise<void> {
+    const settings = await this.getSettings();
+    if (!settings || settings.setupCompleted === false) {
+      throw new AppError(
+        403,
+        "Setup must be completed before editing settings. Complete the Setup Wizard first."
+      );
+    }
   }
 
   // ---- Business Profile ----

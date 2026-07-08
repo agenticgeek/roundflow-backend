@@ -20,8 +20,10 @@ settingsRouter.use(requireAuth);
 
 // ---- helpers -------------------------------------------------------------
 // Same pattern as src/routes/setup.ts. Settings routes are thin: validate →
-// call service → respond. No DB access here. NOTE: unlike the wizard, there is
-// NO assertSetupIncomplete guard — Settings is post-completion, always open.
+// call service → respond. No DB access here. GET endpoints are always open (so
+// the Setup Wizard can read back saved values); every mutating handler (PATCH,
+// POST, DELETE) first calls `assertSetupComplete`, which 403s until setup is
+// complete. (This is the inverse of the wizard's `assertSetupIncomplete`.)
 
 type Handler = (req: Request, res: Response) => Promise<unknown>;
 const h =
@@ -114,6 +116,7 @@ settingsRouter.get(
 settingsRouter.patch(
   "/business-profile",
   h(async (req, res) => {
+    await settingsService.assertSetupComplete(profileIdOf(req));
     const body = asObject(req.body);
     const input: BusinessProfileUpdateInput = {
       businessName: optString(body.businessName, "businessName"),
@@ -143,6 +146,7 @@ settingsRouter.get(
 settingsRouter.patch(
   "/round-settings",
   h(async (req, res) => {
+    await settingsService.assertSetupComplete(profileIdOf(req));
     const body = asObject(req.body);
     const input: RoundSettingsUpdateInput = {
       defaultCycleLength: optNumber(body.defaultCycleLength, "defaultCycleLength"),
@@ -165,6 +169,7 @@ settingsRouter.get(
 settingsRouter.post(
   "/services",
   h(async (req, res) => {
+    await settingsService.assertSetupComplete(profileIdOf(req));
     const body = asObject(req.body);
     const input: ServiceCreateInput = {
       name: reqString(body.name, "name"),
@@ -179,6 +184,7 @@ settingsRouter.post(
 settingsRouter.patch(
   "/services/:id",
   h(async (req, res) => {
+    await settingsService.assertSetupComplete(profileIdOf(req));
     const body = asObject(req.body);
     const input: ServiceUpdateInput = {
       name: optReqString(body.name, "name"),
@@ -193,6 +199,7 @@ settingsRouter.patch(
 settingsRouter.delete(
   "/services/:id",
   h(async (req, res) => {
+    await settingsService.assertSetupComplete(profileIdOf(req));
     await settingsService.deleteService(profileIdOf(req), req.params.id);
     res.status(204).end();
   })
@@ -211,6 +218,7 @@ settingsRouter.get(
 settingsRouter.post(
   "/service-areas",
   h(async (req, res) => {
+    await settingsService.assertSetupComplete(profileIdOf(req));
     const body = asObject(req.body);
     const input: ServiceAreaCreateInput = {
       name: reqString(body.name, "name"),
@@ -223,6 +231,7 @@ settingsRouter.post(
 settingsRouter.patch(
   "/service-areas/:id",
   h(async (req, res) => {
+    await settingsService.assertSetupComplete(profileIdOf(req));
     const body = asObject(req.body);
     const input: ServiceAreaUpdateInput = {
       name: optReqString(body.name, "name"),
@@ -235,6 +244,7 @@ settingsRouter.patch(
 settingsRouter.delete(
   "/service-areas/:id",
   h(async (req, res) => {
+    await settingsService.assertSetupComplete(profileIdOf(req));
     await settingsService.deleteServiceArea(profileIdOf(req), req.params.id);
     res.status(204).end();
   })
@@ -253,6 +263,7 @@ settingsRouter.get(
 settingsRouter.post(
   "/technicians",
   h(async (req, res) => {
+    await settingsService.assertSetupComplete(profileIdOf(req));
     const body = asObject(req.body);
     const input: TechnicianCreateInput = {
       name: optString(body.name, "name"),
@@ -266,6 +277,7 @@ settingsRouter.post(
 settingsRouter.patch(
   "/technicians/:id",
   h(async (req, res) => {
+    await settingsService.assertSetupComplete(profileIdOf(req));
     const body = asObject(req.body);
     const input: TechnicianUpdateInput = {
       name: optString(body.name, "name"),
@@ -279,6 +291,7 @@ settingsRouter.patch(
 settingsRouter.delete(
   "/technicians/:id",
   h(async (req, res) => {
+    await settingsService.assertSetupComplete(profileIdOf(req));
     await settingsService.deleteTechnician(profileIdOf(req), req.params.id);
     res.status(204).end();
   })
@@ -297,6 +310,7 @@ settingsRouter.get(
 settingsRouter.patch(
   "/payment",
   h(async (req, res) => {
+    await settingsService.assertSetupComplete(profileIdOf(req));
     const body = asObject(req.body);
     const input: PaymentRulesUpdateInput = {
       paymentRule: optPaymentTiming(body.paymentRule),
@@ -309,6 +323,7 @@ settingsRouter.patch(
 settingsRouter.post(
   "/payment/:provider/connect",
   h(async (req, res) => {
+    await settingsService.assertSetupComplete(profileIdOf(req));
     const provider = req.params.provider;
     if (provider !== "gocardless" && provider !== "stripe") {
       throw new AppError(400, `Unknown provider: ${provider}. Use "gocardless" or "stripe".`);
@@ -330,6 +345,7 @@ settingsRouter.get(
 settingsRouter.patch(
   "/message-templates",
   h(async (req, res) => {
+    await settingsService.assertSetupComplete(profileIdOf(req));
     // Deferred stub — no DB write; returns the same deferred payload.
     res.json(await settingsService.getMessageTemplates(profileIdOf(req)));
   })
