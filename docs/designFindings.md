@@ -337,8 +337,8 @@ Auth is handled by **Supabase Auth** (frontend + Supabase); this backend only **
 
 ---
 
-### 25. Technicians List  
-**Section:** `/Technicians` · Node `695:14404`  
+### 25. Technicians List *(re-audited 2026-07-08 · RoundFlow-Admin (Copy))*  
+**Section:** `/Technicians` · Node `936:62093` (`technicians-list`) · original Rough node `695:14404`  
 **Purpose:** Monitor team activity, performance, and round assignments.  
 **Elements:**
 - Date + Add Technician button
@@ -348,17 +348,23 @@ Auth is handled by **Supabase Auth** (frontend + Supabase); this backend only **
 - Contact info row: phone, email, service areas
 - Send Message / View Details action buttons
 - **⟳ Update (2026-07-07):** technician cards/table now show an **App Status** column with an availability state — **Active** vs **Unavailable** (e.g. *"On leave 14 July 2026 — N jobs require reassignment"*). Marking a technician Unavailable flags their upcoming recurring jobs for reassignment (surfaced on Round Planner banner + Screen 30). Status pills observed: `● In Progress`, `✓ Active`, `Unavailable`. See change #2 in the Design Update Log and Open Question #13.
+- **Empty state (`936:62193`):** when no technicians exist, the grid shows "No technicians in the system currently".
 
 ---
 
-### 26. Technician Detail  
-**Section:** `/Technicians` · Node `695:14580`  
-**Purpose:** Full profile and performance record for a single technician.
+### 26. Technician Detail *(re-audited 2026-07-08)*  
+**Section:** `/Technicians` · Node `936:62224` (`technician-detail-james`) · original Rough node `695:14580`  
+**Purpose:** Full profile and performance record for a single technician.  
+**Elements:**
+- **Header:** name, "Role · Area · Phone" (e.g. "Lead Technician · Alnwick · 07123 456789"), status pill (● In Progress), **Send Message** button, ← Back to Technicians.
+- **Today's Activity:** per-round progress (e.g. "Alnwick Monday 2/5 completed · £940", "Morpeth Wednesday 0/5 completed") + issue alert ("1 issue flagged on Alnwick Monday").
+- **Performance (This Month):** Value Completed (£4,100), Time on Job (180h), Revenue / Hour (£22.80), Complaints (1), Issues (2).
+- **Technician Info:** Full Name, Role, Phone, Email.
 
 ---
 
-### 27. Send Message to Technician  
-**Section:** `/Technicians` · Node `695:14771`  
+### 27. Send Message to Technician *(node updated 2026-07-08; content matches)*  
+**Section:** `/Technicians` · Node `936:62333` (`message-james`) · original Rough node `695:14771`  
 **Purpose:** Direct messaging interface for admin → technician communication.  
 **Layout:** Full content-area page (not a modal).  
 **Elements:**
@@ -374,15 +380,28 @@ Auth is handled by **Supabase Auth** (frontend + Supabase); this backend only **
 
 ---
 
-### 28. Add Technician  
-**Section:** `/Technicians` · Node `695:14911`  
-**Purpose:** Form to onboard a new technician to the system.
+### 28. Add Technician *(re-audited 2026-07-08)*  
+**Section:** `/Technicians` · Node `936:62394` (`add-technician`) · original Rough node `695:14911`  
+**Purpose:** Form to onboard a new technician to the system — "Add a new team member and assign them to rounds."  
+**Elements:**
+- **Personal Details:** **Full Name \*** (e.g. "James Smith"), **Mobile Number \*** (e.g. "07700 900000"), **Email Address** (e.g. "james@example.com"), **Role** (Select role… dropdown), **Default Area** (Select area… dropdown), **Notes (optional)**.
+- **App Access:** **"Send App Invite via SMS"** toggle — "Technician will receive a link to download the RoundFlow mobile app"; info note: "A text message will be sent to the mobile number above once you save."
+- **Cancel** / **Add Technician** buttons.
 
 ---
 
-### 29. Edit Technician  
-**Section:** `/Technicians` · Node `737:9645`  
-**Purpose:** Edit an existing technician's details and assignments.
+### 29. Edit Technician *(re-audited 2026-07-08)*  
+**Section:** `/Technicians` · Node `936:62464` (`edit-technician-james`) · original Rough node `737:9645`  
+**Purpose:** Edit an existing technician's details and access settings — "Update [name]'s personal details and access settings."  
+**Elements:**
+- **Personal Details:** same fields as Add (Full Name \*, Mobile Number \*, Email Address, Role, Default Area, Notes), **prefilled** (e.g. Default Area = "Alnwick, Morpeth" — can hold multiple areas).
+- **App Access:** "App Access Active" status pill + toggle; when already invited, shows **"App invite already sent. Resend invite?"**.
+- **Danger Zone → Remove Technician:** "This will permanently remove [name] from all rounds." → opens the **Remove Technician Confirmation** modal (**M18**).
+- **Cancel** / **Save Changes** buttons.
+
+**Rule (backend, 2026-07-08):** **Danger Zone → Remove Technician maps to deactivation** — `PATCH /settings/technicians/:id` with `{ active: false }`, **not** a hard delete. Our `deleteTechnician` **409s** for accepted technicians (`profileId` set); that stays correct. Deactivation **preserves visit history** (required by Reports & History, Screen 18). Hard delete of an accepted technician is **not supported**.
+
+> ⚠️ **Schema gaps identified (2026-07-08):** `Technician.email` (P1-nice, unbuilt), `Technician.notes` (new — not previously identified), Default Area wiring (`TechnicianServiceArea` join exists but unused). The **Send App Invite** mechanism requires a `TechnicianInvite` model (P1-req, M5). These are flagged for the next schema migration.
 
 ---
 
@@ -493,10 +512,10 @@ Auth is handled by **Supabase Auth** (frontend + Supabase); this backend only **
 
 ## Modals & Overlays
 
-### M1 — Bulk Message Round  
-**Triggered from:** Dashboard > Bulk Message quick action  
-**Frames:** `733:13202`  
-**Context:** Overlaid on the Dashboard (blurred background).  
+### M1 — Bulk Message Round *(re-audited 2026-07-08)*  
+**Triggered from:** **Bulk Message** quick action — on the **Dashboard** *and* the **Technicians** list (Quick Actions sidebar), not just the Dashboard.  
+**Frames:** `936:62729` (live, RoundFlow-Admin (Copy)) · original `733:13202`  
+**Context:** Overlaid on the background screen (blurred).  
 **Elements:**
 - Title: "Bulk Message Round" + subtitle
 - Round dropdown (e.g. "Alnwick Monday (32 customers)")
@@ -509,10 +528,10 @@ Auth is handled by **Supabase Auth** (frontend + Supabase); this backend only **
 
 ---
 
-### M2 — Add One-Off Job  
-**Triggered from:** Dashboard > Add One-Off Job quick action  
-**Frames:** `733:13907`  
-**Context:** Overlaid on the Dashboard.  
+### M2 — Add One-Off Job *(re-audited 2026-07-08)*  
+**Triggered from:** **Add One-Off Job** quick action — on the **Dashboard** *and* the **Technicians** list, not just the Dashboard.  
+**Frames:** `936:62891` (`AddOneOffJobModal`, live) · original `733:13907`  
+**Context:** Overlaid on the background screen.  
 **Elements:**
 - Title: "Add One-Off Job" + subtitle
 - Customer/Property dropdown (searchable)
@@ -664,6 +683,15 @@ Auth is handled by **Supabase Auth** (frontend + Supabase); this backend only **
 **Frame:** `936:43544`  
 **Purpose:** Update the details for an existing service.  
 **Elements:** Same fields as M16, pre-filled (Service Name, Description, Default Price, Category, Active, Default toggles). **Cancel** / **Save Changes**.
+
+---
+
+### M18 — Remove Technician Confirmation *(NEW — 2026-07-08)*  
+**Triggered from:** Edit Technician (Screen 29) → **Danger Zone → Remove Technician**  
+**Frame:** `936:62619`  
+**Purpose:** Confirm removal of a technician from the system.  
+**Elements:** "Are you sure you want to remove the technician **[name]** from the system?" · **Cancel** / **Remove** (destructive).  
+**Note (backend):** "Remove" maps to **deactivation** (`PATCH /settings/technicians/:id` with `{ active: false }`), **not** a hard delete — accepted technicians (`profileId` set) are never destroyed, preserving visit history. See Screen 29 Rule.
 
 ---
 
@@ -830,3 +858,15 @@ Screens 23 & 24 expanded; 32–36 and M16/M17 added. Node IDs are Page-1
 Catalogue were captured this pass (admin file was the active tab). The seven
 sub-screens are grouped via the cross-reference index in Screen 23 rather than a
 separate top-level section, to keep the existing screen numbering intact.
+
+**2026-07-08 — `/Technicians` section re-audited (from `RoundFlow-Admin (Copy)`, node `936:62092`).**
+**10 frames** found vs **5** documented. **Node IDs updated** to live Page-1 IDs
+(`695/737:xxxx` → `936:62xxx`). Screens **26 / 28 / 29** were purpose-only and are
+now **fully documented** (fields, App Access, Danger Zone); Screen 25 gains an
+**empty state** (`936:62193`). New modal **M18 (Remove Technician Confirmation)**
+added; **M1 (Bulk Message)** and **M2 (Add One-Off Job)** given live node IDs and
+noted as reachable from the Technicians list too. **Remove Technician conflict
+resolved as deactivation** (Option A): Danger-Zone Remove → `PATCH { active: false }`,
+not a hard delete — `deleteTechnician` keeps 409-ing accepted technicians, preserving
+visit history. Schema gaps flagged under Screen 29 (`Technician.email`, `Technician.notes`,
+Default-Area wiring, `TechnicianInvite` for Send App Invite).
