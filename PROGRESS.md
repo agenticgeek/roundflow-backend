@@ -50,6 +50,8 @@
 > bound to `auth.users`). ROADMAP M0 updated (FE-M0-02/03 magic-link; new FE-M0-06 Google OAuth +
 > `/auth/callback`, FE-M0-07 signup email UX, FE-M0-08 auth guards, BE-M0-08 run
 > trigger v2). No `/auth/callback` yet — it's a **frontend** route.
+> **2026-07-08:** Settings API built (7 sub-sections, 21 endpoints, `SettingsService`
+> OCP seam). Setup-completion guard added — mutations blocked until `setupCompleted = true`.
 
 ## Project Overview
 
@@ -299,7 +301,13 @@ Pending/Deferred — see below.
   (the `SINGLETON` const, touched only by two private seam methods `getSettings()` (read)
   / `writeSettings()` (write) — never a business method or route). Routes
   (`src/routes/settings.ts`) are thin (validate → call service → respond); **no
-  `assertSetupIncomplete`** (Settings is always open). 21 endpoints across 7 sections:
+  `assertSetupIncomplete`**. Instead, all mutating endpoints (PATCH, POST, DELETE)
+  call `assertSetupComplete` first — throws `AppError(403, "Setup must be completed
+  before editing settings. Complete the Setup Wizard first.")` if `setupCompleted =
+  false` or the singleton does not exist. GET endpoints are **not** guarded (stay open
+  so the Setup Wizard can read back saved values). This creates a clean **mutual
+  exclusivity**: `/setup/*` mutations require setup to be *incomplete*; `/settings/*`
+  mutations require setup to be *complete*. 21 endpoints across 7 sections:
   - **Business Profile** — `GET`/`PATCH /settings/business-profile` (partial upsert of
     step-1 fields only; omitted = untouched, null clears; never touches round fields).
   - **Round Settings** — `GET`/`PATCH /settings/round-settings` (partial upsert of
@@ -371,6 +379,10 @@ Each item was actually run and observed:
   (total 2, not 4); save areas `[X,Y]` then `[Z]` → `[Z]` only; two `saveFirstRound`
   calls keep a **single ACTIVE round** (same id, fields updated). Accepted
   technicians (real `profileId`) preserved. DB restored via re-seed afterwards.
+- [x] **Settings completion guard verified.** `assertSetupComplete` throws
+  `AppError(403)` with the correct message when `setupCompleted = false`; passes when
+  `setupCompleted = true`. Confirmed **14 mutating ops carry 403** in the OpenAPI spec;
+  **0 GET ops** do. Direct-service test run against the live DB.
 
 **Not yet verified (do not assume working):**
 
