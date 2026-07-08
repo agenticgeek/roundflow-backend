@@ -85,6 +85,7 @@ const ERR = {
   400: { $ref: "#/components/responses/BadRequest" },
   401: { $ref: "#/components/responses/Unauthorized" },
   403: { $ref: "#/components/responses/Forbidden" },
+  404: { $ref: "#/components/responses/NotFound" },
   409: { $ref: "#/components/responses/Conflict" },
   500: { $ref: "#/components/responses/ServerError" },
 } as const;
@@ -129,6 +130,7 @@ const enumSchemas: Record<string, OpenAPIV3.SchemaObject> = {
   InvoiceStatus: stringEnum(["DRAFT", "SENT", "PAID"]),
   IssueType: stringEnum(["ACCESS_PROBLEM", "GATE_LOCKED", "PAYMENT_ISSUE", "OTHER"]),
   PhotoType: stringEnum(["PROPERTY", "BEFORE", "AFTER"]),
+  PaymentTiming: stringEnum(["COLLECT_AFTER_VISIT", "COLLECT_BEFORE_VISIT", "COLLECT_ON_DATE"]),
 };
 
 // ---------------------------------------------------------------------------
@@ -193,6 +195,11 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
         description: "Cycle length in days.",
       },
       bankDetails: { type: "object", nullable: true, additionalProperties: true },
+      paymentRule: nullableRef("PaymentTiming"),
+      debtHoldEnabled: { type: "boolean" },
+      vatInInvoices: { type: "boolean" },
+      gocardlessConnected: { type: "boolean" },
+      stripeConnected: { type: "boolean" },
       setupCompleted: { type: "boolean" },
       updatedAt: dateTime,
     },
@@ -219,6 +226,11 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     properties: {
       id: { type: "string" },
       profileId: { type: "string", nullable: true },
+      name: {
+        type: "string",
+        nullable: true,
+        description: "Admin display label; Profile.name wins once the invite is accepted.",
+      },
       role: { type: "string", nullable: true, description: "Operational role, e.g. Senior." },
       phone: { type: "string", nullable: true },
       active: { type: "boolean" },
@@ -252,6 +264,65 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       serviceAreaId: { type: "string", nullable: true },
       createdAt: dateTime,
       updatedAt: dateTime,
+    },
+  },
+
+  ServiceAreaWithRounds: {
+    allOf: [
+      ref("ServiceArea"),
+      {
+        type: "object",
+        properties: {
+          linkedRounds: {
+            type: "object",
+            description: "Derived, read-only summary of Rounds referencing this area.",
+            properties: {
+              count: { type: "integer" },
+              names: { type: "array", items: { type: "string" } },
+            },
+          },
+        },
+      },
+    ],
+  },
+
+  TechnicianWithDisplayName: {
+    allOf: [
+      ref("Technician"),
+      {
+        type: "object",
+        properties: {
+          profile: nullableRef("Profile"),
+          displayName: {
+            type: "string",
+            nullable: true,
+            description: "profile?.name ?? technician.name ?? null.",
+          },
+          appStatus: stringEnum(["PENDING_INVITE", "ACTIVE", "INACTIVE"]),
+        },
+      },
+    ],
+  },
+
+  ProviderConnectResponse: {
+    type: "object",
+    required: ["status"],
+    properties: {
+      status: { type: "string", example: "connected" },
+      connectUrl: {
+        type: "string",
+        nullable: true,
+        description: "Phase-1 stub returns no URL; a real URL comes from GHL in Phase 2.",
+      },
+    },
+  },
+
+  MessageTemplateDeferred: {
+    type: "object",
+    required: ["status", "source"],
+    properties: {
+      status: { type: "string", enum: ["deferred"] },
+      source: { type: "string", example: "ghl" },
     },
   },
 
@@ -463,6 +534,114 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       serviceAreaId: "clx...",
     },
   },
+
+  // --- Settings (partial updates: omitted = untouched, null clears) ---
+  BusinessProfileUpdateInput: {
+    type: "object",
+    description: "Partial update — all fields optional. Step-1 fields only; does not touch round-settings fields.",
+    properties: {
+      businessName: { type: "string", nullable: true },
+      phone: { type: "string", nullable: true },
+      email: { type: "string", nullable: true },
+      companyNumber: { type: "string", nullable: true },
+      vatRegistered: { type: "boolean" },
+      vatRegistration: { type: "string", nullable: true },
+      timezone: { type: "string", nullable: true },
+      currency: { type: "string", nullable: true },
+      defaultWorkingDays: { type: "array", items: { type: "string" } },
+    },
+    example: { businessName: "Northumberland Window Cleaning", currency: "GBP" },
+  },
+
+  RoundSettingsUpdateInput: {
+    type: "object",
+    description: "Partial update — round-settings fields only.",
+    properties: {
+      defaultCycleLength: { type: "integer", nullable: true, description: "Cycle length in days." },
+      defaultWorkingDays: { type: "array", items: { type: "string" } },
+    },
+    example: { defaultCycleLength: 28 },
+  },
+
+  ServiceCreateInput: {
+    type: "object",
+    required: ["name", "defaultPrice"],
+    properties: {
+      name: { type: "string", minLength: 1 },
+      defaultPrice: { type: "number", description: "Sent as a number; returned as a string." },
+      category: ref("ServiceCategory"),
+      description: { type: "string", nullable: true },
+      active: { type: "boolean" },
+    },
+    example: { name: "Gutter clear", category: "GUTTER_FASCIA", defaultPrice: 60 },
+  },
+
+  ServiceUpdateInput: {
+    type: "object",
+    description: "Partial update — all fields optional.",
+    properties: {
+      name: { type: "string", minLength: 1 },
+      defaultPrice: { type: "number" },
+      category: ref("ServiceCategory"),
+      description: { type: "string", nullable: true },
+      active: { type: "boolean" },
+    },
+  },
+
+  ServiceAreaCreateInput: {
+    type: "object",
+    required: ["name"],
+    properties: {
+      name: { type: "string", minLength: 1 },
+      postcodeSector: { type: "string", nullable: true },
+      isDefault: { type: "boolean" },
+    },
+    example: { name: "Morpeth", postcodeSector: "NE61" },
+  },
+
+  ServiceAreaUpdateInput: {
+    type: "object",
+    description: "Partial update — all fields optional.",
+    properties: {
+      name: { type: "string", minLength: 1 },
+      postcodeSector: { type: "string", nullable: true },
+      isDefault: { type: "boolean" },
+    },
+  },
+
+  TechnicianCreateInput: {
+    type: "object",
+    description: "Single invite-pending technician (profileId = null).",
+    properties: {
+      name: { type: "string", nullable: true, description: "Admin display label." },
+      phone: { type: "string", nullable: true },
+      role: { type: "string", nullable: true },
+      active: { type: "boolean" },
+    },
+    example: { name: "James Fisher", role: "Senior", phone: "+44 7700 900111" },
+  },
+
+  TechnicianUpdateInput: {
+    type: "object",
+    description: "Partial update — all fields optional.",
+    properties: {
+      name: { type: "string", nullable: true },
+      phone: { type: "string", nullable: true },
+      role: { type: "string", nullable: true },
+      active: { type: "boolean" },
+    },
+  },
+
+  PaymentRulesUpdateInput: {
+    type: "object",
+    description: "Partial update of payment RULES only — does not touch the connect flags.",
+    properties: {
+      paymentRule: nullableRef("PaymentTiming"),
+      vatInInvoices: { type: "boolean" },
+      debtHoldEnabled: { type: "boolean" },
+    },
+    example: { paymentRule: "COLLECT_AFTER_VISIT", vatInInvoices: true },
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -488,6 +667,7 @@ const reusableResponses: Record<string, OpenAPIV3.ResponseObject> = {
     "A mutating setup step was called after setup is already complete.",
     "Setup is already complete; wizard endpoints are locked."
   ),
+  NotFound: errorResponse("Resource not found.", "Service not found"),
   Conflict: errorResponse(
     "POST /setup/complete when setup is already complete.",
     "Setup is already complete."
@@ -800,6 +980,261 @@ const paths: OpenAPIV3.PathsObject = {
       },
     },
   },
+
+  // =====================================================================
+  // Settings — post-completion editing (always open; no setup-complete lock)
+  // =====================================================================
+
+  "/settings/business-profile": {
+    get: {
+      tags: ["Settings"],
+      summary: "Get business profile",
+      description: "Returns the BusinessSettings singleton (or null).",
+      responses: {
+        "200": jsonResponse("BusinessSettings (or null).", nullableRef("BusinessSettings")),
+        "401": ERR[401],
+      },
+    },
+    patch: {
+      tags: ["Settings"],
+      summary: "Update business profile (partial)",
+      description:
+        "Partial upsert of step-1 fields (businessName, phone, email, companyNumber, vatRegistered, vatRegistration, timezone, currency, defaultWorkingDays). Omitted = untouched; null clears. Does not touch round-settings fields.",
+      requestBody: jsonBody(ref("BusinessProfileUpdateInput")),
+      responses: {
+        "200": jsonResponse("Updated BusinessSettings.", ref("BusinessSettings")),
+        "400": ERR[400],
+        "401": ERR[401],
+      },
+    },
+  },
+
+  "/settings/round-settings": {
+    get: {
+      tags: ["Settings"],
+      summary: "Get round settings",
+      description: "Returns the BusinessSettings singleton; read `defaultCycleLength` / `defaultWorkingDays`.",
+      responses: {
+        "200": jsonResponse("BusinessSettings (or null).", nullableRef("BusinessSettings")),
+        "401": ERR[401],
+      },
+    },
+    patch: {
+      tags: ["Settings"],
+      summary: "Update round settings (partial)",
+      description: "Partial upsert of round fields only (`defaultCycleLength`, `defaultWorkingDays`).",
+      requestBody: jsonBody(ref("RoundSettingsUpdateInput")),
+      responses: {
+        "200": jsonResponse("Updated BusinessSettings.", ref("BusinessSettings")),
+        "400": ERR[400],
+        "401": ERR[401],
+      },
+    },
+  },
+
+  "/settings/services": {
+    get: {
+      tags: ["Settings"],
+      summary: "List services",
+      responses: {
+        "200": jsonResponse("All services.", { type: "array", items: ref("Service") }),
+        "401": ERR[401],
+      },
+    },
+    post: {
+      tags: ["Settings"],
+      summary: "Create a service",
+      requestBody: jsonBody(ref("ServiceCreateInput")),
+      responses: {
+        "201": jsonResponse("The created service.", ref("Service")),
+        "400": ERR[400],
+        "401": ERR[401],
+      },
+    },
+  },
+  "/settings/services/{id}": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    patch: {
+      tags: ["Settings"],
+      summary: "Update a service (partial)",
+      requestBody: jsonBody(ref("ServiceUpdateInput")),
+      responses: {
+        "200": jsonResponse("The updated service.", ref("Service")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "404": ERR[404],
+      },
+    },
+    delete: {
+      tags: ["Settings"],
+      summary: "Delete a service",
+      description: "409 if any ServicePlan or Visit references the service.",
+      responses: {
+        "204": { description: "Deleted." },
+        "401": ERR[401],
+        "404": ERR[404],
+        "409": ERR[409],
+      },
+    },
+  },
+
+  "/settings/service-areas": {
+    get: {
+      tags: ["Settings"],
+      summary: "List service areas (with linkedRounds)",
+      description: "Each area includes a derived, read-only `linkedRounds` summary.",
+      responses: {
+        "200": jsonResponse("All service areas.", { type: "array", items: ref("ServiceAreaWithRounds") }),
+        "401": ERR[401],
+      },
+    },
+    post: {
+      tags: ["Settings"],
+      summary: "Create a service area",
+      requestBody: jsonBody(ref("ServiceAreaCreateInput")),
+      responses: {
+        "201": jsonResponse("The created service area.", ref("ServiceArea")),
+        "400": ERR[400],
+        "401": ERR[401],
+      },
+    },
+  },
+  "/settings/service-areas/{id}": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    patch: {
+      tags: ["Settings"],
+      summary: "Update a service area (partial)",
+      requestBody: jsonBody(ref("ServiceAreaUpdateInput")),
+      responses: {
+        "200": jsonResponse("The updated service area.", ref("ServiceArea")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "404": ERR[404],
+      },
+    },
+    delete: {
+      tags: ["Settings"],
+      summary: "Delete a service area",
+      description: "409 if any Round or Property references the area.",
+      responses: {
+        "204": { description: "Deleted." },
+        "401": ERR[401],
+        "404": ERR[404],
+        "409": ERR[409],
+      },
+    },
+  },
+
+  "/settings/technicians": {
+    get: {
+      tags: ["Settings"],
+      summary: "List technicians (with displayName + appStatus)",
+      responses: {
+        "200": jsonResponse("All technicians.", { type: "array", items: ref("TechnicianWithDisplayName") }),
+        "401": ERR[401],
+      },
+    },
+    post: {
+      tags: ["Settings"],
+      summary: "Create an invite-pending technician",
+      requestBody: jsonBody(ref("TechnicianCreateInput")),
+      responses: {
+        "201": jsonResponse("The created technician.", ref("Technician")),
+        "400": ERR[400],
+        "401": ERR[401],
+      },
+    },
+  },
+  "/settings/technicians/{id}": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    patch: {
+      tags: ["Settings"],
+      summary: "Update a technician (partial)",
+      requestBody: jsonBody(ref("TechnicianUpdateInput")),
+      responses: {
+        "200": jsonResponse("The updated technician.", ref("Technician")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "404": ERR[404],
+      },
+    },
+    delete: {
+      tags: ["Settings"],
+      summary: "Delete a technician",
+      description: "Only invite-pending technicians (profileId = null) can be deleted; 409 if the invite was accepted.",
+      responses: {
+        "204": { description: "Deleted." },
+        "401": ERR[401],
+        "404": ERR[404],
+        "409": ERR[409],
+      },
+    },
+  },
+
+  "/settings/payment": {
+    get: {
+      tags: ["Settings"],
+      summary: "Get payment setup",
+      description: "Returns the BusinessSettings singleton; read the payment fields.",
+      responses: {
+        "200": jsonResponse("BusinessSettings (or null).", nullableRef("BusinessSettings")),
+        "401": ERR[401],
+      },
+    },
+    patch: {
+      tags: ["Settings"],
+      summary: "Update payment rules (partial)",
+      description: "Updates `paymentRule` / `vatInInvoices` / `debtHoldEnabled` only. Does NOT touch the connect flags — use the connect endpoint for those.",
+      requestBody: jsonBody(ref("PaymentRulesUpdateInput")),
+      responses: {
+        "200": jsonResponse("Updated BusinessSettings.", ref("BusinessSettings")),
+        "400": ERR[400],
+        "401": ERR[401],
+      },
+    },
+  },
+  "/settings/payment/{provider}/connect": {
+    parameters: [
+      {
+        name: "provider",
+        in: "path",
+        required: true,
+        schema: { type: "string", enum: ["gocardless", "stripe"] },
+      },
+    ],
+    post: {
+      tags: ["Settings"],
+      summary: "Connect a payment provider (Phase-1 stub)",
+      description:
+        "Phase-1 stub: flips the relevant *Connected boolean to true and returns `{ status: \"connected\" }`. No OAuth / no URL yet — a real `connectUrl` will come from GHL in Phase 2.",
+      responses: {
+        "200": jsonResponse("Connection result.", ref("ProviderConnectResponse")),
+        "400": ERR[400],
+        "401": ERR[401],
+      },
+    },
+  },
+
+  "/settings/message-templates": {
+    get: {
+      tags: ["Settings"],
+      summary: "SMS templates (deferred)",
+      description: "Deferred — GHL owns messaging in Phase 2. No DB access.",
+      responses: {
+        "200": jsonResponse("Deferred stub.", ref("MessageTemplateDeferred")),
+        "401": ERR[401],
+      },
+    },
+    patch: {
+      tags: ["Settings"],
+      summary: "SMS templates (deferred, no-op)",
+      description: "Deferred — returns the same payload, performs no DB write.",
+      responses: {
+        "200": jsonResponse("Deferred stub.", ref("MessageTemplateDeferred")),
+        "401": ERR[401],
+      },
+    },
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -838,6 +1273,7 @@ export const openApiDocument: OpenAPIV3.Document = {
     },
     { name: "Health", description: "Liveness." },
     { name: "Setup", description: "First-run Setup Wizard (8 steps)." },
+    { name: "Settings", description: "Post-completion settings editing (always open)." },
   ],
   // Global default: all operations require the Bearer token unless they
   // override with `security: []` (e.g. /health).

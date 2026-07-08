@@ -290,6 +290,41 @@ Pending/Deferred — see below.
   - Every mutating step route calls `assertSetupIncomplete` first (throws typed
     **`AppError` 403** once setup is complete). `AppError` (`src/lib/app-error.ts`)
     is mapped to `{ error, statusCode }` by the centralised error handler.
+- **Settings API (`/settings/*`, all `requireAuth`)** — the **post-completion
+  editing surface** for the same data the Setup Wizard seeds (design:
+  `docs/SETTINGS_API_DESIGN.md`). Built as a **separate service**
+  (`src/services/settings.service.ts`, `ISettingsService` interface) — does **not**
+  extend or modify `SetupService`. Same OCP discipline: **`profileId`-first** on every
+  method; the singleton `where: { uniqueId: "singleton" }` lives in **exactly one place**
+  (the `SINGLETON` const, touched only by two private seam methods `getSettings()` (read)
+  / `writeSettings()` (write) — never a business method or route). Routes
+  (`src/routes/settings.ts`) are thin (validate → call service → respond); **no
+  `assertSetupIncomplete`** (Settings is always open). 21 endpoints across 7 sections:
+  - **Business Profile** — `GET`/`PATCH /settings/business-profile` (partial upsert of
+    step-1 fields only; omitted = untouched, null clears; never touches round fields).
+  - **Round Settings** — `GET`/`PATCH /settings/round-settings` (partial upsert of
+    `defaultCycleLength` + `defaultWorkingDays`; `defaultCleanMethod`/`autoGenerateVisits`
+    P1-nice and reminder timing P2 are **not** in the schema, deliberately omitted).
+  - **Service Catalogue** — `GET` · `POST` (create, 201) · `PATCH /:id` · `DELETE /:id`.
+    **Delete guard:** `409` if any `ServicePlan`/`Visit` references the service; `404` if
+    not found.
+  - **Service Areas** — `GET` (each with derived read-only `linkedRounds` {count, names}
+    from `Round.serviceAreaId`) · `POST` · `PATCH /:id` · `DELETE /:id`. **Delete guard:**
+    `409` if any `Round`/`Property` references the area; `404` if not found.
+  - **Technicians** — `GET` (each with derived `displayName` = `profile?.name ?? name`
+    and `appStatus` ∈ `PENDING_INVITE`/`ACTIVE`/`INACTIVE`) · `POST` (single invite-pending
+    create, `profileId=null`) · `PATCH /:id` · `DELETE /:id`. **Delete guard:** only
+    invite-pending (`profileId=null`) deletable; `409` if the invite was accepted; `404`
+    if not found.
+  - **Payment Setup** — `GET` (singleton payment fields) · `PATCH` (rules only:
+    `paymentRule`/`vatInInvoices`/`debtHoldEnabled` — does **not** touch connect flags) ·
+    `POST /:provider/connect` (Phase-1 **stub**: flips `gocardlessConnected`/`stripeConnected`
+    true, returns `{ status: "connected" }`; provider-agnostic + swap-neutral for Phase-2 GHL).
+  - **SMS Templates** — `GET`/`PATCH /settings/message-templates` → deferred stub
+    `{ status: "deferred", source: "ghl" }`, no DB access (GHL owns messaging in Phase 2).
+  - Mounted in `src/index.ts` (`app.use("/settings", settingsRouter)`); all 21 operations
+    documented under the **Settings** tag in `src/swagger.ts` (+ `PaymentTiming` enum,
+    `404`/`NotFound` response, and derived-response schemas).
 
 ## Verified Working
 
