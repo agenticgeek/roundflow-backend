@@ -334,6 +334,55 @@ Pending/Deferred — see below.
     documented under the **Settings** tag in `src/swagger.ts` (+ `PaymentTiming` enum,
     `404`/`NotFound` response, and derived-response schemas).
 
+### Security Hardening (PR review — 2026-07-09)
+
+A senior-engineer PR review flagged that the codebase had **authentication but no
+authorization**, plus several input-validation gaps. The 🔴 Critical items were
+fixed in this pass (🟡/🟠 items are deferred to a later pass):
+
+- **Authorization layer added (`src/middleware/requireRole.ts`).** `requireAuth`
+  proves *who* the caller is; it never proved *what they may do*. New
+  `requireRole(...roles)` loads the caller's `Profile` by `supabaseUserId` and
+  checks the **app role** (`Profile.role`) — not the raw JWT `role` claim, which
+  for Supabase is always `"authenticated"`. It attaches `req.profile`, returns
+  **403 `{ error: "Insufficient permissions" }`** when the role is not allowed or
+  no Profile exists, and **401** if `requireAuth` did not run first. A
+  `requireBusinessAccess()` convenience guard is applied once per router
+  (`/setup`, `/settings`): **GETs** allow `ADMIN`/`MANAGER`/`TECHNICIAN`;
+  **mutations (POST/PATCH/DELETE)** require `ADMIN`/`MANAGER`. `req.profile` was
+  added to the Express `Request` type alongside `req.user`.
+  *Why:* previously any authenticated Supabase user (and the signup trigger makes
+  every signup `ADMIN`) could wipe the service catalogue, delete technicians, or
+  complete setup — anonymous-to-admin data destruction if signup is open.
+- **`defaultWorkingDays` element validation (`src/lib/validation.ts`
+  `validateWorkingDays`).** Both routers now reject any array element that isn't a
+  valid `DayOfWeek` with a **400** (previously `["FUNDAY"]` / non-strings were
+  persisted or 500'd at the driver). One shared validator, called in both
+  `/setup` and `/settings`.
+- **`defaultCycleLength` validation (`assertPositiveInt`).** Both routers now
+  require a **positive integer** (was: any finite number — `3.5`/`-7`/`0` slipped
+  past route validation and either 500'd against the `Int` column or stored
+  nonsense).
+- **Swagger required-steps corrected.** Three locations in `src/swagger.ts` said
+  required steps were `1,3,4,6,7,8` / that step 2 is deferred — contradicting the
+  code, which requires step 2 (`paymentRule != null`). Now consistently
+  **`1,2,3,4,6,7,8`; only step 5 is deferred.**
+- **`requireAuth` rejects tokens with no `sub`.** A token whose subject is missing
+  or empty now returns **401** instead of continuing with an empty-string user id.
+
+Typecheck (`tsc --noEmit`) clean after the changes. **Deferred (not yet fixed):**
+FK indexes, the incomplete Phase-2 tenant seam / `profileId` naming, PgBouncer
+interactive-transaction verification, `@db.Money`, and the duplicated route
+helpers — tracked from the same review.
+
+**Known performance consideration (Phase 2 planning).** `requireRole` calls
+`prisma.profile.findUnique()` on every authenticated request to load the caller's
+app role. This is correct and safe for Phase 1 (single-tenant, low traffic).
+Before Phase 2 or any significant load, consider caching the Profile lookup (e.g.
+a short-lived in-memory cache keyed by `supabaseUserId`, or attaching the role to
+a custom JWT claim set at login so no DB lookup is needed). **Do not optimise
+now** — noted for Phase 2 planning.
+
 ## Verified Working
 
 Each item was actually run and observed:

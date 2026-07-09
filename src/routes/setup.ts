@@ -1,7 +1,9 @@
 import { NextFunction, Request, Response, Router } from "express";
 import { PaymentTiming } from "@prisma/client";
 import { requireAuth } from "../middleware/requireAuth";
+import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
+import { validateWorkingDays, assertPositiveInt } from "../lib/validation";
 import {
   setupService,
   BusinessProfileInput,
@@ -15,6 +17,8 @@ import {
 
 export const setupRouter = Router();
 setupRouter.use(requireAuth);
+// Authorization: reads allowed for any known role; mutations require ADMIN/MANAGER.
+setupRouter.use(requireBusinessAccess());
 
 // ---- helpers -------------------------------------------------------------
 
@@ -95,7 +99,7 @@ setupRouter.post(
         typeof body.vatRegistered === "boolean" ? body.vatRegistered : undefined,
       vatRegistration: body.vatRegistration as string | undefined,
       defaultWorkingDays: Array.isArray(body.defaultWorkingDays)
-        ? (body.defaultWorkingDays as string[])
+        ? validateWorkingDays(body.defaultWorkingDays)
         : undefined,
       timezone: body.timezone as string | undefined,
       currency: body.currency as string | undefined,
@@ -187,9 +191,12 @@ setupRouter.post(
     await setupService.assertSetupIncomplete(profileId);
     const body = asObject(req.body);
     const input: RoundSettingsInput = {
-      defaultCycleLength: requireNumber(body.defaultCycleLength, "defaultCycleLength"),
+      defaultCycleLength: assertPositiveInt(
+        requireNumber(body.defaultCycleLength, "defaultCycleLength"),
+        "defaultCycleLength"
+      ),
       defaultWorkingDays: Array.isArray(body.defaultWorkingDays)
-        ? (body.defaultWorkingDays as string[])
+        ? validateWorkingDays(body.defaultWorkingDays)
         : undefined,
     };
     res.json(await setupService.saveRoundSettings(profileId, input));

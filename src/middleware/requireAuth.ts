@@ -1,6 +1,7 @@
 import { NextFunction, Request, Response } from "express";
 import jwt, { JwtHeader, JwtPayload, SigningKeyCallback } from "jsonwebtoken";
 import jwksClient from "jwks-rsa";
+import type { Profile } from "@prisma/client";
 
 // The authenticated user derived from a verified Supabase JWT.
 export interface AuthUser {
@@ -9,12 +10,14 @@ export interface AuthUser {
   role: string;
 }
 
-// Augment Express's Request so req.user is typed across the app.
+// Augment Express's Request so req.user (set by requireAuth) and req.profile
+// (set by requireRole) are typed across the app.
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
   namespace Express {
     interface Request {
       user?: AuthUser;
+      profile?: Profile;
     }
   }
 }
@@ -71,8 +74,14 @@ export async function requireAuth(
 
   try {
     const payload = await verifyToken(token);
+    // A token without a subject cannot identify a user — reject rather than
+    // continue with an empty-string user id.
+    const sub = typeof payload.sub === "string" ? payload.sub.trim() : "";
+    if (!sub) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
     req.user = {
-      supabaseUserId: String(payload.sub ?? ""),
+      supabaseUserId: sub,
       email: typeof payload.email === "string" ? payload.email : "",
       role: typeof payload.role === "string" ? payload.role : "",
     };

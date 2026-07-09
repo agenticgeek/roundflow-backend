@@ -1,7 +1,9 @@
 import { NextFunction, Request, Response, Router } from "express";
 import { ServiceCategory, PaymentTiming } from "@prisma/client";
 import { requireAuth } from "../middleware/requireAuth";
+import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
+import { validateWorkingDays, assertPositiveInt } from "../lib/validation";
 import {
   settingsService,
   BusinessProfileUpdateInput,
@@ -17,6 +19,8 @@ import {
 
 export const settingsRouter = Router();
 settingsRouter.use(requireAuth);
+// Authorization: reads allowed for any known role; mutations require ADMIN/MANAGER.
+settingsRouter.use(requireBusinessAccess());
 
 // ---- helpers -------------------------------------------------------------
 // Same pattern as src/routes/setup.ts. Settings routes are thin: validate →
@@ -87,6 +91,18 @@ function optStringArray(v: unknown, field: string): string[] | undefined {
   if (Array.isArray(v) && v.every((x) => typeof x === "string")) return v as string[];
   throw new AppError(400, `"${field}" must be an array of strings.`);
 }
+// Working-days array: omitted = untouched; otherwise every element must be a
+// valid DayOfWeek (shared validator).
+function optWorkingDays(v: unknown, field: string): string[] | undefined {
+  const arr = optStringArray(v, field);
+  return arr === undefined ? undefined : validateWorkingDays(arr);
+}
+// Cycle length: omitted = untouched; null clears; a number must be a positive integer.
+function optCycleLength(v: unknown): number | null | undefined {
+  const n = optNumber(v, "defaultCycleLength");
+  if (typeof n === "number") assertPositiveInt(n, "defaultCycleLength");
+  return n;
+}
 function optCategory(v: unknown): ServiceCategory | undefined {
   if (v === undefined) return undefined;
   if (typeof v === "string" && (Object.values(ServiceCategory) as string[]).includes(v)) {
@@ -127,7 +143,7 @@ settingsRouter.patch(
       vatRegistration: optString(body.vatRegistration, "vatRegistration"),
       timezone: optString(body.timezone, "timezone"),
       currency: optString(body.currency, "currency"),
-      defaultWorkingDays: optStringArray(body.defaultWorkingDays, "defaultWorkingDays"),
+      defaultWorkingDays: optWorkingDays(body.defaultWorkingDays, "defaultWorkingDays"),
     };
     res.json(await settingsService.updateBusinessProfile(profileIdOf(req), input));
   })
@@ -149,8 +165,8 @@ settingsRouter.patch(
     await settingsService.assertSetupComplete(profileIdOf(req));
     const body = asObject(req.body);
     const input: RoundSettingsUpdateInput = {
-      defaultCycleLength: optNumber(body.defaultCycleLength, "defaultCycleLength"),
-      defaultWorkingDays: optStringArray(body.defaultWorkingDays, "defaultWorkingDays"),
+      defaultCycleLength: optCycleLength(body.defaultCycleLength),
+      defaultWorkingDays: optWorkingDays(body.defaultWorkingDays, "defaultWorkingDays"),
     };
     res.json(await settingsService.updateRoundSettings(profileIdOf(req), input));
   })

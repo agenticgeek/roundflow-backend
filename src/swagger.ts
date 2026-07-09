@@ -660,7 +660,7 @@ const errorResponse = (
 const reusableResponses: Record<string, OpenAPIV3.ResponseObject> = {
   BadRequest: errorResponse(
     "Validation error, or POST /setup/complete with required steps missing.",
-    'Setup cannot be completed — required steps incomplete: 3, 4, 6, 7, 8'
+    'Setup cannot be completed — required steps incomplete: 2, 3, 4, 6, 7, 8'
   ),
   Unauthorized: errorResponse("Missing, invalid, or expired Bearer token.", "Unauthorized"),
   Forbidden: errorResponse(
@@ -971,7 +971,7 @@ const paths: OpenAPIV3.PathsObject = {
       tags: ["Setup"],
       summary: "Complete setup",
       description:
-        "Marks setup complete. Requires all non-deferred steps (1,3,4,6,7,8). After completion, mutating step endpoints return 403.",
+        "Marks setup complete. Requires all non-deferred steps (1,2,3,4,6,7,8). After completion, mutating step endpoints return 403.",
       responses: {
         "200": jsonResponse("Final status (setupCompleted = true).", ref("SetupStatus")),
         "400": ERR[400], // required steps missing
@@ -1270,7 +1270,7 @@ export const openApiDocument: OpenAPIV3.Document = {
       "",
       "**Money fields** (`defaultPrice`, etc.) are returned as strings but sent as numbers.",
       "",
-      "**Setup Wizard:** required steps are 1, 3, 4, 6, 7, 8; steps 2 & 5 are deferred stubs.",
+      "**Setup Wizard:** required steps are 1, 2, 3, 4, 6, 7, 8; only step 5 (SMS Templates) is a deferred stub.",
       "Phase 1 is single-tenant (one shared business config).",
     ].join("\n"),
   },
