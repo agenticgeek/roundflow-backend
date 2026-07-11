@@ -141,11 +141,28 @@ const SINGLETON = { uniqueId: "singleton" } as const;
 // Implementation
 // ---------------------------------------------------------------------------
 //
-// NOTE ON `profileId`: every method takes it as the first argument — this is
-// the deliberate OCP seam for Phase 2 multi-tenancy. In Phase 1 the business is
-// a single tenant, so config lives in the `BusinessSettings` singleton and
-// `profileId` is not yet used to scope reads/writes. Phase 2 swaps in an
-// implementation that resolves a tenant from `profileId` and scopes every query.
+// PHASE 2 TENANT SEAM — honest assessment:
+//
+// What the seam genuinely covers:
+//   BusinessSettings — all access goes through getSettings()/writeSettings();
+//   the singleton WHERE clause lives in exactly one place. Changing those two
+//   methods to scope by tenant is a real one-place change.
+//
+// What the seam does NOT cover (Phase 2 will require):
+//   - A tenant FK column on every operational table (Service, Technician,
+//     ServiceArea, Round, Property, Visit, ServicePlan, Invoice, Payment,
+//     Message, Complaint, Photo, ActivityLog) — a schema migration with backfill.
+//   - ~30 unscoped query call sites in this service that will each need a
+//     { where: { tenantId } } scope added.
+//   - BusinessSettings.uniqueId @unique ("singleton") must become per-tenant.
+//   - Invoice.invoiceNumber @unique is globally unique — must become unique
+//     per tenant or tenants collide on invoice numbers.
+//   - The actorId parameter (currently supabaseUserId) is the wrong grain for
+//     Phase 2 — tenancy resolves from the GHL install/location, not the acting
+//     user. A separate tenantId resolution step will be needed.
+//
+// Phase 2 is a whole-schema migration + ~30 query edits, not a two-method swap.
+// The interface boundary and thin routes are correct and will not need changing.
 class SetupService implements ISetupService {
   private async getSettings(): Promise<BusinessSettings | null> {
     return prisma.businessSettings.findUnique({ where: SINGLETON });
@@ -357,6 +374,10 @@ class SetupService implements ISetupService {
     _profileId: string,
     input: ServiceAreaInput[]
   ): Promise<ServiceArea[]> {
+    // At most one area may be flagged default. Reject before any DB write.
+    if (input.filter((a) => a.isDefault === true).length > 1) {
+      throw new AppError(400, "Only one service area can be marked as default.");
+    }
     // Replace the whole set — re-posting step 7 must not append duplicates.
     // Safe within the wizard: Rounds/Properties that reference ServiceArea are
     // created after step 7, and only once setup is complete —

@@ -175,10 +175,28 @@ export interface ISettingsService {
   getMessageTemplates(profileId: string): Promise<DeferredStub>;
 }
 
-// The single-tenant singleton key. Defined ONCE here; only the two private
-// seam methods below (getSettings / writeSettings) ever reference it — never a
-// business method, never a route. Phase 2 swaps those two methods to resolve a
-// tenant from profileId; nothing else changes.
+// PHASE 2 TENANT SEAM — honest assessment:
+//
+// What the seam genuinely covers:
+//   BusinessSettings — all access goes through getSettings()/writeSettings();
+//   the singleton WHERE clause lives in exactly one place. Changing those two
+//   methods to scope by tenant is a real one-place change.
+//
+// What the seam does NOT cover (Phase 2 will require):
+//   - A tenant FK column on every operational table (Service, Technician,
+//     ServiceArea, Round, Property, Visit, ServicePlan, Invoice, Payment,
+//     Message, Complaint, Photo, ActivityLog) — a schema migration with backfill.
+//   - ~30 unscoped query call sites in this service that will each need a
+//     { where: { tenantId } } scope added.
+//   - BusinessSettings.uniqueId @unique ("singleton") must become per-tenant.
+//   - Invoice.invoiceNumber @unique is globally unique — must become unique
+//     per tenant or tenants collide on invoice numbers.
+//   - The actorId parameter (currently supabaseUserId) is the wrong grain for
+//     Phase 2 — tenancy resolves from the GHL install/location, not the acting
+//     user. A separate tenantId resolution step will be needed.
+//
+// Phase 2 is a whole-schema migration + ~30 query edits, not a two-method swap.
+// The interface boundary and thin routes are correct and will not need changing.
 const SINGLETON = { uniqueId: "singleton" } as const;
 
 /** The scalar fields any singleton write may touch (plain values, not Prisma ops). */
@@ -349,13 +367,24 @@ class SettingsService implements ISettingsService {
     _profileId: string,
     input: ServiceAreaCreateInput
   ): Promise<ServiceArea> {
-    return prisma.serviceArea.create({
-      data: {
-        name: input.name,
-        postcodeSector: input.postcodeSector ?? null,
-        isDefault: input.isDefault ?? false,
-      },
-    });
+    const data = {
+      name: input.name,
+      postcodeSector: input.postcodeSector ?? null,
+      isDefault: input.isDefault ?? false,
+    };
+    if (input.isDefault === true) {
+      // Single-default invariant: clear every existing default, then insert the
+      // new one — atomically (array-form transaction).
+      const [, created] = await prisma.$transaction([
+        prisma.serviceArea.updateMany({
+          where: { isDefault: true },
+          data: { isDefault: false },
+        }),
+        prisma.serviceArea.create({ data }),
+      ]);
+      return created;
+    }
+    return prisma.serviceArea.create({ data });
   }
 
   async updateServiceArea(
@@ -365,14 +394,24 @@ class SettingsService implements ISettingsService {
   ): Promise<ServiceArea> {
     const existing = await prisma.serviceArea.findUnique({ where: { id } });
     if (!existing) throw new AppError(404, "Service area not found");
-    return prisma.serviceArea.update({
-      where: { id },
-      data: {
-        name: input.name,
-        postcodeSector: input.postcodeSector,
-        isDefault: input.isDefault,
-      },
-    });
+    const data = {
+      name: input.name,
+      postcodeSector: input.postcodeSector,
+      isDefault: input.isDefault,
+    };
+    if (input.isDefault === true) {
+      // Single-default invariant: clear the default flag on every OTHER area
+      // before setting it here — atomically (array-form transaction).
+      const [, updated] = await prisma.$transaction([
+        prisma.serviceArea.updateMany({
+          where: { isDefault: true, id: { not: id } },
+          data: { isDefault: false },
+        }),
+        prisma.serviceArea.update({ where: { id }, data }),
+      ]);
+      return updated;
+    }
+    return prisma.serviceArea.update({ where: { id }, data });
   }
 
   async deleteServiceArea(_profileId: string, id: string): Promise<void> {
