@@ -172,6 +172,10 @@ model Property {
   complaints    Complaint[]
   createdAt     DateTime        @default(now())
   updatedAt     DateTime        @updatedAt
+
+  @@index([customerId])
+  @@index([serviceAreaId])
+  @@index([roundId])
 }
 
 model ServicePlan {
@@ -180,7 +184,7 @@ model ServicePlan {
   property      Property        @relation(fields: [propertyId], references: [id])
   serviceId     String?
   service       Service?        @relation(fields: [serviceId], references: [id])
-  price         Decimal         @db.Money // Add Round step 3 "Price £"; Customer Detail price
+  price         Decimal         @db.Decimal(10, 2) // Add Round step 3 "Price £"; Customer Detail price
   cleanMethod   String? // FLAG: "clean method" shown, options not enumerated
   paymentMethod PaymentMethod?
   status        LifecycleStatus @default(ACTIVE)
@@ -189,6 +193,9 @@ model ServicePlan {
   visits        Visit[]
   createdAt     DateTime        @default(now())
   updatedAt     DateTime        @updatedAt
+
+  @@index([propertyId])
+  @@index([serviceId])
 }
 
 model Round {
@@ -204,6 +211,8 @@ model Round {
   visits        Visit[]
   createdAt     DateTime           @default(now())
   updatedAt     DateTime           @updatedAt
+
+  @@index([serviceAreaId])
 }
 
 model Technician {
@@ -231,6 +240,9 @@ model TechnicianServiceArea {
   assignedAt    DateTime    @default(now())
 
   @@id([technicianId, serviceAreaId])
+  // technicianId is the composite-PK leading column (already indexed); the
+  // trailing serviceAreaId needs its own index for lookups by area.
+  @@index([serviceAreaId])
 }
 
 model Visit {
@@ -238,7 +250,7 @@ model Visit {
   date          DateTime
   status        VisitStatus    @default(SCHEDULED)
   paymentHold   Boolean        @default(false) // "Payment Hold" flag (Round Details panel, KPIs)
-  price         Decimal        @db.Money
+  price         Decimal        @db.Decimal(10, 2)
   isOneOff      Boolean        @default(false) // M2 Add One-Off Job
   serviceId     String? // M2 "Service Type" → Service catalogue; null for plan-driven visits w/o override
   service       Service?       @relation(fields: [serviceId], references: [id])
@@ -260,6 +272,12 @@ model Visit {
   issues        Issue[]
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
+
+  @@index([serviceId])
+  @@index([propertyId])
+  @@index([roundId])
+  @@index([servicePlanId])
+  @@index([technicianId])
 }
 
 model Complaint {
@@ -280,6 +298,10 @@ model Complaint {
   photos       Photo[]
   createdAt    DateTime        @default(now())
   updatedAt    DateTime        @updatedAt
+
+  @@index([customerId])
+  @@index([propertyId])
+  @@index([technicianId])
 }
 
 model Issue {
@@ -291,6 +313,9 @@ model Issue {
   type       IssueType @default(OTHER)
   note       String?
   createdAt  DateTime  @default(now())
+
+  @@index([visitId])
+  @@index([propertyId])
 }
 
 model Invoice {
@@ -300,13 +325,15 @@ model Invoice {
   customer       Customer      @relation(fields: [customerId], references: [id])
   visitId        String?       @unique
   visit          Visit?        @relation(fields: [visitId], references: [id])
-  amount         Decimal       @db.Money
+  amount         Decimal       @db.Decimal(10, 2)
   status         InvoiceStatus @default(DRAFT)
   notes          String?
   sentToCustomer Boolean       @default(false) // "Also send to customer via email" (M4)
   sentAt         DateTime?
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
+
+  @@index([customerId])
 }
 
 model Payment {
@@ -315,7 +342,7 @@ model Payment {
   customer     Customer      @relation(fields: [customerId], references: [id])
   visitId      String?       @unique
   visit        Visit?        @relation(fields: [visitId], references: [id])
-  amount       Decimal       @db.Money
+  amount       Decimal       @db.Decimal(10, 2)
   method       PaymentMethod
   status       PaymentStatus @default(PENDING)
   gocardlessId String?
@@ -324,6 +351,8 @@ model Payment {
   paidAt       DateTime?
   createdAt    DateTime      @default(now())
   updatedAt    DateTime      @updatedAt
+
+  @@index([customerId])
 }
 
 model Message {
@@ -343,6 +372,11 @@ model Message {
   sentAt       DateTime?
   creditCost   Int? // "1 SMS credit · ~3p" (27, M1)
   createdAt    DateTime         @default(now())
+
+  @@index([customerId])
+  @@index([technicianId])
+  @@index([complaintId])
+  @@index([templateId])
 }
 
 model MessageTemplate {
@@ -360,7 +394,7 @@ model Service {
   name         String
   category     ServiceCategory @default(DEFAULT)
   description  String?
-  defaultPrice Decimal         @db.Money
+  defaultPrice Decimal         @db.Decimal(10, 2)
   active       Boolean         @default(true)
   servicePlans ServicePlan[]
   visits       Visit[]
@@ -377,6 +411,7 @@ model ServiceArea {
   rounds         Round[]
   technicians    TechnicianServiceArea[]
   createdAt      DateTime                @default(now())
+  updatedAt      DateTime                @updatedAt
 }
 
 model Photo {
@@ -390,6 +425,10 @@ model Photo {
   complaintId String?
   complaint   Complaint? @relation(fields: [complaintId], references: [id])
   createdAt   DateTime   @default(now())
+
+  @@index([propertyId])
+  @@index([visitId])
+  @@index([complaintId])
 }
 
 model ActivityLog {
@@ -406,18 +445,18 @@ enum PaymentTiming {
 }
 
 model BusinessSettings {
-  id                 String   @id @default(cuid())
-  uniqueId           String   @unique @default("singleton") // DB-level singleton guard: only one row can exist
-  businessName       String?
-  phone              String?
-  email              String?
-  companyNumber      String?
-  vatRegistration    String?
-  vatRegistered      Boolean  @default(false)
-  defaultWorkingDays String[] // toggle buttons (23) — Postgres array
-  timezone           String?
-  currency           String?
-  defaultCycleLength Int? // Round Settings (Setup step 4) — days
+  id                  String         @id @default(cuid())
+  uniqueId            String         @unique @default("singleton") // DB-level singleton guard: only one row can exist
+  businessName        String?
+  phone               String?
+  email               String?
+  companyNumber       String?
+  vatRegistration     String?
+  vatRegistered       Boolean        @default(false)
+  defaultWorkingDays  String[] // toggle buttons (23) — Postgres array
+  timezone            String?
+  currency            String?
+  defaultCycleLength  Int? // Round Settings (Setup step 4) — days
   bankDetails         Json? // Payment Setup BACS/bank (Setup step 2)
   paymentRule         PaymentTiming? // drives payment collection trigger
   debtHoldEnabled     Boolean        @default(false) // gates payment-hold visit generation

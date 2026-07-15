@@ -383,6 +383,81 @@ a short-lived in-memory cache keyed by `supabaseUserId`, or attaching the role t
 a custom JWT claim set at login so no DB lookup is needed). **Do not optimise
 now** — noted for Phase 2 planning.
 
+### Code quality pass (PR review — 🟡/🟠, 2026-07-11)
+
+Follow-up pass addressing the non-critical review findings. **No schema changes,
+no migrations** — code-only. `tsc --noEmit` clean; `prisma db seed` clean.
+
+- **Phase 2 seam comments corrected (🟡/🔵).** The comment blocks in
+  `setup.service.ts` and `settings.service.ts` claimed Phase 2 multi-tenancy was a
+  "swap of two methods" / "nothing else changes." That was false for everything
+  except `BusinessSettings`. Both now carry an **honest `PHASE 2 TENANT SEAM`
+  assessment**: the seam genuinely covers `BusinessSettings` (one-place
+  `getSettings`/`writeSettings` change), but Phase 2 also requires a tenant FK on
+  every operational table (migration + backfill), scoping ~30 unscoped queries,
+  making `BusinessSettings.uniqueId` and `Invoice.invoiceNumber` per-tenant, and a
+  separate `tenantId` resolver (the current actor id is the wrong grain — tenancy
+  resolves from the GHL install/location, not the acting user). The interface
+  boundary and thin routes are correct and unaffected.
+- **`profileIdOf` → `actorIdOf` (🟡).** The route helper returned
+  `supabaseUserId`, not `Profile.id` (a cuid) — the name was misleading and
+  conflated the identifier with the future Phase-2 `tenantId`. Renamed in both
+  routers with a comment documenting the distinction. No `profileIdOf` references
+  remain in code (only in the explanatory comment).
+- **Shared route helpers extracted to `src/lib/http.ts` (🟠).** The generic
+  request plumbing (`asObject`, `asArray`, `Handler`, `h`, `requireString`,
+  `requireNumber`, and the `opt*` validators) was duplicated across the two
+  routers with divergent names (`reqString`/`reqNumber` vs `requireString`/
+  `requireNumber`). Now defined **once** in `src/lib/http.ts` and imported by both;
+  the settings router's `reqString`/`reqNumber` call sites were unified to the
+  canonical names. Domain-specific validators (`validateWorkingDays`,
+  `assertPositiveInt`, `optWorkingDays`, `optCycleLength`, `optCategory`,
+  `optPaymentTiming`, `actorIdOf`) deliberately **stay** in their routers / in
+  `src/lib/validation.ts`.
+- **Single-default `ServiceArea` enforced (🟠).** Nothing prevented multiple areas
+  flagged `isDefault: true`. `settings.service.ts` `createServiceArea` /
+  `updateServiceArea` now clear other defaults in an **array-form `$transaction`**
+  before writing (create clears all; update clears all *other* rows via
+  `id: { not: id }`). `setup.service.ts` `saveServiceAreas` rejects an input array
+  with more than one default via **`AppError(400, "Only one service area can be
+  marked as default.")`** before any DB write. *(Application-level invariant, not a
+  DB constraint — a partial unique index would make it race-proof but requires a
+  migration, deferred.)*
+
+**Schema migrations (PR review — 🟡/🟠, 2026-07-14).** The three schema-level
+review findings were addressed as three ordered migrations (tables hold only seed
+data, so all are safe; `tsc --noEmit` clean, `prisma db seed` clean,
+`prisma migrate status` → "up to date"):
+
+- **`20260714010004_add_fk_indexes` (🟡 #8).** Added `@@index` to all 26 unindexed
+  foreign-key scalar columns across Property (customerId/serviceAreaId/roundId),
+  ServicePlan (propertyId/serviceId), Round (serviceAreaId), TechnicianServiceArea
+  (serviceAreaId — the composite-PK *trailing* column, not covered by the PK's
+  leading `technicianId`), Visit (serviceId/propertyId/roundId/servicePlanId/
+  technicianId), Complaint (customerId/propertyId/technicianId), Issue
+  (visitId/propertyId), Invoice (customerId), Payment (customerId), Message
+  (customerId/technicianId/complaintId/templateId), and Photo
+  (propertyId/visitId/complaintId). `@unique` FKs (`Technician.profileId`,
+  `Invoice.visitId`, `Payment.visitId`) were skipped — already indexed. *Why:*
+  Postgres does not auto-index FK columns; every join and delete-guard `count()`
+  was a sequential scan that degrades as Visits/Payments grow.
+- **`20260714010107_service_area_updated_at` (🟠 #11).** Added
+  `updatedAt DateTime @updatedAt` to `ServiceArea` — the only mutable model lacking
+  a modification timestamp. Hand-edited the generated SQL to backfill existing rows
+  (`DEFAULT CURRENT_TIMESTAMP`) then `DROP DEFAULT`, since a bare `ADD COLUMN … NOT
+  NULL` fails on the non-empty (seeded) table; the dropped default matches how
+  Prisma manages `@updatedAt` at the app layer.
+- **`20260714010321_money_to_decimal` (🟠 #12).** Replaced every `@db.Money` with
+  `@db.Decimal(10, 2)` (Service.defaultPrice, ServicePlan.price, Visit.price,
+  Invoice.amount, Payment.amount). Postgres has no implicit `money → numeric`
+  assignment cast, so the generated `SET DATA TYPE` SQL was hand-edited to add an
+  explicit `USING "col"::numeric` per column (verified via `--create-only` before
+  applying). *Why:* `money` is locale-dependent and a poor fit for a
+  currency-configurable product.
+
+**Still deferred from the review:** only the PgBouncer interactive-transaction
+verification remains — an infrastructure/load-test task, not a code or schema change.
+
 ## Verified Working
 
 Each item was actually run and observed:
