@@ -22,12 +22,16 @@ declare global {
   }
 }
 
+// The Supabase project's auth issuer (the `iss` claim on its JWTs, and the base
+// of the JWKS endpoint). Kept as a single constant so it's easy to find/change
+// when the project moves — used for both JWKS fetch and issuer verification.
+const SUPABASE_ISSUER = "https://cixtfdnuwbmxvilkvihv.supabase.co/auth/v1";
+
 // Supabase signs auth JWTs with ES256 (asymmetric, ECC P-256). We fetch the
 // public verification keys from the project's JWKS endpoint and cache them, so
 // no shared secret is stored on the backend.
 const jwks = jwksClient({
-  jwksUri:
-    "https://cixtfdnuwbmxvilkvihv.supabase.co/auth/v1/.well-known/jwks.json",
+  jwksUri: `${SUPABASE_ISSUER}/.well-known/jwks.json`,
   cache: true,
   cacheMaxAge: 10 * 60 * 60 * 1000, // 10 hours
   rateLimit: true,
@@ -49,12 +53,23 @@ function getKey(header: JwtHeader, callback: SigningKeyCallback) {
 
 function verifyToken(token: string): Promise<JwtPayload> {
   return new Promise((resolve, reject) => {
-    jwt.verify(token, getKey, { algorithms: ["ES256"] }, (err, decoded) => {
-      if (err || !decoded || typeof decoded === "string") {
-        return reject(err ?? new Error("Invalid token"));
+    jwt.verify(
+      token,
+      getKey,
+      {
+        algorithms: ["ES256"],
+        // Reject tokens minted for a different audience or by another Supabase
+        // project (prevents cross-project token replay against this API).
+        audience: "authenticated",
+        issuer: SUPABASE_ISSUER,
+      },
+      (err, decoded) => {
+        if (err || !decoded || typeof decoded === "string") {
+          return reject(err ?? new Error("Invalid token"));
+        }
+        resolve(decoded);
       }
-      resolve(decoded);
-    });
+    );
   });
 }
 

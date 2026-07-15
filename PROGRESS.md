@@ -455,8 +455,16 @@ data, so all are safe; `tsc --noEmit` clean, `prisma db seed` clean,
   applying). *Why:* `money` is locale-dependent and a poor fit for a
   currency-configurable product.
 
-**Still deferred from the review:** only the PgBouncer interactive-transaction
-verification remains — an infrastructure/load-test task, not a code or schema change.
+**Auth hardening (PR review, 2026-07-16).** `requireAuth`'s `jwt.verify` now also
+enforces **`audience: "authenticated"`** and **`issuer: SUPABASE_ISSUER`** (the
+project auth URL, extracted as a top-of-file constant and reused for the JWKS
+URI) — previously only `algorithms: ["ES256"]` was checked, so a validly-signed
+token from another Supabase project could be replayed against this API. Closes the
+remaining auth-hardening note.
+
+**Review status:** all 🔴/🟡/🟠 findings from the PR review are now resolved. The
+PgBouncer interactive-transaction concern (🟡 #7) was **verified**, not deferred —
+see the confirmed item under *Verified Working*.
 
 ## Verified Working
 
@@ -507,6 +515,12 @@ Each item was actually run and observed:
   `AppError(403)` with the correct message when `setupCompleted = false`; passes when
   `setupCompleted = true`. Confirmed **14 mutating ops carry 403** in the OpenAPI spec;
   **0 GET ops** do. Direct-service test run against the live DB.
+- [x] **Interactive `$transaction` (callback form) commits and rolls back
+  atomically under the PgBouncer transaction-mode pooler** — confirmed by a
+  deliberate-rollback test against the live Supabase DB. (A temporary `_tx_test.ts`
+  created a `ServiceArea` inside a transaction, proved it visible inside, threw to
+  force rollback, and confirmed the row was absent outside; script deleted after
+  passing.) Resolves the last remaining PR-review item (🟡 #7).
 
 **Not yet verified (do not assume working):**
 
