@@ -188,9 +188,8 @@ setupRouter.post(
 setupRouter.get("/step/5", h(async (_req, res) => res.json(STEP5_DEFERRED)));
 setupRouter.post(
   "/step/5",
-  h(async (req, res) => {
-    await setupService.assertSetupIncomplete(actorIdOf(req));
-    res.json(STEP5_DEFERRED); // deferred stub — no DB write
+  h(async (_req, res) => {
+    res.json(STEP5_DEFERRED); // deferred stub — no DB write, no setup-lock guard
   })
 );
 
