@@ -128,6 +128,7 @@ model Profile {
   role           UserRole // ADMIN | MANAGER | TECHNICIAN (required — no default)
   name           String
   technician     Technician? // 1:1 — set when this profile is a field technician
+  authoredNotes  PropertyNote[] // notes this profile authored (M2 Notes & Risk)
   createdAt      DateTime    @default(now())
   updatedAt      DateTime    @updatedAt
 }
@@ -170,12 +171,36 @@ model Property {
   photos        Photo[]
   issues        Issue[]
   complaints    Complaint[]
+  notes         PropertyNote[] // M2 Notes & Risk tab (Screen 15)
   createdAt     DateTime        @default(now())
   updatedAt     DateTime        @updatedAt
 
   @@index([customerId])
   @@index([serviceAreaId])
   @@index([roundId])
+}
+
+enum NoteType {
+  INTERNAL
+  RISK_WARNING
+  CUSTOMER
+}
+
+// Notes & Risk tab (Screen 15) / Add Note modal (M20). Multiple authored,
+// timestamped notes per property, typed Internal / Risk Warning / Customer —
+// distinct from Property.accessNotes/riskNotes (single free-text strings).
+model PropertyNote {
+  id              String   @id @default(cuid())
+  propertyId      String
+  property        Property @relation(fields: [propertyId], references: [id])
+  type            NoteType @default(INTERNAL)
+  body            String
+  authorProfileId String? // Profile that authored the note ("By Admin"); nullable
+  author          Profile? @relation(fields: [authorProfileId], references: [id])
+  createdAt       DateTime @default(now())
+
+  @@index([propertyId])
+  @@index([authorProfileId])
 }
 
 model ServicePlan {
@@ -190,6 +215,8 @@ model ServicePlan {
   status        LifecycleStatus @default(ACTIVE)
   nextDueDate   DateTime? // backend-calculated after each completion
   lastCompleted DateTime?
+  pauseStartDate DateTime? // M9 Pause Service — start of pause window
+  pauseEndDate   DateTime? // M9 Pause Service — resume date; null = indefinite pause
   visits        Visit[]
   createdAt     DateTime        @default(now())
   updatedAt     DateTime        @updatedAt

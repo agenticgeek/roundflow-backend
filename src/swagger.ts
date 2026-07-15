@@ -131,6 +131,7 @@ const enumSchemas: Record<string, OpenAPIV3.SchemaObject> = {
   IssueType: stringEnum(["ACCESS_PROBLEM", "GATE_LOCKED", "PAYMENT_ISSUE", "OTHER"]),
   PhotoType: stringEnum(["PROPERTY", "BEFORE", "AFTER"]),
   PaymentTiming: stringEnum(["COLLECT_AFTER_VISIT", "COLLECT_BEFORE_VISIT", "COLLECT_ON_DATE"]),
+  NoteType: stringEnum(["INTERNAL", "RISK_WARNING", "CUSTOMER"]),
 };
 
 // ---------------------------------------------------------------------------
@@ -641,6 +642,245 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       debtHoldEnabled: { type: "boolean" },
     },
     example: { paymentRule: "COLLECT_AFTER_VISIT", vatInInvoices: true },
+  },
+
+  // ---- M2: Customers & Properties — entities & response shapes ----
+  Property: {
+    type: "object",
+    properties: {
+      id: { type: "string" },
+      customerId: { type: "string" },
+      propertyName: { type: "string", nullable: true },
+      addressLine: { type: "string" },
+      postcode: { type: "string" },
+      serviceAreaId: { type: "string", nullable: true },
+      propertyType: { type: "string", nullable: true },
+      accessNotes: { type: "string", nullable: true },
+      riskNotes: { type: "string", nullable: true },
+      status: ref("LifecycleStatus"),
+      roundId: { type: "string", nullable: true },
+      createdAt: dateTime,
+      updatedAt: dateTime,
+    },
+  },
+  PropertyNote: {
+    type: "object",
+    properties: {
+      id: { type: "string" },
+      propertyId: { type: "string" },
+      type: ref("NoteType"),
+      body: { type: "string" },
+      authorProfileId: { type: "string", nullable: true },
+      authorName: { type: "string", nullable: true, description: "Derived from the author Profile (list/detail reads)." },
+      createdAt: dateTime,
+    },
+  },
+  ServicePlanView: {
+    type: "object",
+    properties: {
+      id: { type: "string" },
+      serviceId: { type: "string", nullable: true },
+      serviceName: { type: "string", nullable: true },
+      price: { type: "number", nullable: true, description: "Numeric (Decimal serialised to a number here, unlike raw money-string fields)." },
+      cleanMethod: { type: "string", nullable: true },
+      paymentMethod: nullableRef("PaymentMethod"),
+      status: ref("LifecycleStatus"),
+      nextDueDate: { ...dateTime, nullable: true },
+      lastCompleted: { ...dateTime, nullable: true },
+      pauseStartDate: { ...dateTime, nullable: true },
+      pauseEndDate: { ...dateTime, nullable: true },
+      paymentRule: nullableRef("PaymentTiming"),
+    },
+  },
+  CustomerListRow: {
+    type: "object",
+    properties: {
+      customerId: { type: "string" },
+      customerName: { type: "string" },
+      status: ref("LifecycleStatus"),
+      propertyId: { type: "string" },
+      addressLine: { type: "string" },
+      postcode: { type: "string" },
+      roundId: { type: "string", nullable: true },
+      roundName: { type: "string", nullable: true },
+      frequency: nullableRef("CleaningFrequency"),
+      price: { type: "number", nullable: true },
+      technicianId: { type: "string", nullable: true },
+      technicianName: { type: "string", nullable: true },
+      nextDueDate: { ...dateTime, nullable: true },
+      paymentStatus: { type: "string", enum: ["paid", "hold", "pending", "overdue", "failed"] },
+      onHold: { type: "boolean" },
+      amountDue: { type: "number" },
+    },
+  },
+  CustomerListResult: {
+    type: "object",
+    properties: {
+      summary: {
+        type: "object",
+        properties: {
+          totalCustomers: { type: "integer" },
+          active: { type: "integer" },
+          paymentHolds: { type: "integer" },
+          amountDue: { type: "number" },
+        },
+      },
+      customers: { type: "array", items: ref("CustomerListRow") },
+    },
+  },
+  VisitHistoryRow: {
+    type: "object",
+    properties: {
+      visitId: { type: "string" },
+      date: dateTime,
+      roundName: { type: "string", nullable: true },
+      status: ref("VisitStatus"),
+      paymentStatus: nullableRef("PaymentStatus"),
+      notes: { type: "string", nullable: true },
+    },
+  },
+  PaymentRow: {
+    type: "object",
+    properties: {
+      visitId: { type: "string" },
+      visitDate: dateTime,
+      technicianName: { type: "string", nullable: true },
+      amount: { type: "number", nullable: true },
+      paymentStatus: nullableRef("PaymentStatus"),
+      paymentId: { type: "string", nullable: true },
+      invoiceStatus: nullableRef("InvoiceStatus"),
+      invoiceId: { type: "string", nullable: true },
+      invoiceNumber: { type: "string", nullable: true },
+      transactionId: { type: "string", nullable: true, description: "Payment.gocardlessId ?? stripeId." },
+      canGenerate: { type: "boolean" },
+      canDownload: { type: "boolean" },
+    },
+  },
+  CustomerDetail: {
+    type: "object",
+    description: "Full Customer Detail aggregate (Screen 15, all 6 tabs). Phase 1: one active property per customer; round/technician/next-visit fields are null when the property is unassigned (Property.roundId = null).",
+    properties: {
+      customer: {
+        type: "object",
+        properties: {
+          id: { type: "string" }, name: { type: "string" },
+          phone: { type: "string", nullable: true }, email: { type: "string", nullable: true },
+          status: ref("LifecycleStatus"), ghlContactId: { type: "string", nullable: true },
+        },
+      },
+      property: {
+        type: "object",
+        nullable: true,
+        properties: {
+          id: { type: "string" }, addressLine: { type: "string" }, postcode: { type: "string" },
+          propertyType: { type: "string", nullable: true }, accessNotes: { type: "string", nullable: true },
+          riskNotes: { type: "string", nullable: true }, status: ref("LifecycleStatus"),
+          roundId: { type: "string", nullable: true }, roundName: { type: "string", nullable: true },
+          serviceAreaId: { type: "string", nullable: true },
+        },
+      },
+      servicePlan: nullableRef("ServicePlanView"),
+      standingInfo: {
+        type: "object",
+        properties: {
+          frequency: nullableRef("CleaningFrequency"),
+          assignedRound: { type: "string", nullable: true },
+          technicianName: { type: "string", nullable: true },
+          paymentStatus: { type: "string" },
+          outstandingBalance: { type: "number" },
+          lastPaymentDate: { ...dateTime, nullable: true },
+          issuesCount: { type: "integer" },
+          nextVisitStatus: nullableRef("VisitStatus"),
+        },
+      },
+      tabs: {
+        type: "object",
+        properties: {
+          overview: { type: "object", nullable: true, additionalProperties: true },
+          servicePlan: nullableRef("ServicePlanView"),
+          visitHistory: { type: "array", items: ref("VisitHistoryRow") },
+          payments: { type: "object", properties: { rows: { type: "array", items: ref("PaymentRow") } } },
+          notes: { type: "array", items: ref("PropertyNote") },
+          photos: { type: "array", items: { type: "object", additionalProperties: true } },
+        },
+      },
+    },
+  },
+
+  // ---- M2: request bodies ----
+  PropertyCreateInput: {
+    type: "object",
+    required: ["customerName", "addressLine", "postcode", "price"],
+    properties: {
+      customerName: { type: "string", minLength: 1 },
+      phone: { type: "string", nullable: true },
+      email: { type: "string", nullable: true },
+      addressLine: { type: "string", minLength: 1 },
+      postcode: { type: "string", minLength: 1 },
+      propertyName: { type: "string", nullable: true },
+      propertyType: { type: "string", nullable: true },
+      serviceAreaId: { type: "string", nullable: true, description: "Must exist (404 if not)." },
+      serviceId: { type: "string", nullable: true },
+      price: { type: "number", description: "Positive number." },
+      cleanMethod: { type: "string", nullable: true },
+      paymentMethod: nullableRef("PaymentMethod"),
+      nextDueDate: { type: "string", format: "date", nullable: true },
+      accessNotes: { type: "string", nullable: true },
+      riskNotes: { type: "string", nullable: true },
+      roundId: { type: "string", nullable: true, description: "null = Save & Assign Later (unassigned); an id must exist (404 if not)." },
+    },
+    example: { customerName: "John Smith", addressLine: "12 Market Street", postcode: "NE66 1SS", price: 35, cleanMethod: "Water Fed Pole", paymentMethod: "GOCARDLESS", roundId: null },
+  },
+  PropertyUpdateInput: {
+    type: "object",
+    description: "Partial update. roundId: null = unassign, an id = assign/reassign (Move Round).",
+    properties: {
+      addressLine: { type: "string", minLength: 1 },
+      postcode: { type: "string", minLength: 1 },
+      propertyName: { type: "string", nullable: true },
+      propertyType: { type: "string", nullable: true },
+      serviceAreaId: { type: "string", nullable: true },
+      accessNotes: { type: "string", nullable: true },
+      riskNotes: { type: "string", nullable: true },
+      roundId: { type: "string", nullable: true },
+    },
+  },
+  CustomerUpdateInput: {
+    type: "object",
+    description: "M19 Edit Customer Record — partial update across Customer + Property + ServicePlan (atomic). Assigned Technician is deferred to M3.",
+    properties: {
+      name: { type: "string", minLength: 1 },
+      phone: { type: "string", nullable: true },
+      email: { type: "string", nullable: true },
+      addressLine: { type: "string", minLength: 1 },
+      postcode: { type: "string", minLength: 1 },
+      propertyType: { type: "string", nullable: true },
+      accessNotes: { type: "string", nullable: true },
+      riskNotes: { type: "string", nullable: true },
+      roundId: { type: "string", nullable: true },
+      price: { type: "number" },
+      cleanMethod: { type: "string", nullable: true },
+      paymentMethod: nullableRef("PaymentMethod"),
+    },
+  },
+  PauseServiceInput: {
+    type: "object",
+    required: ["reason", "pauseStartDate"],
+    properties: {
+      reason: { type: "string", minLength: 1, description: "Required by the UI; not persisted (no column)." },
+      pauseStartDate: { type: "string", format: "date" },
+      pauseEndDate: { type: "string", format: "date", nullable: true, description: "null = indefinite pause." },
+    },
+    example: { reason: "Customer Holiday/Away", pauseStartDate: "2026-05-22", pauseEndDate: "2026-06-22" },
+  },
+  NoteCreateInput: {
+    type: "object",
+    required: ["type", "body"],
+    properties: {
+      type: ref("NoteType"),
+      body: { type: "string", minLength: 1 },
+    },
+    example: { type: "INTERNAL", body: "Prefers morning slots." },
   },
 };
 
@@ -1249,6 +1489,161 @@ const paths: OpenAPIV3.PathsObject = {
       },
     },
   },
+
+  // =====================================================================
+  // Customers (M2) — reads: any known role; mutations: ADMIN/MANAGER
+  // =====================================================================
+  "/customers": {
+    get: {
+      tags: ["Customers"],
+      summary: "List customers + summary KPIs (Screen 14)",
+      description:
+        "Search + filter. `?search=` matches name/addressLine/postcode (case-insensitive contains); `?roundId=` filters by assigned round; `?status=` ∈ ACTIVE|PAUSED|CANCELLED|HOLD (HOLD is derived from paymentHold visits). Summary KPIs are business-wide (not filtered).",
+      parameters: [
+        { name: "search", in: "query", required: false, schema: { type: "string" } },
+        { name: "roundId", in: "query", required: false, schema: { type: "string" } },
+        { name: "status", in: "query", required: false, schema: { type: "string", enum: ["ACTIVE", "PAUSED", "CANCELLED", "HOLD"] } },
+      ],
+      responses: {
+        "200": jsonResponse("List + summary.", ref("CustomerListResult")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+  "/customers/{id}": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Customers"],
+      summary: "Full Customer Detail aggregate (Screen 15 — all 6 tabs in one call)",
+      responses: {
+        "200": jsonResponse("Customer Detail aggregate.", ref("CustomerDetail")),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+    patch: {
+      tags: ["Customers"],
+      summary: "M19 — Edit Customer Record (Customer + Property + Plan, atomic)",
+      requestBody: jsonBody(ref("CustomerUpdateInput")),
+      responses: {
+        "200": jsonResponse("Updated ids.", {
+          type: "object",
+          properties: {
+            customerId: { type: "string" },
+            propertyId: { type: "string", nullable: true },
+            servicePlanId: { type: "string", nullable: true },
+          },
+        }),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  // =====================================================================
+  // Properties (M2)
+  // =====================================================================
+  "/properties": {
+    post: {
+      tags: ["Properties"],
+      summary: "M6 — Add Property (creates Customer + Property + ServicePlan, atomic)",
+      description:
+        "The only way customers are created (there is no POST /customers). `roundId: null` = Save & Assign Later (unassigned).",
+      requestBody: jsonBody(ref("PropertyCreateInput")),
+      responses: {
+        "201": jsonResponse("Created.", {
+          type: "object",
+          properties: {
+            customerId: { type: "string" },
+            propertyId: { type: "string" },
+            servicePlanId: { type: "string" },
+            assigned: { type: "boolean" },
+          },
+        }),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+  "/properties/{id}": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    patch: {
+      tags: ["Properties"],
+      summary: "Update property (+ Move Round: assign/unassign)",
+      requestBody: jsonBody(ref("PropertyUpdateInput")),
+      responses: {
+        "200": jsonResponse("Updated property.", ref("Property")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+  "/properties/{id}/pause": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    post: {
+      tags: ["Properties"],
+      summary: "M9 — Pause Service (ServicePlan.status → PAUSED)",
+      description: "409 if the plan is already PAUSED. `reason` is validated but not persisted (no column).",
+      requestBody: jsonBody(ref("PauseServiceInput")),
+      responses: {
+        "200": jsonResponse("Updated ServicePlan.", { type: "object", additionalProperties: true }),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+        "409": ERR[409],
+      },
+    },
+  },
+  "/properties/{id}/resume": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    post: {
+      tags: ["Properties"],
+      summary: "Resume Service (status → ACTIVE, clears pause window)",
+      description: "409 if the plan is not currently PAUSED.",
+      responses: {
+        "200": jsonResponse("Updated ServicePlan.", { type: "object", additionalProperties: true }),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+        "409": ERR[409],
+      },
+    },
+  },
+  "/properties/{id}/notes": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Properties"],
+      summary: "List notes (Notes & Risk), newest first",
+      responses: {
+        "200": jsonResponse("Notes.", { type: "array", items: ref("PropertyNote") }),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+    post: {
+      tags: ["Properties"],
+      summary: "M20 — Add Note (author = acting Profile)",
+      requestBody: jsonBody(ref("NoteCreateInput")),
+      responses: {
+        "201": jsonResponse("Created note.", ref("PropertyNote")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -1288,6 +1683,8 @@ export const openApiDocument: OpenAPIV3.Document = {
     { name: "Health", description: "Liveness." },
     { name: "Setup", description: "First-run Setup Wizard (8 steps)." },
     { name: "Settings", description: "Post-completion settings editing. Mutations (PATCH, POST, DELETE) require setup to be complete; GETs are always open." },
+    { name: "Customers", description: "M2 — customer/property list + aggregate detail (Screens 14/15). Reads: any role; mutations: ADMIN/MANAGER." },
+    { name: "Properties", description: "M2 — property create/update, pause/resume, notes (Add Property, M9, M20)." },
   ],
   // Global default: all operations require the Bearer token unless they
   // override with `security: []` (e.g. /health).

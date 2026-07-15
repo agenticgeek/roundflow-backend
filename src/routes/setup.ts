@@ -143,7 +143,11 @@ setupRouter.post(
       name: requireString(s.name, `services[${i}].name`),
       category: s.category as string | undefined,
       description: s.description as string | undefined,
-      defaultPrice: requireNumber(s.defaultPrice, `services[${i}].defaultPrice`),
+      defaultPrice: (() => {
+        const p = requireNumber(s.defaultPrice, `services[${i}].defaultPrice`);
+        if (p < 0) throw new AppError(400, `services[${i}].defaultPrice must be >= 0`);
+        return p;
+      })(),
       active: typeof s.active === "boolean" ? s.active : undefined,
     }));
     res.json(await setupService.saveServices(profileId, input));

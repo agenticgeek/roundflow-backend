@@ -201,31 +201,69 @@ Auth is handled by **Supabase Auth** (frontend + Supabase); this backend only **
 
 ---
 
-### 14. Customers & Properties  
-**Section:** `/Customers-Properties` · Node `401:12909`  
-**Purpose:** Master customer list — browse all customers, see payment status and round assignment at a glance.  
-**Elements:**
-- Info banner (how-to-use tip)
-- Summary row: Total Customers, Active, Payment Holds (red), Amount Due (amber)
-- Rounds filter dropdown, Status filter dropdown
-- Customer list rows: Name + status badge (Active / Hold), address, Round, Frequency, Price, Technician, Next Due date, Payment Status badge (paid / hold)
-- Amount-due flag on hold rows (e.g. "£84 due")
-- Chevron → Customer Detail
+### 14. Customers & Properties *(re-audited 2026-07-16 · Rough page)*  
+**Section:** `/Customers-Properties` — **section node `401:12908`** · list frame `401:12909` (+ filter-open variants `761:9885`, `761:10213`; state variants `796:32658`, `796:32922`)  
+**Purpose:** Master customer/property list — browse all customers, see round assignment and payment status at a glance.  
+**Header:** "Customers & Properties" / subtitle "Showing 5 sample customers with complete records".  
+**How-to banner:** "Click any customer row below to view their full property record. All text on this screen is selectable - just highlight and copy (Ctrl/Cmd+C)."  
+**Search:** full-width — "Search customers by name, address, or postcode…".  
+**Summary KPI row (4 cards):** **Total Customers** (5) · **Active** (2, green) · **Payment Holds** (1, red) · **Amount Due** (£84, amber).  
+**Filters (top-right):** **Rounds** dropdown · **Status** dropdown (open-state variants captured in `761:9885` / `761:10213`).  
+**Customer row (per property):**
+- Name + **status badge** — `Active` (green) / `Hold` (red)
+- Address with map-pin (e.g. "12 Market Street, NE66 1SS")
+- Inline meta: **Round:** (Alnwick Monday) · **Frequency:** (Every 4 weeks) · **Price:** (£35) · **Technician:** (James) · **Next Due:** (15/06/2026) · **Payment Status:** badge — `paid` (green) / `hold` (red)
+- **Hold rows** additionally show a red **⚠ "£84 due"** flag
+- Chevron **›** → Customer Detail (Screen 15)
+
+**Unassigned property row (inline state):** a property with no round replaces the meta row with an info banner — *"Not assigned to a round or technician yet — Assign this property to a round so visits can be scheduled and payments collected."* + **Assign to Round & Technician** button → Assign Property to Round (Screen 31). Maps to `Property.roundId = null`.
+
+**Backend mapping:** each row = a `Property` joined to its `Customer` (name), current `ServicePlan` (price, cleanMethod), assigned `Round` + `Technician`. KPI cards + `Amount Due` + `Payment Status` "hold" are **derived** (no stored fields). Implies `GET /customers` (list) with **`?search=`** (name/address/postcode) and **`?round=` / `?status=`** filters — **endpoint not built**.
 
 ---
 
-### 15. Customer Detail  
-**Section:** `/Customers-Properties` · Node `401:13125`  
-**Note:** Figma layers use both "Customers Details" and "Customer Details" interchangeably — same screen, naming is a Figma layer error.  
-**Purpose:** Full property record for a single customer.  
-**Elements:**
-- Header: ← back, customer name + address, status badge, round badge, Edit / Pause Service / Send Message action buttons
-- Two-column info block: Property Information (type, frequency, price, clean method, next due, last completed, assigned round, technician) + Payment & Status (payment status, outstanding balance, payment method, last payment, issues count, next visit status)
-- Tab bar: Overview · Service Plan · Visit History · Payments · Notes & Risk · Photos (each tab is a distinct route)
-- Overview tab: Property Details (address, type, access notes, risk notes) + Contact Information (name, phone, email)
-- Visit History tab (other frame): date, price, notes icon, photos icon per visit row
+### 15. Customer Detail *(re-audited 2026-07-16 · all 6 tabs)*  
+**Section:** `/Customers-Properties` (section `401:12908`)  
+**Tab frames:** Overview `401:13125` · Service Plan `401:13325` · Visit History `559:44443` · Payments `401:13983` · Notes & Risk `401:14181` (Add-Note `592:6976`, toast `629:11606`) · Photos `401:14364`. (Naming note: Figma layers use both "Customers Details" and "Customer Details" — same screen.)  
+**Purpose:** Full property record for a single customer/property.  
+**Header (all tabs):** ← back · customer name + address · **status badge** (Active) · **round badge** (Alnwick Monday) · actions **Edit** (→ M19) · **Pause Service** (→ M9) · **Send Message** (→ Send Message route).  
+**Standing info block (above the tabs, two columns):**
+- **Property Information:** Property Type (Residential) · Frequency (Every 4 weeks) · Price (£35) · Clean Method (Water Fed Pole) · Next Due (15/06/2026) · Last Completed (20/05/2026) · Assigned Round (Alnwick Monday) · Technician (James).
+- **Payment & Status:** Payment Status (paid) · Outstanding Balance (£0) · Payment Method (GoCardless) · Last Payment (15/05/2026) · Issues Count (0) · Next Visit Status (Scheduled).
 
-**Interactions:** Edit → distinct route (Edit Customer). Pause Service → M9 modal. Send Message → distinct route. All six tabs are distinct routes. Generate Invoice → M4 modal (from visit row on Visit History tab).
+**Tab bar (6 tabs — distinct routes): Overview · Service Plan · Visit History · Payments · Notes & Risk · Photos.**
+- **Overview** (`401:13125`) — **Property Details:** Full Address (12 Market Street, NE66 1SS) · Access Notes ("No access notes") · Risk Notes ("No risk notes"). **Contact Information:** phone (+44 7700 900000) · email (customer@example.com).
+- **Service Plan** (`401:13325`) — **Service Plan Details:** Service Type (Window Cleaning) · Price (Inc. VAT) · Round Assignment · Payment Rule · Plan Status (Active). Panel actions: **Move Round** · **Pause**.
+- **Visit History** (`559:44443`) — table columns **Round · Status · Payment · Notes** (per visit; date + amount per row).
+- **Payments** (`401:13983`) — **Payment History → "Visits & Invoices" ("N visits total")** table: **Visit Date · Technician · Amount · Payment** (badge `Unpaid` amber / `Paid` green) **· Invoice** (`Sent` / —) **· Transaction** (GoCardless id, e.g. `GC-2026-05-001`, or —) **· Action** (**Download** when invoiced, else **Generate** → M4). Toasts: "Invoice INV-… downloaded as PDF" (M11); "Message sent successfully" (M12).
+- **Notes & Risk** (`401:14181`) — **Notes & Risk Information** + **Add Note** (→ M20). Note cards: type label (**Internal Note** / Risk Warning / Customer), body, "Added on 10 Mar 2026", "By Admin".
+- **Photos** (`401:14364`) — **Property Photos** / **Upload Photo**; empty state "No property photos uploaded yet — Upload before and after photos to track work quality" + **Upload First Photo**.
+
+**Unassigned property state:** when `Property.roundId = null`, the round badge / Assigned Round / Technician render as *Unassigned* with an **Assign to Round & Technician** CTA (→ Screen 31) — matches the list's unassigned row.
+
+**Interactions:** Edit → **M19 (Edit Customer Record)** · Pause Service → **M9** · Send Message → route · Generate Invoice → **M4** (Payments-tab **Generate** action) · Add Note → **M20**. All six tabs are distinct routes.
+
+**Backend mapping:** the info block + tabs read `Property` + current `ServicePlan` + latest `Payment`/`Visit`/`Invoice` (mostly **derived**). Notes → `Property.accessNotes`/`riskNotes` (Overview) **but** the Notes & Risk tab needs a multi-note model (see gaps). Contact → `Customer.phone`/`email`. Payments rows → `Visit`+`Invoice`+`Payment` (`Payment.gocardlessId` = Transaction). Photos → `Photo`. Implies `GET /customers/:id` (aggregate) — **not built**.
+
+#### `/Customers-Properties` — full frame inventory & Buttons sub-group *(audited 2026-07-16)*
+**Section `401:12908`** (Rough page, `RoundFlow-Admin`) holds **23 frames**: 18 in the main group + 5 in a nested **Buttons** sub-section (`401:14712`).
+- **List states:** `401:12909` (default) · `761:9885` / `761:10213` (filter-dropdown open) · `796:32658` / `796:32922` (list state/button variants).
+- **Detail tabs:** Overview `401:13125` · Service Plan `401:13325` · Visit History `559:44443` · Payments `401:13983` · Notes & Risk `401:14181` (+ Add-Note `592:6976`, toast `629:11606`) · Photos `401:14364`.
+- **Payments overlays/toasts:** Generate Invoice `534:35154` (M4) · Preview Invoice `540:36009` (M5) · Download-PDF toast `540:38369` / `592:4974` (M11) · action toasts `559:44158` / `629:9938` / `629:10254` ("Message sent successfully" etc. — M12).
+- **Buttons sub-group (`401:14712`, 5 frames):** **Edit Modal** `401:14713` (→ M19) · **Pause Service Modal** `401:15085` + `401:15414` (two states → M9) · list variants `796:32658` / `796:32922`. These are **component/state variants** (modal-open, toast, filter-open) overlaid on the list or Customer Detail — **not new routes**.
+
+> ⚠️ **Schema gaps — Customers & Properties (2026-07-16):**
+> - **Multi-note model missing.** The Notes & Risk tab + M20 show **multiple authored, timestamped notes** with a **type** (Internal / Risk Warning / Customer). Schema only has `Property.accessNotes` / `Property.riskNotes` as single strings → needs a `PropertyNote` model `{ id, propertyId, type, body, authorProfileId, createdAt }`. **Not in `schema.prisma`.**
+> - **"Hold" has no field.** List/Detail show a `Hold` customer badge + `hold` payment badge, but `PaymentStatus` enum has no `HOLD`/`ON_HOLD`. How "hold" is set/derived is undefined (relates to overdue / `Visit.paymentHold`). See OQ-CP1.
+> - **Derived-only values:** Outstanding Balance, Amount Due, Payment Holds count, Issues Count, Next Visit Status — no stored fields (aggregate queries needed).
+> - **Per-plan Payment Rule** appears on the Service Plan tab, but `paymentRule` lives on `BusinessSettings` (global). See OQ-CP2.
+> - **Endpoints implied but not built:** `GET /customers` (list + search + `?round`/`?status`), `GET /customers/:id`, `PATCH` customer/property/plan (Edit — M19), `POST /properties` (Add Property — M6), pause/resume (M9), `POST …/notes` (M20), `POST …/invoices` (M4), `POST …/photos` (upload), assign-to-round (Screen 31).
+
+> **Open questions (Customers & Properties, 2026-07-16):**
+> - **OQ-CP1:** How is **"Hold"** determined — manual flag, derived from overdue payments, or `Visit.paymentHold`? No dedicated field.
+> - **OQ-CP2:** Is **Payment Rule** per-`ServicePlan` (Service Plan tab implies) or global (`BusinessSettings.paymentRule`)?
+> - **OQ-CP3:** Notes stream scoped per **property** or per **customer**? (Tab is property-scoped but titled "Notes & Risk".)
+> - **OQ-CP4:** **"Move Round"** (Service Plan tab) — same as Screen 31 (Assign Property to Round) or a distinct reassign flow?
 
 ---
 
@@ -560,10 +598,10 @@ Auth is handled by **Supabase Auth** (frontend + Supabase); this backend only **
 
 ---
 
-### M4 — Generate Invoice  
-**Triggered from:** Customer Detail > visit row action  
+### M4 — Generate Invoice *(re-audited 2026-07-16)*  
+**Triggered from:** Customer Detail → Payments tab → a row's **Generate** action  
 **Frames:** `534:35154`  
-**Context:** Overlaid on the Customer Detail screen.  
+**Context:** Overlaid on the Customer Detail (Payments tab) screen.  
 **Elements:**
 - Title: "Generate Invoice" + customer name + date
 - Summary grid: Customer, Property, Visit Date, Amount (£35.00), Customer Email
@@ -575,11 +613,11 @@ Auth is handled by **Supabase Auth** (frontend + Supabase); this backend only **
 
 ---
 
-### M5 — Preview Invoice  
-**Triggered from:** Generate Invoice modal > Preview Invoice  
+### M5 — Preview Invoice *(re-audited 2026-07-16)*  
+**Triggered from:** Generate Invoice modal (M4) > **Preview Invoice**  
 **Frames:** `540:36009`  
 **Context:** Overlaid on Customer Detail.  
-**Elements:** Rendered invoice preview. Download / Send actions.
+**Elements:** "Invoice Preview" — a **rendered invoice**: RoundFlow logo + **INVOICE #INV-…**; **BILL TO** (name, address, email, phone); **INVOICE DETAILS** (Invoice Date, Visit Date, Due Date, Payment method e.g. GoCardless); **DESCRIPTION** (e.g. "Window Cleaning Service · Alnwick Monday · Saturday 23 May 2026") + **TECHNICIAN** + **AMOUNT** (£35.00); **Subtotal**, **VAT (0%)**, **Total Due**; footer "Thank you for your business". Actions: **← Edit Details** · **Print** · **Download PDF** (→ M11 toast).
 
 ---
 
@@ -612,10 +650,18 @@ Auth is handled by **Supabase Auth** (frontend + Supabase); this backend only **
 
 ---
 
-### M9 — Pause Service / Resume Service  
-**Triggered from:** Customer Detail / Debt Board  
-**Frames:** `401:17677` (Pause), `401:17984` (Resume)  
-**Elements:** Reason selector, date, confirmation note, Cancel / Confirm.
+### M9 — Pause Service / Resume Service *(re-audited 2026-07-16)*  
+**Triggered from:** Customer Detail → **Pause Service** (Screen 15) / Debt Board  
+**Frames:** `401:15085`, `401:15414` (Buttons group — Pause states) · original `401:17677` (Pause), `401:17984` (Resume)  
+**Elements:**
+- **Reason for Pause** dropdown (e.g. "Customer Holiday/ Away").
+- **Pause Duration:** **Specific date range** ("Service will automatically resume on the end date") **/ Indefinite pause** ("Must be manually resumed — no scheduled visits will be generated").
+- **Start Date** + **Resume Date** pickers.
+- **Notify customer by SMS** toggle + editable message preview (e.g. "Hi John Smith, we're temporarily pausing your window cleaning service as requested…", char count · 1 SMS).
+- Warning banner: **"Upcoming visits will be cancelled — Any scheduled visits during the pause period will not be generated. Payment collection will also be suspended."**
+- **Cancel** / **Pause Service**.
+
+**Backend:** sets a paused `LifecycleStatus` on `ServicePlan`/`Property`/`Customer` (`PAUSED` exists) + a pause window (start/resume) — **no pause-window fields in schema**; visit generation + payment collection must skip the window. Implies `POST /customers/:id/pause` + `/resume` — not built.
 
 ---
 
@@ -626,10 +672,10 @@ Auth is handled by **Supabase Auth** (frontend + Supabase); this backend only **
 
 ---
 
-### M11 — Download Confirmation  
-**Triggered from:** Customer Detail > Payments tab  
-**Frames:** `540:38369`, `592:4974` — single confirmation state reused in two contexts (not two distinct states).  
-**Elements:** PDF/download confirmation with file name, Download / Cancel.
+### M11 — Download Confirmation *(re-audited 2026-07-16)*  
+**Triggered from:** Customer Detail → Payments tab → **Download** (or Preview Invoice → Download PDF)  
+**Frames:** `540:38369`, `592:4974`  
+**Elements:** A **success toast** (not a dialog) — e.g. **"Invoice INV-2026-733 downloaded as PDF"** with an X dismiss, shown over the Payments tab. Same toast pattern as M12.
 
 ---
 
@@ -692,6 +738,30 @@ Auth is handled by **Supabase Auth** (frontend + Supabase); this backend only **
 **Purpose:** Confirm removal of a technician from the system.  
 **Elements:** "Are you sure you want to remove the technician **[name]** from the system?" · **Cancel** / **Remove** (destructive).  
 **Note (backend):** "Remove" maps to **deactivation** (`PATCH /settings/technicians/:id` with `{ active: false }`), **not** a hard delete — accepted technicians (`profileId` set) are never destroyed, preserving visit history. See Screen 29 Rule.
+
+---
+
+### M19 — Edit Customer Record *(NEW — 2026-07-16)*  
+**Triggered from:** Customer Detail → **Edit** (Screen 15)  
+**Frame:** `401:14713` (Buttons sub-group)  
+**Purpose:** Edit a customer + their property + service plan in one form.  
+**Elements:**
+- **Contact Details:** Full Name · Phone Number · Email Address.
+- **Property Address:** Street Address · Postcode · Property Type (dropdown).
+- **Service Details:** Frequency (dropdown) · Price (£) · Clean Method (dropdown) · Payment Method (dropdown) · Assigned Round (dropdown) · Assigned Technician (dropdown).
+- **Notes:** Access Notes ("e.g. Gate code: 1234, side access only…") · Risk Notes (⚠ "visible to all technicians" — "e.g. Aggressive dog, slippery path…").
+- **Cancel** / **Save Changes**.
+
+**Backend:** one form that writes across **`Customer`** (name/phone/email), **`Property`** (address/postcode/type/accessNotes/riskNotes/roundId), **`ServicePlan`** (price/cleanMethod/paymentMethod) and **`Visit.technicianId`** (assigned technician). Implies `PATCH /customers/:id` (+ nested property/plan) — **not built**.
+
+---
+
+### M20 — Add Note (Notes & Risk) *(NEW — 2026-07-16)*  
+**Triggered from:** Customer Detail → Notes & Risk tab → **Add Note** (Screen 15)  
+**Frame:** `592:6976`  
+**Purpose:** Add a timestamped, authored note to a property/customer.  
+**Elements:** **New Note** — type toggle **Internal** / **Risk Warning** / **Customer** — + Text Area ("Type your note here…"); Save / Cancel.  
+**Backend gap:** implies a **note entity** `{ type, body, author, createdAt }` per property — **no such model exists** (`Property.accessNotes`/`riskNotes` are single free-text strings). See the Customers & Properties schema-gaps note under Screen 15 (OQ-CP3).
 
 ---
 
@@ -870,3 +940,18 @@ resolved as deactivation** (Option A): Danger-Zone Remove → `PATCH { active: f
 not a hard delete — `deleteTechnician` keeps 409-ing accepted technicians, preserving
 visit history. Schema gaps flagged under Screen 29 (`Technician.email`, `Technician.notes`,
 Default-Area wiring, `TechnicianInvite` for Send App Invite).
+
+**2026-07-16 — `/Customers-Properties` section fully audited (Rough page, section node `401:12908`).**
+Corrected the section reference: **`401:12909` is the list screen, not the section** — the
+container is **`401:12908`**, which holds **23 frames** (18 main + 5 in a nested **Buttons**
+sub-section `401:14712`). Screen 14 expanded (header, how-to banner, search, Rounds/Status
+filters, 4 KPI cards, full row columns, `Active`/`Hold` + `paid`/`hold` badges, `£N due`
+flag, **inline Unassigned property row** → Assign to Round & Technician). Screen 15 expanded
+to **all 6 tabs** (Overview, Service Plan, Visit History, Payments w/ Visits & Invoices table,
+Notes & Risk, Photos) + standing info block + Unassigned state. Modals **M4/M5/M9/M11**
+expanded from the live frames; new modals **M19 (Edit Customer Record)** and **M20 (Add Note)**
+added. **Schema gaps** flagged (Screen 15): missing multi-note model (`PropertyNote`), no
+"Hold" field, per-plan Payment Rule ambiguity, pause-window fields, and a raft of unbuilt
+`/customers`, `/properties`, invoice/pause/note/photo endpoints. **4 open questions**
+(OQ-CP1..4). Method: text extracted from the Rough-page metadata dump; 7 frames screenshotted
+(Generate/Preview Invoice, Edit Customer, Pause Service, list, Confirmation + Download toasts).

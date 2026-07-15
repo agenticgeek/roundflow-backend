@@ -1,4 +1,4 @@
-import { DayOfWeek } from "@prisma/client";
+import { DayOfWeek, PaymentMethod, NoteType } from "@prisma/client";
 import { AppError } from "./app-error";
 
 // Shared request-value validators used by both the /setup and /settings routers,
@@ -27,4 +27,53 @@ export function assertPositiveInt(v: number, field: string): number {
     throw new AppError(400, `${field} must be a positive integer`);
   }
   return v;
+}
+
+// ---- M2 (Customers & Properties) domain validators ------------------------
+// Shared by the /customers and /properties routers.
+
+/** Assert a numeric value is a positive number (e.g. a Decimal price). Allows
+ *  non-integers (£35.50); throws AppError(400) otherwise. */
+export function assertPositive(v: number, field: string): number {
+  if (!Number.isFinite(v) || v <= 0) {
+    throw new AppError(400, `${field} must be a positive number`);
+  }
+  return v;
+}
+
+/** Parse a required ISO date string → Date; throws AppError(400) if invalid. */
+export function parseIsoDate(v: unknown, field: string): Date {
+  if (typeof v !== "string" || v.trim() === "") {
+    throw new AppError(400, `"${field}" is required and must be an ISO date string.`);
+  }
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) {
+    throw new AppError(400, `"${field}" must be a valid ISO date.`);
+  }
+  return d;
+}
+
+/** Optional ISO date: undefined = omitted, null = clear, else parse. */
+export function optIsoDate(v: unknown, field: string): Date | null | undefined {
+  if (v === undefined) return undefined;
+  if (v === null) return null;
+  return parseIsoDate(v, field);
+}
+
+/** Optional PaymentMethod: undefined = omitted, null = clear, else validate. */
+export function optPaymentMethod(v: unknown): PaymentMethod | null | undefined {
+  if (v === undefined) return undefined;
+  if (v === null) return null;
+  if (typeof v === "string" && (Object.values(PaymentMethod) as string[]).includes(v)) {
+    return v as PaymentMethod;
+  }
+  throw new AppError(400, `Invalid paymentMethod: ${String(v)}`);
+}
+
+/** Required NoteType (INTERNAL | RISK_WARNING | CUSTOMER). */
+export function requireNoteType(v: unknown): NoteType {
+  if (typeof v === "string" && (Object.values(NoteType) as string[]).includes(v)) {
+    return v as NoteType;
+  }
+  throw new AppError(400, `"type" must be one of: ${Object.values(NoteType).join(", ")}`);
 }

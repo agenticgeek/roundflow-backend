@@ -7,6 +7,8 @@ import { requireAuth } from "./middleware/requireAuth";
 import { AppError } from "./lib/app-error";
 import { setupRouter } from "./routes/setup";
 import { settingsRouter } from "./routes/settings";
+import { customersRouter } from "./routes/customers";
+import { propertiesRouter } from "./routes/properties";
 import { openApiDocument } from "./swagger";
 
 const app = express();
@@ -43,6 +45,8 @@ app.get(
 
 app.use("/setup", setupRouter);
 app.use("/settings", settingsRouter);
+app.use("/customers", customersRouter);
+app.use("/properties", propertiesRouter);
 
 // API docs (public) — interactive UI at /docs, raw spec at /openapi.json.
 app.get("/openapi.json", (_req: Request, res: Response) => {
