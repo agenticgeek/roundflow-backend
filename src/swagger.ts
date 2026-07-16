@@ -1650,6 +1650,22 @@ const paths: OpenAPIV3.PathsObject = {
 // 7. Assembled document.
 // ---------------------------------------------------------------------------
 
+// Swagger's "Execute" button targets the FIRST entry in `servers`. In a deployed
+// environment we must point it at the public origin, not localhost. Resolution
+// order: explicit PUBLIC_API_URL override → Railway's injected RAILWAY_PUBLIC_DOMAIN
+// → (neither set, i.e. local dev) → localhost only. The deployed URL is listed
+// first so it's the default; localhost stays available in the dropdown.
+const PUBLIC_API_URL =
+  process.env.PUBLIC_API_URL ??
+  (process.env.RAILWAY_PUBLIC_DOMAIN
+    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+    : undefined);
+
+const servers: OpenAPIV3.ServerObject[] = [
+  ...(PUBLIC_API_URL ? [{ url: PUBLIC_API_URL, description: "Deployed" }] : []),
+  { url: "http://localhost:3000", description: "Local dev" },
+];
+
 export const openApiDocument: OpenAPIV3.Document = {
   openapi: "3.0.3",
   info: {
@@ -1669,11 +1685,7 @@ export const openApiDocument: OpenAPIV3.Document = {
       "Phase 1 is single-tenant (one shared business config).",
     ].join("\n"),
   },
-  servers: [
-    { url: "http://localhost:3000", description: "Local dev" },
-    // Add your tunnel/staging/prod origin here, e.g.:
-    // { url: "https://<subdomain>.loca.lt", description: "localtunnel" },
-  ],
+  servers,
   tags: [
     {
       name: "Auth",
