@@ -12,7 +12,7 @@ import type {
   ServiceArea,
   Round,
 } from "../generated/tenant-client";
-import { tenantPrisma as prisma } from "../lib/tenant-prisma";
+import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 
 // ---------------------------------------------------------------------------
@@ -163,18 +163,20 @@ export interface ISetupService {
 // Phase 2 is a whole-schema migration + ~30 query edits, not a two-method swap.
 // The interface boundary and thin routes are correct and will not need changing.
 class SetupService implements ISetupService {
+  constructor(private readonly prisma: TenantPrismaClient) {}
+
   private async getSettings(): Promise<BusinessSettings | null> {
-    return prisma.businessSettings.findFirst();
+    return this.prisma.businessSettings.findFirst();
   }
 
   async getStatus(_profileId: string): Promise<SetupStatus> {
     const [settings, serviceCount, technicianCount, serviceAreaCount, activeRoundCount] =
       await Promise.all([
         this.getSettings(),
-        prisma.service.count(),
-        prisma.technician.count(),
-        prisma.serviceArea.count(),
-        prisma.round.count({ where: { status: RoundStatus.ACTIVE } }),
+        this.prisma.service.count(),
+        this.prisma.technician.count(),
+        this.prisma.serviceArea.count(),
+        this.prisma.round.count({ where: { status: RoundStatus.ACTIVE } }),
       ]);
 
     const step = (n: number, complete: boolean, deferred = false): StepStatus => ({
@@ -229,9 +231,9 @@ class SetupService implements ISetupService {
         `Setup cannot be completed — required steps incomplete: ${missing.join(", ")}`
       );
     }
-    const bs = await prisma.businessSettings.findFirst();
+    const bs = await this.prisma.businessSettings.findFirst();
     if (bs) {
-      await prisma.businessSettings.update({ where: { id: bs.id }, data: { setupCompleted: true } });
+      await this.prisma.businessSettings.update({ where: { id: bs.id }, data: { setupCompleted: true } });
     }
   }
 
@@ -250,9 +252,9 @@ class SetupService implements ISetupService {
       timezone: input.timezone,
       currency: input.currency,
     };
-    const bs = await prisma.businessSettings.findFirst();
-    if (bs) return prisma.businessSettings.update({ where: { id: bs.id }, data });
-    return prisma.businessSettings.create({ data });
+    const bs = await this.prisma.businessSettings.findFirst();
+    if (bs) return this.prisma.businessSettings.update({ where: { id: bs.id }, data });
+    return this.prisma.businessSettings.create({ data });
   }
 
   async getBusinessSettings(_profileId: string): Promise<BusinessSettings | null> {
@@ -260,7 +262,7 @@ class SetupService implements ISetupService {
   }
 
   async getServices(_profileId: string): Promise<Service[]> {
-    return prisma.service.findMany({ orderBy: { createdAt: "asc" } });
+    return this.prisma.service.findMany({ orderBy: { createdAt: "asc" } });
   }
 
   async saveServices(
@@ -277,7 +279,7 @@ class SetupService implements ISetupService {
     }
     // "create/replace" the whole catalogue. Safe during setup: no ServicePlan
     // or Visit references the catalogue yet (guarded by assertSetupIncomplete).
-    return prisma.$transaction(async (tx) => {
+    return this.prisma.$transaction(async (tx) => {
       await tx.service.deleteMany({});
       if (input.length > 0) {
         await tx.service.createMany({
@@ -302,9 +304,9 @@ class SetupService implements ISetupService {
       defaultCycleLength: input.defaultCycleLength,
       defaultWorkingDays: input.defaultWorkingDays,
     };
-    const bs = await prisma.businessSettings.findFirst();
-    if (bs) return prisma.businessSettings.update({ where: { id: bs.id }, data });
-    return prisma.businessSettings.create({ data });
+    const bs = await this.prisma.businessSettings.findFirst();
+    if (bs) return this.prisma.businessSettings.update({ where: { id: bs.id }, data });
+    return this.prisma.businessSettings.create({ data });
   }
 
   async getPaymentSetup(_profileId: string): Promise<BusinessSettings | null> {
@@ -324,13 +326,13 @@ class SetupService implements ISetupService {
       gocardlessConnected: input.gocardlessConnected,
       stripeConnected: input.stripeConnected,
     };
-    const bs = await prisma.businessSettings.findFirst();
-    if (bs) return prisma.businessSettings.update({ where: { id: bs.id }, data });
-    return prisma.businessSettings.create({ data });
+    const bs = await this.prisma.businessSettings.findFirst();
+    if (bs) return this.prisma.businessSettings.update({ where: { id: bs.id }, data });
+    return this.prisma.businessSettings.create({ data });
   }
 
   async getTechnicians(_profileId: string): Promise<Technician[]> {
-    return prisma.technician.findMany({ orderBy: { createdAt: "asc" } });
+    return this.prisma.technician.findMany({ orderBy: { createdAt: "asc" } });
   }
 
   async saveTechnicians(
@@ -342,7 +344,7 @@ class SetupService implements ISetupService {
     // have accepted an invite (real profileId) are never touched. Then recreate
     // from the input. Each created technician is invite-pending (profileId = null;
     // name/email arrive when the invite is accepted).
-    return prisma.$transaction(async (tx) => {
+    return this.prisma.$transaction(async (tx) => {
       await tx.technician.deleteMany({ where: { profileId: null } });
       if (input.length > 0) {
         await tx.technician.createMany({
@@ -360,7 +362,7 @@ class SetupService implements ISetupService {
   }
 
   async getServiceAreas(_profileId: string): Promise<ServiceArea[]> {
-    return prisma.serviceArea.findMany({ orderBy: { createdAt: "asc" } });
+    return this.prisma.serviceArea.findMany({ orderBy: { createdAt: "asc" } });
   }
 
   async saveServiceAreas(
@@ -376,7 +378,7 @@ class SetupService implements ISetupService {
     // created after step 7, and only once setup is complete —
     // assertSetupIncomplete blocks this POST after completion, so no live FK
     // reference to a deleted area can exist here.
-    return prisma.$transaction(async (tx) => {
+    return this.prisma.$transaction(async (tx) => {
       await tx.serviceArea.deleteMany({});
       if (input.length > 0) {
         await tx.serviceArea.createMany({
@@ -392,7 +394,7 @@ class SetupService implements ISetupService {
   }
 
   async getActiveRounds(_profileId: string): Promise<Round[]> {
-    return prisma.round.findMany({
+    return this.prisma.round.findMany({
       where: { status: RoundStatus.ACTIVE },
       orderBy: { createdAt: "asc" },
     });
@@ -415,7 +417,7 @@ class SetupService implements ISetupService {
       throw new AppError(400, `Invalid frequency: ${input.frequency}`);
     }
     if (input.serviceAreaId) {
-      const area = await prisma.serviceArea.findUnique({
+      const area = await this.prisma.serviceArea.findUnique({
         where: { id: input.serviceAreaId },
       });
       if (!area) {
@@ -433,18 +435,19 @@ class SetupService implements ISetupService {
     // Upsert the single setup round — re-posting step 8 must update the existing
     // ACTIVE round, not create a second. If an ACTIVE round exists, update it;
     // otherwise create it (the first round → ACTIVE).
-    const existing = await prisma.round.findFirst({
+    const existing = await this.prisma.round.findFirst({
       where: { status: RoundStatus.ACTIVE },
       orderBy: { createdAt: "asc" },
     });
     if (existing) {
-      return prisma.round.update({ where: { id: existing.id }, data });
+      return this.prisma.round.update({ where: { id: existing.id }, data });
     }
-    return prisma.round.create({
+    return this.prisma.round.create({
       data: { ...data, status: RoundStatus.ACTIVE },
     });
   }
 }
 
-// Single shared instance, exported behind the interface (the swap point).
-export const setupService: ISetupService = new SetupService();
+export function createSetupService(prisma: TenantPrismaClient): ISetupService {
+  return new SetupService(prisma);
+}

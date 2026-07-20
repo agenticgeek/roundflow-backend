@@ -1,17 +1,21 @@
 import { Request, Router } from "express";
 import { requireAuth } from "../middleware/requireAuth";
+import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { asObject, h, optString, optReqString, optReqNumber, optId } from "../lib/http";
 import { assertPositive, optPaymentMethod } from "../lib/validation";
 import {
-  customerService,
+  createCustomerService,
   CustomerUpdateInput,
 } from "../services/customer.service";
 
 export const customersRouter = Router();
 customersRouter.use(requireAuth);
+customersRouter.use(requireTenantAccess);
 // Authorization: reads allowed for any known role; mutations require ADMIN/MANAGER.
 customersRouter.use(requireBusinessAccess());
+
+const svc = (req: Request) => createCustomerService(req.tenantPrisma!);
 
 // Thin routes: validate → call service → respond. No DB access here.
 // Returns the Supabase user ID of the acting caller (the profileId seam).
@@ -24,7 +28,7 @@ customersRouter.get(
   "/",
   h(async (req, res) => {
     res.json(
-      await customerService.getCustomers(
+      await svc(req).getCustomers(
         actorIdOf(req),
         {
           search: typeof req.query.search === "string" ? req.query.search : undefined,
@@ -43,7 +47,7 @@ customersRouter.get(
 customersRouter.get(
   "/:id",
   h(async (req, res) => {
-    res.json(await customerService.getCustomerDetail(actorIdOf(req), req.params.id, req.profile!.role));
+    res.json(await svc(req).getCustomerDetail(actorIdOf(req), req.params.id, req.profile!.role));
   })
 );
 
@@ -74,6 +78,6 @@ customersRouter.patch(
       cleanMethod: optString(body.cleanMethod, "cleanMethod"),
       paymentMethod: optPaymentMethod(body.paymentMethod),
     };
-    res.json(await customerService.updateCustomer(actorIdOf(req), req.params.id, input));
+    res.json(await svc(req).updateCustomer(actorIdOf(req), req.params.id, input));
   })
 );

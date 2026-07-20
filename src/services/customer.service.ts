@@ -15,7 +15,7 @@ import type {
   PaymentTiming,
 } from "../generated/tenant-client";
 import { UserRole } from "@prisma/client";
-import { tenantPrisma as prisma } from "../lib/tenant-prisma";
+import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 
 // ---------------------------------------------------------------------------
@@ -259,6 +259,8 @@ const DUE_PAYMENT: PaymentStatus[] = [
 ];
 
 class CustomerService implements ICustomerService {
+  constructor(private readonly prisma: TenantPrismaClient) {}
+
   /** Decimal | number | null → number | null. */
   private num(d: Prisma.Decimal | number | null | undefined): number | null {
     return d == null ? null : Number(d);
@@ -311,8 +313,8 @@ class CustomerService implements ICustomerService {
 
     // Summary KPIs are business-wide (not filtered) — they reflect totals.
     const [totalCustomers, active, paymentHolds, dueAgg, customers] = await Promise.all([
-      prisma.customer.count(),
-      prisma.customer.count({
+      this.prisma.customer.count(),
+      this.prisma.customer.count({
         where: {
           status: LifecycleStatus.ACTIVE,
           NOT: {
@@ -322,11 +324,11 @@ class CustomerService implements ICustomerService {
           },
         },
       }),
-      prisma.property.count({
+      this.prisma.property.count({
         where: { visits: { some: { paymentHold: true, status: { in: OPEN_VISIT } } } },
       }),
-      prisma.payment.aggregate({ _sum: { amount: true }, where: { status: { in: DUE_PAYMENT } } }),
-      prisma.customer.findMany({
+      this.prisma.payment.aggregate({ _sum: { amount: true }, where: { status: { in: DUE_PAYMENT } } }),
+      this.prisma.customer.findMany({
         where,
         orderBy: { createdAt: "asc" },
         include: {
@@ -409,7 +411,7 @@ class CustomerService implements ICustomerService {
   ): Promise<CustomerDetail> {
     // TECHNICIAN viewers must not see financial data (debt + processor ids).
     const hideFinancials = viewerRole === UserRole.TECHNICIAN;
-    const customer = await prisma.customer.findUnique({
+    const customer = await this.prisma.customer.findUnique({
       where: { id: customerId },
       include: {
         payments: { orderBy: { createdAt: "desc" } },
@@ -448,7 +450,7 @@ class CustomerService implements ICustomerService {
         null
       : null;
 
-    const settings = await prisma.businessSettings.findFirst();
+    const settings = await this.prisma.businessSettings.findFirst();
     const paymentRule = settings?.paymentRule ?? null;
 
     const servicePlanView: ServicePlanView | null = plan
@@ -577,7 +579,7 @@ class CustomerService implements ICustomerService {
     customerId: string,
     input: CustomerUpdateInput
   ): Promise<{ customerId: string; propertyId: string | null; servicePlanId: string | null }> {
-    const customer = await prisma.customer.findUnique({
+    const customer = await this.prisma.customer.findUnique({
       where: { id: customerId },
       include: {
         properties: {
@@ -600,7 +602,7 @@ class CustomerService implements ICustomerService {
 
     if (input.roundId) await this.assertRoundExists(input.roundId);
 
-    return prisma.$transaction(async (tx) => {
+    return this.prisma.$transaction(async (tx) => {
       await tx.customer.update({
         where: { id: customer.id },
         data: { name: input.name, phone: input.phone, email: input.email },
@@ -645,7 +647,7 @@ class CustomerService implements ICustomerService {
     if (input.roundId) await this.assertRoundExists(input.roundId);
     if (input.serviceAreaId) await this.assertServiceAreaExists(input.serviceAreaId);
 
-    return prisma.$transaction(async (tx) => {
+    return this.prisma.$transaction(async (tx) => {
       const customer = await tx.customer.create({
         data: { name: input.customerName, phone: input.phone ?? null, email: input.email ?? null },
       });
@@ -688,12 +690,12 @@ class CustomerService implements ICustomerService {
     propertyId: string,
     input: PropertyUpdateInput
   ): Promise<Property> {
-    const existing = await prisma.property.findUnique({ where: { id: propertyId } });
+    const existing = await this.prisma.property.findUnique({ where: { id: propertyId } });
     if (!existing) throw new AppError(404, "Property not found");
     if (input.roundId) await this.assertRoundExists(input.roundId);
     if (input.serviceAreaId) await this.assertServiceAreaExists(input.serviceAreaId);
 
-    return prisma.property.update({
+    return this.prisma.property.update({
       where: { id: propertyId },
       data: {
         addressLine: input.addressLine,
@@ -719,7 +721,7 @@ class CustomerService implements ICustomerService {
     if (plan.status === LifecycleStatus.PAUSED) {
       throw new AppError(409, "Service plan is already paused");
     }
-    return prisma.servicePlan.update({
+    return this.prisma.servicePlan.update({
       where: { id: plan.id },
       data: {
         status: LifecycleStatus.PAUSED,
@@ -734,7 +736,7 @@ class CustomerService implements ICustomerService {
     if (plan.status !== LifecycleStatus.PAUSED) {
       throw new AppError(409, "Service plan is not paused");
     }
-    return prisma.servicePlan.update({
+    return this.prisma.servicePlan.update({
       where: { id: plan.id },
       data: {
         status: LifecycleStatus.ACTIVE,
@@ -748,7 +750,7 @@ class CustomerService implements ICustomerService {
 
   async getNotes(_profileId: string, propertyId: string): Promise<PropertyNote[]> {
     await this.assertPropertyExists(propertyId);
-    return prisma.propertyNote.findMany({
+    return this.prisma.propertyNote.findMany({
       where: { propertyId },
       orderBy: { createdAt: "desc" },
     });
@@ -760,7 +762,7 @@ class CustomerService implements ICustomerService {
     input: NoteCreateInput
   ): Promise<PropertyNote> {
     await this.assertPropertyExists(propertyId);
-    return prisma.propertyNote.create({
+    return this.prisma.propertyNote.create({
       data: {
         propertyId,
         type: input.type,
@@ -773,23 +775,23 @@ class CustomerService implements ICustomerService {
   // ---- shared guards ----
 
   private async assertRoundExists(id: string): Promise<void> {
-    if (!(await prisma.round.findUnique({ where: { id } }))) {
+    if (!(await this.prisma.round.findUnique({ where: { id } }))) {
       throw new AppError(404, `Round not found: ${id}`);
     }
   }
   private async assertServiceAreaExists(id: string): Promise<void> {
-    if (!(await prisma.serviceArea.findUnique({ where: { id } }))) {
+    if (!(await this.prisma.serviceArea.findUnique({ where: { id } }))) {
       throw new AppError(404, `Service area not found: ${id}`);
     }
   }
   private async assertPropertyExists(id: string): Promise<void> {
-    if (!(await prisma.property.findUnique({ where: { id } }))) {
+    if (!(await this.prisma.property.findUnique({ where: { id } }))) {
       throw new AppError(404, "Property not found");
     }
   }
   /** The property's primary service plan (active, else most recent). 404 if none. */
   private async primaryPlan(propertyId: string): Promise<ServicePlan> {
-    const property = await prisma.property.findUnique({
+    const property = await this.prisma.property.findUnique({
       where: { id: propertyId },
       include: { servicePlans: { orderBy: { createdAt: "desc" } } },
     });
@@ -803,5 +805,6 @@ class CustomerService implements ICustomerService {
   }
 }
 
-// Single shared instance, exported behind the interface (the swap point).
-export const customerService: ICustomerService = new CustomerService();
+export function createCustomerService(prisma: TenantPrismaClient): ICustomerService {
+  return new CustomerService(prisma);
+}

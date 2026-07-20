@@ -1,6 +1,7 @@
 import { Request, Router } from "express";
 import { ServiceCategory, PaymentTiming } from "../generated/tenant-client";
 import { requireAuth } from "../middleware/requireAuth";
+import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
 import { validateWorkingDays, assertPositiveInt } from "../lib/validation";
@@ -17,7 +18,7 @@ import {
   optStringArray,
 } from "../lib/http";
 import {
-  settingsService,
+  createSettingsService,
   BusinessProfileUpdateInput,
   RoundSettingsUpdateInput,
   ServiceCreateInput,
@@ -31,8 +32,11 @@ import {
 
 export const settingsRouter = Router();
 settingsRouter.use(requireAuth);
+settingsRouter.use(requireTenantAccess);
 // Authorization: reads allowed for any known role; mutations require ADMIN/MANAGER.
 settingsRouter.use(requireBusinessAccess());
+
+const svc = (req: Request) => createSettingsService(req.tenantPrisma!);
 
 // ---- helpers -------------------------------------------------------------
 // Settings routes are thin: validate → call service → respond. No DB access
@@ -86,13 +90,13 @@ function optPaymentTiming(v: unknown): PaymentTiming | null | undefined {
 settingsRouter.get(
   "/business-profile",
   h(async (req, res) => {
-    res.json(await settingsService.getBusinessProfile(actorIdOf(req)));
+    res.json(await svc(req).getBusinessProfile(actorIdOf(req)));
   })
 );
 settingsRouter.patch(
   "/business-profile",
   h(async (req, res) => {
-    await settingsService.assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete(actorIdOf(req));
     const body = asObject(req.body);
     const input: BusinessProfileUpdateInput = {
       businessName: optString(body.businessName, "businessName"),
@@ -105,7 +109,7 @@ settingsRouter.patch(
       currency: optString(body.currency, "currency"),
       defaultWorkingDays: optWorkingDays(body.defaultWorkingDays, "defaultWorkingDays"),
     };
-    res.json(await settingsService.updateBusinessProfile(actorIdOf(req), input));
+    res.json(await svc(req).updateBusinessProfile(actorIdOf(req), input));
   })
 );
 
@@ -116,19 +120,19 @@ settingsRouter.patch(
 settingsRouter.get(
   "/round-settings",
   h(async (req, res) => {
-    res.json(await settingsService.getRoundSettings(actorIdOf(req)));
+    res.json(await svc(req).getRoundSettings(actorIdOf(req)));
   })
 );
 settingsRouter.patch(
   "/round-settings",
   h(async (req, res) => {
-    await settingsService.assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete(actorIdOf(req));
     const body = asObject(req.body);
     const input: RoundSettingsUpdateInput = {
       defaultCycleLength: optCycleLength(body.defaultCycleLength),
       defaultWorkingDays: optWorkingDays(body.defaultWorkingDays, "defaultWorkingDays"),
     };
-    res.json(await settingsService.updateRoundSettings(actorIdOf(req), input));
+    res.json(await svc(req).updateRoundSettings(actorIdOf(req), input));
   })
 );
 
@@ -139,13 +143,13 @@ settingsRouter.patch(
 settingsRouter.get(
   "/services",
   h(async (req, res) => {
-    res.json(await settingsService.getServices(actorIdOf(req)));
+    res.json(await svc(req).getServices(actorIdOf(req)));
   })
 );
 settingsRouter.post(
   "/services",
   h(async (req, res) => {
-    await settingsService.assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete(actorIdOf(req));
     const body = asObject(req.body);
     const input: ServiceCreateInput = {
       name: requireString(body.name, "name"),
@@ -154,13 +158,13 @@ settingsRouter.post(
       description: optString(body.description, "description"),
       active: optBool(body.active, "active"),
     };
-    res.status(201).json(await settingsService.createService(actorIdOf(req), input));
+    res.status(201).json(await svc(req).createService(actorIdOf(req), input));
   })
 );
 settingsRouter.patch(
   "/services/:id",
   h(async (req, res) => {
-    await settingsService.assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete(actorIdOf(req));
     const body = asObject(req.body);
     const input: ServiceUpdateInput = {
       name: optReqString(body.name, "name"),
@@ -169,14 +173,14 @@ settingsRouter.patch(
       description: optString(body.description, "description"),
       active: optBool(body.active, "active"),
     };
-    res.json(await settingsService.updateService(actorIdOf(req), req.params.id, input));
+    res.json(await svc(req).updateService(actorIdOf(req), req.params.id, input));
   })
 );
 settingsRouter.delete(
   "/services/:id",
   h(async (req, res) => {
-    await settingsService.assertSetupComplete(actorIdOf(req));
-    await settingsService.deleteService(actorIdOf(req), req.params.id);
+    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).deleteService(actorIdOf(req), req.params.id);
     res.status(204).end();
   })
 );
@@ -188,40 +192,40 @@ settingsRouter.delete(
 settingsRouter.get(
   "/service-areas",
   h(async (req, res) => {
-    res.json(await settingsService.getServiceAreas(actorIdOf(req)));
+    res.json(await svc(req).getServiceAreas(actorIdOf(req)));
   })
 );
 settingsRouter.post(
   "/service-areas",
   h(async (req, res) => {
-    await settingsService.assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete(actorIdOf(req));
     const body = asObject(req.body);
     const input: ServiceAreaCreateInput = {
       name: requireString(body.name, "name"),
       postcodeSector: optString(body.postcodeSector, "postcodeSector"),
       isDefault: optBool(body.isDefault, "isDefault"),
     };
-    res.status(201).json(await settingsService.createServiceArea(actorIdOf(req), input));
+    res.status(201).json(await svc(req).createServiceArea(actorIdOf(req), input));
   })
 );
 settingsRouter.patch(
   "/service-areas/:id",
   h(async (req, res) => {
-    await settingsService.assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete(actorIdOf(req));
     const body = asObject(req.body);
     const input: ServiceAreaUpdateInput = {
       name: optReqString(body.name, "name"),
       postcodeSector: optString(body.postcodeSector, "postcodeSector"),
       isDefault: optBool(body.isDefault, "isDefault"),
     };
-    res.json(await settingsService.updateServiceArea(actorIdOf(req), req.params.id, input));
+    res.json(await svc(req).updateServiceArea(actorIdOf(req), req.params.id, input));
   })
 );
 settingsRouter.delete(
   "/service-areas/:id",
   h(async (req, res) => {
-    await settingsService.assertSetupComplete(actorIdOf(req));
-    await settingsService.deleteServiceArea(actorIdOf(req), req.params.id);
+    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).deleteServiceArea(actorIdOf(req), req.params.id);
     res.status(204).end();
   })
 );
@@ -233,13 +237,13 @@ settingsRouter.delete(
 settingsRouter.get(
   "/technicians",
   h(async (req, res) => {
-    res.json(await settingsService.getTechnicians(actorIdOf(req)));
+    res.json(await svc(req).getTechnicians(actorIdOf(req)));
   })
 );
 settingsRouter.post(
   "/technicians",
   h(async (req, res) => {
-    await settingsService.assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete(actorIdOf(req));
     const body = asObject(req.body);
     const input: TechnicianCreateInput = {
       name: optString(body.name, "name"),
@@ -247,13 +251,13 @@ settingsRouter.post(
       role: optString(body.role, "role"),
       active: optBool(body.active, "active"),
     };
-    res.status(201).json(await settingsService.createTechnician(actorIdOf(req), input));
+    res.status(201).json(await svc(req).createTechnician(actorIdOf(req), input));
   })
 );
 settingsRouter.patch(
   "/technicians/:id",
   h(async (req, res) => {
-    await settingsService.assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete(actorIdOf(req));
     const body = asObject(req.body);
     const input: TechnicianUpdateInput = {
       name: optString(body.name, "name"),
@@ -261,14 +265,14 @@ settingsRouter.patch(
       role: optString(body.role, "role"),
       active: optBool(body.active, "active"),
     };
-    res.json(await settingsService.updateTechnician(actorIdOf(req), req.params.id, input));
+    res.json(await svc(req).updateTechnician(actorIdOf(req), req.params.id, input));
   })
 );
 settingsRouter.delete(
   "/technicians/:id",
   h(async (req, res) => {
-    await settingsService.assertSetupComplete(actorIdOf(req));
-    await settingsService.deleteTechnician(actorIdOf(req), req.params.id);
+    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).deleteTechnician(actorIdOf(req), req.params.id);
     res.status(204).end();
   })
 );
@@ -280,31 +284,31 @@ settingsRouter.delete(
 settingsRouter.get(
   "/payment",
   h(async (req, res) => {
-    res.json(await settingsService.getPaymentSetup(actorIdOf(req)));
+    res.json(await svc(req).getPaymentSetup(actorIdOf(req)));
   })
 );
 settingsRouter.patch(
   "/payment",
   h(async (req, res) => {
-    await settingsService.assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete(actorIdOf(req));
     const body = asObject(req.body);
     const input: PaymentRulesUpdateInput = {
       paymentRule: optPaymentTiming(body.paymentRule),
       vatInInvoices: optBool(body.vatInInvoices, "vatInInvoices"),
       debtHoldEnabled: optBool(body.debtHoldEnabled, "debtHoldEnabled"),
     };
-    res.json(await settingsService.updatePaymentRules(actorIdOf(req), input));
+    res.json(await svc(req).updatePaymentRules(actorIdOf(req), input));
   })
 );
 settingsRouter.post(
   "/payment/:provider/connect",
   h(async (req, res) => {
-    await settingsService.assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete(actorIdOf(req));
     const provider = req.params.provider;
     if (provider !== "gocardless" && provider !== "stripe") {
       throw new AppError(400, `Unknown provider: ${provider}. Use "gocardless" or "stripe".`);
     }
-    res.json(await settingsService.connectProvider(actorIdOf(req), provider));
+    res.json(await svc(req).connectProvider(actorIdOf(req), provider));
   })
 );
 
@@ -315,14 +319,14 @@ settingsRouter.post(
 settingsRouter.get(
   "/message-templates",
   h(async (req, res) => {
-    res.json(await settingsService.getMessageTemplates(actorIdOf(req)));
+    res.json(await svc(req).getMessageTemplates(actorIdOf(req)));
   })
 );
 settingsRouter.patch(
   "/message-templates",
   h(async (req, res) => {
-    await settingsService.assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete(actorIdOf(req));
     // Deferred stub — no DB write; returns the same deferred payload.
-    res.json(await settingsService.getMessageTemplates(actorIdOf(req)));
+    res.json(await svc(req).getMessageTemplates(actorIdOf(req)));
   })
 );

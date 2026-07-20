@@ -2,6 +2,7 @@ import { randomBytes } from "crypto";
 import { Router } from "express";
 import { prisma } from "../lib/prisma";
 import { requireAuth } from "../middleware/requireAuth";
+import { provisionTenantSchema } from "../lib/tenant-provisioning";
 import { AppError } from "../lib/app-error";
 import { h, requireString, optString } from "../lib/http";
 
@@ -83,6 +84,7 @@ authRouter.post(
         return { profile, tenantId: tenant.id };
       });
 
+      await provisionTenantSchema(result.profile.tenant.schemaName);
       return res.status(201).json(result);
     } catch (err: unknown) {
       // Concurrent signup calls can both pass the findUnique check before

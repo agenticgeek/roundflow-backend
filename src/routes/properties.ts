@@ -1,5 +1,6 @@
 import { Request, Router } from "express";
 import { requireAuth } from "../middleware/requireAuth";
+import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
 import { asObject, h, requireString, requireNumber, optString, optReqString, optId } from "../lib/http";
@@ -11,18 +12,20 @@ import {
   requireNoteType,
 } from "../lib/validation";
 import {
-  customerService,
+  createCustomerService,
   PropertyCreateInput,
   PropertyUpdateInput,
 } from "../services/customer.service";
 
 export const propertiesRouter = Router();
 propertiesRouter.use(requireAuth);
+propertiesRouter.use(requireTenantAccess);
 // Authorization: reads allowed for any known role; mutations require ADMIN/MANAGER.
 propertiesRouter.use(requireBusinessAccess());
 
 // Thin routes: validate → call service → respond. No DB access here.
 const actorIdOf = (req: Request): string => req.user!.supabaseUserId;
+const svc = (req: Request) => createCustomerService(req.tenantPrisma!);
 
 // ==========================================================================
 // POST /properties — M6 Add Property (Customer + Property + ServicePlan, atomic)
@@ -55,7 +58,7 @@ propertiesRouter.post(
       // Assignment (step 5 / Screen 31) — null = Save & Assign Later (unassigned)
       roundId: optId(body.roundId, "roundId"),
     };
-    res.status(201).json(await customerService.createProperty(actorIdOf(req), input));
+    res.status(201).json(await svc(req).createProperty(actorIdOf(req), input));
   })
 );
 
@@ -76,7 +79,7 @@ propertiesRouter.patch(
       riskNotes: optString(body.riskNotes, "riskNotes"),
       roundId: optId(body.roundId, "roundId"), // null = unassign; id = assign/reassign
     };
-    res.json(await customerService.updateProperty(actorIdOf(req), req.params.id, input));
+    res.json(await svc(req).updateProperty(actorIdOf(req), req.params.id, input));
   })
 );
 
@@ -96,7 +99,7 @@ propertiesRouter.post(
       throw new AppError(400, "pauseEndDate must be after pauseStartDate");
     }
     res.json(
-      await customerService.pauseService(actorIdOf(req), req.params.id, {
+      await svc(req).pauseService(actorIdOf(req), req.params.id, {
         pauseStartDate,
         pauseEndDate,
       })
@@ -110,7 +113,7 @@ propertiesRouter.post(
 propertiesRouter.post(
   "/:id/resume",
   h(async (req, res) => {
-    res.json(await customerService.resumeService(actorIdOf(req), req.params.id));
+    res.json(await svc(req).resumeService(actorIdOf(req), req.params.id));
   })
 );
 
@@ -120,7 +123,7 @@ propertiesRouter.post(
 propertiesRouter.get(
   "/:id/notes",
   h(async (req, res) => {
-    res.json(await customerService.getNotes(actorIdOf(req), req.params.id));
+    res.json(await svc(req).getNotes(actorIdOf(req), req.params.id));
   })
 );
 
@@ -136,6 +139,6 @@ propertiesRouter.post(
       body: requireString(body.body, "body"),
       authorProfileId: req.profile?.id ?? null,
     };
-    res.status(201).json(await customerService.addNote(actorIdOf(req), req.params.id, input));
+    res.status(201).json(await svc(req).addNote(actorIdOf(req), req.params.id, input));
   })
 );

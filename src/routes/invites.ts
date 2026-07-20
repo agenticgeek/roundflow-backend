@@ -1,8 +1,9 @@
 import { Router } from "express";
 import { UserRole } from "@prisma/client";
 import { prisma } from "../lib/prisma";
-import { tenantPrisma } from "../lib/tenant-prisma";
+import { getTenantPrismaForSchema } from "../lib/tenant-prisma-manager";
 import { requireAuth } from "../middleware/requireAuth";
+import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireRole } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
 import { h, asObject, requireString, optString } from "../lib/http";
@@ -28,6 +29,7 @@ function assertInviteUsable(invite: {
 invitesRouter.post(
   "/",
   requireAuth,
+  requireTenantAccess,
   requireRole(UserRole.ADMIN, UserRole.MANAGER),
   h(async (req, res) => {
     const profile = req.profile!;
@@ -44,7 +46,7 @@ invitesRouter.post(
 
     const technicianId = optString(body.technicianId, "technicianId") ?? null;
     if (technicianId) {
-      const tech = await tenantPrisma.technician.findUnique({ where: { id: technicianId } });
+      const tech = await req.tenantPrisma!.technician.findUnique({ where: { id: technicianId } });
       if (!tech) throw new AppError(404, "Technician not found");
       if (tech.profileId !== null)
         throw new AppError(409, "Technician has already accepted an invite");
@@ -62,7 +64,7 @@ invitesRouter.post(
       data: { tenantId: profile.tenantId, email, role, technicianId, expiresAt },
     });
 
-    const settings = await tenantPrisma.businessSettings.findFirst();
+    const settings = await req.tenantPrisma!.businessSettings.findFirst();
     const base = process.env.INVITE_BASE_URL ?? "";
     await sendInviteEmail({
       to: email,
@@ -135,10 +137,13 @@ invitesRouter.post(
     });
 
     if (invite.technicianId) {
-      await tenantPrisma.technician.update({
-        where: { id: invite.technicianId },
-        data: { profileId: profile.id },
-      });
+      const tenant = await prisma.tenant.findUnique({ where: { id: invite.tenantId } });
+      if (tenant) {
+        await getTenantPrismaForSchema(tenant.schemaName).technician.update({
+          where: { id: invite.technicianId },
+          data: { profileId: profile.id },
+        });
+      }
     }
 
     return res.status(201).json({ profile });

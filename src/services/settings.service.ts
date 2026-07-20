@@ -6,7 +6,7 @@ import type {
   Technician,
 } from "../generated/tenant-client";
 import type { Profile } from "@prisma/client";
-import { tenantPrisma as prisma } from "../lib/tenant-prisma";
+import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 
 // ---------------------------------------------------------------------------
@@ -223,19 +223,21 @@ type SettingsWritable = {
 // ---------------------------------------------------------------------------
 
 class SettingsService implements ISettingsService {
+  constructor(private readonly prisma: TenantPrismaClient) {}
+
   // ---- singleton seam (the ONLY two methods that know the singleton key) ----
 
   /** Read the BusinessSettings singleton. */
   private async getSettings(): Promise<BusinessSettings | null> {
-    return prisma.businessSettings.findFirst();
+    return this.prisma.businessSettings.findFirst();
   }
 
   /** Partial upsert of the BusinessSettings singleton. Undefined fields are
    *  left unchanged; null clears the field. */
   private async writeSettings(data: SettingsWritable): Promise<BusinessSettings> {
-    const existing = await prisma.businessSettings.findFirst();
-    if (existing) return prisma.businessSettings.update({ where: { id: existing.id }, data });
-    return prisma.businessSettings.create({ data });
+    const existing = await this.prisma.businessSettings.findFirst();
+    if (existing) return this.prisma.businessSettings.update({ where: { id: existing.id }, data });
+    return this.prisma.businessSettings.create({ data });
   }
 
   // ---- guard ----
@@ -297,14 +299,14 @@ class SettingsService implements ISettingsService {
   // ---- Service Catalogue ----
 
   async getServices(_profileId: string): Promise<Service[]> {
-    return prisma.service.findMany({ orderBy: { createdAt: "asc" } });
+    return this.prisma.service.findMany({ orderBy: { createdAt: "asc" } });
   }
 
   async createService(
     _profileId: string,
     input: ServiceCreateInput
   ): Promise<Service> {
-    return prisma.service.create({
+    return this.prisma.service.create({
       data: {
         name: input.name,
         defaultPrice: input.defaultPrice,
@@ -320,9 +322,9 @@ class SettingsService implements ISettingsService {
     id: string,
     input: ServiceUpdateInput
   ): Promise<Service> {
-    const existing = await prisma.service.findUnique({ where: { id } });
+    const existing = await this.prisma.service.findUnique({ where: { id } });
     if (!existing) throw new AppError(404, "Service not found");
-    return prisma.service.update({
+    return this.prisma.service.update({
       where: { id },
       data: {
         name: input.name,
@@ -335,22 +337,22 @@ class SettingsService implements ISettingsService {
   }
 
   async deleteService(_profileId: string, id: string): Promise<void> {
-    const existing = await prisma.service.findUnique({ where: { id } });
+    const existing = await this.prisma.service.findUnique({ where: { id } });
     if (!existing) throw new AppError(404, "Service not found");
     const [planRefs, visitRefs] = await Promise.all([
-      prisma.servicePlan.count({ where: { serviceId: id } }),
-      prisma.visit.count({ where: { serviceId: id } }),
+      this.prisma.servicePlan.count({ where: { serviceId: id } }),
+      this.prisma.visit.count({ where: { serviceId: id } }),
     ]);
     if (planRefs > 0 || visitRefs > 0) {
       throw new AppError(409, "Service is in use and cannot be deleted");
     }
-    await prisma.service.delete({ where: { id } });
+    await this.prisma.service.delete({ where: { id } });
   }
 
   // ---- Service Areas ----
 
   async getServiceAreas(_profileId: string): Promise<ServiceAreaWithRounds[]> {
-    const areas = await prisma.serviceArea.findMany({
+    const areas = await this.prisma.serviceArea.findMany({
       orderBy: { createdAt: "asc" },
       include: { rounds: { select: { id: true, name: true } } },
     });
@@ -373,16 +375,16 @@ class SettingsService implements ISettingsService {
     if (input.isDefault === true) {
       // Single-default invariant: clear every existing default, then insert the
       // new one — atomically (array-form transaction).
-      const [, created] = await prisma.$transaction([
-        prisma.serviceArea.updateMany({
+      const [, created] = await this.prisma.$transaction([
+        this.prisma.serviceArea.updateMany({
           where: { isDefault: true },
           data: { isDefault: false },
         }),
-        prisma.serviceArea.create({ data }),
+        this.prisma.serviceArea.create({ data }),
       ]);
       return created;
     }
-    return prisma.serviceArea.create({ data });
+    return this.prisma.serviceArea.create({ data });
   }
 
   async updateServiceArea(
@@ -390,7 +392,7 @@ class SettingsService implements ISettingsService {
     id: string,
     input: ServiceAreaUpdateInput
   ): Promise<ServiceArea> {
-    const existing = await prisma.serviceArea.findUnique({ where: { id } });
+    const existing = await this.prisma.serviceArea.findUnique({ where: { id } });
     if (!existing) throw new AppError(404, "Service area not found");
     const data = {
       name: input.name,
@@ -400,29 +402,29 @@ class SettingsService implements ISettingsService {
     if (input.isDefault === true) {
       // Single-default invariant: clear the default flag on every OTHER area
       // before setting it here — atomically (array-form transaction).
-      const [, updated] = await prisma.$transaction([
-        prisma.serviceArea.updateMany({
+      const [, updated] = await this.prisma.$transaction([
+        this.prisma.serviceArea.updateMany({
           where: { isDefault: true, id: { not: id } },
           data: { isDefault: false },
         }),
-        prisma.serviceArea.update({ where: { id }, data }),
+        this.prisma.serviceArea.update({ where: { id }, data }),
       ]);
       return updated;
     }
-    return prisma.serviceArea.update({ where: { id }, data });
+    return this.prisma.serviceArea.update({ where: { id }, data });
   }
 
   async deleteServiceArea(_profileId: string, id: string): Promise<void> {
-    const existing = await prisma.serviceArea.findUnique({ where: { id } });
+    const existing = await this.prisma.serviceArea.findUnique({ where: { id } });
     if (!existing) throw new AppError(404, "Service area not found");
     const [roundRefs, propertyRefs] = await Promise.all([
-      prisma.round.count({ where: { serviceAreaId: id } }),
-      prisma.property.count({ where: { serviceAreaId: id } }),
+      this.prisma.round.count({ where: { serviceAreaId: id } }),
+      this.prisma.property.count({ where: { serviceAreaId: id } }),
     ]);
     if (roundRefs > 0 || propertyRefs > 0) {
       throw new AppError(409, "Service area is in use and cannot be deleted");
     }
-    await prisma.serviceArea.delete({ where: { id } });
+    await this.prisma.serviceArea.delete({ where: { id } });
   }
 
   // ---- Technician Management ----
@@ -430,7 +432,7 @@ class SettingsService implements ISettingsService {
   async getTechnicians(
     _profileId: string
   ): Promise<TechnicianWithDisplayName[]> {
-    const techs = await prisma.technician.findMany({
+    const techs = await this.prisma.technician.findMany({
       orderBy: { createdAt: "asc" },
     });
     return techs.map((t) => ({
@@ -452,7 +454,7 @@ class SettingsService implements ISettingsService {
     input: TechnicianCreateInput
   ): Promise<Technician> {
     // Single invite-pending create (profileId = null) — not the wizard's bulk replace.
-    return prisma.technician.create({
+    return this.prisma.technician.create({
       data: {
         profileId: null,
         name: input.name ?? null,
@@ -468,9 +470,9 @@ class SettingsService implements ISettingsService {
     id: string,
     input: TechnicianUpdateInput
   ): Promise<Technician> {
-    const existing = await prisma.technician.findUnique({ where: { id } });
+    const existing = await this.prisma.technician.findUnique({ where: { id } });
     if (!existing) throw new AppError(404, "Technician not found");
-    return prisma.technician.update({
+    return this.prisma.technician.update({
       where: { id },
       data: {
         name: input.name,
@@ -482,7 +484,7 @@ class SettingsService implements ISettingsService {
   }
 
   async deleteTechnician(_profileId: string, id: string): Promise<void> {
-    const existing = await prisma.technician.findUnique({ where: { id } });
+    const existing = await this.prisma.technician.findUnique({ where: { id } });
     if (!existing) throw new AppError(404, "Technician not found");
     if (existing.profileId !== null) {
       throw new AppError(
@@ -490,7 +492,7 @@ class SettingsService implements ISettingsService {
         "Cannot delete a technician who has accepted their invite. Deactivate them instead."
       );
     }
-    await prisma.technician.delete({ where: { id } });
+    await this.prisma.technician.delete({ where: { id } });
   }
 
   // ---- Payment Setup ----
@@ -533,5 +535,6 @@ class SettingsService implements ISettingsService {
   }
 }
 
-// Single shared instance, exported behind the interface (the swap point).
-export const settingsService: ISettingsService = new SettingsService();
+export function createSettingsService(prisma: TenantPrismaClient): ISettingsService {
+  return new SettingsService(prisma);
+}
