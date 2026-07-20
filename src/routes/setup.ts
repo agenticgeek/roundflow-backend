@@ -1,5 +1,5 @@
 import { Request, Router } from "express";
-import { PaymentTiming } from "@prisma/client";
+import { PaymentTiming } from "../generated/tenant-client";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";

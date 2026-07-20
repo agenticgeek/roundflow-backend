@@ -4,15 +4,15 @@ import {
   CleaningFrequency,
   RoundStatus,
   PaymentTiming,
-} from "@prisma/client";
+} from "../generated/tenant-client";
 import type {
   BusinessSettings,
   Service,
   Technician,
   ServiceArea,
   Round,
-} from "@prisma/client";
-import { prisma } from "../lib/prisma";
+} from "../generated/tenant-client";
+import { tenantPrisma as prisma } from "../lib/tenant-prisma";
 import { AppError } from "../lib/app-error";
 
 // ---------------------------------------------------------------------------
@@ -135,7 +135,6 @@ export interface ISetupService {
   saveFirstRound(profileId: string, input: FirstRoundInput): Promise<Round>;
 }
 
-const SINGLETON = { uniqueId: "singleton" } as const;
 
 // ---------------------------------------------------------------------------
 // Implementation
@@ -165,7 +164,7 @@ const SINGLETON = { uniqueId: "singleton" } as const;
 // The interface boundary and thin routes are correct and will not need changing.
 class SetupService implements ISetupService {
   private async getSettings(): Promise<BusinessSettings | null> {
-    return prisma.businessSettings.findUnique({ where: SINGLETON });
+    return prisma.businessSettings.findFirst();
   }
 
   async getStatus(_profileId: string): Promise<SetupStatus> {
@@ -230,10 +229,10 @@ class SetupService implements ISetupService {
         `Setup cannot be completed — required steps incomplete: ${missing.join(", ")}`
       );
     }
-    await prisma.businessSettings.update({
-      where: SINGLETON,
-      data: { setupCompleted: true },
-    });
+    const bs = await prisma.businessSettings.findFirst();
+    if (bs) {
+      await prisma.businessSettings.update({ where: { id: bs.id }, data: { setupCompleted: true } });
+    }
   }
 
   async saveBusinessProfile(
@@ -251,11 +250,9 @@ class SetupService implements ISetupService {
       timezone: input.timezone,
       currency: input.currency,
     };
-    return prisma.businessSettings.upsert({
-      where: SINGLETON,
-      update: data,
-      create: { ...SINGLETON, ...data },
-    });
+    const bs = await prisma.businessSettings.findFirst();
+    if (bs) return prisma.businessSettings.update({ where: { id: bs.id }, data });
+    return prisma.businessSettings.create({ data });
   }
 
   async getBusinessSettings(_profileId: string): Promise<BusinessSettings | null> {
@@ -305,11 +302,9 @@ class SetupService implements ISetupService {
       defaultCycleLength: input.defaultCycleLength,
       defaultWorkingDays: input.defaultWorkingDays,
     };
-    return prisma.businessSettings.upsert({
-      where: SINGLETON,
-      update: data,
-      create: { ...SINGLETON, ...data },
-    });
+    const bs = await prisma.businessSettings.findFirst();
+    if (bs) return prisma.businessSettings.update({ where: { id: bs.id }, data });
+    return prisma.businessSettings.create({ data });
   }
 
   async getPaymentSetup(_profileId: string): Promise<BusinessSettings | null> {
@@ -329,11 +324,9 @@ class SetupService implements ISetupService {
       gocardlessConnected: input.gocardlessConnected,
       stripeConnected: input.stripeConnected,
     };
-    return prisma.businessSettings.upsert({
-      where: SINGLETON,
-      update: data,
-      create: { ...SINGLETON, ...data },
-    });
+    const bs = await prisma.businessSettings.findFirst();
+    if (bs) return prisma.businessSettings.update({ where: { id: bs.id }, data });
+    return prisma.businessSettings.create({ data });
   }
 
   async getTechnicians(_profileId: string): Promise<Technician[]> {

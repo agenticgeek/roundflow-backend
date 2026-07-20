@@ -1,12 +1,12 @@
-import { ServiceCategory, PaymentTiming } from "@prisma/client";
+import { ServiceCategory, PaymentTiming } from "../generated/tenant-client";
 import type {
   BusinessSettings,
   Service,
   ServiceArea,
   Technician,
-  Profile,
-} from "@prisma/client";
-import { prisma } from "../lib/prisma";
+} from "../generated/tenant-client";
+import type { Profile } from "@prisma/client";
+import { tenantPrisma as prisma } from "../lib/tenant-prisma";
 import { AppError } from "../lib/app-error";
 
 // ---------------------------------------------------------------------------
@@ -90,9 +90,10 @@ export interface ServiceAreaWithRounds extends ServiceArea {
 
 export type AppStatus = "PENDING_INVITE" | "ACTIVE" | "INACTIVE";
 
-/** Technician + linked Profile + derived display name / app status. */
+/** Technician + derived display name / app status.
+ *  Profile is in the public schema (cross-schema) — name falls back to the
+ *  admin label on Technician.name until per-request profile lookup is wired. */
 export interface TechnicianWithDisplayName extends Technician {
-  profile: Profile | null;
   displayName: string | null;
   appStatus: AppStatus;
 }
@@ -197,7 +198,6 @@ export interface ISettingsService {
 //
 // Phase 2 is a whole-schema migration + ~30 query edits, not a two-method swap.
 // The interface boundary and thin routes are correct and will not need changing.
-const SINGLETON = { uniqueId: "singleton" } as const;
 
 /** The scalar fields any singleton write may touch (plain values, not Prisma ops). */
 type SettingsWritable = {
@@ -227,17 +227,15 @@ class SettingsService implements ISettingsService {
 
   /** Read the BusinessSettings singleton. */
   private async getSettings(): Promise<BusinessSettings | null> {
-    return prisma.businessSettings.findUnique({ where: SINGLETON });
+    return prisma.businessSettings.findFirst();
   }
 
   /** Partial upsert of the BusinessSettings singleton. Undefined fields are
    *  left unchanged; null clears the field. */
   private async writeSettings(data: SettingsWritable): Promise<BusinessSettings> {
-    return prisma.businessSettings.upsert({
-      where: SINGLETON,
-      update: data,
-      create: { ...SINGLETON, ...data },
-    });
+    const existing = await prisma.businessSettings.findFirst();
+    if (existing) return prisma.businessSettings.update({ where: { id: existing.id }, data });
+    return prisma.businessSettings.create({ data });
   }
 
   // ---- guard ----
@@ -434,12 +432,12 @@ class SettingsService implements ISettingsService {
   ): Promise<TechnicianWithDisplayName[]> {
     const techs = await prisma.technician.findMany({
       orderBy: { createdAt: "asc" },
-      include: { profile: true },
     });
     return techs.map((t) => ({
       ...t,
-      // Profile.name (once the invite is accepted) wins over the admin label.
-      displayName: t.profile?.name ?? t.name ?? null,
+      // Profile.name resolution is deferred until per-request tenant client is
+      // wired (cross-schema lookup required). Use admin label for now.
+      displayName: t.name ?? null,
       appStatus:
         t.profileId === null
           ? "PENDING_INVITE"

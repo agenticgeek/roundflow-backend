@@ -1,4 +1,4 @@
-import { DayOfWeek, PaymentMethod, NoteType } from "@prisma/client";
+import { DayOfWeek, PaymentMethod, NoteType } from "../generated/tenant-client";
 import { AppError } from "./app-error";
 
 // Shared request-value validators used by both the /setup and /settings routers,

@@ -5,17 +5,17 @@ import {
   PaymentMethod,
   PhotoType,
   NoteType,
-  UserRole,
   Prisma,
-} from "@prisma/client";
+} from "../generated/tenant-client";
 import type {
   Property,
   ServicePlan,
   PropertyNote,
   CleaningFrequency,
   PaymentTiming,
-} from "@prisma/client";
-import { prisma } from "../lib/prisma";
+} from "../generated/tenant-client";
+import { UserRole } from "@prisma/client";
+import { tenantPrisma as prisma } from "../lib/tenant-prisma";
 import { AppError } from "../lib/app-error";
 
 // ---------------------------------------------------------------------------
@@ -339,7 +339,7 @@ class CustomerService implements ICustomerService {
               visits: {
                 where: { status: { in: OPEN_VISIT } },
                 orderBy: { date: "asc" },
-                include: { technician: { include: { profile: true } } },
+                include: { technician: true },
               },
             },
           },
@@ -378,7 +378,7 @@ class CustomerService implements ICustomerService {
         price: this.num(plan?.price),
         technicianId: nextVisit?.technicianId ?? null,
         technicianName:
-          nextVisit?.technician?.profile?.name ?? nextVisit?.technician?.name ?? null,
+          nextVisit?.technician?.name ?? null,
         nextDueDate: plan?.nextDueDate ?? null,
         paymentStatus: this.derivePaymentStatus(onHold, c.payments[0]?.status),
         onHold,
@@ -419,13 +419,13 @@ class CustomerService implements ICustomerService {
             round: true,
             serviceArea: true,
             servicePlans: { orderBy: { createdAt: "desc" }, include: { service: true } },
-            notes: { orderBy: { createdAt: "desc" }, include: { author: true } },
+            notes: { orderBy: { createdAt: "desc" } },
             photos: { where: { type: PhotoType.PROPERTY }, orderBy: { createdAt: "desc" } },
             visits: {
               orderBy: { date: "desc" },
               include: {
                 round: true,
-                technician: { include: { profile: true } },
+                technician: true,
                 invoice: true,
                 payment: true,
                 issues: true,
@@ -448,9 +448,7 @@ class CustomerService implements ICustomerService {
         null
       : null;
 
-    const settings = await prisma.businessSettings.findUnique({
-      where: { uniqueId: "singleton" },
-    });
+    const settings = await prisma.businessSettings.findFirst();
     const paymentRule = settings?.paymentRule ?? null;
 
     const servicePlanView: ServicePlanView | null = plan
@@ -489,7 +487,7 @@ class CustomerService implements ICustomerService {
         .sort((a, b) => b.getTime() - a.getTime())[0] ?? null;
     const issuesCount = visits.reduce((n, v) => n + v.issues.length, 0);
     const technicianName =
-      nextScheduled?.technician?.profile?.name ?? nextScheduled?.technician?.name ?? null;
+      nextScheduled?.technician?.name ?? null;
 
     return {
       customer: {
@@ -551,7 +549,7 @@ class CustomerService implements ICustomerService {
               rows: visits.map((v) => ({
                 visitId: v.id,
                 visitDate: v.date,
-                technicianName: v.technician?.profile?.name ?? v.technician?.name ?? null,
+                technicianName: v.technician?.name ?? null,
                 amount: this.num(v.payment?.amount ?? v.price),
                 paymentStatus: v.payment?.status ?? null,
                 paymentId: v.payment?.id ?? null,
@@ -565,7 +563,7 @@ class CustomerService implements ICustomerService {
             },
         notes: (property?.notes ?? []).map((n) => ({
           ...n,
-          authorName: n.author?.name ?? null,
+          authorName: null, // cross-schema: Profile.name resolved via public client in future step
         })),
         photos: property?.photos ?? [],
       },
@@ -753,7 +751,6 @@ class CustomerService implements ICustomerService {
     return prisma.propertyNote.findMany({
       where: { propertyId },
       orderBy: { createdAt: "desc" },
-      include: { author: true },
     });
   }
 
