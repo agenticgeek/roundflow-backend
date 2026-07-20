@@ -1,0 +1,494 @@
+// Tenant schema — all operational models for one window cleaning business.
+// This schema is NOT applied via "prisma migrate dev" at runtime. Instead,
+// the provisioning function reads prisma/tenant/migrations/*.sql in order
+// and executes them against a newly created Postgres schema (e.g. "t_cm8abc").
+//
+// To generate a new migration SQL file:
+//   TENANT_MIGRATION_URL="<DIRECT_URL>?schema=_tenant_scratch" \
+//   prisma migrate dev --schema prisma/tenant/schema.prisma --name <description>
+// Then commit the generated SQL from prisma/tenant/migrations/ into source control.
+//
+// Note: Technician.profileId and PropertyNote.authorProfileId reference
+// public.Profile.id. Prisma cannot express cross-schema FK relations, so these
+// are plain String fields — the application enforces the relationship.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../../src/generated/tenant-client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("TENANT_MIGRATION_URL")
+}
+
+// ── Enums ──────────────────────────────────────────────────────────────────
+
+enum LifecycleStatus {
+  ACTIVE
+  PAUSED
+  CANCELLED
+}
+
+enum RoundStatus {
+  ACTIVE
+  DRAFT
+  ARCHIVED
+}
+
+enum DayOfWeek {
+  MON
+  TUE
+  WED
+  THU
+  FRI
+  SAT
+  SUN
+}
+
+enum CleaningFrequency {
+  FORTNIGHTLY
+  FOUR_WEEKLY
+  SIX_WEEKLY
+  EIGHT_WEEKLY
+  MONTHLY
+}
+
+enum VisitStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  SKIPPED
+}
+
+enum PaymentStatus {
+  NOT_DUE
+  PENDING
+  PAID
+  FAILED
+  OVERDUE
+}
+
+enum PaymentMethod {
+  GOCARDLESS
+  CASH
+  CHEQUE
+  BACS
+  STRIPE
+}
+
+enum PaymentTiming {
+  COLLECT_AFTER_VISIT
+  COLLECT_BEFORE_VISIT
+  COLLECT_ON_DATE
+}
+
+enum MessageChannel {
+  SMS
+  WHATSAPP
+  EMAIL
+}
+
+enum MessageDirection {
+  OUTBOUND
+  INBOUND
+}
+
+enum Severity {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum ComplaintStatus {
+  OPEN
+  IN_REVIEW
+  REVISIT_BOOKED
+  RESOLVED
+}
+
+enum ServiceCategory {
+  DEFAULT
+  WINDOW_CLEANING
+  GUTTER_FASCIA
+  EXTERIOR_CLEANING
+  SPECIALIST
+}
+
+enum InvoiceStatus {
+  DRAFT
+  SENT
+  PAID
+}
+
+enum IssueType {
+  ACCESS_PROBLEM
+  GATE_LOCKED
+  PAYMENT_ISSUE
+  OTHER
+}
+
+enum PhotoType {
+  PROPERTY
+  BEFORE
+  AFTER
+}
+
+enum NoteType {
+  INTERNAL
+  RISK_WARNING
+  CUSTOMER
+}
+
+// ── Models ─────────────────────────────────────────────────────────────────
+
+// One row per tenant schema — no uniqueId singleton.
+// Isolation is enforced by the schema boundary: each tenant's schema contains
+// exactly one BusinessSettings row, found via findFirst().
+model BusinessSettings {
+  id                  String         @id @default(cuid())
+  businessName        String?
+  phone               String?
+  email               String?
+  companyNumber       String?
+  vatRegistration     String?
+  vatRegistered       Boolean        @default(false)
+  defaultWorkingDays  String[]
+  timezone            String?
+  currency            String?
+  defaultCycleLength  Int?
+  bankDetails         Json?
+  paymentRule         PaymentTiming?
+  debtHoldEnabled     Boolean        @default(false)
+  vatInInvoices       Boolean        @default(false)
+  gocardlessConnected Boolean        @default(false)
+  stripeConnected     Boolean        @default(false)
+  setupCompleted      Boolean        @default(false)
+  updatedAt           DateTime       @updatedAt
+}
+
+model Customer {
+  id            String          @id @default(cuid())
+  name          String
+  phone         String?
+  email         String?
+  status        LifecycleStatus @default(ACTIVE)
+  ghlContactId  String?
+  paymentMethod PaymentMethod?
+  badDebt       Boolean         @default(false)
+  properties    Property[]
+  invoices      Invoice[]
+  payments      Payment[]
+  messages      Message[]
+  complaints    Complaint[]
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+}
+
+model Property {
+  id            String          @id @default(cuid())
+  customerId    String
+  customer      Customer        @relation(fields: [customerId], references: [id])
+  propertyName  String?
+  addressLine   String
+  postcode      String
+  serviceAreaId String?
+  serviceArea   ServiceArea?    @relation(fields: [serviceAreaId], references: [id])
+  propertyType  String?
+  accessNotes   String?
+  riskNotes     String?
+  status        LifecycleStatus @default(ACTIVE)
+  roundId       String?
+  round         Round?          @relation(fields: [roundId], references: [id])
+  servicePlans  ServicePlan[]
+  visits        Visit[]
+  photos        Photo[]
+  issues        Issue[]
+  complaints    Complaint[]
+  notes         PropertyNote[]
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  @@index([customerId])
+  @@index([serviceAreaId])
+  @@index([roundId])
+}
+
+// Notes & Risk tab (Screen 15). authorProfileId references public.Profile.id —
+// no DB-level FK since Profile lives in a different schema.
+model PropertyNote {
+  id              String   @id @default(cuid())
+  propertyId      String
+  property        Property @relation(fields: [propertyId], references: [id])
+  type            NoteType @default(INTERNAL)
+  body            String
+  authorProfileId String?
+  createdAt       DateTime @default(now())
+
+  @@index([propertyId])
+  @@index([authorProfileId])
+}
+
+model ServicePlan {
+  id             String          @id @default(cuid())
+  propertyId     String
+  property       Property        @relation(fields: [propertyId], references: [id])
+  serviceId      String?
+  service        Service?        @relation(fields: [serviceId], references: [id])
+  price          Decimal         @db.Decimal(10, 2)
+  cleanMethod    String?
+  paymentMethod  PaymentMethod?
+  status         LifecycleStatus @default(ACTIVE)
+  nextDueDate    DateTime?
+  lastCompleted  DateTime?
+  pauseStartDate DateTime?
+  pauseEndDate   DateTime?
+  visits         Visit[]
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  @@index([propertyId])
+  @@index([serviceId])
+}
+
+model Round {
+  id            String             @id @default(cuid())
+  name          String
+  defaultDay    DayOfWeek?
+  frequency     CleaningFrequency?
+  description   String?
+  status        RoundStatus        @default(DRAFT)
+  serviceAreaId String?
+  serviceArea   ServiceArea?       @relation(fields: [serviceAreaId], references: [id])
+  properties    Property[]
+  visits        Visit[]
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+
+  @@index([serviceAreaId])
+}
+
+// profileId references public.Profile.id — no DB-level FK (cross-schema).
+// null = invited but not yet accepted; name is the admin display label until
+// the invite is accepted and Profile.name takes over.
+model Technician {
+  id           String                  @id @default(cuid())
+  profileId    String?                 @unique
+  name         String?
+  role         String?
+  phone        String?
+  active       Boolean                 @default(true)
+  avatarUrl    String?
+  serviceAreas TechnicianServiceArea[]
+  visits       Visit[]
+  messages     Message[]
+  complaints   Complaint[]
+  createdAt    DateTime                @default(now())
+  updatedAt    DateTime                @updatedAt
+}
+
+model TechnicianServiceArea {
+  technicianId  String
+  technician    Technician  @relation(fields: [technicianId], references: [id])
+  serviceAreaId String
+  serviceArea   ServiceArea @relation(fields: [serviceAreaId], references: [id])
+  assignedAt    DateTime    @default(now())
+
+  @@id([technicianId, serviceAreaId])
+  @@index([serviceAreaId])
+}
+
+model Visit {
+  id            String         @id @default(cuid())
+  date          DateTime
+  status        VisitStatus    @default(SCHEDULED)
+  paymentHold   Boolean        @default(false)
+  price         Decimal        @db.Decimal(10, 2)
+  isOneOff      Boolean        @default(false)
+  serviceId     String?
+  service       Service?       @relation(fields: [serviceId], references: [id])
+  notes         String?
+  skipReason    String?
+  completedAt   DateTime?
+  propertyId    String
+  property      Property       @relation(fields: [propertyId], references: [id])
+  roundId       String?
+  round         Round?         @relation(fields: [roundId], references: [id])
+  servicePlanId String?
+  servicePlan   ServicePlan?   @relation(fields: [servicePlanId], references: [id])
+  technicianId  String?
+  technician    Technician?    @relation(fields: [technicianId], references: [id])
+  paymentMethod PaymentMethod?
+  invoice       Invoice?
+  payment       Payment?
+  photos        Photo[]
+  issues        Issue[]
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  @@index([serviceId])
+  @@index([propertyId])
+  @@index([roundId])
+  @@index([servicePlanId])
+  @@index([technicianId])
+}
+
+model Complaint {
+  id           String          @id @default(cuid())
+  customerId   String
+  customer     Customer        @relation(fields: [customerId], references: [id])
+  propertyId   String?
+  property     Property?       @relation(fields: [propertyId], references: [id])
+  technicianId String?
+  technician   Technician?     @relation(fields: [technicianId], references: [id])
+  title        String
+  description  String?
+  issueType    String?
+  severity     Severity        @default(LOW)
+  status       ComplaintStatus @default(OPEN)
+  revisitDate  DateTime?
+  messages     Message[]
+  photos       Photo[]
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  @@index([customerId])
+  @@index([propertyId])
+  @@index([technicianId])
+}
+
+model Issue {
+  id         String    @id @default(cuid())
+  visitId    String
+  visit      Visit     @relation(fields: [visitId], references: [id])
+  propertyId String?
+  property   Property? @relation(fields: [propertyId], references: [id])
+  type       IssueType @default(OTHER)
+  note       String?
+  createdAt  DateTime  @default(now())
+
+  @@index([visitId])
+  @@index([propertyId])
+}
+
+// invoiceNumber is @unique within the tenant schema — no cross-tenant collision
+// risk (Phase 2 concern is resolved by schema isolation).
+model Invoice {
+  id             String        @id @default(cuid())
+  invoiceNumber  String        @unique
+  customerId     String
+  customer       Customer      @relation(fields: [customerId], references: [id])
+  visitId        String?       @unique
+  visit          Visit?        @relation(fields: [visitId], references: [id])
+  amount         Decimal       @db.Decimal(10, 2)
+  status         InvoiceStatus @default(DRAFT)
+  notes          String?
+  sentToCustomer Boolean       @default(false)
+  sentAt         DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@index([customerId])
+}
+
+model Payment {
+  id           String        @id @default(cuid())
+  customerId   String
+  customer     Customer      @relation(fields: [customerId], references: [id])
+  visitId      String?       @unique
+  visit        Visit?        @relation(fields: [visitId], references: [id])
+  amount       Decimal       @db.Decimal(10, 2)
+  method       PaymentMethod
+  status       PaymentStatus @default(PENDING)
+  gocardlessId String?
+  stripeId     String?
+  contactedAt  DateTime?
+  paidAt       DateTime?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@index([customerId])
+}
+
+model Message {
+  id           String           @id @default(cuid())
+  channel      MessageChannel
+  direction    MessageDirection @default(OUTBOUND)
+  body         String
+  customerId   String?
+  customer     Customer?        @relation(fields: [customerId], references: [id])
+  technicianId String?
+  technician   Technician?      @relation(fields: [technicianId], references: [id])
+  complaintId  String?
+  complaint    Complaint?       @relation(fields: [complaintId], references: [id])
+  templateId   String?
+  template     MessageTemplate? @relation(fields: [templateId], references: [id])
+  scheduledFor DateTime?
+  sentAt       DateTime?
+  creditCost   Int?
+  createdAt    DateTime         @default(now())
+
+  @@index([customerId])
+  @@index([technicianId])
+  @@index([complaintId])
+  @@index([templateId])
+}
+
+model MessageTemplate {
+  id        String          @id @default(cuid())
+  name      String
+  channel   MessageChannel?
+  body      String
+  messages  Message[]
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+}
+
+model Service {
+  id           String          @id @default(cuid())
+  name         String
+  category     ServiceCategory @default(DEFAULT)
+  description  String?
+  defaultPrice Decimal         @db.Decimal(10, 2)
+  active       Boolean         @default(true)
+  servicePlans ServicePlan[]
+  visits       Visit[]
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+}
+
+model ServiceArea {
+  id             String                  @id @default(cuid())
+  name           String
+  postcodeSector String?
+  isDefault      Boolean                 @default(false)
+  properties     Property[]
+  rounds         Round[]
+  technicians    TechnicianServiceArea[]
+  createdAt      DateTime                @default(now())
+  updatedAt      DateTime                @updatedAt
+}
+
+model Photo {
+  id          String     @id @default(cuid())
+  url         String
+  type        PhotoType  @default(PROPERTY)
+  propertyId  String?
+  property    Property?  @relation(fields: [propertyId], references: [id])
+  visitId     String?
+  visit       Visit?     @relation(fields: [visitId], references: [id])
+  complaintId String?
+  complaint   Complaint? @relation(fields: [complaintId], references: [id])
+  createdAt   DateTime   @default(now())
+
+  @@index([propertyId])
+  @@index([visitId])
+  @@index([complaintId])
+}
+
+model ActivityLog {
+  id        String   @id @default(cuid())
+  type      String
+  message   String
+  createdAt DateTime @default(now())
+}

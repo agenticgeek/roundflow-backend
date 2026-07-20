@@ -5,6 +5,7 @@ import swaggerUi from "swagger-ui-express";
 import { prisma } from "./lib/prisma";
 import { requireAuth } from "./middleware/requireAuth";
 import { AppError } from "./lib/app-error";
+import { authRouter } from "./routes/auth";
 import { setupRouter } from "./routes/setup";
 import { settingsRouter } from "./routes/settings";
 import { customersRouter } from "./routes/customers";
@@ -21,10 +22,9 @@ app.get("/health", (_req: Request, res: Response) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-// Temporary protected test route: verifies the full auth chain
-// (Bearer JWT → req.user → Profile lookup by supabaseUserId).
-// Profile rows are auto-created by a Postgres trigger in Supabase on signup.
-// Replace this with real domain routes once they exist.
+// GET /auth/me — returns the Profile for the authenticated user, or 404 if
+// no Profile exists yet (new user who hasn't called POST /auth/signup).
+// The frontend uses the 404 response to detect new users and trigger signup.
 app.get(
   "/auth/me",
   requireAuth,
@@ -43,6 +43,7 @@ app.get(
   }
 );
 
+app.use("/auth", authRouter);
 app.use("/setup", setupRouter);
 app.use("/settings", settingsRouter);
 app.use("/customers", customersRouter);
