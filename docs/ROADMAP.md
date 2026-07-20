@@ -48,12 +48,12 @@ Two locked assignment rules run through the scheduling milestones (see
 ### Backend tickets
 - [x] **[BE-M0-01]** Prisma schema + migrations — 19 models / 16 enums; `init`, `remove-round-technician-id`, `add_setup_completed` applied to Supabase. `labels: backend, infra`
 - [x] **[BE-M0-02]** `requireAuth` middleware — ES256 JWKS verification → `req.user`; 401 on missing/invalid. `labels: backend, auth`
-- [x] **[BE-M0-03]** `handle_new_user` Profile trigger + `GET /auth/me` (full auth chain verified with a real token). `labels: backend, auth`
+- [x] **[BE-M0-03]** ~~`handle_new_user` Profile trigger~~ **Replaced** by `POST /auth/signup` (trigger dropped 2026-07-21 — see `docs/sql/drop_handle_new_user.sql`). `GET /auth/me` still confirmed. `labels: backend, auth`
 - [x] **[BE-M0-04]** Express app skeleton — cors, json, `/health`, centralised `AppError` handler. `labels: backend, infra`
 - [x] **[BE-M0-05]** Prisma client singleton + idempotent dev seed. `labels: backend, infra`
 - [x] **[BE-M0-06]** Build pipeline (`clean → typecheck → emit dist`) + `start:prod`. `labels: backend, infra`
 - [x] **[BE-M0-07]** OpenAPI spec (`swagger.ts`) served at `/docs` + `/openapi.json`. `labels: backend, docs`
-- [x] **[BE-M0-08]** Update `handle_new_user` trigger — ran `docs/sql/handle_new_user_v2.sql` in Supabase (**applied + verified live 2026-07-08**): writes `company_name` metadata → `BusinessSettings.businessName` on first signup (only if unset). **Manual Supabase SQL step, not a Prisma migration.** `labels: backend, auth`
+- [x] **[BE-M0-08]** ~~Update `handle_new_user` trigger~~ **Superseded** — trigger dropped entirely (2026-07-21). Tenant + Profile provisioning moved to `POST /auth/signup`; `company_name` collected by Setup Wizard step 1 instead. `labels: backend, auth`
 
 ### Frontend tickets
 - [ ] **[FE-M0-01]** Scaffold frontend (Vite + React + TS) + Supabase JS client + env config. `labels: frontend, infra`
@@ -101,17 +101,19 @@ Two locked assignment rules run through the scheduling milestones (see
 
 ---
 
-## M2 — Customers & Properties · 🔴 Not Started
+## M2 — Customers & Properties · 🟡 In Progress
 **Goal:** Admin can create customers + properties (Add Property flow), browse the customer list, and view/edit the full customer record.
 **Depends on:** M1
 
+> Backend complete and PR-reviewed (2026-07-21). 5 findings from senior review resolved (F1–F5): `optId` FK normalisation, `Decimal.add()` money accumulation, TECHNICIAN financial-field projection, `paymentStatus` "none" default, `pauseEndDate` guard. Frontend tickets not yet started.
+
 ### Backend tickets
-- [ ] **[BE-M2-01]** Customer service+routes — create/read/update + list with filters (Screen 14). `labels: backend, customers`
-- [ ] **[BE-M2-02]** Property CRUD — create/read/update; `roundId` nullable (unassigned) (Screen 15). `labels: backend, properties`
-- [ ] **[BE-M2-03]** Add Property transaction — create Customer + Property together (M6 step 1). `labels: backend, properties`
-- [ ] **[BE-M2-04]** ServicePlan create/read for a property (price, cleanMethod, paymentMethod, next-due) (Screen 15 Service Plan tab). `labels: backend, service-plans`
-- [ ] **[BE-M2-05]** Customer Detail aggregate read — property info + payment & status + tab data (Screen 15). `labels: backend, customers`
-- [ ] **[BE-M2-06]** Pause / Resume service — `LifecycleStatus` transitions (M9). `labels: backend, customers`
+- [x] **[BE-M2-01]** Customer service+routes — create/read/update + list with filters (Screen 14). `labels: backend, customers`
+- [x] **[BE-M2-02]** Property CRUD — create/read/update; `roundId` nullable (unassigned) (Screen 15). `labels: backend, properties`
+- [x] **[BE-M2-03]** Add Property transaction — create Customer + Property together (M6 step 1). `labels: backend, properties`
+- [x] **[BE-M2-04]** ServicePlan create/read for a property (price, cleanMethod, paymentMethod, next-due) (Screen 15 Service Plan tab). `labels: backend, service-plans`
+- [x] **[BE-M2-05]** Customer Detail aggregate read — property info + payment & status + tab data (Screen 15). `labels: backend, customers`
+- [x] **[BE-M2-06]** Pause / Resume service — `LifecycleStatus` transitions (M9). `labels: backend, customers`
 - [ ] **[BE-M2-07]** Assign Property to Round + "Save & Assign Later" (unassigned) (Screen 31). `labels: backend, rounds`
 
 ### Frontend tickets
@@ -299,9 +301,28 @@ Two locked assignment rules run through the scheduling milestones (see
 
 ---
 
+## Schema-Per-Tenant Foundation — ✅ Done (2026-07-21)
+> Architectural prerequisite for multi-tenancy, resolved before M1 frontend starts so the backend is production-correct from day one.
+
+- [x] Public schema split: `Tenant`, `Profile` (with `tenantId`), `TenantInvite` only — all operational models moved to per-tenant schemas.
+- [x] Tenant schema (`prisma/tenant/schema.prisma`) — all operational models; generated to `src/generated/tenant-client`.
+- [x] `POST /auth/signup` — provisions a fresh Postgres schema (`t_<20-hex>`) + Tenant row + ADMIN Profile on first signup; idempotent.
+- [x] `src/lib/tenant-prisma.ts` — temporary singleton tenant client (placeholder until per-request client wiring in step 9).
+- [x] `docs/sql/drop_handle_new_user.sql` — drops the old trigger; must be run in Supabase SQL Editor before first live signup.
+- [x] Cross-schema FK relations removed from Prisma; `Technician.name` and `PropertyNote.authorProfileId` are plain string fields.
+- [x] tsc clean — all service/route files updated to import from `generated/tenant-client`; `BusinessSettings` singleton pattern replaced with `findFirst()`.
+
+**Remaining tenant steps (pre-M5):**
+- [ ] `getTenantClient(schemaName)` factory + `provisionTenant()` (per-request client wiring).
+- [ ] `requireTenant()` middleware — resolves schema from `Profile.tenant.schemaName`.
+- [ ] `POST /invites` + `POST /invites/:token/accept` — technician invite flow (BE-M5-01).
+- [ ] `TENANT_MIGRATION_URL` env var + `prisma migrate dev --schema prisma/tenant/schema.prisma` — generate tenant migration SQL.
+
+---
+
 ## Deferred to Phase 2
 - GHL **Marketplace listing** + OAuth install flow + self-serve onboarding.
-- **Multi-tenancy** (per-tenant data isolation, **RLS**).
+- **Row-level security (RLS)** — Phase 1 uses schema-per-tenant isolation instead (see foundation above).
 - Route optimisation / GPS tracking (Phase 3 per the brief; Dashboard GPS map is a placeholder only).
 - Advanced analytics / BI.
 - Customer-facing portal.
@@ -317,13 +338,13 @@ From `PROGRESS.md` Decisions Pending + `designFindings.md` OQ#13 / MOB-1/2/3.
 | **Mobile completion delivery** (native vs mobile web) — DP-MOBILE | **M5** (all FE-M5-*) |
 | **GHL automation trigger mechanism** (contact-field-sync vs direct API) — DP-GHL | **M8** (BE-M8-01+); payment automation in **M6** |
 | **Skip-reason enum** (#7) — currently free `String` | **M5** (BE-M5-04) |
-| **Technician invite entity** (#5) — no invite-token model | **M5** (BE-M5-01) |
+| **Technician invite entity** (#5) — `TenantInvite` model exists; accept flow pending | **M5** (BE-M5-01), schema-per-tenant remaining steps |
 | **Notifications feed entity** (#6) + push-vs-in-app (MOB-3) | **M5** (BE-M5-07, FE-M5-06) |
 | **Technician availability model** (#4) + self-mark "unavailable" (OQ#13/MOB-2) | **M9** (BE-M9-02); reassignment in **M4** |
 | **Per-round assignment history** (#9) | **M3/M4** (Screen 30 "Recent Activity") |
 | **App roles in JWT** (DP-ROLES) — Supabase claim vs `Profile` role | Role-based authz from **M2** onward; **M9** (BE-M9-03) |
-| **`handle_new_user` trigger provenance** (commit SQL vs Supabase-managed) — DP-TRIGGER | **M9** (BE-M9-05) |
-| **Auth hardening** (`audience`/`issuer`) — DP-AUTHHARD | **M9** (BE-M9-03) |
+| ~~**`handle_new_user` trigger provenance** — DP-TRIGGER~~ | ✅ **Resolved 2026-07-21** — trigger dropped; `POST /auth/signup` is the provisioning path |
+| ~~**Auth hardening** (`audience`/`issuer`) — DP-AUTHHARD~~ | ✅ **Resolved** — `requireAuth` validates issuer + audience (commit c816192) |
 | **Mobile app scope / "B2C" naming** (MOB-1) | **M5** scope |
 
 ---

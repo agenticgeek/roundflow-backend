@@ -22,6 +22,13 @@
   `POST /auth/signup`** to provision the Tenant and Profile. This replaced the
   old `handle_new_user` Postgres trigger, which cannot create per-tenant
   Postgres schemas. See §5.
+- **Each signup creates a completely isolated business.** Every `POST /auth/signup`
+  provisions a fresh Postgres schema (`t_<20-char-hex>`) that is private to that
+  business. There is no shared data between businesses.
+- **Technicians do NOT self-signup.** They are invited by an ADMIN via
+  `POST /invites` and accept via `POST /invites/:token/accept` — this is a
+  separate flow (not yet built; pending BE-M5-01). A technician who lands on
+  the Sign Up screen should be told to use their invite link instead.
 - **`GET /auth/me`** returns `404` when no Profile exists yet — the frontend
   uses this to detect new users who need provisioning.
 
