@@ -7,6 +7,24 @@ import { h, requireString, optString } from "../lib/http";
 
 export const authRouter = Router();
 
+// GET /auth/me
+// Returns the Profile for the authenticated user, or 404 if no Profile exists
+// yet (new user who hasn't called POST /auth/signup).
+// The frontend uses the 404 to detect new users and trigger signup.
+authRouter.get(
+  "/me",
+  requireAuth,
+  h(async (req, res) => {
+    const profile = await prisma.profile.findUnique({
+      where: { supabaseUserId: req.user!.supabaseUserId },
+    });
+    if (!profile) {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+    return res.json(profile);
+  })
+);
+
 // POST /auth/signup
 // Called by the frontend after Supabase confirms a new session and
 // GET /auth/me returns 404 (no Profile yet for this supabaseUserId).

@@ -10,7 +10,7 @@
     "start:prod": "node dist/index.js",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",
-    "build": "npm run clean && npm run typecheck && tsc -p tsconfig.build.json",
+    "build": "npm run clean && npm run typecheck && tsc -p tsconfig.build.json && cp -r src/generated dist/",
     "prisma:generate": "prisma generate && prisma generate --schema prisma/tenant/schema.prisma",
     "prisma:migrate": "prisma migrate dev",
     "prisma:studio": "prisma studio",

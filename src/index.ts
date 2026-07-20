@@ -2,8 +2,6 @@ import "dotenv/config";
 import express, { NextFunction, Request, Response } from "express";
 import cors from "cors";
 import swaggerUi from "swagger-ui-express";
-import { prisma } from "./lib/prisma";
-import { requireAuth } from "./middleware/requireAuth";
 import { AppError } from "./lib/app-error";
 import { authRouter } from "./routes/auth";
 import { setupRouter } from "./routes/setup";
@@ -21,27 +19,6 @@ app.use(express.json());
 app.get("/health", (_req: Request, res: Response) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
-
-// GET /auth/me — returns the Profile for the authenticated user, or 404 if
-// no Profile exists yet (new user who hasn't called POST /auth/signup).
-// The frontend uses the 404 response to detect new users and trigger signup.
-app.get(
-  "/auth/me",
-  requireAuth,
-  async (req: Request, res: Response, next: NextFunction) => {
-    try {
-      const profile = await prisma.profile.findUnique({
-        where: { supabaseUserId: req.user!.supabaseUserId },
-      });
-      if (!profile) {
-        return res.status(404).json({ error: "Profile not found" });
-      }
-      return res.json(profile);
-    } catch (err) {
-      next(err);
-    }
-  }
-);
 
 app.use("/auth", authRouter);
 app.use("/setup", setupRouter);
