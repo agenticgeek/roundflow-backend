@@ -5,6 +5,7 @@ import {
   PaymentMethod,
   PhotoType,
   NoteType,
+  UserRole,
   Prisma,
 } from "@prisma/client";
 import type {
@@ -111,7 +112,7 @@ export interface CustomerListRow {
   nextDueDate: Date | null;
   paymentStatus: string;
   onHold: boolean;
-  amountDue: number;
+  amountDue?: number; // financial — omitted for TECHNICIAN viewers
 }
 
 export interface CustomerListResult {
@@ -119,7 +120,7 @@ export interface CustomerListResult {
     totalCustomers: number;
     active: number;
     paymentHolds: number;
-    amountDue: number;
+    amountDue?: number; // financial — omitted for TECHNICIAN viewers
   };
   customers: CustomerListRow[];
 }
@@ -190,7 +191,7 @@ export interface CustomerDetail {
     assignedRound: string | null;
     technicianName: string | null;
     paymentStatus: string;
-    outstandingBalance: number;
+    outstandingBalance?: number; // financial — omitted for TECHNICIAN viewers
     lastPaymentDate: Date | null;
     issuesCount: number;
     nextVisitStatus: VisitStatus | null;
@@ -206,7 +207,7 @@ export interface CustomerDetail {
     } | null;
     servicePlan: ServicePlanView | null;
     visitHistory: VisitHistoryRow[];
-    payments: { rows: PaymentRow[] };
+    payments?: { rows: PaymentRow[] }; // full payment history + transaction ids — omitted for TECHNICIAN viewers
     notes: Array<PropertyNote & { authorName: string | null }>;
     photos: unknown[];
   };
@@ -217,9 +218,14 @@ export interface CustomerDetail {
 export interface ICustomerService {
   getCustomers(
     profileId: string,
-    filters: CustomerListFilters
+    filters: CustomerListFilters,
+    viewerRole: UserRole
   ): Promise<CustomerListResult>;
-  getCustomerDetail(profileId: string, customerId: string): Promise<CustomerDetail>;
+  getCustomerDetail(
+    profileId: string,
+    customerId: string,
+    viewerRole: UserRole
+  ): Promise<CustomerDetail>;
   updateCustomer(
     profileId: string,
     customerId: string,
@@ -274,7 +280,7 @@ class CustomerService implements ICustomerService {
       case PaymentStatus.FAILED:
         return "failed";
       default:
-        return "paid"; // NOT_DUE / no payments → nothing outstanding
+        return "none"; // NOT_DUE / no payment history → render blank/dash, not a Paid badge
     }
   }
 
@@ -282,8 +288,11 @@ class CustomerService implements ICustomerService {
 
   async getCustomers(
     _profileId: string,
-    filters: CustomerListFilters
+    filters: CustomerListFilters,
+    viewerRole: UserRole
   ): Promise<CustomerListResult> {
+    // TECHNICIAN viewers must not see financial data (debt position).
+    const hideFinancials = viewerRole === UserRole.TECHNICIAN;
     const { search, roundId, status } = filters;
     if (status && !["ACTIVE", "PAUSED", "CANCELLED", "HOLD"].includes(status)) {
       throw new AppError(400, `Invalid status: ${status}. Use ACTIVE|PAUSED|CANCELLED|HOLD.`);
@@ -350,9 +359,11 @@ class CustomerService implements ICustomerService {
         null;
       const nextVisit = property.visits[0] ?? null; // soonest open visit
       const onHold = property.visits.some((v) => v.paymentHold);
-      const amountDue = c.payments
-        .filter((p) => DUE_PAYMENT.includes(p.status))
-        .reduce((sum, p) => sum + Number(p.amount), 0);
+      const amountDue = Number(
+        c.payments
+          .filter((p) => DUE_PAYMENT.includes(p.status))
+          .reduce((sum, p) => sum.add(p.amount), new Prisma.Decimal(0))
+      );
 
       rows.push({
         customerId: c.id,
@@ -371,7 +382,7 @@ class CustomerService implements ICustomerService {
         nextDueDate: plan?.nextDueDate ?? null,
         paymentStatus: this.derivePaymentStatus(onHold, c.payments[0]?.status),
         onHold,
-        amountDue,
+        amountDue: hideFinancials ? undefined : amountDue,
       });
     }
 
@@ -383,7 +394,7 @@ class CustomerService implements ICustomerService {
         totalCustomers,
         active,
         paymentHolds,
-        amountDue: Number(dueAgg._sum.amount ?? 0),
+        amountDue: hideFinancials ? undefined : Number(dueAgg._sum.amount ?? 0),
       },
       customers: rows,
     };
@@ -391,7 +402,13 @@ class CustomerService implements ICustomerService {
 
   // ---- detail aggregate ----
 
-  async getCustomerDetail(_profileId: string, customerId: string): Promise<CustomerDetail> {
+  async getCustomerDetail(
+    _profileId: string,
+    customerId: string,
+    viewerRole: UserRole
+  ): Promise<CustomerDetail> {
+    // TECHNICIAN viewers must not see financial data (debt + processor ids).
+    const hideFinancials = viewerRole === UserRole.TECHNICIAN;
     const customer = await prisma.customer.findUnique({
       where: { id: customerId },
       include: {
@@ -460,9 +477,11 @@ class CustomerService implements ICustomerService {
     const nextScheduled = scheduled[0] ?? null;
     const onHold = visits.some((v) => v.paymentHold && OPEN_VISIT.includes(v.status));
 
-    const outstandingBalance = customer.payments
-      .filter((p) => DUE_PAYMENT.includes(p.status))
-      .reduce((sum, p) => sum + Number(p.amount), 0);
+    const outstandingBalance = Number(
+      customer.payments
+        .filter((p) => DUE_PAYMENT.includes(p.status))
+        .reduce((sum, p) => sum.add(p.amount), new Prisma.Decimal(0))
+    );
     const lastPaymentDate =
       customer.payments
         .filter((p) => p.paidAt != null)
@@ -501,7 +520,7 @@ class CustomerService implements ICustomerService {
         assignedRound: property?.round?.name ?? null,
         technicianName,
         paymentStatus: this.derivePaymentStatus(onHold, customer.payments[0]?.status),
-        outstandingBalance,
+        outstandingBalance: hideFinancials ? undefined : outstandingBalance,
         lastPaymentDate,
         issuesCount,
         nextVisitStatus: nextScheduled?.status ?? null,
@@ -526,22 +545,24 @@ class CustomerService implements ICustomerService {
           paymentStatus: v.payment?.status ?? null,
           notes: v.notes,
         })),
-        payments: {
-          rows: visits.map((v) => ({
-            visitId: v.id,
-            visitDate: v.date,
-            technicianName: v.technician?.profile?.name ?? v.technician?.name ?? null,
-            amount: this.num(v.payment?.amount ?? v.price),
-            paymentStatus: v.payment?.status ?? null,
-            paymentId: v.payment?.id ?? null,
-            invoiceStatus: v.invoice?.status ?? null,
-            invoiceId: v.invoice?.id ?? null,
-            invoiceNumber: v.invoice?.invoiceNumber ?? null,
-            transactionId: v.payment?.gocardlessId ?? v.payment?.stripeId ?? null,
-            canGenerate: v.status === VisitStatus.COMPLETED && v.invoice == null,
-            canDownload: v.invoice != null,
-          })),
-        },
+        payments: hideFinancials
+          ? undefined
+          : {
+              rows: visits.map((v) => ({
+                visitId: v.id,
+                visitDate: v.date,
+                technicianName: v.technician?.profile?.name ?? v.technician?.name ?? null,
+                amount: this.num(v.payment?.amount ?? v.price),
+                paymentStatus: v.payment?.status ?? null,
+                paymentId: v.payment?.id ?? null,
+                invoiceStatus: v.invoice?.status ?? null,
+                invoiceId: v.invoice?.id ?? null,
+                invoiceNumber: v.invoice?.invoiceNumber ?? null,
+                transactionId: v.payment?.gocardlessId ?? v.payment?.stripeId ?? null,
+                canGenerate: v.status === VisitStatus.COMPLETED && v.invoice == null,
+                canDownload: v.invoice != null,
+              })),
+            },
         notes: (property?.notes ?? []).map((n) => ({
           ...n,
           authorName: n.author?.name ?? null,

@@ -265,6 +265,13 @@ Auth is handled by **Supabase Auth** (frontend + Supabase); this backend only **
 > - **OQ-CP3:** Notes stream scoped per **property** or per **customer**? (Tab is property-scoped but titled "Notes & Risk".)
 > - **OQ-CP4:** **"Move Round"** (Service Plan tab) — same as Screen 31 (Assign Property to Round) or a distinct reassign flow?
 
+> ✅ **M2 post-review patched (2026-07-21):** the Customers & Properties backend (M2) was built, then five senior-review findings were fixed:
+> - **F1** — empty-string `roundId` / `serviceAreaId` / `serviceId` bypassed the FK guard → 500. **Resolved** (new `optId` helper normalises `""` → `null`).
+> - **F2** — money summed in JS floating point → rounding errors + KPI/row mismatch. **Resolved** (`Prisma.Decimal.add` accumulation).
+> - **F3** — `TECHNICIAN` role could read full financial data via `GET /customers` and `/customers/:id`. **Resolved** (Option B projection — `amountDue` / `outstandingBalance` / the payments tab are omitted for TECHNICIAN viewers).
+> - **F4** — `pauseEndDate` not validated against `pauseStartDate`. **Resolved** (400 guard: end must be after start).
+> - **F5** — `derivePaymentStatus` returned `"paid"` for zero-payment customers. **Resolved** (default now `"none"`; see OQ-CP1).
+
 ---
 
 ### 16. Debt / Payment Risk Board  

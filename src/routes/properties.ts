@@ -1,7 +1,8 @@
 import { Request, Router } from "express";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireBusinessAccess } from "../middleware/requireRole";
-import { asObject, h, requireString, requireNumber, optString, optReqString } from "../lib/http";
+import { AppError } from "../lib/app-error";
+import { asObject, h, requireString, requireNumber, optString, optReqString, optId } from "../lib/http";
 import {
   assertPositive,
   optPaymentMethod,
@@ -40,9 +41,9 @@ propertiesRouter.post(
       postcode: requireString(body.postcode, "postcode").trim(),
       propertyName: optString(body.propertyName, "propertyName"),
       propertyType: optString(body.propertyType, "propertyType"),
-      serviceAreaId: optString(body.serviceAreaId, "serviceAreaId"),
+      serviceAreaId: optId(body.serviceAreaId, "serviceAreaId"),
       // Service Plan (step 2)
-      serviceId: optString(body.serviceId, "serviceId"),
+      serviceId: optId(body.serviceId, "serviceId"),
       price: assertPositive(requireNumber(body.price, "price"), "price"),
       cleanMethod: optString(body.cleanMethod, "cleanMethod"),
       paymentMethod: optPaymentMethod(body.paymentMethod),
@@ -52,7 +53,7 @@ propertiesRouter.post(
       accessNotes: optString(body.accessNotes, "accessNotes"),
       riskNotes: optString(body.riskNotes, "riskNotes"),
       // Assignment (step 5 / Screen 31) — null = Save & Assign Later (unassigned)
-      roundId: optString(body.roundId, "roundId"),
+      roundId: optId(body.roundId, "roundId"),
     };
     res.status(201).json(await customerService.createProperty(actorIdOf(req), input));
   })
@@ -70,10 +71,10 @@ propertiesRouter.patch(
       postcode: optReqString(body.postcode, "postcode"),
       propertyName: optString(body.propertyName, "propertyName"),
       propertyType: optString(body.propertyType, "propertyType"),
-      serviceAreaId: optString(body.serviceAreaId, "serviceAreaId"),
+      serviceAreaId: optId(body.serviceAreaId, "serviceAreaId"),
       accessNotes: optString(body.accessNotes, "accessNotes"),
       riskNotes: optString(body.riskNotes, "riskNotes"),
-      roundId: optString(body.roundId, "roundId"), // null = unassign; id = assign/reassign
+      roundId: optId(body.roundId, "roundId"), // null = unassign; id = assign/reassign
     };
     res.json(await customerService.updateProperty(actorIdOf(req), req.params.id, input));
   })
@@ -91,6 +92,9 @@ propertiesRouter.post(
     requireString(body.reason, "reason");
     const pauseStartDate = parseIsoDate(body.pauseStartDate, "pauseStartDate");
     const pauseEndDate = optIsoDate(body.pauseEndDate, "pauseEndDate");
+    if (pauseEndDate !== undefined && pauseEndDate !== null && pauseEndDate <= pauseStartDate) {
+      throw new AppError(400, "pauseEndDate must be after pauseStartDate");
+    }
     res.json(
       await customerService.pauseService(actorIdOf(req), req.params.id, {
         pauseStartDate,

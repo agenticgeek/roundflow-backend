@@ -1,7 +1,7 @@
 import { Request, Router } from "express";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireBusinessAccess } from "../middleware/requireRole";
-import { asObject, h, optString, optReqString, optReqNumber } from "../lib/http";
+import { asObject, h, optString, optReqString, optReqNumber, optId } from "../lib/http";
 import { assertPositive, optPaymentMethod } from "../lib/validation";
 import {
   customerService,
@@ -24,11 +24,15 @@ customersRouter.get(
   "/",
   h(async (req, res) => {
     res.json(
-      await customerService.getCustomers(actorIdOf(req), {
-        search: typeof req.query.search === "string" ? req.query.search : undefined,
-        roundId: typeof req.query.roundId === "string" ? req.query.roundId : undefined,
-        status: typeof req.query.status === "string" ? req.query.status : undefined,
-      })
+      await customerService.getCustomers(
+        actorIdOf(req),
+        {
+          search: typeof req.query.search === "string" ? req.query.search : undefined,
+          roundId: typeof req.query.roundId === "string" ? req.query.roundId : undefined,
+          status: typeof req.query.status === "string" ? req.query.status : undefined,
+        },
+        req.profile!.role
+      )
     );
   })
 );
@@ -39,7 +43,7 @@ customersRouter.get(
 customersRouter.get(
   "/:id",
   h(async (req, res) => {
-    res.json(await customerService.getCustomerDetail(actorIdOf(req), req.params.id));
+    res.json(await customerService.getCustomerDetail(actorIdOf(req), req.params.id, req.profile!.role));
   })
 );
 
@@ -64,7 +68,7 @@ customersRouter.patch(
       propertyType: optString(body.propertyType, "propertyType"),
       accessNotes: optString(body.accessNotes, "accessNotes"),
       riskNotes: optString(body.riskNotes, "riskNotes"),
-      roundId: optString(body.roundId, "roundId"), // null = unassign (OQ-CP4)
+      roundId: optId(body.roundId, "roundId"), // null = unassign (OQ-CP4)
       // ServicePlan (Assigned Technician is deferred to M3 — per-Visit)
       price,
       cleanMethod: optString(body.cleanMethod, "cleanMethod"),

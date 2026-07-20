@@ -61,6 +61,16 @@ export function optString(v: unknown, field: string): string | null | undefined 
   throw new AppError(400, `"${field}" must be a string or null.`);
 }
 
+// Returns undefined if value is absent, null if value is null or "",
+// or the string value if non-empty. Use for optional FK id fields where
+// an empty string must be treated as "no value", not a literal id.
+export function optId(value: unknown, field: string): string | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || value === "") return null;
+  if (typeof value !== "string") throw new AppError(400, `${field} must be a string`);
+  return value;
+}
+
 export function optReqString(v: unknown, field: string): string | undefined {
   if (v === undefined) return undefined;
   if (typeof v === "string" && v.trim() !== "") return v;
