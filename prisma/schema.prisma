@@ -51,14 +51,15 @@ model Tenant {
 // One TenantInvite per email per tenant — duplicate invites are prevented
 // by application logic (check for existing unaccepted invite before creating).
 model TenantInvite {
-  id         String    @id @default(cuid())
-  tenantId   String
-  email      String
-  role       UserRole  @default(TECHNICIAN)
-  token      String    @unique @default(cuid())
-  expiresAt  DateTime
-  acceptedAt DateTime?
-  createdAt  DateTime  @default(now())
+  id            String    @id @default(cuid())
+  tenantId      String
+  email         String
+  role          UserRole  @default(TECHNICIAN)
+  token         String    @unique @default(cuid())
+  expiresAt     DateTime
+  acceptedAt    DateTime?
+  technicianId  String?
+  createdAt     DateTime  @default(now())
 
   @@index([tenantId])
   @@index([token])

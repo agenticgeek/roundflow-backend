@@ -87,6 +87,7 @@ const ERR = {
   403: { $ref: "#/components/responses/Forbidden" },
   404: { $ref: "#/components/responses/NotFound" },
   409: { $ref: "#/components/responses/Conflict" },
+  410: { $ref: "#/components/responses/Gone" },
   500: { $ref: "#/components/responses/ServerError" },
 } as const;
 
@@ -243,12 +244,29 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
 
   ServiceArea: {
     type: "object",
-    description: "A geographic service area. Note: no updatedAt field.",
     properties: {
       id: { type: "string" },
       name: { type: "string" },
       postcodeSector: { type: "string", nullable: true },
       isDefault: { type: "boolean" },
+      createdAt: dateTime,
+      updatedAt: dateTime,
+    },
+  },
+
+  TenantInvite: {
+    type: "object",
+    description: "A pending invitation for a technician or manager to join the tenant.",
+    required: ["id", "tenantId", "email", "role", "token", "expiresAt", "createdAt"],
+    properties: {
+      id: { type: "string" },
+      tenantId: { type: "string" },
+      email: { type: "string", format: "email" },
+      role: ref("UserRole"),
+      token: { type: "string" },
+      expiresAt: dateTime,
+      acceptedAt: { ...dateTime, nullable: true },
+      technicianId: { type: "string", nullable: true },
       createdAt: dateTime,
     },
   },
@@ -882,6 +900,70 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     },
     example: { type: "INTERNAL", body: "Prefers morning slots." },
   },
+
+  // ---- Auth ----
+  SignupInput: {
+    type: "object",
+    required: ["name"],
+    description: "Called after Supabase confirms the session and GET /auth/me returns 404.",
+    properties: {
+      name: { type: "string", minLength: 1, description: "Full name for the admin Profile." },
+      companyName: {
+        type: "string",
+        description: "Optional — accepted but not persisted here; collected by Setup Wizard step 1.",
+      },
+    },
+    example: { name: "Maaz Kashif", companyName: "Northumberland Window Cleaning" },
+  },
+
+  SignupResponse: {
+    type: "object",
+    required: ["profile", "tenantId"],
+    properties: {
+      profile: ref("Profile"),
+      tenantId: { type: "string" },
+    },
+  },
+
+  // ---- Invites ----
+  InviteSendInput: {
+    type: "object",
+    required: ["email"],
+    properties: {
+      email: { type: "string", format: "email" },
+      role: {
+        allOf: [ref("UserRole")],
+        description: "Defaults to TECHNICIAN if omitted.",
+      },
+      technicianId: {
+        type: "string",
+        nullable: true,
+        description: "If provided, links the invite to an existing invite-pending Technician row. On accept, that row's profileId is set to the new Profile's id.",
+      },
+    },
+    example: { email: "james@example.com", role: "TECHNICIAN", technicianId: "clx..." },
+  },
+
+  InviteTokenInfo: {
+    type: "object",
+    required: ["email", "role", "tenantId", "expiresAt"],
+    description: "Public — returned before auth so the frontend can pre-fill the signup form.",
+    properties: {
+      email: { type: "string", format: "email" },
+      role: ref("UserRole"),
+      tenantId: { type: "string" },
+      expiresAt: dateTime,
+    },
+  },
+
+  InviteAcceptInput: {
+    type: "object",
+    required: ["name"],
+    properties: {
+      name: { type: "string", minLength: 1, description: "Display name for the new Profile." },
+    },
+    example: { name: "James Fisher" },
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -911,6 +993,10 @@ const reusableResponses: Record<string, OpenAPIV3.ResponseObject> = {
   Conflict: errorResponse(
     "POST /setup/complete when setup is already complete.",
     "Setup is already complete."
+  ),
+  Gone: errorResponse(
+    "Invite has expired or has already been accepted.",
+    "Invite has expired"
   ),
   ServerError: errorResponse("Unexpected server error.", "Internal Server Error"),
 };
@@ -983,11 +1069,108 @@ const paths: OpenAPIV3.PathsObject = {
       tags: ["Auth"],
       summary: "Current user's profile",
       description:
-        "Returns the Profile for the authenticated caller (looked up by supabaseUserId from the JWT `sub`). 404 if no Profile exists.",
+        "Returns the Profile for the authenticated caller (looked up by supabaseUserId from the JWT `sub`). 404 if no Profile exists yet — the frontend uses this to detect new users and trigger POST /auth/signup.",
       responses: {
         "200": jsonResponse("The caller's Profile.", ref("Profile")),
-        "404": errorResponse("No Profile for this user.", "Profile not found"),
+        "404": errorResponse("No Profile for this user — call POST /auth/signup.", "Profile not found"),
         "401": ERR[401],
+      },
+    },
+  },
+
+  "/auth/signup": {
+    post: {
+      tags: ["Auth"],
+      summary: "Register a new admin (first-time signup)",
+      description:
+        "Called by the frontend after Supabase confirms a new session and `GET /auth/me` returns 404. " +
+        "Creates a Profile (role: ADMIN) and a Tenant row in one transaction. " +
+        "**Idempotent** — if a Profile already exists for this `supabaseUserId` it is returned with 200 instead of 201. " +
+        "`companyName` is accepted but not persisted here; it is collected by Setup Wizard step 1.",
+      requestBody: jsonBody(ref("SignupInput")),
+      responses: {
+        "201": jsonResponse("Profile + tenantId created.", ref("SignupResponse")),
+        "200": jsonResponse("Profile already existed (idempotent).", ref("SignupResponse")),
+        "400": ERR[400],
+        "401": ERR[401],
+      },
+    },
+  },
+
+  // ---- Invites ----
+  "/invites": {
+    post: {
+      tags: ["Invites"],
+      summary: "Send an invite email",
+      description:
+        "Creates a `TenantInvite` (7-day TTL) and sends an email to the invitee via Resend. " +
+        "Only one pending invite per email+tenant is allowed — 409 if a pending invite already exists. " +
+        "Requires ADMIN or MANAGER role. " +
+        "If `technicianId` is supplied, that Technician row's `profileId` is set when the invite is accepted.",
+      requestBody: jsonBody(ref("InviteSendInput")),
+      responses: {
+        "201": jsonResponse("The created TenantInvite.", ref("TenantInvite")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": errorResponse("technicianId does not exist.", "Technician not found"),
+        "409": errorResponse(
+          "A pending invite for this email already exists, or the technician has already accepted an invite.",
+          "A pending invite for this email already exists"
+        ),
+      },
+    },
+  },
+
+  "/invites/{token}": {
+    parameters: [{ name: "token", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Invites"],
+      summary: "Validate an invite token (public)",
+      description:
+        "Public endpoint — no auth required. " +
+        "Used by the frontend before the invitee authenticates to check the token is valid and pre-fill the signup form. " +
+        "Returns 410 if the token is expired or has already been accepted.",
+      security: [],
+      responses: {
+        "200": jsonResponse("Token is valid.", ref("InviteTokenInfo")),
+        "404": ERR[404],
+        "410": ERR[410],
+      },
+    },
+  },
+
+  "/invites/{token}/accept": {
+    parameters: [{ name: "token", in: "path", required: true, schema: { type: "string" } }],
+    post: {
+      tags: ["Invites"],
+      summary: "Accept an invite (invitee calls after Supabase auth)",
+      description:
+        "Called by the frontend after the invitee authenticates with Supabase. " +
+        "The caller's JWT email must match the invite email (403 if not). " +
+        "Creates a `Profile` with the invite's `tenantId` and `role`, stamps `acceptedAt`, " +
+        "and — if the invite had a `technicianId` — links that Technician row (`profileId = profile.id`). " +
+        "**Idempotent** — returns the existing Profile with 200 if it was already created.",
+      requestBody: jsonBody(ref("InviteAcceptInput")),
+      responses: {
+        "201": jsonResponse("Profile created and invite accepted.", {
+          type: "object",
+          required: ["profile"],
+          properties: { profile: ref("Profile") },
+        }),
+        "200": jsonResponse("Profile already existed (idempotent).", {
+          type: "object",
+          required: ["profile"],
+          properties: { profile: ref("Profile") },
+        }),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": errorResponse(
+          "The authenticated user's email does not match the invite email.",
+          "This invite was sent to a different email address"
+        ),
+        "404": ERR[404],
+        "410": ERR[410],
       },
     },
   },
@@ -1695,6 +1878,7 @@ export const openApiDocument: OpenAPIV3.Document = {
     { name: "Health", description: "Liveness." },
     { name: "Setup", description: "First-run Setup Wizard (8 steps)." },
     { name: "Settings", description: "Post-completion settings editing. Mutations (PATCH, POST, DELETE) require setup to be complete; GETs are always open." },
+    { name: "Invites", description: "Tenant invite flow — send, validate, and accept invites for new technicians/managers." },
     { name: "Customers", description: "M2 — customer/property list + aggregate detail (Screens 14/15). Reads: any role; mutations: ADMIN/MANAGER." },
     { name: "Properties", description: "M2 — property create/update, pause/resume, notes (Add Property, M9, M20)." },
   ],

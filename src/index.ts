@@ -4,6 +4,7 @@ import cors from "cors";
 import swaggerUi from "swagger-ui-express";
 import { AppError } from "./lib/app-error";
 import { authRouter } from "./routes/auth";
+import { invitesRouter } from "./routes/invites";
 import { setupRouter } from "./routes/setup";
 import { settingsRouter } from "./routes/settings";
 import { customersRouter } from "./routes/customers";
@@ -21,6 +22,7 @@ app.get("/health", (_req: Request, res: Response) => {
 });
 
 app.use("/auth", authRouter);
+app.use("/invites", invitesRouter);
 app.use("/setup", setupRouter);
 app.use("/settings", settingsRouter);
 app.use("/customers", customersRouter);

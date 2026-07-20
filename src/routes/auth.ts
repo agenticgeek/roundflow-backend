@@ -60,28 +60,48 @@ authRouter.post(
     // Unused until tenant schema provisioning is implemented.
     optString(body.companyName, "companyName");
 
-    const result = await prisma.$transaction(async (tx) => {
-      const tenant = await tx.tenant.create({
-        data: {
-          // "t_" + 20 random hex chars: valid Postgres identifier,
-          // globally unique, not guessable.
-          schemaName: `t_${randomBytes(10).toString("hex")}`,
-        },
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        const tenant = await tx.tenant.create({
+          data: {
+            // "t_" + 20 random hex chars: valid Postgres identifier,
+            // globally unique, not guessable.
+            schemaName: `t_${randomBytes(10).toString("hex")}`,
+          },
+        });
+
+        const profile = await tx.profile.create({
+          data: {
+            supabaseUserId,
+            tenantId: tenant.id,
+            role: "ADMIN",
+            name,
+          },
+          include: { tenant: true },
+        });
+
+        return { profile, tenantId: tenant.id };
       });
 
-      const profile = await tx.profile.create({
-        data: {
-          supabaseUserId,
-          tenantId: tenant.id,
-          role: "ADMIN",
-          name,
-        },
-        include: { tenant: true },
-      });
-
-      return { profile, tenantId: tenant.id };
-    });
-
-    res.status(201).json(result);
+      return res.status(201).json(result);
+    } catch (err: unknown) {
+      // Concurrent signup calls can both pass the findUnique check before
+      // either commits. Catch the unique violation and return the now-existing
+      // profile instead of propagating a 500.
+      if (
+        err instanceof Error &&
+        "code" in err &&
+        (err as { code: string }).code === "P2002"
+      ) {
+        const profile = await prisma.profile.findUnique({
+          where: { supabaseUserId },
+          include: { tenant: true },
+        });
+        if (profile) {
+          return res.json({ profile, tenantId: profile.tenantId });
+        }
+      }
+      throw err;
+    }
   })
 );
