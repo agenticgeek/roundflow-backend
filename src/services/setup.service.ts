@@ -231,10 +231,11 @@ class SetupService implements ISetupService {
         `Setup cannot be completed — required steps incomplete: ${missing.join(", ")}`
       );
     }
-    const bs = await this.prisma.businessSettings.findFirst();
-    if (bs) {
-      await this.prisma.businessSettings.update({ where: { id: bs.id }, data: { setupCompleted: true } });
-    }
+    await this.prisma.businessSettings.upsert({
+      where: { uniqueId: "singleton" },
+      update: { setupCompleted: true },
+      create: { setupCompleted: true },
+    });
   }
 
   async saveBusinessProfile(
@@ -252,9 +253,11 @@ class SetupService implements ISetupService {
       timezone: input.timezone,
       currency: input.currency,
     };
-    const bs = await this.prisma.businessSettings.findFirst();
-    if (bs) return this.prisma.businessSettings.update({ where: { id: bs.id }, data });
-    return this.prisma.businessSettings.create({ data });
+    return this.prisma.businessSettings.upsert({
+      where: { uniqueId: "singleton" },
+      update: data,
+      create: { ...data },
+    });
   }
 
   async getBusinessSettings(_profileId: string): Promise<BusinessSettings | null> {
@@ -304,9 +307,11 @@ class SetupService implements ISetupService {
       defaultCycleLength: input.defaultCycleLength,
       defaultWorkingDays: input.defaultWorkingDays,
     };
-    const bs = await this.prisma.businessSettings.findFirst();
-    if (bs) return this.prisma.businessSettings.update({ where: { id: bs.id }, data });
-    return this.prisma.businessSettings.create({ data });
+    return this.prisma.businessSettings.upsert({
+      where: { uniqueId: "singleton" },
+      update: data,
+      create: { ...data },
+    });
   }
 
   async getPaymentSetup(_profileId: string): Promise<BusinessSettings | null> {
@@ -326,9 +331,11 @@ class SetupService implements ISetupService {
       gocardlessConnected: input.gocardlessConnected,
       stripeConnected: input.stripeConnected,
     };
-    const bs = await this.prisma.businessSettings.findFirst();
-    if (bs) return this.prisma.businessSettings.update({ where: { id: bs.id }, data });
-    return this.prisma.businessSettings.create({ data });
+    return this.prisma.businessSettings.upsert({
+      where: { uniqueId: "singleton" },
+      update: data,
+      create: { ...data },
+    });
   }
 
   async getTechnicians(_profileId: string): Promise<Technician[]> {

@@ -65,12 +65,18 @@ invitesRouter.post(
     });
 
     const settings = await req.tenantPrisma!.businessSettings.findFirst();
-    const base = process.env.INVITE_BASE_URL ?? "";
-    await sendInviteEmail({
-      to: email,
-      inviteUrl: `${base}/accept-invite?token=${invite.token}`,
-      businessName: settings?.businessName,
-    });
+    const base = process.env.INVITE_BASE_URL!;
+    try {
+      await sendInviteEmail({
+        to: email,
+        inviteUrl: `${base}/accept-invite?token=${invite.token}`,
+        businessName: settings?.businessName,
+      });
+    } catch (emailErr) {
+      // Roll back the invite row so the admin can retry without hitting 409.
+      await prisma.tenantInvite.delete({ where: { id: invite.id } }).catch(() => {});
+      throw new AppError(503, "Invite created but email delivery failed. Please try again.");
+    }
 
     return res.status(201).json(invite);
   })
@@ -104,17 +110,45 @@ invitesRouter.post(
       where: { token: req.params.token },
     });
     if (!invite) throw new AppError(404, "Invite not found");
+
+    // Idempotency check BEFORE assertInviteUsable: if the process crashed after
+    // the profile+acceptedAt transaction committed but before the Technician
+    // update ran, invite.acceptedAt is already set and assertInviteUsable would
+    // throw 410 — making the tech-link completion permanently unreachable.
+    const existing = await prisma.profile.findUnique({
+      where: { supabaseUserId: req.user!.supabaseUserId },
+    });
+    if (existing) {
+      // Guard 1: invite must belong to the same tenant as this user's profile.
+      if (existing.tenantId !== invite.tenantId) {
+        throw new AppError(403, "This invite belongs to a different organisation");
+      }
+      // Guard 2: invite must have been sent to this user's email address.
+      if (req.user!.email.toLowerCase() !== invite.email.toLowerCase()) {
+        throw new AppError(403, "This invite was sent to a different email address");
+      }
+      if (invite.technicianId) {
+        const tenant = await prisma.tenant.findUnique({ where: { id: invite.tenantId } });
+        if (tenant) {
+          const tPrisma = getTenantPrismaForSchema(tenant.schemaName);
+          const tech = await tPrisma.technician.findUnique({ where: { id: invite.technicianId } });
+          if (tech && tech.profileId === null) {
+            await tPrisma.technician.update({
+              where: { id: invite.technicianId },
+              data: { profileId: existing.id },
+            });
+          }
+        }
+      }
+      return res.json({ profile: existing });
+    }
+
+    // No existing profile — verify the invite is still usable for a fresh accept.
     assertInviteUsable(invite);
 
     if (req.user!.email.toLowerCase() !== invite.email.toLowerCase()) {
       throw new AppError(403, "This invite was sent to a different email address");
     }
-
-    // Idempotent: return existing profile if the invitee already accepted
-    const existing = await prisma.profile.findUnique({
-      where: { supabaseUserId: req.user!.supabaseUserId },
-    });
-    if (existing) return res.json({ profile: existing });
 
     const body = asObject(req.body);
     const name = requireString(body.name, "name").trim();

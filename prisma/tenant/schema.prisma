@@ -142,11 +142,12 @@ enum NoteType {
 
 // ── Models ─────────────────────────────────────────────────────────────────
 
-// One row per tenant schema — no uniqueId singleton.
-// Isolation is enforced by the schema boundary: each tenant's schema contains
-// exactly one BusinessSettings row, found via findFirst().
+// One row per tenant schema. uniqueId is a constant "singleton" so Postgres
+// enforces the one-row invariant via a unique constraint — prevents duplicate
+// rows from concurrent first-write races during setup.
 model BusinessSettings {
   id                  String         @id @default(cuid())
+  uniqueId            String         @unique @default("singleton")
   businessName        String?
   phone               String?
   email               String?

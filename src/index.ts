@@ -11,10 +11,20 @@ import { customersRouter } from "./routes/customers";
 import { propertiesRouter } from "./routes/properties";
 import { openApiDocument } from "./swagger";
 
+const FRONTEND_URL = process.env.FRONTEND_URL;
+if (!FRONTEND_URL) {
+  console.error("FATAL: FRONTEND_URL env var is required");
+  process.exit(1);
+}
+
+if (!process.env.INVITE_BASE_URL) {
+  console.error("FATAL: INVITE_BASE_URL env var is required");
+  process.exit(1);
+}
+
 const app = express();
 
-// Allow all origins for now — tighten to the frontend origin(s) later.
-app.use(cors());
+app.use(cors({ origin: FRONTEND_URL, credentials: true }));
 app.use(express.json());
 
 app.get("/health", (_req: Request, res: Response) => {

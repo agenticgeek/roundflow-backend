@@ -27,6 +27,8 @@ const actorIdOf = (req: Request): string => req.user!.supabaseUserId;
 customersRouter.get(
   "/",
   h(async (req, res) => {
+    const pageRaw = Number(req.query.page);
+    const pageSizeRaw = Number(req.query.pageSize);
     res.json(
       await svc(req).getCustomers(
         actorIdOf(req),
@@ -34,6 +36,8 @@ customersRouter.get(
           search: typeof req.query.search === "string" ? req.query.search : undefined,
           roundId: typeof req.query.roundId === "string" ? req.query.roundId : undefined,
           status: typeof req.query.status === "string" ? req.query.status : undefined,
+          page: Number.isFinite(pageRaw) && pageRaw > 0 ? pageRaw : undefined,
+          pageSize: Number.isFinite(pageSizeRaw) && pageSizeRaw > 0 ? pageSizeRaw : undefined,
         },
         req.profile!.role
       )

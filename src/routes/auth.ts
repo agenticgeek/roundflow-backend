@@ -50,6 +50,10 @@ authRouter.post(
       include: { tenant: true },
     });
     if (existing) {
+      // Re-attempt provisioning in case a prior signup call committed the
+      // Profile+Tenant row but crashed before provisionTenantSchema completed.
+      // provisionTenantSchema is idempotent: no-op if already fully provisioned.
+      await provisionTenantSchema(existing.tenant.schemaName);
       return res.json({ profile: existing, tenantId: existing.tenantId });
     }
 
@@ -100,6 +104,7 @@ authRouter.post(
           include: { tenant: true },
         });
         if (profile) {
+          await provisionTenantSchema(profile.tenant.schemaName);
           return res.json({ profile, tenantId: profile.tenantId });
         }
       }

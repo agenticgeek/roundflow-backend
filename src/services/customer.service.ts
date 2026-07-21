@@ -33,6 +33,8 @@ export interface CustomerListFilters {
   search?: string;
   roundId?: string;
   status?: string; // ACTIVE | PAUSED | CANCELLED | HOLD
+  page?: number;     // 1-based, default 1
+  pageSize?: number; // default 50, max 100
 }
 
 export interface PropertyCreateInput {
@@ -123,6 +125,12 @@ export interface CustomerListResult {
     amountDue?: number; // financial — omitted for TECHNICIAN viewers
   };
   customers: CustomerListRow[];
+  pagination: {
+    page: number;
+    pageSize: number;
+    total: number;       // total matching the applied filters
+    totalPages: number;
+  };
 }
 
 export interface ServicePlanView {
@@ -293,12 +301,15 @@ class CustomerService implements ICustomerService {
     filters: CustomerListFilters,
     viewerRole: UserRole
   ): Promise<CustomerListResult> {
-    // TECHNICIAN viewers must not see financial data (debt position).
     const hideFinancials = viewerRole === UserRole.TECHNICIAN;
     const { search, roundId, status } = filters;
     if (status && !["ACTIVE", "PAUSED", "CANCELLED", "HOLD"].includes(status)) {
       throw new AppError(400, `Invalid status: ${status}. Use ACTIVE|PAUSED|CANCELLED|HOLD.`);
     }
+
+    const page = Math.max(1, filters.page ?? 1);
+    const pageSize = Math.min(100, Math.max(1, filters.pageSize ?? 50));
+    const skip = (page - 1) * pageSize;
 
     const where: Prisma.CustomerWhereInput = {};
     if (search) {
@@ -311,8 +322,8 @@ class CustomerService implements ICustomerService {
     if (roundId) where.properties = { some: { roundId } };
     if (status && status !== "HOLD") where.status = status as LifecycleStatus;
 
-    // Summary KPIs are business-wide (not filtered) — they reflect totals.
-    const [totalCustomers, active, paymentHolds, dueAgg, customers] = await Promise.all([
+    // Summary KPIs are always business-wide — never filtered or paginated.
+    const [totalCustomers, active, paymentHolds, dueAgg] = await Promise.all([
       this.prisma.customer.count(),
       this.prisma.customer.count({
         where: {
@@ -328,38 +339,37 @@ class CustomerService implements ICustomerService {
         where: { visits: { some: { paymentHold: true, status: { in: OPEN_VISIT } } } },
       }),
       this.prisma.payment.aggregate({ _sum: { amount: true }, where: { status: { in: DUE_PAYMENT } } }),
-      this.prisma.customer.findMany({
-        where,
-        orderBy: { createdAt: "asc" },
-        include: {
-          payments: { orderBy: { createdAt: "desc" } },
-          properties: {
-            orderBy: { createdAt: "asc" },
-            include: {
-              round: true,
-              servicePlans: { orderBy: { createdAt: "desc" } },
-              visits: {
-                where: { status: { in: OPEN_VISIT } },
-                orderBy: { date: "asc" },
-                include: { technician: true },
-              },
-            },
-          },
-        },
-      }),
     ]);
 
-    let rows: CustomerListRow[] = [];
-    for (const c of customers) {
+    // Shared include for both list paths.
+    const listInclude = {
+      payments: { orderBy: { createdAt: "desc" as const } },
+      properties: {
+        orderBy: { createdAt: "asc" as const },
+        include: {
+          round: true,
+          servicePlans: { orderBy: { createdAt: "desc" as const } },
+          visits: {
+            where: { status: { in: OPEN_VISIT } },
+            orderBy: { date: "asc" as const },
+            include: { technician: true },
+          },
+        },
+      },
+    } satisfies Prisma.CustomerInclude;
+
+    type FetchedCustomer = Prisma.CustomerGetPayload<{ include: typeof listInclude }>;
+
+    const toRow = (c: FetchedCustomer): CustomerListRow | null => {
       const property =
         c.properties.find((p) => p.status === LifecycleStatus.ACTIVE) ?? c.properties[0];
-      if (!property) continue; // a customer with no property can't render a row
+      if (!property) return null;
 
       const plan =
         property.servicePlans.find((p) => p.status === LifecycleStatus.ACTIVE) ??
         property.servicePlans[0] ??
         null;
-      const nextVisit = property.visits[0] ?? null; // soonest open visit
+      const nextVisit = property.visits[0] ?? null;
       const onHold = property.visits.some((v) => v.paymentHold);
       const amountDue = Number(
         c.payments
@@ -367,7 +377,7 @@ class CustomerService implements ICustomerService {
           .reduce((sum, p) => sum.add(p.amount), new Prisma.Decimal(0))
       );
 
-      rows.push({
+      return {
         customerId: c.id,
         customerName: c.name,
         status: c.status,
@@ -379,17 +389,43 @@ class CustomerService implements ICustomerService {
         frequency: property.round?.frequency ?? null,
         price: this.num(plan?.price),
         technicianId: nextVisit?.technicianId ?? null,
-        technicianName:
-          nextVisit?.technician?.name ?? null,
+        technicianName: nextVisit?.technician?.name ?? null,
         nextDueDate: plan?.nextDueDate ?? null,
         paymentStatus: this.derivePaymentStatus(onHold, c.payments[0]?.status),
         onHold,
         amountDue: hideFinancials ? undefined : amountDue,
-      });
-    }
+      };
+    };
 
-    // ?status=HOLD is a derived filter (no stored field).
-    if (status === "HOLD") rows = rows.filter((r) => r.onHold);
+    let rows: CustomerListRow[];
+    let total: number;
+
+    if (status === "HOLD") {
+      // HOLD is a derived filter (paymentHold lives on Visit, not Customer).
+      // Must fetch all matching customers, filter in memory, then slice.
+      const all = await this.prisma.customer.findMany({
+        where,
+        orderBy: { createdAt: "asc" },
+        include: listInclude,
+      });
+      const held = all.map(toRow).filter((r): r is CustomerListRow => r !== null && r.onHold);
+      total = held.length;
+      rows = held.slice(skip, skip + pageSize);
+    } else {
+      // DB-level pagination for all other filters.
+      const [count, customers] = await Promise.all([
+        this.prisma.customer.count({ where }),
+        this.prisma.customer.findMany({
+          where,
+          orderBy: { createdAt: "asc" },
+          take: pageSize,
+          skip,
+          include: listInclude,
+        }),
+      ]);
+      total = count;
+      rows = customers.map(toRow).filter((r): r is CustomerListRow => r !== null);
+    }
 
     return {
       summary: {
@@ -399,6 +435,12 @@ class CustomerService implements ICustomerService {
         amountDue: hideFinancials ? undefined : Number(dueAgg._sum.amount ?? 0),
       },
       customers: rows,
+      pagination: {
+        page,
+        pageSize,
+        total,
+        totalPages: Math.ceil(total / pageSize),
+      },
     };
   }
 
@@ -548,7 +590,7 @@ class CustomerService implements ICustomerService {
         payments: hideFinancials
           ? undefined
           : {
-              rows: visits.map((v) => ({
+              rows: visits.slice(0, 50).map((v) => ({
                 visitId: v.id,
                 visitDate: v.date,
                 technicianName: v.technician?.name ?? null,

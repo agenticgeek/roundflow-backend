@@ -235,9 +235,11 @@ class SettingsService implements ISettingsService {
   /** Partial upsert of the BusinessSettings singleton. Undefined fields are
    *  left unchanged; null clears the field. */
   private async writeSettings(data: SettingsWritable): Promise<BusinessSettings> {
-    const existing = await this.prisma.businessSettings.findFirst();
-    if (existing) return this.prisma.businessSettings.update({ where: { id: existing.id }, data });
-    return this.prisma.businessSettings.create({ data });
+    return this.prisma.businessSettings.upsert({
+      where: { uniqueId: "singleton" },
+      update: data,
+      create: { ...data },
+    });
   }
 
   // ---- guard ----
