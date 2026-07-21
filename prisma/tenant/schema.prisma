@@ -115,6 +115,14 @@ enum ServiceCategory {
   SPECIALIST
 }
 
+enum PropertyType {
+  HOUSE
+  FLAT_APARTMENT
+  COMMERCIAL
+  OFFICE
+  CONSERVATORY
+}
+
 enum InvoiceStatus {
   DRAFT
   SENT
@@ -195,7 +203,7 @@ model Property {
   postcode      String
   serviceAreaId String?
   serviceArea   ServiceArea?    @relation(fields: [serviceAreaId], references: [id])
-  propertyType  String?
+  propertyType  PropertyType?
   accessNotes   String?
   riskNotes     String?
   status        LifecycleStatus @default(ACTIVE)
@@ -236,10 +244,11 @@ model ServicePlan {
   property       Property        @relation(fields: [propertyId], references: [id])
   serviceId      String?
   service        Service?        @relation(fields: [serviceId], references: [id])
-  price          Decimal         @db.Decimal(10, 2)
-  cleanMethod    String?
-  paymentMethod  PaymentMethod?
-  status         LifecycleStatus @default(ACTIVE)
+  price             Decimal            @db.Decimal(10, 2)
+  cleanMethod       String?
+  paymentMethod     PaymentMethod?
+  cleaningFrequency CleaningFrequency?
+  status            LifecycleStatus    @default(ACTIVE)
   nextDueDate    DateTime?
   lastCompleted  DateTime?
   pauseStartDate DateTime?
@@ -261,10 +270,11 @@ model Round {
   status        RoundStatus        @default(DRAFT)
   serviceAreaId String?
   serviceArea   ServiceArea?       @relation(fields: [serviceAreaId], references: [id])
-  properties    Property[]
-  visits        Visit[]
-  createdAt     DateTime           @default(now())
-  updatedAt     DateTime           @updatedAt
+  properties       Property[]
+  visits           Visit[]
+  roundTechnicians RoundTechnician[]
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
 
   @@index([serviceAreaId])
 }
@@ -273,19 +283,20 @@ model Round {
 // null = invited but not yet accepted; name is the admin display label until
 // the invite is accepted and Profile.name takes over.
 model Technician {
-  id           String                  @id @default(cuid())
-  profileId    String?                 @unique
-  name         String?
-  role         String?
-  phone        String?
-  active       Boolean                 @default(true)
-  avatarUrl    String?
-  serviceAreas TechnicianServiceArea[]
-  visits       Visit[]
-  messages     Message[]
-  complaints   Complaint[]
-  createdAt    DateTime                @default(now())
-  updatedAt    DateTime                @updatedAt
+  id               String                  @id @default(cuid())
+  profileId        String?                 @unique
+  name             String?
+  role             String?
+  phone            String?
+  active           Boolean                 @default(true)
+  avatarUrl        String?
+  serviceAreas     TechnicianServiceArea[]
+  visits           Visit[]
+  messages         Message[]
+  complaints       Complaint[]
+  roundTechnicians RoundTechnician[]
+  createdAt        DateTime                @default(now())
+  updatedAt        DateTime                @updatedAt
 }
 
 model TechnicianServiceArea {
@@ -297,6 +308,17 @@ model TechnicianServiceArea {
 
   @@id([technicianId, serviceAreaId])
   @@index([serviceAreaId])
+}
+
+model RoundTechnician {
+  roundId      String
+  round        Round      @relation(fields: [roundId], references: [id])
+  technicianId String
+  technician   Technician @relation(fields: [technicianId], references: [id])
+  assignedAt   DateTime   @default(now())
+
+  @@id([roundId, technicianId])
+  @@index([technicianId])
 }
 
 model Visit {

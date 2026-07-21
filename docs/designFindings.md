@@ -117,6 +117,104 @@ Auth is handled by **Supabase Auth** (frontend + Supabase); this backend only **
 
 **Superseded:** the earlier **8-step** description (Business Profile · Payment Setup · Service Catalogue · Round Settings · SMS · Technicians · Service Area · Assign Round, "Step N of 8") reflected the older cut and is **no longer authoritative**.
 
+#### Step-by-step Detail: Steps 9–12 *(deep audit 2026-07-21)*
+
+**Step 9 — Add Property** · nodes `936:46253` / `46371` (sub-step 01, dropdown closed/open) · `46514` (sub-step 02) · `46601` · `46673` (sub-step 04) · `46743` / `46813` (sub-step 05)
+
+Layout: horizontal top stepper (steps 1–12) + vertical left sub-stepper (01–05) + main content area. Header: "Add Property" / "Add properties to link with the rounds". Top-right: **Add Property** button (to add more than one during setup).
+
+| Sub-step | Label | Fields |
+|----------|-------|--------|
+| 01 | Property Details | **Customer/Property:** Customer Name\*, Property Name (optional; defaults to customer name), Phone Number\*, Email (optional). **Address:** Full Address\*, Postcode\*, Service Area (dropdown, req), Property Type (dropdown: **House · Flat/Apartment · Commercial · Office · Conservatory**) |
+| 02 | Service Plan | Cleaning Frequency (dropdown), Price per visit (£), VAT applicable (toggle/dropdown), Payment Method (GoCardless / Stripe / Cash) |
+| 03 | Scheduling | Start Date (date picker), Preferred Day (dropdown) |
+| 04 | Risk & Notes | Customer Notes (free text), Risk Notes (e.g. "Dog behind fence"), Access Notes (e.g. "Key under mat, side gate access") |
+| 05 | Assign Property to Round | Select Round (dropdown), Select Service Area (sub-area within round, for "precise allotment") |
+
+Footer: **Back** | "Step 6 of 7" (legacy label — ignore) | **Continue**.
+
+**Backend:** `POST /setup/step/9` — one-time setup only, does NOT reuse `POST /customers` or `POST /properties`. Creates a `Customer` + `Property` + `ServicePlan` record atomically. Multiple properties can be added in sequence during setup (re-entering sub-step 01). Request body: `{ customerName, propertyName?, phone, email?, fullAddress, postcode, serviceAreaId, propertyType, cleaningFrequency, pricePerVisit, vatApplicable, paymentMethod, startDate, preferredDay, customerNotes?, riskNotes?, accessNotes?, roundId }`.
+
+> ⚠️ **Schema note:** `PropertyType` enum needs: `HOUSE | FLAT_APARTMENT | COMMERCIAL | OFFICE | CONSERVATORY` — not yet in `schema.prisma`.
+
+---
+
+**Step 10 — Assign Technicians to Rounds** · node `936:47259` (main) · `47453` / `47665` (variants) · `47853` (Edit Changes state)
+
+Layout: stat cards row + "Round Assignments" table + "Technician Workload" panel.
+
+**Stat cards (3):**
+- **Total Rounds** — integer count of all configured rounds
+- **Technicians** — integer count of all technicians added in step 6
+- **Unassigned** — rounds with no technician assigned yet (amber/warning styling, `#fffbeb` bg, `#fee685` border, value in `#bb4d00`)
+
+**Round Assignments table** columns: `Round` (name + day-of-week sub-label) · `Area` (pin icon + area name) · `Properties` (count) · `Assigned Technician` (inline dropdown selector) · `Status` (badge) · `Action` (Edit link)
+
+**Technician selector states per row:**
+- Assigned: teal background (`rgba(2,155,182,0.1)`), technician name + chevron, Status = "Assigned" (green `#dcfce7` / `#008236`)
+- Unassigned: dashed amber border (`#ffd230`), "— Unassigned —" text in `#e17100`, Status = "Missing" (amber `#fef3c6` / `#bb4d00`)
+
+**Technician Workload panel** (below table): per-technician row with avatar initials circle (teal bg), name, horizontal progress bar (teal fill), "N rounds" label. Workload is derived from how many rounds are assigned to each tech.
+
+**Backend:** `POST /setup/step/10` — accepts `assignments: [{ roundId: string, technicianIds: string[] }]`. Idempotent — re-submitting replaces all assignments for each listed round. Does NOT reuse any existing round-update endpoint.
+
+> ⚠️ **Schema gap — multi-technician rounds:** The current schema has `Technician.roundId` (single FK — a technician belongs to one round). The design and user requirement ("one round can have multiple technicians") require a **many-to-many join table**: `RoundTechnician { roundId String, technicianId String, @@id([roundId, technicianId]) }`. This schema migration is needed before step 10 can be built. `Technician.roundId` can be kept for now as a "primary round" or retired once the join table is in place.
+
+---
+
+**Step 11 — Activate System & Generate Visits** · node `936:47044` (main) · `47141` (variant)
+
+Layout: single-page form. Header: "Activate System & Generate Visits" / "Create first cycle of visits from your configured rounds".
+
+**Section 1 — Generate Visits:**
+| Option | Default | Description |
+|--------|---------|-------------|
+| All Rounds (recommended) | **ON** (teal toggle) | Generate visits for every configured round |
+| Selected Rounds Only | OFF (grey toggle) | Generate for a subset — user selects which rounds |
+
+**Section 2 — Start Date & Cycle:**
+- **First Cycle Start Date** — date picker (example: "20 May 2025")
+- **Frequency/Cycle** — dropdown (example: "4-week cycle"; options: 1-week, 2-week, 3-week, 4-week)
+
+**CTA:** "Ready to Activate?" heading + sub-text "This will generate first set of visits and make them available for your team" + **Generate Visits & Activate System** button (teal with play icon, box-shadow glow).
+
+**Backend:** `POST /setup/step/11` — one-time activation endpoint. Body: `{ generateAll: boolean, startDate: string (ISO date), cycleWeeks: 1 | 2 | 3 | 4, roundIds?: string[] }`. Creates `Visit` records for every `Property` in each selected (or all) `Round` for the first cycle, using the service plan's frequency. Marks the tenant's setup phase as activated. Does NOT reuse any existing visit-generation logic.
+
+> **Note:** if `generateAll = true`, `roundIds` is ignored. If `generateAll = false`, `roundIds` is required and must be non-empty.
+
+---
+
+**Step 12 — Review & Launch** · node `936:46888`
+
+Layout: centered content (no left stepper). Green check-circle icon at top centre.
+
+**Setup Progress section:**
+- Label "Setup Progress" + "7 of 7 completed" counter
+- Full-width green progress bar (100% fill)
+
+**Completed checklist** (all with green ✅ icons):
+1. Business profile completed
+2. GoCardless connected
+3. Stripe configured
+4. SMS templates created
+5. Technicians added
+6. Service areas created
+7. Round settings saved
+
+> Note: the checklist shows 7 items matching the **original 7-step cut** — the design has not yet been updated to reflect the full 12-step list. Build backend to check the 12-step items we control (steps 1–4, 6–11; skip 5 as deferred stub).
+
+**"Ready to Launch" info box** (teal bg `#f0fdfb`, teal border `#99e0da`): "Ready to Launch" heading + "All required steps are complete. You can now launch your system and start managing your window cleaning business."
+
+**"What happens next?" info box** (teal bg, blue border `#bedbff`): bulleted list:
+- You'll be taken to your main dashboard
+- You can start adding customer properties and creating rounds
+- Access Settings anytime to update your configuration
+- Your technicians will receive app invitations if configured
+
+**Footer:** Back | "Step 6 of 7" (legacy label) | **Continue** (acts as the final **Launch** action).
+
+**Backend:** `POST /setup/complete` — **already exists**. Marks setup as complete, sets `isSetupComplete = true` on `BusinessSettings`. The frontend's "Continue" on step 12 calls this. Extend to return a checklist summary of which steps are complete vs pending so the UI can render the progress bar accurately.
+
 ---
 
 ### 7. Dashboard  
@@ -947,6 +1045,9 @@ resolved as deactivation** (Option A): Danger-Zone Remove → `PATCH { active: f
 not a hard delete — `deleteTechnician` keeps 409-ing accepted technicians, preserving
 visit history. Schema gaps flagged under Screen 29 (`Technician.email`, `Technician.notes`,
 Default-Area wiring, `TechnicianInvite` for Send App Invite).
+
+**2026-07-21 — Setup Wizard steps 9–12 deep audit (`RoundFlow-Admin`, Page 1, nodes `936:46253`–`936:47259`+).**
+Steps 9–12 live-inspected via Figma MCP plugin (fresh fetch, no cached nodes). Confirmed 34 total setup frames. Added full per-sub-step breakdown for step 9 (5 sub-steps, vertical left stepper), full field/state inventory for step 10 (Round Assignments table, Technician Workload panel, multi-tech schema gap flagged), step 11 (Generate Visits toggles, Start Date, Frequency/Cycle, Activate CTA), and step 12 (7-item checklist, Ready to Launch, What Happens Next). Key decisions recorded: step 9 does NOT reuse `POST /customers`/`POST /properties`; step 10 requires a new `RoundTechnician` join table (multi-tech per round); step 11 generates the first visit cycle; step 12 reuses existing `POST /setup/complete`. Figma screenshots captured for steps 9 (sub-step 01 two states), 10, 11, 12.
 
 **2026-07-16 — `/Customers-Properties` section fully audited (Rough page, section node `401:12908`).**
 Corrected the section reference: **`401:12909` is the list screen, not the section** — the

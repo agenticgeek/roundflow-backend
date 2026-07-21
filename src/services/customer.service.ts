@@ -5,6 +5,7 @@ import {
   PaymentMethod,
   PhotoType,
   NoteType,
+  PropertyType,
   Prisma,
 } from "../generated/tenant-client";
 import type {
@@ -655,7 +656,7 @@ class CustomerService implements ICustomerService {
           data: {
             addressLine: input.addressLine,
             postcode: input.postcode,
-            propertyType: input.propertyType,
+            propertyType: (input.propertyType as PropertyType) ?? null,
             accessNotes: input.accessNotes,
             riskNotes: input.riskNotes,
             roundId: input.roundId,
@@ -699,7 +700,7 @@ class CustomerService implements ICustomerService {
           addressLine: input.addressLine,
           postcode: input.postcode,
           propertyName: input.propertyName ?? null,
-          propertyType: input.propertyType ?? null,
+          propertyType: (input.propertyType as PropertyType) ?? null,
           serviceAreaId: input.serviceAreaId ?? null,
           accessNotes: input.accessNotes ?? null,
           riskNotes: input.riskNotes ?? null,
@@ -743,7 +744,7 @@ class CustomerService implements ICustomerService {
         addressLine: input.addressLine,
         postcode: input.postcode,
         propertyName: input.propertyName,
-        propertyType: input.propertyType,
+        propertyType: (input.propertyType as PropertyType) ?? null,
         serviceAreaId: input.serviceAreaId,
         accessNotes: input.accessNotes,
         riskNotes: input.riskNotes,

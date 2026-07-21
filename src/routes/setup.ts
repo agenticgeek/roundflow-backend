@@ -4,13 +4,15 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
-import { validateWorkingDays, assertPositiveInt } from "../lib/validation";
+import { validateWorkingDays, assertPositiveInt, assertPositive } from "../lib/validation";
 import {
   asObject,
   asArray,
   h,
   requireString,
   requireNumber,
+  optString,
+  optId,
 } from "../lib/http";
 import {
   createSetupService,
@@ -21,6 +23,9 @@ import {
   TechnicianInput,
   ServiceAreaInput,
   FirstRoundInput,
+  SetupPropertyInput,
+  RoundTechnicianAssignment,
+  ActivationInput,
 } from "../services/setup.service";
 
 export const setupRouter = Router();
@@ -265,6 +270,130 @@ setupRouter.post(
       serviceAreaId: body.serviceAreaId as string | undefined,
     };
     res.json(await svc(req).saveFirstRound(profileId, input));
+  })
+);
+
+// ---- Step 9: Add Property ------------------------------------------------
+// One-time setup property creation. Does NOT reuse /customers or /properties.
+// Multiple properties may be added during setup by calling this endpoint
+// multiple times.
+
+setupRouter.get(
+  "/step/9",
+  h(async (req, res) => {
+    res.json(await svc(req).getSetupProperties());
+  })
+);
+setupRouter.post(
+  "/step/9",
+  h(async (req, res) => {
+    const profileId = actorIdOf(req);
+    await svc(req).assertSetupIncomplete(profileId);
+    const body = asObject(req.body);
+
+    const input: SetupPropertyInput = {
+      customerName: requireString(body.customerName, "customerName"),
+      propertyName: optString(body.propertyName, "propertyName") ?? null,
+      phone: optString(body.phone, "phone") ?? null,
+      email: optString(body.email, "email") ?? null,
+      fullAddress: requireString(body.fullAddress, "fullAddress"),
+      postcode: requireString(body.postcode, "postcode"),
+      serviceAreaId: optId(body.serviceAreaId, "serviceAreaId") ?? null,
+      propertyType: optString(body.propertyType, "propertyType") ?? null,
+      price: assertPositive(requireNumber(body.price, "price"), "price"),
+      cleaningFrequency: optString(body.cleaningFrequency, "cleaningFrequency") ?? null,
+      paymentMethod: optString(body.paymentMethod, "paymentMethod") ?? null,
+      serviceId: optId(body.serviceId, "serviceId") ?? null,
+      accessNotes: optString(body.accessNotes, "accessNotes") ?? null,
+      riskNotes: optString(body.riskNotes, "riskNotes") ?? null,
+      // L-1: roundId is required so the property counts toward step 9 completion.
+      // A property with no round cannot be scheduled and would leave step 9 stuck.
+      roundId: requireString(body.roundId, "roundId"),
+    };
+
+    res.status(201).json(await svc(req).addSetupProperty(input));
+  })
+);
+
+// ---- Step 10: Assign Technicians to Rounds --------------------------------
+
+setupRouter.get(
+  "/step/10",
+  h(async (req, res) => {
+    res.json(await svc(req).getSetupRoundAssignments());
+  })
+);
+setupRouter.post(
+  "/step/10",
+  h(async (req, res) => {
+    const profileId = actorIdOf(req);
+    await svc(req).assertSetupIncomplete(profileId);
+
+    const raw = asArray<Record<string, unknown>>(req.body, "assignments");
+    const assignments: RoundTechnicianAssignment[] = raw.map((a, i) => {
+      const roundId = requireString(a.roundId, `assignments[${i}].roundId`);
+      const techIds = a.technicianIds;
+      if (!Array.isArray(techIds) || !techIds.every((t) => typeof t === "string")) {
+        throw new AppError(
+          400,
+          `assignments[${i}].technicianIds must be an array of strings`
+        );
+      }
+      return { roundId, technicianIds: techIds as string[] };
+    });
+
+    res.json(await svc(req).assignTechniciansToRounds(assignments));
+  })
+);
+
+// ---- Step 11: Activate System & Generate Visits ---------------------------
+
+setupRouter.get(
+  "/step/11",
+  h(async (req, res) => {
+    res.json(await svc(req).getActivationStatus());
+  })
+);
+setupRouter.post(
+  "/step/11",
+  h(async (req, res) => {
+    const profileId = actorIdOf(req);
+    await svc(req).assertSetupIncomplete(profileId);
+    const body = asObject(req.body);
+
+    const generateAll =
+      typeof body.generateAll === "boolean" ? body.generateAll : true;
+    const startDate = requireString(body.startDate, "startDate");
+    const cycleWeeks = assertPositiveInt(
+      requireNumber(body.cycleWeeks, "cycleWeeks"),
+      "cycleWeeks"
+    );
+
+    let roundIds: string[] | undefined;
+    if (!generateAll) {
+      if (!Array.isArray(body.roundIds) || body.roundIds.length === 0) {
+        throw new AppError(
+          400,
+          "roundIds is required and must be a non-empty array when generateAll is false"
+        );
+      }
+      if (!body.roundIds.every((id: unknown) => typeof id === "string")) {
+        throw new AppError(400, "roundIds must be an array of strings");
+      }
+      roundIds = body.roundIds as string[];
+    }
+
+    const input: ActivationInput = { generateAll, startDate, cycleWeeks, roundIds };
+    res.json(await svc(req).activateSystem(input));
+  })
+);
+
+// ---- Step 12: Review & Launch (checklist) ---------------------------------
+
+setupRouter.get(
+  "/step/12",
+  h(async (req, res) => {
+    res.json(await svc(req).getReviewChecklist());
   })
 );
 

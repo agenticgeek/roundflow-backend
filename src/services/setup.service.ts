@@ -3,7 +3,11 @@ import {
   DayOfWeek,
   CleaningFrequency,
   RoundStatus,
+  VisitStatus,
+  LifecycleStatus,
   PaymentTiming,
+  PropertyType,
+  PaymentMethod,
 } from "../generated/tenant-client";
 import type {
   BusinessSettings,
@@ -11,6 +15,10 @@ import type {
   Technician,
   ServiceArea,
   Round,
+  Customer,
+  Property,
+  ServicePlan,
+  RoundTechnician,
 } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
@@ -84,6 +92,73 @@ export interface FirstRoundInput {
   serviceAreaId?: string | null;
 }
 
+export interface SetupPropertyInput {
+  customerName: string;
+  propertyName?: string | null;
+  phone?: string | null;
+  email?: string | null;
+  fullAddress: string;
+  postcode: string;
+  serviceAreaId?: string | null;
+  propertyType?: string | null;
+  // Service plan
+  price: number;
+  cleaningFrequency?: string | null;
+  paymentMethod?: string | null;
+  serviceId?: string | null;
+  // Notes
+  accessNotes?: string | null;
+  riskNotes?: string | null;
+  // Round assignment — required during setup (property must be schedulable)
+  roundId: string;
+}
+
+export interface RoundTechnicianAssignment {
+  roundId: string;
+  technicianIds: string[];
+}
+
+export interface ActivationInput {
+  generateAll: boolean;
+  startDate: string; // ISO date string
+  cycleWeeks: number; // 1 | 2 | 3 | 4
+  roundIds?: string[];
+}
+
+export interface SetupPropertyResult {
+  customer: Customer;
+  property: Property;
+  servicePlan: ServicePlan;
+}
+
+export interface RoundAssignmentResult {
+  roundId: string;
+  roundName: string;
+  defaultDay: string | null;
+  serviceAreaName: string | null;
+  propertyCount: number;
+  technicianIds: string[];
+  technicians: Array<{ id: string; name: string | null }>;
+}
+
+export interface WorkloadEntry {
+  technicianId: string;
+  name: string | null;
+  roundCount: number;
+}
+
+export interface Step10Result {
+  totalRounds: number;
+  technicianCount: number;
+  unassignedCount: number;
+  assignments: RoundAssignmentResult[];
+  workload: WorkloadEntry[];
+}
+
+export interface ActivationResult {
+  visitsGenerated: number;
+}
+
 // The service contract. Routes depend on this abstraction, never on the
 // concrete class — so Phase 2 (multi-tenancy) can bind a different
 // implementation (e.g. one that scopes by tenant derived from profileId)
@@ -133,6 +208,26 @@ export interface ISetupService {
 
   getActiveRounds(profileId: string): Promise<Round[]>;
   saveFirstRound(profileId: string, input: FirstRoundInput): Promise<Round>;
+
+  // Step 9: Add Property (one-time setup; does not reuse /customers or /properties)
+  getSetupProperties(): Promise<SetupPropertyResult[]>;
+  addSetupProperty(input: SetupPropertyInput): Promise<SetupPropertyResult>;
+
+  // Step 10: Assign Technicians to Rounds
+  getSetupRoundAssignments(): Promise<Step10Result>;
+  assignTechniciansToRounds(
+    assignments: RoundTechnicianAssignment[]
+  ): Promise<Step10Result>;
+
+  // Step 11: Activate System & Generate Visits
+  getActivationStatus(): Promise<{ activated: boolean; visitsGenerated: number }>;
+  activateSystem(input: ActivationInput): Promise<ActivationResult>;
+
+  // Step 12: Review & Launch checklist (read-only; launch = POST /setup/complete)
+  getReviewChecklist(): Promise<{
+    checklist: Array<{ label: string; complete: boolean }>;
+    allComplete: boolean;
+  }>;
 }
 
 
@@ -170,14 +265,32 @@ class SetupService implements ISetupService {
   }
 
   async getStatus(_profileId: string): Promise<SetupStatus> {
-    const [settings, serviceCount, technicianCount, serviceAreaCount, activeRoundCount] =
-      await Promise.all([
-        this.getSettings(),
-        this.prisma.service.count(),
-        this.prisma.technician.count(),
-        this.prisma.serviceArea.count(),
-        this.prisma.round.count({ where: { status: RoundStatus.ACTIVE } }),
-      ]);
+    const [
+      settings,
+      serviceCount,
+      technicianCount,
+      serviceAreaCount,
+      activeRoundCount,
+      setupPropertyCount,
+      visitCount,
+    ] = await Promise.all([
+      this.getSettings(),
+      this.prisma.service.count(),
+      this.prisma.technician.count(),
+      this.prisma.serviceArea.count(),
+      this.prisma.round.count({ where: { status: RoundStatus.ACTIVE } }),
+      this.prisma.property.count({ where: { roundId: { not: null } } }),
+      this.prisma.visit.count({ where: { status: VisitStatus.SCHEDULED } }),
+    ]);
+
+    // Step 10: all ACTIVE rounds must have ≥1 technician assigned.
+    const activeRounds = await this.prisma.round.findMany({
+      where: { status: RoundStatus.ACTIVE },
+      include: { roundTechnicians: { select: { technicianId: true } } },
+    });
+    const allRoundsAssigned =
+      activeRounds.length > 0 &&
+      activeRounds.every((r) => r.roundTechnicians.length > 0);
 
     const step = (n: number, complete: boolean, deferred = false): StepStatus => ({
       step: n,
@@ -186,18 +299,25 @@ class SetupService implements ISetupService {
     });
 
     const steps: StepStatus[] = [
-      step(1, settings?.businessName != null), // Business Profile
-      step(2, settings?.paymentRule != null), // Payment Setup (real — complete once a payment rule is set)
-      step(3, serviceCount > 0), // Service Catalogue
-      step(4, settings?.defaultCycleLength != null), // Round Settings
+      step(1, settings?.businessName != null),
+      step(2, settings?.paymentRule != null),
+      step(3, serviceCount > 0),
+      step(4, settings?.defaultCycleLength != null),
       step(5, false, true), // SMS Templates — deferred
-      step(6, technicianCount > 0), // Technicians
-      step(7, serviceAreaCount > 0), // Service Areas
-      step(8, activeRoundCount > 0), // First Round (ACTIVE)
+      step(6, technicianCount > 0),
+      step(7, serviceAreaCount > 0),
+      step(8, activeRoundCount > 0),
+      step(9, setupPropertyCount > 0),
+      step(10, allRoundsAssigned),
+      step(11, visitCount > 0),
+      // Step 12 (Review & Launch) is the final action — complete === setupCompleted
+      step(12, settings?.setupCompleted ?? false),
     ];
 
+    // Step 12 (Review & Launch) is the completion action itself — exclude it
+    // from allRequiredComplete so POST /setup/complete doesn't deadlock on it.
     const allRequiredComplete = steps
-      .filter((s) => !s.deferred)
+      .filter((s) => !s.deferred && s.step < 12)
       .every((s) => s.complete);
 
     return {
@@ -452,6 +572,375 @@ class SetupService implements ISetupService {
     return this.prisma.round.create({
       data: { ...data, status: RoundStatus.ACTIVE },
     });
+  }
+
+  // ── Step 9: Add Property ────────────────────────────────────────────────
+
+  async getSetupProperties(): Promise<SetupPropertyResult[]> {
+    const properties = await this.prisma.property.findMany({
+      include: {
+        customer: true,
+        servicePlans: {
+          where: { status: LifecycleStatus.ACTIVE },
+          orderBy: { createdAt: "asc" },
+          take: 1,
+        },
+      },
+      orderBy: { createdAt: "asc" },
+    });
+    return properties.map((p) => ({
+      customer: p.customer,
+      property: p,
+      servicePlan: p.servicePlans[0],
+    })).filter((r) => r.servicePlan != null) as SetupPropertyResult[];
+  }
+
+  async addSetupProperty(input: SetupPropertyInput): Promise<SetupPropertyResult> {
+    if (
+      input.propertyType &&
+      !(Object.values(PropertyType) as string[]).includes(input.propertyType)
+    ) {
+      throw new AppError(400, `Invalid propertyType: ${input.propertyType}`);
+    }
+    if (
+      input.cleaningFrequency &&
+      !(Object.values(CleaningFrequency) as string[]).includes(input.cleaningFrequency)
+    ) {
+      throw new AppError(400, `Invalid cleaningFrequency: ${input.cleaningFrequency}`);
+    }
+    if (
+      input.paymentMethod &&
+      !(Object.values(PaymentMethod) as string[]).includes(input.paymentMethod)
+    ) {
+      throw new AppError(400, `Invalid paymentMethod: ${input.paymentMethod}`);
+    }
+    if (input.serviceAreaId) {
+      const area = await this.prisma.serviceArea.findUnique({
+        where: { id: input.serviceAreaId },
+      });
+      if (!area) throw new AppError(400, `serviceAreaId not found: ${input.serviceAreaId}`);
+    }
+    if (input.roundId) {
+      // M-1: Require ACTIVE status — a DRAFT round never appears in step 10's
+      // ACTIVE-round query, so properties assigned to it would be orphaned from
+      // technician coverage checks.
+      const round = await this.prisma.round.findUnique({ where: { id: input.roundId } });
+      if (!round) throw new AppError(400, `roundId not found: ${input.roundId}`);
+      if (round.status !== RoundStatus.ACTIVE) {
+        throw new AppError(400, "roundId must reference an ACTIVE round");
+      }
+    }
+    if (input.price < 0) throw new AppError(400, "price must be >= 0");
+
+    return this.prisma.$transaction(async (tx) => {
+      const customer = await tx.customer.create({
+        data: {
+          name: input.customerName,
+          phone: input.phone ?? null,
+          email: input.email ?? null,
+          paymentMethod: (input.paymentMethod as PaymentMethod) ?? null,
+        },
+      });
+      const property = await tx.property.create({
+        data: {
+          customerId: customer.id,
+          propertyName: input.propertyName ?? null,
+          addressLine: input.fullAddress,
+          postcode: input.postcode,
+          serviceAreaId: input.serviceAreaId ?? null,
+          propertyType: (input.propertyType as PropertyType) ?? null,
+          accessNotes: input.accessNotes ?? null,
+          riskNotes: input.riskNotes ?? null,
+          roundId: input.roundId,
+        },
+      });
+      const servicePlan = await tx.servicePlan.create({
+        data: {
+          propertyId: property.id,
+          serviceId: input.serviceId ?? null,
+          price: input.price,
+          paymentMethod: (input.paymentMethod as PaymentMethod) ?? null,
+          cleaningFrequency: (input.cleaningFrequency as CleaningFrequency) ?? null,
+        },
+      });
+      return { customer, property, servicePlan };
+    });
+  }
+
+  // ── Step 10: Assign Technicians to Rounds ───────────────────────────────
+
+  private async buildStep10Result(): Promise<Step10Result> {
+    const [rounds, technicians] = await Promise.all([
+      this.prisma.round.findMany({
+        where: { status: RoundStatus.ACTIVE },
+        include: {
+          serviceArea: { select: { name: true } },
+          _count: { select: { properties: true } },
+          roundTechnicians: {
+            include: { technician: { select: { id: true, name: true } } },
+          },
+        },
+        orderBy: { createdAt: "asc" },
+      }),
+      this.prisma.technician.findMany({
+        where: { active: true },
+        include: { roundTechnicians: { select: { roundId: true } } },
+        orderBy: { createdAt: "asc" },
+      }),
+    ]);
+
+    const assignments: RoundAssignmentResult[] = rounds.map((r) => ({
+      roundId: r.id,
+      roundName: r.name,
+      defaultDay: r.defaultDay,
+      serviceAreaName: r.serviceArea?.name ?? null,
+      propertyCount: r._count.properties,
+      technicianIds: r.roundTechnicians.map((rt) => rt.technicianId),
+      technicians: r.roundTechnicians.map((rt) => rt.technician),
+    }));
+
+    const workload: WorkloadEntry[] = technicians.map((t) => ({
+      technicianId: t.id,
+      name: t.name,
+      roundCount: t.roundTechnicians.length,
+    }));
+
+    const unassignedCount = rounds.filter((r) => r.roundTechnicians.length === 0).length;
+
+    return {
+      totalRounds: rounds.length,
+      technicianCount: technicians.length,
+      unassignedCount,
+      assignments,
+      workload,
+    };
+  }
+
+  async getSetupRoundAssignments(): Promise<Step10Result> {
+    return this.buildStep10Result();
+  }
+
+  async assignTechniciansToRounds(
+    assignments: RoundTechnicianAssignment[]
+  ): Promise<Step10Result> {
+    // H-2: Reject duplicate roundIds up front — a second entry for the same round
+    // would deleteMany the technicians just written by the first, silently losing data.
+    const seenRoundIds = new Set<string>();
+    for (const a of assignments) {
+      if (seenRoundIds.has(a.roundId)) {
+        throw new AppError(400, `Duplicate roundId in assignments: ${a.roundId}`);
+      }
+      seenRoundIds.add(a.roundId);
+    }
+
+    // Validate all round and technician IDs up front.
+    const allRoundIds = assignments.map((a) => a.roundId);
+    const allTechIds = assignments.flatMap((a) => a.technicianIds);
+    const [roundHits, techHits] = await Promise.all([
+      this.prisma.round.findMany({
+        where: { id: { in: allRoundIds }, status: RoundStatus.ACTIVE },
+        select: { id: true },
+      }),
+      allTechIds.length > 0
+        ? this.prisma.technician.findMany({
+            // M-2: Only allow active technicians to be assigned.
+            where: { id: { in: allTechIds }, active: true },
+            select: { id: true },
+          })
+        : Promise.resolve([]),
+    ]);
+    const validRoundIds = new Set(roundHits.map((r) => r.id));
+    const validTechIds = new Set(techHits.map((t) => t.id));
+    for (const a of assignments) {
+      if (!validRoundIds.has(a.roundId)) {
+        throw new AppError(400, `roundId not found or not an ACTIVE round: ${a.roundId}`);
+      }
+      for (const tid of a.technicianIds) {
+        if (!validTechIds.has(tid)) {
+          throw new AppError(400, `technicianId not found or inactive: ${tid}`);
+        }
+      }
+    }
+
+    // Replace assignments for each supplied round (idempotent).
+    await this.prisma.$transaction(async (tx) => {
+      for (const a of assignments) {
+        // H-3: Deduplicate technicianIds to avoid P2002 on the composite PK.
+        const uniqueTechIds = [...new Set(a.technicianIds)];
+        await tx.roundTechnician.deleteMany({ where: { roundId: a.roundId } });
+        if (uniqueTechIds.length > 0) {
+          await tx.roundTechnician.createMany({
+            data: uniqueTechIds.map((tid) => ({
+              roundId: a.roundId,
+              technicianId: tid,
+            })),
+          });
+        }
+      }
+    });
+
+    return this.buildStep10Result();
+  }
+
+  // ── Step 11: Activate System & Generate Visits ──────────────────────────
+
+  async getActivationStatus(): Promise<{ activated: boolean; visitsGenerated: number }> {
+    const count = await this.prisma.visit.count({
+      where: { status: VisitStatus.SCHEDULED },
+    });
+    return { activated: count > 0, visitsGenerated: count };
+  }
+
+  async activateSystem(input: ActivationInput): Promise<ActivationResult> {
+    if (input.cycleWeeks < 1 || input.cycleWeeks > 52 || !Number.isInteger(input.cycleWeeks)) {
+      throw new AppError(400, "cycleWeeks must be an integer between 1 and 52");
+    }
+
+    // H-1: Use setupCompleted as the canonical activation guard, not visit.count().
+    // An unrelated visit (e.g. created during testing) must not permanently block activation.
+    const settings = await this.getSettings();
+    if (settings?.setupCompleted) {
+      throw new AppError(409, "System is already activated — setup is complete");
+    }
+
+    const startDate = new Date(input.startDate);
+    if (Number.isNaN(startDate.getTime())) {
+      throw new AppError(400, "startDate must be a valid ISO date string");
+    }
+    // M-3: Reject past start dates — they generate immediately-overdue visits.
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    if (startDate < today) {
+      throw new AppError(400, "startDate must be today or in the future");
+    }
+    const cycleEndDate = new Date(startDate);
+    cycleEndDate.setDate(cycleEndDate.getDate() + input.cycleWeeks * 7);
+
+    if (!input.generateAll && (!input.roundIds || input.roundIds.length === 0)) {
+      throw new AppError(400, "roundIds is required when generateAll is false");
+    }
+
+    const roundWhere = input.generateAll
+      ? { status: RoundStatus.ACTIVE }
+      : { status: RoundStatus.ACTIVE, id: { in: input.roundIds ?? [] } };
+
+    const rounds = await this.prisma.round.findMany({
+      where: roundWhere,
+      include: {
+        properties: {
+          where: { status: LifecycleStatus.ACTIVE, roundId: { not: null } },
+          include: {
+            servicePlans: {
+              where: { status: LifecycleStatus.ACTIVE },
+              orderBy: { createdAt: "asc" },
+              take: 1,
+            },
+          },
+        },
+      },
+    });
+
+    // M-4: When targeting specific rounds, fail early if none matched.
+    if (!input.generateAll && rounds.length === 0) {
+      throw new AppError(404, "None of the specified roundIds were found");
+    }
+
+    const visitData: Array<{
+      date: Date;
+      status: VisitStatus;
+      price: typeof rounds[0]["properties"][0]["servicePlans"][0]["price"];
+      propertyId: string;
+      roundId: string;
+      servicePlanId: string;
+      paymentMethod: PaymentMethod | null;
+    }> = [];
+
+    for (const round of rounds) {
+      for (const property of round.properties) {
+        const plan = property.servicePlans[0];
+        if (!plan) continue;
+
+        const firstDate = round.defaultDay
+          ? nextOccurrenceOfDay(startDate, round.defaultDay as DayOfWeek)
+          : new Date(startDate);
+
+        const freqWeeks = plan.cleaningFrequency
+          ? frequencyToWeeks(plan.cleaningFrequency as CleaningFrequency)
+          : null;
+
+        let visitDate = new Date(firstDate);
+        while (visitDate <= cycleEndDate) {
+          visitData.push({
+            date: new Date(visitDate),
+            status: VisitStatus.SCHEDULED,
+            price: plan.price,
+            propertyId: property.id,
+            roundId: round.id,
+            servicePlanId: plan.id,
+            paymentMethod: plan.paymentMethod,
+          });
+          if (!freqWeeks) break;
+          visitDate = new Date(visitDate);
+          visitDate.setDate(visitDate.getDate() + freqWeeks * 7);
+        }
+      }
+    }
+
+    if (visitData.length > 0) {
+      await this.prisma.visit.createMany({ data: visitData });
+    }
+
+    return { visitsGenerated: visitData.length };
+  }
+
+  // ── Step 12: Review & Launch checklist ─────────────────────────────────
+
+  async getReviewChecklist(): Promise<{
+    checklist: Array<{ label: string; complete: boolean }>;
+    allComplete: boolean;
+  }> {
+    const status = await this.getStatus("");
+    const checklist = [
+      { label: "Business profile completed", complete: status.steps[0].complete },
+      { label: "Payment setup configured", complete: status.steps[1].complete },
+      { label: "Service catalogue created", complete: status.steps[2].complete },
+      { label: "Round settings saved", complete: status.steps[3].complete },
+      { label: "Technicians added", complete: status.steps[5].complete },
+      { label: "Service areas created", complete: status.steps[6].complete },
+      { label: "Rounds configured", complete: status.steps[7].complete },
+      { label: "Properties added", complete: status.steps[8].complete },
+      { label: "Technicians assigned to rounds", complete: status.steps[9].complete },
+      { label: "Visits generated", complete: status.steps[10].complete },
+    ];
+    const allComplete = checklist.every((c) => c.complete);
+    return { checklist, allComplete };
+  }
+}
+
+// ── Module-level helpers ─────────────────────────────────────────────────────
+
+function nextOccurrenceOfDay(from: Date, day: DayOfWeek): Date {
+  const dayIndex: Record<DayOfWeek, number> = {
+    SUN: 0, MON: 1, TUE: 2, WED: 3, THU: 4, FRI: 5, SAT: 6,
+  };
+  const target = dayIndex[day];
+  const current = from.getDay();
+  const daysUntil = (target - current + 7) % 7;
+  const result = new Date(from);
+  result.setDate(from.getDate() + daysUntil);
+  return result;
+}
+
+function frequencyToWeeks(freq: CleaningFrequency): number {
+  switch (freq) {
+    case CleaningFrequency.FORTNIGHTLY:   return 2;
+    case CleaningFrequency.FOUR_WEEKLY:   return 4;
+    case CleaningFrequency.SIX_WEEKLY:    return 6;
+    case CleaningFrequency.EIGHT_WEEKLY:  return 8;
+    // L-2: MONTHLY is approximated as 4 weeks (28 days). This generates 13
+    // visits/year instead of 12. Use calendar-month arithmetic if exact billing
+    // cycles are required in a future milestone.
+    case CleaningFrequency.MONTHLY:       return 4;
   }
 }
 
