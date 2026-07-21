@@ -189,7 +189,7 @@ Two locked assignment rules run through the scheduling milestones (see
 **Depends on:** M3 (visits exist). ⚠️ **Blocked** on the native-vs-mobile-web decision (DP-MOBILE) before FE work.
 
 ### Backend tickets
-- [ ] **[BE-M5-01]** Technician invite/onboarding — invite-token entity + accept flow (links a `Profile` role TECHNICIAN) (Mobile Screen 2; schema item #5). `labels: backend, mobile`
+- [x] **[BE-M5-01]** Technician invite/onboarding — `TenantInvite` entity + `POST /invites` + `POST /invites/:token/accept` (tech-link idempotent; cross-tenant guards) (done 2026-07-21). `labels: backend, mobile`
 - [ ] **[BE-M5-02]** "Today's jobs" endpoint — the logged-in technician's assigned `Visit`s for the day (Mobile Screen 5). `labels: backend, mobile`
 - [ ] **[BE-M5-03]** Visit action endpoints — start / complete / skip / access-issue (Mobile Screen 8). `labels: backend, mobile`
 - [ ] **[BE-M5-04]** Skip-reason enum migration (Not home / No access / Customer refused / Unsafe / Other) (schema item #7). `labels: backend, visits`
@@ -284,9 +284,9 @@ Two locked assignment rules run through the scheduling milestones (see
 ### Backend tickets
 - [ ] **[BE-M9-01]** Settings read/update per section — Business Profile, Round Settings, Service Catalogue, Service Areas, Payment Setup (Screen 23/24). `labels: backend, settings`
 - [ ] **[BE-M9-02]** Technician CRUD (Add/Edit/Delete) + availability status (Active/Unavailable) (Screens 25/28/29; Design Update #2; schema item #4). `labels: backend, technicians`
-- [ ] **[BE-M9-03]** Auth hardening — `audience`/`issuer` checks; resolve app role from `Profile` (DP-ROLES / DP-AUTHHARD). `labels: backend, auth`
-- [ ] **[BE-M9-04]** Production hardening — CORS lockdown, structured logging, health/readiness. `labels: backend, infra`
-- [ ] **[BE-M9-05]** Commit `handle_new_user` trigger SQL as a migration (DP-TRIGGER). `labels: backend, infra`
+- [x] **[BE-M9-03]** Auth hardening — `audience`/`issuer` checks (done 2026-07-16); app role resolved from `Profile` via `requireTenantAccess` (done 2026-07-21). `labels: backend, auth`
+- [ ] **[BE-M9-04]** Production hardening — ~~CORS lockdown~~ ✅ (2026-07-21); structured logging + health/readiness still pending. `labels: backend, infra`
+- [x] **[BE-M9-05]** ~~Commit `handle_new_user` trigger~~ — trigger dropped (2026-07-21); `POST /auth/signup` is the provisioning path. `labels: backend, infra`
 - [ ] **[BE-M9-06]** End-to-end cycle test — property → visit → completion → payment (Phase 1 success criterion). `labels: backend, infra`
 
 ### Frontend tickets
@@ -306,17 +306,19 @@ Two locked assignment rules run through the scheduling milestones (see
 
 - [x] Public schema split: `Tenant`, `Profile` (with `tenantId`), `TenantInvite` only — all operational models moved to per-tenant schemas.
 - [x] Tenant schema (`prisma/tenant/schema.prisma`) — all operational models; generated to `src/generated/tenant-client`.
-- [x] `POST /auth/signup` — provisions a fresh Postgres schema (`t_<20-hex>`) + Tenant row + ADMIN Profile on first signup; idempotent.
-- [x] `src/lib/tenant-prisma.ts` — temporary singleton tenant client (placeholder until per-request client wiring in step 9).
+- [x] `POST /auth/signup` — provisions a fresh Postgres schema (`t_<20-hex>`) + Tenant row + ADMIN Profile on first signup; idempotent. Re-provisions on every call path (new / idempotent / P2002 race).
 - [x] `docs/sql/drop_handle_new_user.sql` — drops the old trigger; must be run in Supabase SQL Editor before first live signup.
 - [x] Cross-schema FK relations removed from Prisma; `Technician.name` and `PropertyNote.authorProfileId` are plain string fields.
 - [x] tsc clean — all service/route files updated to import from `generated/tenant-client`; `BusinessSettings` singleton pattern replaced with `findFirst()`.
-
-**Remaining tenant steps (pre-M5):**
-- [ ] `getTenantClient(schemaName)` factory + `provisionTenant()` (per-request client wiring).
-- [ ] `requireTenant()` middleware — resolves schema from `Profile.tenant.schemaName`.
-- [ ] `POST /invites` + `POST /invites/:token/accept` — technician invite flow (BE-M5-01).
-- [ ] `TENANT_MIGRATION_URL` env var + `prisma migrate dev --schema prisma/tenant/schema.prisma` — generate tenant migration SQL.
+- [x] `src/lib/tenant-prisma-manager.ts` — per-schema PrismaClient factory with LRU cache (max 100); replaces deleted `tenant-prisma.ts` singleton.
+- [x] `src/lib/tenant-provisioning.ts` — atomic schema provisioning (BEGIN/COMMIT); DROP only on empty schema; refuses to DROP if tables exist without `BusinessSettings`.
+- [x] `src/middleware/requireTenantAccess.ts` — resolves `Profile` + `Tenant.schemaName` per request; attaches `req.profile` and `req.tenantPrisma`.
+- [x] `POST /invites` + `GET /invites/:token` + `POST /invites/:token/accept` — full invite flow with tech-link idempotency, cross-tenant guards, and email rollback.
+- [x] Services converted to constructor injection (`createXxxService(prisma)` factories); all `BusinessSettings` writes use `upsert`.
+- [x] `BusinessSettings.uniqueId @unique @default("singleton")` — migration `20260721000002_business_settings_unique_id`; prevents concurrent create races.
+- [x] CORS locked to `FRONTEND_URL`; `FRONTEND_URL` + `INVITE_BASE_URL` validated at startup with `process.exit(1)`.
+- [x] Customer list pagination (`page`/`pageSize`) + payments tab capped at 50 rows.
+- [x] HTML escaping + `encodeURI` in invite emails.
 
 ---
 

@@ -1,6 +1,6 @@
 # RoundFlow Backend — Progress Log
 
-> Living document. Last updated: 2026-07-08 · Branch: `dev` · HEAD: `2abb18d`
+> Living document. Last updated: 2026-07-21 · Branch: `dev`
 > Written by reading the codebase directly. If a claim isn't backed by code or a
 > run, it's flagged as unverified. Update this file as the backend grows.
 > **2026-07-07:** `docs/designFindings.md` re-audited (admin design update + new
@@ -466,6 +466,84 @@ remaining auth-hardening note.
 PgBouncer interactive-transaction concern (🟡 #7) was **verified**, not deferred —
 see the confirmed item under *Verified Working*.
 
+### Multi-Tenancy: Per-Request Schema Resolution (2026-07-21)
+
+Replaced the broken `TENANT_SCHEMA` env-var singleton with proper per-request tenant
+schema resolution. Architecture: `JWT → supabaseUserId → Profile.tenantId →
+Tenant.schemaName → LRU-cached PrismaClient`.
+
+- **`src/lib/tenant-prisma-manager.ts`** — Per-schema PrismaClient factory with an
+  LRU cache (max 100 entries; evicted clients are `$disconnect()`d). Replaces the
+  deleted `src/lib/tenant-prisma.ts` singleton. `lru-cache` declared as an explicit
+  `package.json` dependency.
+- **`src/middleware/requireTenantAccess.ts`** — Runs after `requireAuth`; loads
+  `Profile` (with `tenant`) by `supabaseUserId`, attaches `req.profile` and
+  `req.tenantPrisma`, returns 401 if `req.user` absent or 403 if no Profile found.
+  Supersedes `requireRole`'s redundant DB call — `requireRole` now just reads
+  `req.profile.role` (no DB hit).
+- **`src/lib/tenant-provisioning.ts`** — Atomic schema provisioning via a direct `pg`
+  connection (not pooled): `isAlreadyProvisioned` checks for `BusinessSettings`;
+  if absent, checks for any tables (refuses to DROP if tables exist without
+  `BusinessSettings` — prevents silent data destruction); DROP+CREATE only on
+  a completely empty schema; migration SQL runs inside `BEGIN/COMMIT`; failures
+  `ROLLBACK` cleanly so the next call retries from scratch.
+- **Services** — `SetupService`, `SettingsService`, `CustomerService` all converted
+  from singletons to constructor injection (`createXxxService(prisma)` factories).
+  All writes to `BusinessSettings` use `upsert({ where: { uniqueId: "singleton" } })`
+  — the `uniqueId @unique @default("singleton")` DB constraint prevents concurrent
+  create races (migration `20260721000002_business_settings_unique_id`).
+- **Routes** — `/setup`, `/settings`, `/customers`, `/properties` all use
+  `requireTenantAccess` middleware + the `(req) => createXxxService(req.tenantPrisma!)`
+  pattern per handler.
+- **`POST /auth/signup`** — re-provisions the tenant schema on every call path
+  (new, idempotent, P2002 race recovery) so a tenant whose schema is absent or
+  partially provisioned can recover on next login.
+- **`src/index.ts`** — `TENANT_SCHEMA` env var removed; `FRONTEND_URL` and
+  `INVITE_BASE_URL` validated at startup with `process.exit(1)` on absence.
+- **`.env.example`** — `TENANT_SCHEMA` removed; `FRONTEND_URL` and `INVITE_BASE_URL`
+  added.
+
+### Invite Flow (2026-07-21)
+
+Full technician/staff invite flow implemented in `src/routes/invites.ts`:
+
+- `POST /invites` (ADMIN/MANAGER) — creates a `TenantInvite`, sends an email via
+  Resend; on email failure **deletes the invite** so the admin can retry without
+  hitting 409 (H-4).
+- `GET /invites/:token` — public pre-auth endpoint; returns email + role + expiry
+  for the signup pre-fill flow.
+- `POST /invites/:token/accept` (requireAuth) — idempotent accept:
+  1. Looks up the existing Profile **first** (before `assertInviteUsable`) so a
+     crash after the profile+acceptedAt transaction still completes the tech-link on
+     retry.
+  2. Guards: invite must belong to the **same tenant** as the existing profile; email
+     must match — prevents cross-tenant technician hijacking.
+  3. On fresh accept: validates invite usable + email match → creates Profile + marks
+     `acceptedAt` in a transaction → links `Technician.profileId` if
+     `invite.technicianId` is set.
+
+### Security & Robustness Audit Remediation (2026-07-21)
+
+A senior-engineer audit of the multi-tenancy work identified 12 findings (C-1/C-2
+Critical, H-1–H-4 High, M-1–M-4/M-7 Medium) plus 2 new issues introduced by early
+fixes. All 14 are resolved:
+
+| Item | Fix |
+|------|-----|
+| **C-1** Invite accept tech-link unreachable after crash | Moved existing-profile check + tenant/email guards **before** `assertInviteUsable` |
+| **C-2** Partial tenant schema left inconsistent | `BEGIN/COMMIT` wraps migration SQL; `ROLLBACK` on failure; empty-schema-only DROP |
+| **H-1** Re-provision not called on idempotent signup | `provisionTenantSchema` called in all three `POST /auth/signup` return paths |
+| **H-2** Customer list uncapped (no pagination) | Offset-based pagination (`page`/`pageSize`) added; HOLD filter in-memory, others DB-level `take/skip` |
+| **H-3** Unbounded `Map` for tenant PrismaClients | Replaced with `LRUCache(max: 100)` from `lru-cache`; eviction calls `$disconnect()` |
+| **H-4** Email failure leaves orphan invite row | Invite deleted on email send failure so admin can retry |
+| **M-1** CORS wildcard origin | Locked to `FRONTEND_URL` env var with `credentials: true` |
+| **M-2** `BusinessSettings` concurrent create race | `uniqueId @unique @default("singleton")` + all writes use `upsert` |
+| **M-3** `INVITE_BASE_URL` not validated at startup | `process.exit(1)` if `FRONTEND_URL` or `INVITE_BASE_URL` absent on boot |
+| **M-4** Unsanitised HTML in invite emails | `escapeHtml()` on company name; `encodeURI()` on invite URL in HTML body |
+| **M-7** Payments tab uncapped (vs visitHistory cap of 50) | `visits.slice(0, 50).map(...)` in `getCustomerDetail` payments tab |
+| **NEW-1** Email + tenant ownership checks bypassed on idempotent path | Two guards added at top of `if (existing)` block: `existing.tenantId !== invite.tenantId` → 403; email mismatch → 403 |
+| **NEW-2** `DROP SCHEMA CASCADE` could destroy live tenant data | Table-count check before DROP: if tables > 0 but no `BusinessSettings` → throw (manual intervention required); DROP only on empty schema |
+
 ## Verified Working
 
 Each item was actually run and observed:
@@ -537,10 +615,8 @@ Each item was actually run and observed:
   from a real token. Replace once a real admin signs up.
 - **Seed Technician is linked to the admin Profile** for boot convenience; real
   technicians get their own TECHNICIAN-role Profile.
-- **CORS allows all origins** (`app.use(cors())`) — tighten to the frontend
-  origin(s) before production.
-- **`handle_new_user` trigger is not version-controlled** — capture it as a SQL
-  migration so it's reproducible across environments.
+- ~~**CORS allows all origins**~~ — locked to `FRONTEND_URL` with `credentials: true` (2026-07-21).
+- ~~**`handle_new_user` trigger**~~ — trigger dropped; `POST /auth/signup` is the provisioning path (2026-07-21).
 - **No production runtime hardening** — a `dist/` build now exists (`npm run
   build` → `npm run start:prod`), but there's still no process manager,
   deploy-grade health/readiness, or structured logging yet.
