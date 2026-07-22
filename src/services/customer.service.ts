@@ -46,7 +46,7 @@ export interface PropertyCreateInput {
   postcode: string;
   propertyName?: string | null;
   propertyType?: string | null;
-  serviceAreaId?: string | null;
+  serviceAreaId: string;
   serviceId?: string | null;
   price: number;
   cleanMethod?: string | null;
@@ -688,7 +688,7 @@ class CustomerService implements ICustomerService {
     input: PropertyCreateInput
   ): Promise<{ customerId: string; propertyId: string; servicePlanId: string; assigned: boolean }> {
     if (input.roundId) await this.assertRoundExists(input.roundId);
-    if (input.serviceAreaId) await this.assertServiceAreaExists(input.serviceAreaId);
+    await this.assertServiceAreaExists(input.serviceAreaId);
 
     return this.prisma.$transaction(async (tx) => {
       const customer = await tx.customer.create({
@@ -701,7 +701,7 @@ class CustomerService implements ICustomerService {
           postcode: input.postcode,
           propertyName: input.propertyName ?? null,
           propertyType: (input.propertyType as PropertyType) ?? null,
-          serviceAreaId: input.serviceAreaId ?? null,
+          serviceAreaId: input.serviceAreaId,
           accessNotes: input.accessNotes ?? null,
           riskNotes: input.riskNotes ?? null,
           roundId: input.roundId ?? null,

@@ -4,10 +4,12 @@ import jwksClient from "jwks-rsa";
 import type { Profile } from "@prisma/client";
 
 // The authenticated user derived from a verified Supabase JWT.
+// Role is intentionally absent — Supabase's JWT role claim is always
+// "authenticated" (useless for authorisation). The app role (ADMIN/MANAGER/
+// TECHNICIAN) is read from Profile.role via requireTenantAccess on every request.
 export interface AuthUser {
   supabaseUserId: string;
   email: string;
-  role: string;
 }
 
 // Augment Express's Request so req.user (set by requireAuth) and req.profile
@@ -98,7 +100,6 @@ export async function requireAuth(
     req.user = {
       supabaseUserId: sub,
       email: typeof payload.email === "string" ? payload.email : "",
-      role: typeof payload.role === "string" ? payload.role : "",
     };
     return next();
   } catch {

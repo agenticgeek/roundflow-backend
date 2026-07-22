@@ -99,7 +99,7 @@ export interface SetupPropertyInput {
   email?: string | null;
   fullAddress: string;
   postcode: string;
-  serviceAreaId?: string | null;
+  serviceAreaId: string;
   propertyType?: string | null;
   // Service plan
   price: number;
@@ -614,12 +614,10 @@ class SetupService implements ISetupService {
     ) {
       throw new AppError(400, `Invalid paymentMethod: ${input.paymentMethod}`);
     }
-    if (input.serviceAreaId) {
-      const area = await this.prisma.serviceArea.findUnique({
-        where: { id: input.serviceAreaId },
-      });
-      if (!area) throw new AppError(400, `serviceAreaId not found: ${input.serviceAreaId}`);
-    }
+    const area = await this.prisma.serviceArea.findUnique({
+      where: { id: input.serviceAreaId },
+    });
+    if (!area) throw new AppError(400, `serviceAreaId not found: ${input.serviceAreaId}`);
     if (input.roundId) {
       // M-1: Require ACTIVE status — a DRAFT round never appears in step 10's
       // ACTIVE-round query, so properties assigned to it would be orphaned from
@@ -647,7 +645,7 @@ class SetupService implements ISetupService {
           propertyName: input.propertyName ?? null,
           addressLine: input.fullAddress,
           postcode: input.postcode,
-          serviceAreaId: input.serviceAreaId ?? null,
+          serviceAreaId: input.serviceAreaId,
           propertyType: (input.propertyType as PropertyType) ?? null,
           accessNotes: input.accessNotes ?? null,
           riskNotes: input.riskNotes ?? null,

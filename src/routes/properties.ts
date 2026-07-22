@@ -44,7 +44,7 @@ propertiesRouter.post(
       postcode: requireString(body.postcode, "postcode").trim(),
       propertyName: optString(body.propertyName, "propertyName"),
       propertyType: optString(body.propertyType, "propertyType"),
-      serviceAreaId: optId(body.serviceAreaId, "serviceAreaId"),
+      serviceAreaId: requireString(body.serviceAreaId, "serviceAreaId"),
       // Service Plan (step 2)
       serviceId: optId(body.serviceId, "serviceId"),
       price: assertPositive(requireNumber(body.price, "price"), "price"),

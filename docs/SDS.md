@@ -1,9 +1,9 @@
 # RoundFlow Phase 1 — Software Design Specification
 
-> Derived from `PROGRESS.md`, `prisma/schema.prisma`, `docs/designFindings.md`,
-> and `docs/RoundFlow_Context_and_Roadmap_v1.md`. **Built** items reflect the
-> current codebase (per PROGRESS.md); **Planned** items are proposals derived
-> from the screen set and roadmap — proposed route paths are *not yet in code*.
+> Derived from `PROGRESS.md`, `prisma/schema.prisma`, `prisma/tenant/schema.prisma`,
+> `docs/designFindings.md`, `docs/RoundFlow_Context_and_Roadmap_v1.md`, and the
+> implemented codebase (`src/`). **Built** items are present in code; **Planned**
+> items are proposed from the screen set — route paths not yet in code.
 
 ---
 
@@ -16,12 +16,16 @@
 - **Mobile technician app** ("RoundFlow Technician") — field job execution;
   delivery form (native vs mobile web) TBD.
 - **Express backend** (Node + TypeScript) — REST API; system of record access;
-  all business logic. Runs via `tsx` (no compiled build step yet).
+  all business logic. Built via `tsc -p tsconfig.build.json`; run via `tsx` in dev,
+  `node dist/index.js` in prod.
 - **Supabase Postgres** — managed database (Prisma ORM 6.19.3), region
-  `ap-northeast-1`.
-- **Supabase Auth** — identity provider; issues ES256 JWTs; `handle_new_user`
-  Postgres trigger creates the `Profile` mirror.
+  `ap-northeast-1`. Two schema layers: `public` (identity + tenant registry) and
+  per-tenant operational schemas (`t_<20-hex>`).
+- **Supabase Auth** — identity provider; issues ES256 JWTs. The backend replaces
+  the retired `handle_new_user` trigger with `POST /auth/signup`, which creates the
+  `Tenant` + `Profile` row and provisions the tenant schema atomically.
 - **GHL (utility, deferred)** — messaging + payment assistance; single account.
+- **Deployment** — Railway (backend); Supabase (DB + Auth).
 
 ### 1.2 Component Interaction (text diagram)
 ```
@@ -31,44 +35,60 @@
              │  Supabase JS (auth)           │
              │  + Bearer JWT (ES256)         │
              ▼                               ▼
-        ┌──────────────────────────────────────────┐
-        │        Express Backend (REST API)         │
-        │  requireAuth (JWKS/ES256) → routes → svc  │
-        │  services (all logic + DB access)         │
-        └───────┬───────────────────────┬──────────┘
-                │ Prisma (pooler 6543)    │ (deferred)
-                ▼                         ▼
-        ┌───────────────┐        ┌──────────────────┐
-        │ Supabase      │        │  GHL utility     │
-        │ Postgres      │        │  (SMS/WhatsApp/   │
-        │ (system of    │        │   Email, payments│
-        │  record)      │        │   assist)        │
-        └──────┬────────┘        └──────────────────┘
-               │ trigger (handle_new_user) on auth.users insert
-               ▼
-        ┌───────────────┐
-        │ Supabase Auth │  ← verifies JWTs via JWKS (well-known endpoint)
-        └───────────────┘
+        ┌──────────────────────────────────────────────────┐
+        │           Express Backend (REST API)              │
+        │  requireAuth (JWKS/ES256)                         │
+        │  → requireTenantAccess (JWT→Profile→Tenant→schema)│
+        │  → routes → services → DB                        │
+        └──┬─────────────────────┬──────────────────┬──────┘
+           │ @prisma/client       │ tenant-client    │ pg (direct)
+           │ (pooler 6543)        │ LRU pool         │ (port 5432)
+           ▼                     ▼                  ▼
+    ┌──────────────┐   ┌──────────────────┐  ┌──────────────────┐
+    │ public schema│   │ t_<hex> schema   │  │ Schema           │
+    │ Profile      │   │ (per-tenant ops) │  │ Provisioning     │
+    │ Tenant       │   │ Customer, Round, │  │ (new tenant      │
+    │ TenantInvite │   │ Visit, etc.      │  │  setup only)     │
+    └──────────────┘   └──────────────────┘  └──────────────────┘
+           │
+           ▼ (deferred)
+    ┌──────────────┐
+    │  GHL utility │
+    │  Resend email│
+    └──────────────┘
 ```
 Auth token flow: frontend authenticates with Supabase → receives ES256 JWT →
-sends `Authorization: Bearer <jwt>` to the backend → `requireAuth` verifies it
-against Supabase's JWKS endpoint (public key by `kid`).
+sends `Authorization: Bearer <jwt>` to the backend → `requireAuth` verifies
+against Supabase's JWKS endpoint → `requireTenantAccess` resolves
+`supabaseUserId → Profile → Tenant.schemaName` → attaches a per-schema
+`TenantPrismaClient` on `req.tenantPrisma`.
 
 ### 1.3 Why each component (from PROGRESS Architecture Decisions)
 - **Prisma 6.19.3 (not 7):** Prisma 7 needs a driver adapter, moves the datasource
   URL into `prisma.config.ts`, drops `directUrl`, and its `migrate dev` bailed in
   the non-TTY environment. Prisma 6 keeps schema-based datasource, the
   `prisma-client-js` generator, and non-interactive `migrate dev`. Chosen for
-  stability. *(Note: PROGRESS also records that destructive `migrate dev` prompts
-  can't be answered non-interactively — see §3.3.)*
-- **Supabase Postgres:** managed DB; also provides Supabase Auth. (Early bring-up
-  used local Homebrew Postgres, then moved.)
+  stability.
+- **Two Prisma generated clients:** The public schema (`prisma/schema.prisma`) and
+  tenant schema (`prisma/tenant/schema.prisma`) are fully separate Prisma projects.
+  They generate into `@prisma/client` and `src/generated/tenant-client` respectively.
+  Prisma cannot express cross-schema foreign keys, so cross-schema references
+  (`Technician.profileId`, `PropertyNote.authorProfileId`) are plain `String` fields
+  enforced at the application layer.
+- **Schema-per-tenant (not RLS, not database-per-tenant):** Each business gets its
+  own PostgreSQL schema (`t_<20-hex>`). RLS was not chosen because it adds
+  query-level complexity to every operation; database-per-tenant is impractical on
+  Supabase. Schema isolation is enforced by `requireTenantAccess` + the LRU pool.
+- **LRU PrismaClient pool:** One `TenantPrismaClient` per `schemaName`, cached in
+  an LRU (max 100 entries). Evicted clients call `$disconnect()` to release PgBouncer
+  connections. Prevents connection exhaustion with many tenants; prevents duplicated
+  Prisma engine processes.
+- **`POST /auth/signup` (not `handle_new_user` trigger):** Replaces the Postgres
+  trigger to put tenant provisioning under application control — the trigger had no
+  way to run `provisionTenantSchema`. The frontend calls `GET /auth/me` first; if
+  it gets a 404, it calls `POST /auth/signup`.
 - **Supabase Auth + ES256 JWKS:** the project signs with ES256 (asymmetric), so
-  the backend verifies via JWKS public keys — no shared secret stored. An earlier
-  HS256 shared-secret approach rejected real tokens and was removed.
-- **Profile via Postgres trigger (not HTTP webhook):** transactional with the user
-  insert, no shared secret, no network round-trip, no public unauthenticated
-  route. (An earlier `POST /auth/webhook` was built then deleted.)
+  the backend verifies via JWKS public keys — no shared secret stored.
 - **GHL as utility, not platform:** avoids building messaging/payments infra;
   keeps RoundFlow's Postgres as the system of record.
 
@@ -77,290 +97,464 @@ against Supabase's JWKS endpoint (public key by `kid`).
 ## 2. Backend Design
 
 ### 2.1 Technology Stack
-| Layer | Choice |
-|-------|--------|
-| Runtime | Node.js + TypeScript, run via `tsx` (dev; no `dist` build yet) |
-| Web framework | Express 4 |
-| ORM | Prisma 6.19.3 (`prisma-client-js` generator) |
-| Database | Supabase Postgres (`ap-northeast-1`) |
-| Auth verify | `jsonwebtoken` + `jwks-rsa` (ES256, JWKS) |
-| Config | `dotenv` (`.env`) |
-| Typecheck | `tsc --noEmit` (Node16 module/resolution, strict) |
+| Layer | Choice | Notes |
+|-------|--------|-------|
+| Runtime | Node.js + TypeScript | Run via `tsx` in dev; `node dist/` in prod |
+| Build | `tsc -p tsconfig.build.json` | Outputs `dist/`; copies `src/generated` + `prisma/tenant` |
+| Web framework | Express 4 | |
+| ORM (public schema) | `@prisma/client` 6.19.3 | Singleton `prisma` client; `globalThis`-cached |
+| ORM (tenant schema) | `src/generated/tenant-client` 6.19.3 | LRU-pooled per `schemaName` |
+| Database | Supabase Postgres (`ap-northeast-1`) | |
+| Auth verify | `jsonwebtoken` + `jwks-rsa` | ES256; JWKS keys cached 10h |
+| Email | `resend` | Transactional (invite emails) |
+| Schema provisioning | `pg` (direct connection, port 5432) | Used only by `provisionTenantSchema` |
+| Client pool | `lru-cache` ^11 | Max 100 tenant clients; `$disconnect` on eviction |
+| API docs | `swagger-ui-express` | `/docs` (UI), `/openapi.json` (raw spec) |
+| Config | `dotenv` | `.env`; `FRONTEND_URL` + `INVITE_BASE_URL` validated at startup |
+| Typecheck | `tsc --noEmit` | `strict`, `Node16` module/resolution |
 
 ### 2.2 Project Structure
-Current `src/` layout (per PROGRESS "Current File Structure"):
+Current `src/` layout:
 ```
 src/
-├── index.ts                # Express app: cors + json, /health, /auth/me, /setup router,
-│                           #   AppError-aware error handler, listen
+├── index.ts                    # Express app wiring: CORS (locked to FRONTEND_URL),
+│                               #   JSON body, all routers, error handler, listen.
+│                               #   Startup validation: exits if FRONTEND_URL or
+│                               #   INVITE_BASE_URL are missing.
+├── swagger.ts                  # OpenAPI document (served at /docs + /openapi.json)
+├── generated/
+│   └── tenant-client/          # Prisma-generated client for tenant schemas
+│                               #   (output of `prisma generate --schema prisma/tenant/schema.prisma`)
 ├── lib/
-│   ├── prisma.ts           # Shared PrismaClient singleton (globalThis-cached)
-│   └── app-error.ts        # Typed AppError (statusCode + message)
+│   ├── app-error.ts            # Typed AppError(statusCode, message)
+│   ├── prisma.ts               # @prisma/client singleton (globalThis-cached)
+│   ├── tenant-prisma-manager.ts# LRU pool of TenantPrismaClient; getTenantPrismaForSchema()
+│   ├── tenant-provisioning.ts  # provisionTenantSchema(): creates schema + replays
+│   │                           #   all prisma/tenant/migrations/*.sql in a transaction
+│   ├── email.ts                # sendInviteEmail() via Resend (HTML-escaped, URL-encoded)
+│   ├── http.ts                 # Route helpers: h(), asObject(), asArray(),
+│   │                           #   requireString(), requireNumber(), optString(), optId(), etc.
+│   └── validation.ts           # Domain validators: assertPositive(), assertPositiveInt(),
+│                               #   validateWorkingDays(), optPaymentMethod(), etc.
 ├── middleware/
-│   └── requireAuth.ts      # JWKS/ES256 Bearer verification; attaches req.user; 401
-├── services/
-│   └── setup.service.ts    # Setup Wizard logic + all DB access (ISetupService — OCP seam)
-└── routes/
-    └── setup.ts            # Thin /setup routes: validate → call service → respond
+│   ├── requireAuth.ts          # JWKS/ES256 Bearer verification → req.user; 401 on fail
+│   ├── requireTenantAccess.ts  # JWT→Profile→Tenant.schemaName → req.tenantPrisma; 403 on fail
+│   └── requireRole.ts          # requireRole(...roles): checks req.profile.role
+│                               #   requireBusinessAccess(): GETs open to all, mutations ADMIN/MANAGER
+├── routes/
+│   ├── auth.ts                 # GET /auth/me, POST /auth/signup
+│   ├── invites.ts              # POST /invites, GET /invites/:token,
+│   │                           #   POST /invites/:token/accept
+│   ├── setup.ts                # /setup/* (12 steps + /status + /complete)
+│   ├── customers.ts            # GET /customers, GET /customers/:id, PATCH /customers/:id
+│   ├── properties.ts           # POST /properties, PATCH /properties/:id,
+│   │                           #   POST/GET /properties/:id/notes,
+│   │                           #   POST /properties/:id/pause, POST /properties/:id/resume
+│   └── settings.ts             # /settings/business-profile, /settings/round-settings,
+│                               #   /settings/services(/:id), /settings/service-areas(/:id),
+│                               #   /settings/technicians(/:id), /settings/payment,
+│                               #   /settings/payment/:provider/connect,
+│                               #   /settings/message-templates
+└── services/
+    ├── setup.service.ts        # ISetupService + SetupService (all 12 setup steps)
+    ├── customer.service.ts     # ICustomerService: getCustomers, getCustomerDetail,
+    │                           #   updateCustomer, createProperty, updateProperty,
+    │                           #   pauseService, resumeService, getNotes, addNote
+    └── settings.service.ts     # ISettingsService: all settings section reads/writes
 ```
 **Intended layout** (as domains land): one `routes/<domain>.ts` + one
-`services/<domain>.service.ts` per domain (Customers/Properties, Rounds, Visits,
-Debt, Invoices, Complaints, Reports, Technicians, Settings, Mobile), following the
-same thin-route / service-owns-logic pattern established by Setup.
+`services/<domain>.service.ts` per domain, following the thin-route /
+service-owns-logic pattern established by Setup.
 
 ### 2.3 API Design Principles
 - **RESTful conventions:** resource-oriented paths; `GET` reads, `POST` creates/
-  actions; JSON request/response bodies (`express.json()`). Setup uses
-  step-scoped sub-resources (`/setup/step/N`) plus `/setup/status` and
-  `/setup/complete`.
-- **Auth pattern:** every protected route runs `requireAuth` — reads
-  `Authorization: Bearer <token>`, verifies **ES256** against the Supabase **JWKS**
-  endpoint (`jwks-rsa` resolves the public key by `kid`; keys cached 10h,
-  rate-limited), attaches `req.user = { supabaseUserId, email, role }`, else 401.
+  actions, `PATCH` partial updates; JSON request/response bodies.
+- **Auth middleware chain:** `requireAuth` (JWKS/ES256 Bearer) → `requireTenantAccess`
+  (tenant schema resolution) → `requireRole` / `requireBusinessAccess` (role gate).
+  Every protected route runs the chain. `/health`, `GET /invites/:token`, and
+  `GET /auth/me` are partial exceptions (auth only, no tenant resolution).
 - **Error handling:** typed **`AppError(statusCode, message)`** thrown by services;
-  a centralised 4-arg Express error handler maps `AppError → { error, statusCode }`
-  and everything else → `500 { error: "Internal Server Error" }` (internals logged,
-  not leaked). Async route errors are forwarded to the handler.
+  centralised 4-arg Express error handler maps `AppError → { error, statusCode }`;
+  everything else → `500 { error: "Internal Server Error" }` (internals logged, not
+  leaked).
 - **Service layer (OCP seam):** routes are **thin** (validate input → call service
   → respond); **all business logic and DB access live in services**. Services are
-  bound behind an interface (e.g. `ISetupService`) and every method takes
-  `profileId` first, so a Phase 2 tenant-scoped implementation can be swapped in
-  **without touching routes**.
+  bound behind interfaces and every method takes `profileId` first, so a Phase 2
+  implementation scoped by GHL install/location can be swapped in without changing
+  routes.
+- **Shared route utilities:** `src/lib/http.ts` provides `h()` (async error
+  forwarding), `asObject()`, `asArray()`, `requireString()`, `requireNumber()`,
+  `optString()`, `optId()` etc. `src/lib/validation.ts` provides domain-specific
+  validators. Routes never duplicate validation logic.
 
 ### 2.4 Route Inventory
-**Built** = present in code (PROGRESS). **Planned** = proposed from the screen set
-(path not yet in code). All non-`/health` routes require a Bearer JWT.
+**Built** = present in code. **Planned** = proposed from the screen set (path not
+yet in code). All non-`/health` routes require a Bearer JWT.
 
 | Method | Path | Auth | Service | Status |
 |--------|------|------|---------|--------|
 | GET | `/health` | No | — | **Built** |
-| GET | `/auth/me` | Yes | (inline; Profile lookup) | **Built** (temporary) |
-| GET | `/setup/status` | Yes | SetupService | **Built** |
-| POST | `/setup/step/1` (Business Profile) | Yes | SetupService | **Built** |
-| GET/POST | `/setup/step/2` (Payment — deferred stub) | Yes | — | **Built** |
-| GET/POST | `/setup/step/3` (Service Catalogue) | Yes | SetupService | **Built** |
-| POST | `/setup/step/4` (Round Settings) | Yes | SetupService | **Built** |
-| GET/POST | `/setup/step/5` (SMS Templates — deferred stub) | Yes | — | **Built** |
-| GET/POST | `/setup/step/6` (Technicians, invite-pending) | Yes | SetupService | **Built** |
-| GET/POST | `/setup/step/7` (Service Areas) | Yes | SetupService | **Built** |
-| GET/POST | `/setup/step/8` (first Round, ACTIVE) | Yes | SetupService | **Built** |
-| POST | `/setup/complete` | Yes | SetupService | **Built** |
-| — | Customers & Properties CRUD (Add Property flow, list, detail, tabs) | Yes | CustomerService (planned) | **Planned** |
-| — | Service Plans | Yes | ServicePlanService (planned) | **Planned** |
-| — | Rounds + assignment (Add Round wizard, multi-tech allocation) | Yes | RoundService (planned) | **Planned** |
-| — | Visit generation (cron) + Visit reads | Yes / cron | VisitService (planned) | **Planned** |
-| — | Round Planner reads (calendar/map/list) | Yes | RoundService (planned) | **Planned** |
-| — | Today's Work + Reassign / Push Missed | Yes | VisitService (planned) | **Planned** |
-| — | Debt / Payment Risk Board (+ reminders/links) | Yes | DebtService (planned) | **Planned** |
-| — | Invoices (generate/preview/send) | Yes | InvoiceService (planned) | **Planned** |
-| — | Complaints (log/review/revisit/resolve) | Yes | ComplaintService (planned) | **Planned** |
-| — | Reports & History | Yes | ReportService (planned) | **Planned** |
-| — | Technicians CRUD + messaging | Yes | TechnicianService (planned) | **Planned** |
-| — | Settings sections | Yes | SettingsService (planned) | **Planned** |
-| — | Mobile: job list, visit actions, notifications | Yes (JWT) | MobileService (planned) | **Planned** |
-
-*Planned rows omit exact method/path deliberately — those are defined when each
-domain is built; the screens indicate the surface, not the URL scheme.*
+| GET | `/auth/me` | JWT only | (inline; Profile lookup) | **Built** |
+| POST | `/auth/signup` | JWT only | (inline; Tenant + Profile create + schema provision) | **Built** |
+| GET | `/invites/:token` | No | (inline; invite lookup) | **Built** |
+| POST | `/invites` | JWT + Tenant | — | **Built** |
+| POST | `/invites/:token/accept` | JWT only | — | **Built** |
+| GET | `/setup/status` | JWT + Tenant | SetupService | **Built** |
+| GET/POST | `/setup/step/1` (Business Profile) | JWT + Tenant | SetupService | **Built** |
+| GET/POST | `/setup/step/2` (Payment — deferred stub) | JWT + Tenant | — | **Built** |
+| GET/POST | `/setup/step/3` (Service Catalogue) | JWT + Tenant | SetupService | **Built** |
+| GET/POST | `/setup/step/4` (Round Settings) | JWT + Tenant | SetupService | **Built** |
+| GET/POST | `/setup/step/5` (SMS Templates — deferred stub) | JWT + Tenant | — | **Built** |
+| GET/POST | `/setup/step/6` (Technicians) | JWT + Tenant | SetupService | **Built** |
+| GET/POST | `/setup/step/7` (Service Areas) | JWT + Tenant | SetupService | **Built** |
+| GET/POST | `/setup/step/8` (First Round) | JWT + Tenant | SetupService | **Built** |
+| GET/POST | `/setup/step/9` (Add Property) | JWT + Tenant | SetupService | **Built** |
+| GET/POST | `/setup/step/10` (Assign Technicians) | JWT + Tenant | SetupService | **Built** |
+| GET/POST | `/setup/step/11` (Activate / Generate Visits) | JWT + Tenant | SetupService | **Built** |
+| GET | `/setup/step/12` (Review checklist) | JWT + Tenant | SetupService | **Built** |
+| POST | `/setup/complete` | JWT + Tenant | SetupService | **Built** |
+| GET | `/customers` | JWT + Tenant | CustomerService | **Built** |
+| GET | `/customers/:id` | JWT + Tenant | CustomerService | **Built** |
+| PATCH | `/customers/:id` | JWT + Tenant (ADMIN/MGR) | CustomerService | **Built** |
+| POST | `/properties` | JWT + Tenant (ADMIN/MGR) | CustomerService | **Built** |
+| PATCH | `/properties/:id` | JWT + Tenant (ADMIN/MGR) | CustomerService | **Built** |
+| POST | `/properties/:id/pause` | JWT + Tenant (ADMIN/MGR) | CustomerService | **Built** |
+| POST | `/properties/:id/resume` | JWT + Tenant (ADMIN/MGR) | CustomerService | **Built** |
+| GET | `/properties/:id/notes` | JWT + Tenant | CustomerService | **Built** |
+| POST | `/properties/:id/notes` | JWT + Tenant (ADMIN/MGR) | CustomerService | **Built** |
+| GET | `/settings/business-profile` | JWT + Tenant | SettingsService | **Built** |
+| PATCH | `/settings/business-profile` | JWT + Tenant (ADMIN/MGR) | SettingsService | **Built** |
+| GET | `/settings/round-settings` | JWT + Tenant | SettingsService | **Built** |
+| PATCH | `/settings/round-settings` | JWT + Tenant (ADMIN/MGR) | SettingsService | **Built** |
+| GET | `/settings/services` | JWT + Tenant | SettingsService | **Built** |
+| POST | `/settings/services` | JWT + Tenant (ADMIN/MGR) | SettingsService | **Built** |
+| PATCH | `/settings/services/:id` | JWT + Tenant (ADMIN/MGR) | SettingsService | **Built** |
+| DELETE | `/settings/services/:id` | JWT + Tenant (ADMIN/MGR) | SettingsService | **Built** |
+| GET | `/settings/service-areas` | JWT + Tenant | SettingsService | **Built** |
+| POST | `/settings/service-areas` | JWT + Tenant (ADMIN/MGR) | SettingsService | **Built** |
+| PATCH | `/settings/service-areas/:id` | JWT + Tenant (ADMIN/MGR) | SettingsService | **Built** |
+| DELETE | `/settings/service-areas/:id` | JWT + Tenant (ADMIN/MGR) | SettingsService | **Built** |
+| GET | `/settings/technicians` | JWT + Tenant | SettingsService | **Built** |
+| POST | `/settings/technicians` | JWT + Tenant (ADMIN/MGR) | SettingsService | **Built** |
+| PATCH | `/settings/technicians/:id` | JWT + Tenant (ADMIN/MGR) | SettingsService | **Built** |
+| DELETE | `/settings/technicians/:id` | JWT + Tenant (ADMIN/MGR) | SettingsService | **Built** |
+| GET | `/settings/payment` | JWT + Tenant | SettingsService | **Built** |
+| PATCH | `/settings/payment` | JWT + Tenant (ADMIN/MGR) | SettingsService | **Built** |
+| POST | `/settings/payment/:provider/connect` | JWT + Tenant (ADMIN/MGR) | SettingsService | **Built** |
+| GET | `/settings/message-templates` | JWT + Tenant | SettingsService | **Built** |
+| PATCH | `/settings/message-templates` | JWT + Tenant (ADMIN/MGR) | SettingsService (stub) | **Built** |
+| GET | `/openapi.json` | No | — | **Built** |
+| GET | `/docs` | No | swagger-ui-express | **Built** |
+| — | Rounds + assignment (Add Round wizard, multi-tech allocation) | JWT + Tenant | RoundService (planned) | **Planned** |
+| — | Visit generation (cron) + Visit reads | JWT + Tenant / cron | VisitService (planned) | **Planned** |
+| — | Round Planner reads (calendar/map/list) | JWT + Tenant | RoundService (planned) | **Planned** |
+| — | Today's Work + Reassign / Push Missed | JWT + Tenant | VisitService (planned) | **Planned** |
+| — | Debt / Payment Risk Board | JWT + Tenant | DebtService (planned) | **Planned** |
+| — | Invoices (generate/preview/send) | JWT + Tenant | InvoiceService (planned) | **Planned** |
+| — | Complaints (log/review/revisit/resolve) | JWT + Tenant | ComplaintService (planned) | **Planned** |
+| — | Reports & History | JWT + Tenant | ReportService (planned) | **Planned** |
+| — | Mobile: job list, visit actions, notifications | JWT + Tenant | MobileService (planned) | **Planned** |
 
 ### 2.5 Data Access Pattern
-- **Prisma 6.x** via a **single shared `PrismaClient` singleton** (`src/lib/prisma.ts`),
-  cached on `globalThis` so dev hot-reload doesn't exhaust connections.
-- **Two connection URLs:** runtime uses `DATABASE_URL` → Supabase **transaction-mode
-  pooler** (port 6543, `?pgbouncer=true`); migrations use `DIRECT_URL` → **direct**
-  connection (port 5432), because PgBouncer transaction mode can't run migration
-  DDL / advisory locks. Both are declared in the `schema.prisma` datasource block.
-- Services perform all reads/writes; the `BusinessSettings` singleton is looked up
-  by `uniqueId = "singleton"`.
+Two Prisma clients and one direct `pg` connection cover all DB access:
+
+**Public schema client (`@prisma/client`)** — singleton on `globalThis`, manages
+`Profile`, `Tenant`, `TenantInvite`. Used directly in `auth.ts` and `invites.ts`;
+never put on `req.tenantPrisma`.
+
+**Tenant schema client pool (`src/generated/tenant-client`)** — one
+`TenantPrismaClient` per `Tenant.schemaName`, cached in an LRU (max 100). The
+`getTenantPrismaForSchema(schemaName)` function checks the cache and creates a new
+client with `?schema=<name>` appended to `DATABASE_URL` on miss. Evicted clients
+call `$disconnect()`. `requireTenantAccess` middleware attaches the resolved client
+to `req.tenantPrisma`; all tenant-domain service methods read from it.
+
+**Direct `pg` connection** — used only by `provisionTenantSchema()`. Opens a
+non-pooled connection to `DIRECT_URL` (port 5432) so that `SET search_path TO
+"<schema>"` persists across all statements in the provisioning session. Creates the
+schema, then replays every `prisma/tenant/migrations/*.sql` file in lexicographic
+order inside a single `BEGIN`/`COMMIT`.
+
+Both Prisma clients use `DATABASE_URL` (Supabase transaction-mode pooler, port 6543,
+`?pgbouncer=true`) for runtime queries. `DIRECT_URL` (port 5432) is used by Prisma
+`migrate` CLI and by `provisionTenantSchema`.
 
 ---
 
 ## 3. Database Design
 
 ### 3.1 Schema Overview
-19 models + 16 enums (`schema.prisma`). Screen citations from `designFindings.md`.
+The database is split into two Prisma projects and migration trees:
 
-**Auth / identity**
-- **Profile** — public-schema mirror of Supabase `auth.users`. Key fields:
-  `supabaseUserId` (unique join key), `role` (`UserRole`), `name`. Relations: 1:1
-  `Technician?`. Source: Login/signup (Screens 1–5).
+#### Public schema (`prisma/schema.prisma`)
+Holds cross-tenant identity and tenant registry. 3 models, 1 enum.
+
+| Model | Purpose |
+|-------|---------|
+| `Profile` | Public-schema mirror of `auth.users`. Fields: `supabaseUserId` (unique join key), `tenantId`, `role` (`UserRole`), `name`. |
+| `Tenant` | One row per business. Fields: `schemaName` (`t_<20-hex>`, unique Postgres schema). |
+| `TenantInvite` | Pending invite for a staff member. Fields: `tenantId`, `email`, `role`, `token` (unique cuid), `expiresAt`, `acceptedAt?`, `technicianId?` (link to tenant-schema Technician row). |
+
+**Enum:** `UserRole` (ADMIN, MANAGER, TECHNICIAN).
+
+#### Tenant schema (`prisma/tenant/schema.prisma`)
+Holds all operational data for one business. Deployed per-tenant as `t_<20-hex>`.
+20 models, 17 enums.
+
+**Auth / config**
+- **BusinessSettings** — single config row, DB-guarded singleton via
+  `uniqueId @unique @default("singleton")`. Fields: business profile,
+  `defaultWorkingDays`, `timezone`, `currency`, `defaultCycleLength`, `bankDetails`
+  (Json), payment toggles, `setupCompleted`.
 
 **Customers & properties**
-- **Customer** — a customer/contact. Fields: `name`, `phone`, `email`, `status`
-  (`LifecycleStatus`), `ghlContactId` (GHL join), `paymentMethod`, `badDebt`.
-  Relations: many `Property`, `Invoice`, `Payment`, `Message`, `Complaint`.
-  Source: Screens 14/15; created via Add Property (M6).
-- **Property** — a physical site to clean. Fields: `addressLine`, `postcode`,
-  `propertyName?`, `propertyType?`, `accessNotes?`, `riskNotes?`, `status`,
-  `roundId?` (**nullable = unassigned**, OQ#8). Relations: `Customer`,
-  `ServiceArea?`, `Round?`, many `ServicePlan`/`Visit`/`Photo`/`Issue`/`Complaint`.
-  Source: Screens 14/15/31; M6.
-- **ServicePlan** — recurring service agreement for a property. Fields: `price`
-  (`Money`), `cleanMethod?`, `paymentMethod?`, `status`, `nextDueDate?`,
-  `lastCompleted?`; `serviceId?` → catalogue. (Frequency lives on `Round`.)
-  Source: Customer Detail Service Plan tab (Screen 15).
+- **Customer** — fields: `name`, `phone?`, `email?`, `status` (`LifecycleStatus`),
+  `ghlContactId?` (GHL join), `paymentMethod?`, `badDebt`. Relations: many
+  `Property`, `Invoice`, `Payment`, `Message`, `Complaint`.
+- **Property** — fields: `addressLine`, `postcode`, `propertyName?`,
+  `propertyType?` (`PropertyType` enum), `accessNotes?`, `riskNotes?`, `status`,
+  `roundId?` (nullable = unassigned). Relations: `Customer`, `ServiceArea?`,
+  `Round?`, many `ServicePlan`/`Visit`/`Photo`/`Issue`/`Complaint`/`PropertyNote`.
+- **ServicePlan** — recurring service agreement. Fields: `price` (Decimal),
+  `cleanMethod?`, `paymentMethod?`, `cleaningFrequency?` (`CleaningFrequency`),
+  `status`, `nextDueDate?`, `lastCompleted?`. Relations: `Property`, `Service?`,
+  `Visit[]`.
+- **PropertyNote** — notes & risk. Fields: `type` (`NoteType`), `body`,
+  `authorProfileId?` (references `public.Profile.id` — application-enforced, no
+  DB FK). Relations: `Property`.
 
 **Scheduling**
 - **Round** — geographic cluster + cadence unit. Fields: `name`, `defaultDay?`
-  (`DayOfWeek`), `frequency?` (`CleaningFrequency`), `description?`, `status`
-  (`RoundStatus`), `serviceAreaId?`. **No technician FK** — "who does this round"
-  is derived from per-`Visit.technicianId`. Source: Screens 8–11, 30; Add Round.
-- **Visit** — one clean of one property on one date (the operational spine).
-  Fields: `date`, `status` (`VisitStatus`), `price` (`Money`), `paymentHold`,
-  `isOneOff`, `serviceId?`, `skipReason?`, `notes?`, `completedAt?`, `technicianId?`
-  (per-job assignment). Relations: `Property`, `Round?`, `ServicePlan?`,
-  `Technician?`, `Invoice?`, `Payment?`, `Photo[]`, `Issue[]`. Source: Screens
-  12/13/10, M2.
-- **Technician** — field operative. Fields: `profileId?` (**null = invited**,
-  unique), `role?` (operational, not auth role), `phone?`, `active`, `avatarUrl?`.
-  Relations: `Profile?`, `TechnicianServiceArea[]`, `Visit[]`, `Message[]`,
-  `Complaint[]`. Source: Screens 25–29.
-- **TechnicianServiceArea** — explicit m:n join Technician ↔ ServiceArea
-  (`assignedAt`). Source: Technician card "service areas" (Screen 25).
+  (`DayOfWeek`), `frequency?` (`CleaningFrequency`), `status` (`RoundStatus`),
+  `serviceAreaId?`. **No single `technicianId` FK** — multi-technician assignment
+  uses `RoundTechnician`. Relations: `Property[]`, `Visit[]`, `RoundTechnician[]`.
+- **RoundTechnician** — join table for Round ↔ Technician m:n. Fields: `roundId`,
+  `technicianId`, `assignedAt`. Composite PK `(roundId, technicianId)`. DB-level
+  FK constraints with `ON DELETE CASCADE`. Used in setup (step 10) and post-setup
+  round management.
+- **Visit** — one clean of one property on one date (the operational spine). Fields:
+  `date`, `status` (`VisitStatus`), `price`, `paymentHold`, `isOneOff`, `skipReason?`,
+  `notes?`, `completedAt?`, `technicianId?` (per-job assignment). Relations:
+  `Property`, `Round?`, `ServicePlan?`, `Technician?`, `Invoice?`, `Payment?`,
+  `Photo[]`, `Issue[]`.
+- **Technician** — field operative. Fields: `profileId?` (**null = invited**, unique),
+  `role?`, `phone?`, `active`, `avatarUrl?`. Relations: `TechnicianServiceArea[]`,
+  `Visit[]`, `Message[]`, `Complaint[]`, `RoundTechnician[]`.
+- **TechnicianServiceArea** — m:n join Technician ↔ ServiceArea.
+- **ServiceArea** — geographic area. Fields: `name`, `postcodeSector?`, `isDefault`.
 
 **Exceptions**
-- **Complaint** — customer quality complaint with workflow. Fields: `title`,
-  `description?`, `issueType?`, `severity` (`Severity`), `status`
-  (`ComplaintStatus`), `revisitDate?`. Relations: `Customer`, `Property?`,
-  `Technician?`, `Message[]`, `Photo[]`. Source: Screens 20–22.
+- **Complaint** — customer quality complaint. Fields: `title`, `severity` (`Severity`),
+  `status` (`ComplaintStatus`), `revisitDate?`. Relations: `Customer`, `Property?`,
+  `Technician?`, `Message[]`, `Photo[]`.
 - **Issue** — lightweight operational exception on a visit. Fields: `type`
-  (`IssueType`), `note?`. Relations: `Visit`, `Property?`. Source: Screen 13
-  flags; Dashboard "Issues".
+  (`IssueType`), `note?`.
 
 **Billing**
-- **Invoice** — a bill for a visit. Fields: `invoiceNumber` (unique), `amount`
-  (`Money`), `status` (`InvoiceStatus`), `notes?`, `sentToCustomer`, `sentAt?`.
-  Relations: `Customer`, `Visit?` (unique). Source: M4/M5/M10.
-- **Payment** — a payment record. Fields: `amount` (`Money`), `method`
-  (`PaymentMethod`), `status` (`PaymentStatus`), `gocardlessId?`, `stripeId?`,
-  `contactedAt?`, `paidAt?`. Relations: `Customer`, `Visit?` (unique). Source:
-  Screens 15/16.
+- **Invoice** — fields: `invoiceNumber` (unique within tenant schema), `amount`,
+  `status` (`InvoiceStatus`). Relations: `Customer`, `Visit?` (unique).
+- **Payment** — fields: `amount`, `method` (`PaymentMethod`), `status`
+  (`PaymentStatus`), `gocardlessId?`, `stripeId?`. Relations: `Customer`, `Visit?`.
 
 **Messaging**
-- **Message** — SMS/WhatsApp/Email to a customer or technician. Fields: `channel`
-  (`MessageChannel`), `direction` (`MessageDirection`), `body`, `scheduledFor?`,
-  `sentAt?`, `creditCost?`. Relations: `Customer?`, `Technician?`, `Complaint?`,
-  `MessageTemplate?`. Source: Screen 27, M1/M3.
-- **MessageTemplate** — reusable template (`name`, `channel?`, `body`). Source:
-  SMS Templates settings, D7.
+- **Message** — fields: `channel` (`MessageChannel`), `direction`, `body`,
+  `scheduledFor?`, `sentAt?`, `creditCost?`.
+- **MessageTemplate** — reusable template (`name`, `channel?`, `body`).
 
 **Catalogue / config**
-- **Service** — service-catalogue entry. Fields: `name`, `category`
-  (`ServiceCategory`), `description?`, `defaultPrice` (`Money`), `active`. Source:
-  Settings Service Catalogue (Screen 24), Setup step 3.
-- **ServiceArea** — geographic area. Fields: `name`, `postcodeSector?`,
-  `isDefault`. Relations: `Property[]`, `Round[]`, `TechnicianServiceArea[]`.
-  Source: Setup step 7, Add Round step 2.
-- **Photo** — photo linked to Property/Visit/Complaint. Fields: `url`, `type`
-  (`PhotoType`). Source: Customer Detail Photos tab; mobile before/after.
-- **ActivityLog** — timestamped audit entries (`type`, `message`). Source:
-  Reports System Activity Log (Screen 18).
-- **BusinessSettings** — single config row, **DB-guarded singleton** via
-  `uniqueId @unique @default("singleton")`. Fields: business profile,
-  `defaultWorkingDays` (String[]), `timezone`, `currency`, `defaultCycleLength`,
-  `bankDetails` (Json), **`setupCompleted`**. Source: Settings (Screen 23),
-  Setup Wizard.
+- **Service** — catalogue entry. Fields: `name`, `category` (`ServiceCategory`),
+  `description?`, `defaultPrice`, `active`.
+- **Photo** — linked to Property/Visit/Complaint. Fields: `url`, `type` (`PhotoType`).
+- **ActivityLog** — timestamped audit entries (`type`, `message`).
 
-**Enums (16):** `UserRole`, `LifecycleStatus`, `RoundStatus`, `DayOfWeek`,
-`CleaningFrequency`, `VisitStatus`, `PaymentStatus`, `PaymentMethod`,
-`MessageChannel`, `MessageDirection`, `Severity`, `ComplaintStatus`,
-`ServiceCategory`, `InvoiceStatus`, `IssueType`, `PhotoType`.
+**Enums (17):** `LifecycleStatus`, `RoundStatus`, `DayOfWeek`, `CleaningFrequency`,
+`VisitStatus`, `PaymentStatus`, `PaymentMethod`, `PaymentTiming`, `MessageChannel`,
+`MessageDirection`, `Severity`, `ComplaintStatus`, `ServiceCategory`, `PropertyType`,
+`InvoiceStatus`, `IssueType`, `PhotoType`, `NoteType`.
 
 ### 3.2 Schema Decisions
-From PROGRESS "Schema Decisions & Implications (2026-07-07 Design Update)":
-
 **Decided:**
 - **Per-occurrence assignment → derived (Option A); no `RoundOccurrence` model.**
-  An occurrence = Visits sharing a Round + cycle date; the 3-step wizard sets
-  `Visit.technicianId` per job at visit generation.
-- **Removed `Round.technicianId` (single FK)** — assignment is per-`Visit`; a
-  round's assigned technicians are derived. (Also dropped the `Technician.rounds`
-  back-relation.) Applied via migration `20260706211550`.
+  An occurrence = Visits sharing a Round + cycle date. Visit is already the per-date
+  instance; a separate occurrence entity is redundant in Phase 1.
+- **`RoundTechnician` join table for setup-phase round ↔ technician assignment.**
+  Used in Setup step 10 (assign technicians to rounds before visit generation) and
+  will serve post-setup round management. Distinct from per-Visit `technicianId`
+  (which is the per-job operational assignment).
+- **`BusinessSettings.uniqueId @unique @default("singleton")** — DB-level uniqueness
+  constraint prevents concurrent first-write races from creating duplicate rows.
 
 **Review queue (status):**
 | # | Implication | Status |
 |---|-------------|--------|
-| 1 | `Round.technicianId` → m:n join table | **Rejected** (superseded by removal) |
+| 1 | `Round.technicianId` → m:n join table | **Done** (`RoundTechnician`) |
 | 2 | `RoundOccurrence` entity | **Deferred** (derived for Phase 1) |
-| 3 | Manual job division via `Visit.technicianId` | **Approved (no change)** |
+| 3 | Manual job division via `Visit.technicianId` | **Done** |
 | 4 | Technician **availability** status (enum + leave date) | **Pending** |
-| 5 | Technician **invite** entity (invite code) | **Pending** |
+| 5 | Technician **invite** entity | **Done** (`TenantInvite` in public schema) |
 | 6 | **Notifications** feed entity | **Pending** |
 | 7 | **Skip reason** enum (currently free `String`) | **Pending** |
-| 8 | Access-issue description → `Issue.note` | **Approved (no change)** |
+| 8 | Access-issue description → `Issue.note` | **Done** |
 | 9 | Per-round **assignment history** | **Pending** |
-| 10 | Cash payment → `Payment.method = CASH` | **Approved (no change)** |
+| 10 | Cash payment → `Payment.method = CASH` | **Done** |
 
 ### 3.3 Migration History
+
+#### Public schema (`prisma/migrations/`)
 | Migration | Purpose |
 |-----------|---------|
-| `20260701220655_init` | Full initial schema — all tables + enums. |
-| `20260706211550_remove-round-technician-id` | Drop `Round.technicianId` + FK (assignment moved to per-`Visit`; Decision 2). |
-| `20260706220349_add_setup_completed` | Add `BusinessSettings.setupCompleted` (Setup Wizard completion flag). |
+| `20260720205728_init_public` | Creates `Profile`, `Tenant`, `TenantInvite` + `UserRole` enum. Replaces the retired `handle_new_user` trigger approach. |
+| `20260721000001_add_technician_id_to_invite` | Adds `TenantInvite.technicianId` — links an invite to an existing `Technician` row so the tech-link is completed on invite acceptance. |
 
-*Process note (PROGRESS): destructive `migrate dev` (dropping a column with data)
-raises an interactive confirmation that the non-TTY environment can't answer, so
-that migration was produced via `migrate diff` → `migrate deploy`. The
-`handle_new_user` Supabase trigger is **not** in migration history (a known gap).*
+#### Tenant schema (`prisma/tenant/migrations/`)
+Applied per-tenant by `provisionTenantSchema()` in lexicographic order inside a
+single transaction.
+
+| Migration | Purpose |
+|-----------|---------|
+| `20260721000001_init_tenant` | Full initial tenant schema — all operational models + enums. |
+| `20260721000002_business_settings_unique_id` | Adds `BusinessSettings.uniqueId String @unique @default("singleton")` — DB-enforced singleton constraint. |
+| `20260721000003_setup_steps_9_12` | Creates `PropertyType` enum; alters `Property.propertyType` from `String?` to `PropertyType?`; adds `ServicePlan.cleaningFrequency`; creates `RoundTechnician` join table with FK constraints (`ON DELETE CASCADE`). |
+
+*Process note: destructive `migrate dev` prompts can't be answered in a non-TTY
+environment, so breaking migrations are produced via `migrate diff` → `migrate
+deploy`. The tenant migration tree is replayed by `provisionTenantSchema`, not by
+`prisma migrate deploy`.*
 
 ### 3.4 Technician Assignment Model (multi-tech + per-occurrence)
-Two assignment rules — **multi-technician rounds** and **per-occurrence manual
-assignment** (`designFindings.md` Screen 30 **Rule** / M14 **Rule**; SRS
-FR-ROUND-9/10) — are implemented **entirely at the `Visit` level**. No dedicated
-occurrence entity exists.
+Two assignment layers exist:
 
-**Why no `RoundOccurrence` model (Phase 1 decision — deferred).** An "occurrence"
-is simply the set of `Visit`s that share a `Round` + a cycle date. `Visit`s are
-already the per-date instances, so a separate occurrence entity would be
-redundant in Phase 1. It is **deferred** (revisit only if per-occurrence
-attributes ever need to diverge from the derived set). Consequently `Round` has
-**no technician FK** — it was removed (migration `20260706211550`).
+**`RoundTechnician` (round-level):** which technicians are assigned to a given round
+as a whole — populated during Setup step 10. Used for scheduling and step 10
+completion tracking (`allRoundsAssigned`). This is the "standing" assignment.
 
-**How multi-technician assignment works (Visit level).** A round has no single
-technician column; "who does this round" is **derived** from the distinct
-`Visit.technicianId` values across the round's current occurrence. Assigning 2+
-technicians = the admin setting `Visit.technicianId` **per job**, manually
-dividing the jobs (the 3-step Select Technicians → Allocate Jobs → Review wizard,
-Screen 30). There is no automatic split.
+**`Visit.technicianId` (job-level):** which technician does a specific visit on a
+specific date. Set during the 3-step Select → Allocate → Review wizard (Screen 30)
+at visit generation time. Each new recurrence starts with `technicianId = null`;
+visit generation never inherits the previous occurrence's technician. An admin must
+explicitly assign per-occurrence (FR-ROUND-10). There is no automatic split across
+multiple technicians.
 
-**How per-recurrence assignment is surfaced.** Visit generation creates each new
-occurrence's `Visit`s with **`technicianId = null`** (the column default) — every
-recurrence **starts unassigned**, and generation **does not copy** the previous
-occurrence's technician forward. Unassigned upcoming recurrences are surfaced to
-the admin via the **Upcoming Property Recurrences** modal (M14, reached from the
-Round Planner alert banner); the admin then **explicitly assigns** technicians,
-which **sets `Visit.technicianId` per job**. (An admin may deliberately roll a
-prior assignment forward — still a manual action, shown with a review warning —
-but generation never auto-inherits.)
+### 3.5 Frequency Model & Automatic Round Reassignment
 
-**Enforcement note.** These are **business-logic rules** enforced by the
-(not-yet-built) visit-generation and assignment code, **not DB constraints**. The
-schema *supports* them (no `defaultTechnicianId` anywhere; new `Visit.technicianId`
-defaults to null) but does not itself enforce "must be manually assigned" — that
-lives in the service layer.
+#### Frequency fields
+Two fields carry cleaning frequency in the schema:
+- `Round.frequency` (`CleaningFrequency?`) — the cadence of the entire round.
+- `ServicePlan.cleaningFrequency` (`CleaningFrequency?`) — the cadence for a specific
+  property's service plan.
+
+Under normal operation these are equal. When a property is first assigned to a round
+(during Setup step 9, `POST /properties`, or "Assign to Round"), the service layer
+**SHALL set `ServicePlan.cleaningFrequency = Round.frequency`** so the property
+inherits the round's cadence (FR-FREQ-1).
+
+#### Trigger point
+The reassignment logic fires whenever `ServicePlan.cleaningFrequency` is updated
+to a value that differs from `Property.round.frequency`. Concretely, this is
+triggered by:
+- `PATCH /customers/:id` (Customer Detail edit — updates Customer + Property + ServicePlan)
+- A future dedicated `PATCH /service-plans/:id` route
+
+The service layer is responsible for detecting the change and executing the
+reassignment; routes stay thin.
+
+#### Reassignment algorithm (FR-FREQ-2 through FR-FREQ-6)
+Run atomically in a single Prisma transaction.
+
+```
+given: property P (currently in Round A with frequency F_A), new frequency F_B
+
+if P.roundId is null:
+    → update ServicePlan.cleaningFrequency = F_B only (FR-FREQ-5)
+    → done
+
+if F_B == F_A:
+    → update ServicePlan.cleaningFrequency = F_B only (FR-FREQ-6)
+    → done
+
+// F_B differs from F_A — reassignment required.
+// P.serviceAreaId is always set (FR-CUST-3a), so this is a concrete equality match.
+roundB = find first ACTIVE round where:
+    frequency     = F_B
+    serviceAreaId = P.serviceAreaId
+
+if roundB found:                                   // Case A (FR-FREQ-3)
+    update Property.roundId = roundB.id
+    update ServicePlan.cleaningFrequency = F_B
+    // roundB's RoundTechnician rows are untouched
+
+else:                                              // Case B (FR-FREQ-4)
+    freqLabel = human-readable label for F_B
+                (FORTNIGHTLY→"Fortnightly", FOUR_WEEKLY→"4-Weekly",
+                 SIX_WEEKLY→"6-Weekly", EIGHT_WEEKLY→"8-Weekly", MONTHLY→"Monthly")
+    create roundB:
+        name          = "<Round A name> (<freqLabel>)"
+                        e.g. "North London (Fortnightly)"
+        defaultDay    = Round A.defaultDay
+        serviceAreaId = Round A.serviceAreaId
+        status        = ACTIVE
+        frequency     = F_B
+    copy RoundTechnician rows from Round A → roundB
+    update Property.roundId = roundB.id
+    update ServicePlan.cleaningFrequency = F_B
+
+// Round A is never modified — it keeps its remaining properties and technicians
+```
+
+#### Key invariants
+- **Every property always has a `serviceAreaId`** (FR-CUST-3a). The round lookup is
+  always a concrete `serviceAreaId = X` equality, never a null comparison.
+- **Round A is never touched.** Reassignment only updates the moving property's
+  `roundId` and `ServicePlan.cleaningFrequency`.
+- **Case A preserves Round B's technicians.** The existing `RoundTechnician` rows on
+  Round B are left as-is; only the property moves in.
+- **Case B copies technicians from Round A.** New `RoundTechnician` rows for Round B
+  are created from Round A's current assignments — not from Round B, which doesn't
+  exist yet.
+- **Atomicity.** The round create (if needed), `RoundTechnician` copy, and
+  `Property.roundId` + `ServicePlan.cleaningFrequency` updates all run in one
+  transaction. A failure rolls back completely; no partial state.
+
+#### Code gap — `serviceAreaId` currently optional in routes
+`POST /properties` and Setup step 9 (`POST /setup/step/9`) currently accept
+`serviceAreaId` via `optId()` — making it optional at the HTTP layer. This
+contradicts FR-CUST-3a. Both routes need to be updated to use `requireString()` for
+`serviceAreaId` (and validate that the ID exists in the tenant's `ServiceArea` table)
+before the frequency-reassignment feature is built. The corresponding service inputs
+(`PropertyCreateInput`, `SetupPropertyInput`) also need `serviceAreaId: string`
+changed from `string | null` to `string`.
 
 ---
 
 ## 4. Auth Design
-- **Supabase Auth flow:** email/password + **Google OAuth** (Google configured in
-  Supabase + Google Cloud Console; backend uninvolved). Forgot/OTP/reset are
-  entirely Supabase (Screens 3–5). The backend has **no login/signup endpoints**.
-- **JWT verification:** tokens are **ES256** (asymmetric, ECC P-256). `requireAuth`
-  fetches public keys from the project **JWKS endpoint**
-  (`https://<ref>.supabase.co/auth/v1/.well-known/jwks.json`) via `jwks-rsa`,
-  resolves by `kid`, and calls `jwt.verify(..., { algorithms: ["ES256"] })`.
-  Verifies signature + algorithm + expiry (no audience/issuer check yet — see §8).
-  Attaches `req.user = { supabaseUserId (from sub), email, role }`.
-- **Profile auto-creation:** a Supabase **Postgres trigger `handle_new_user`** on
-  `auth.users` inserts a matching `Profile` on signup. ⚠️ The trigger SQL is not
-  version-controlled; its `name`/`role` derivation is unverified from the repo.
-- **Technician invite flow:** technicians are **invited, not self-signup**. An
-  invited technician is a `Technician` row with **`profileId = null`**; on
-  accepting the invite (mobile: enter invite code → Complete Your Profile), a
-  Supabase user + `Profile` (role TECHNICIAN) is created and linked. *(An invite
-  token/entity is not yet modelled — Pending #5.)*
-- **App role vs JWT role:** `req.user.role` is currently the raw Supabase claim
-  (`authenticated`), **not** the app role (ADMIN/MANAGER/TECHNICIAN on `Profile`) —
-  an open decision (DP-ROLES).
+- **Supabase Auth flow:** email/password + **Google OAuth** (backend uninvolved).
+  Forgot/OTP/reset are entirely Supabase (Screens 3–5). The backend has **no
+  login/signup endpoint via Supabase** — only `POST /auth/signup` (creates Tenant +
+  Profile + provisions tenant schema).
+- **JWT verification:** tokens are **ES256** (asymmetric). `requireAuth` fetches
+  public keys from the Supabase **JWKS endpoint** via `jwks-rsa` (10h cache,
+  rate-limited), resolves by `kid`, and calls `jwt.verify(..., { algorithms:
+  ["ES256"] })`. Attaches `req.user = { supabaseUserId, email, role }`.
+- **Tenant resolution:** `requireTenantAccess` loads `Profile` (with `Tenant`) by
+  `supabaseUserId`, calls `getTenantPrismaForSchema(tenant.schemaName)`, and attaches
+  the result as `req.tenantPrisma` and `req.profile`. Returns 401 if no `req.user`,
+  403 if no `Profile` found.
+- **Technician invite flow:** `POST /invites` creates a `TenantInvite` and sends an
+  invite email via Resend. `POST /invites/:token/accept` is called by the invitee
+  after authenticating. It creates a `Profile` and marks the invite accepted
+  atomically (Prisma transaction). If the invite has a `technicianId`, the
+  corresponding `Technician.profileId` is linked after the transaction. The endpoint
+  is idempotent: if a Profile already exists for the caller, it re-attempts the
+  tech-link and returns the existing profile. Cross-tenant and cross-email acceptance
+  are rejected with 403.
+- **RBAC — app role from DB, not JWT:** The Supabase JWT carries no app role claim.
+  `requireTenantAccess` loads `Profile` by `supabaseUserId` on every request and
+  attaches it as `req.profile`; `requireRole` and `requireBusinessAccess` gate on
+  `req.profile.role` (ADMIN / MANAGER / TECHNICIAN). ADMIN and MANAGER may call any
+  endpoint; TECHNICIAN requests to mutating routes are rejected with 403. Role
+  changes in the DB take effect on the very next request — no token refresh needed.
+  `AuthUser` (set by `requireAuth`) intentionally omits a role field to prevent
+  reaching for the useless Supabase `"authenticated"` claim by mistake.
 
 ---
 
@@ -370,92 +564,96 @@ lives in the service layer.
 - **Role:** messaging (SMS/WhatsApp/Email) and assisting Stripe/GoCardless payment
   flows, against a **single GHL account**. Not the data layer, business-logic
   engine, delivery mechanism, or auth (that GHL-native architecture was retired).
-- **Trigger mechanism — OPEN DECISION:** either (a) write to a synced GHL
-  Contact's custom fields and let a GHL Workflow watch for the change, or (b) call
-  the GHL API directly. To be resolved before visit-generation/payment logic
-  depends on it.
-- **Join point:** every `Customer`/`Property` carries `ghlContactId` from day one,
-  regardless of which mechanism is chosen. No GHL integration code exists yet.
+- **Trigger mechanism — OPEN DECISION:** either (a) write to a synced GHL Contact's
+  custom fields and let a GHL Workflow watch for the change, or (b) call the GHL
+  API directly. To be resolved before visit-generation/payment logic depends on it.
+- **Join point:** every `Customer`/`Property` carries `ghlContactId` from day one.
 
 ### 5.2 GoCardless / Stripe (deferred)
-- **GoCardless** = primary (direct-debit-first) provider; **Stripe** = card
-  fallback (payment links). Schema carries `Payment.gocardlessId` / `stripeId` and
-  `PaymentMethod` includes `GOCARDLESS`/`STRIPE`/`CASH`/`CHEQUE`/`BACS`. No
-  provider integration code yet; payments must trigger automatically post-
-  completion (a Phase 1 success criterion).
+- **GoCardless** = primary (direct-debit-first) provider; **Stripe** = card fallback
+  (payment links). Schema carries `Payment.gocardlessId` / `stripeId` and
+  `PaymentMethod` includes `GOCARDLESS`/`STRIPE`/`CASH`/`CHEQUE`/`BACS`.
+  `POST /settings/payment/:provider/connect` exists as a Phase-1 stub (boolean flag
+  only, no real OAuth). No provider integration code beyond the stub.
 
-### 5.3 Supabase Auth (live)
-- Live and depended upon: JWT issuance (ES256), JWKS endpoint for verification,
-  and the `handle_new_user` trigger. The backend verifies tokens on every
-  protected route.
+### 5.3 Resend (live)
+- **Role:** transactional email for invite delivery. `sendInviteEmail()` in
+  `src/lib/email.ts` sends via the Resend SDK. The `businessName` field
+  (user-supplied) is HTML-escaped before interpolation; the invite URL is encoded
+  with `encodeURI`.
+
+### 5.4 Supabase Auth (live)
+- JWT issuance (ES256), JWKS endpoint for verification. `POST /auth/signup` replaces
+  the retired `handle_new_user` trigger; the trigger SQL can be dropped via
+  `docs/sql/drop_handle_new_user.sql`.
 
 ---
 
 ## 6. Frontend Design (high level — separate repo)
 - **Stack (intended):** Vite + React + TypeScript with the **Supabase JS client**
-  for auth. *(The roadmap/PROGRESS specify React + TypeScript + Supabase Auth;
-  Vite is the conventional toolchain — confirm in the frontend repo.)*
-- **Auth screens** (Login, Sign Up, Forgot Password, OTP, Reset — Screens 1–5)
-  are handled **entirely by Supabase**; the frontend obtains an ES256 JWT and
-  sends it as a Bearer token to the backend.
-- **Admin route structure** (from the `designFindings.md` screen set / left nav):
-  `/dashboard`, `/round-planner` (Calendar/Map/List; `?round=X`), `/todays-work`,
-  `/customers` (+ Customer Detail tabs: Overview/Service Plan/Visit
-  History/Payments/Notes & Risk/Photos), `/debt-board`, `/reports/history`
-  (+ `/reports/technicians`), `/complaints`, `/settings` (Business Profile /
-  Payment Setup / Round Settings / SMS Templates / Technician Mgmt / Service
-  Areas / Service Catalogue), `/technicians`, `/setup` (wizard). Modals/flows:
-  Add Property (M6), Add Round (CreateRoundModal), Assign Property to Round
-  (Screen 31), Round & Technician Assignment (Screen 30), Bulk Message (M1),
-  Add One-Off Job (M2), Generate/Preview Invoice (M4/M5), Reassign Technician
-  (M15), Upcoming Property Recurrences (M14).
-- **Mobile app** (technician): Login/Invite/Reset/Complete Profile, Today's job
-  list, Property Details, Active Visit + bottom sheets (Photo/Note/Cash/Skip/
-  Access Issue/Complete Confirm), Notifications.
+  for auth. *(Confirm in the frontend repo.)*
+- **Auth screens** (Screens 1–5) are handled entirely by Supabase; the frontend
+  obtains an ES256 JWT, then calls `GET /auth/me` to check for an existing Profile.
+  If 404, it calls `POST /auth/signup` to create one.
+- **Admin route structure** (from `designFindings.md`): `/dashboard`,
+  `/round-planner`, `/todays-work`, `/customers` (+ detail tabs), `/debt-board`,
+  `/reports/history`, `/complaints`, `/settings`, `/technicians`, `/setup` (wizard).
 
 ---
 
 ## 7. Security Design
-- **Auth boundary:** all backend routes **except `/health`** require a Bearer JWT
-  (`requireAuth`). Missing/invalid → 401.
+- **Auth boundary:** all backend routes **except `/health`**, `GET /invites/:token`**,
+  and (partially) `GET /auth/me` require a Bearer JWT via `requireAuth`.
 - **No secret on backend:** verification is via JWKS public keys (ES256); the
   legacy HS256 shared secret was removed.
-- **Single-tenant Phase 1 — no RLS (documented decision).** One business; no
-  per-tenant isolation or row-level security in Phase 1. Phase 2 introduces
-  multi-tenant isolation/RLS.
-- **OCP seam for Phase 2 multi-tenancy:** service methods take `profileId` first
-  (`SetupService` pattern) so a tenant-scoped implementation can be bound behind
-  the same interface without changing routes.
-- **Credential handling:** secrets in `.env` (gitignored); `.env.example`
-  documents keys without values; **no secrets in code**. `GOOGLE_CLIENT_ID/SECRET`
-  exist in `.env` but are unused by backend code (Google OAuth is Supabase-side).
-- **CORS:** currently all origins (dev) — tighten to frontend origin(s) for prod.
+- **Schema-per-tenant isolation:** each tenant's operational data lives in its own
+  PostgreSQL schema. `requireTenantAccess` resolves the schema from the JWT on every
+  request and provides a schema-scoped `TenantPrismaClient`. There is no
+  cross-tenant data access path in the application layer.
+- **CORS:** locked to `FRONTEND_URL` environment variable (`cors({ origin:
+  FRONTEND_URL, credentials: true })`). The backend exits at startup if
+  `FRONTEND_URL` or `INVITE_BASE_URL` are missing.
+- **Invite security:** cross-tenant (invite.tenantId ≠ profile.tenantId) and
+  cross-email (req.user.email ≠ invite.email) acceptance are explicitly rejected
+  with 403 in `POST /invites/:token/accept`.
+- **Email injection prevention:** `businessName` is HTML-escaped; invite URL is
+  `encodeURI`-encoded before embedding in Resend email body.
+- **Credential handling:** secrets in `.env` (gitignored); `.env.example` documents
+  keys without values; no secrets in code.
 - **Error hygiene:** typed `AppError` maps to its status; all else → generic 500
   (internals logged, not returned).
 
 ---
 
 ## 8. Deferred Design Decisions
-Items acknowledged in the sources as not-yet-designed / pending:
+Items not-yet-designed / pending:
+
+- **Frequency-reassignment service** — `PATCH /customers/:id` (and the future
+  `PATCH /service-plans/:id`) must implement the FR-FREQ algorithm (§3.5). Not yet
+  built. Both open questions (naming convention, null serviceAreaId) are now resolved
+  — see §3.5. Prerequisite: make `serviceAreaId` required in `POST /properties` and
+  `POST /setup/step/9` (code gap noted in §3.5).
 - **Mobile completion delivery** — native app (React Native/Expo) vs mobile web
   (blocks the mobile build).
 - **GHL automation trigger mechanism** — contact-field-sync-and-watch vs direct
   API call (blocks messaging/payment automation design).
-- **RLS / multi-tenancy** — deferred to Phase 2 (Phase 1 is single-tenant, no RLS).
-- **`RoundOccurrence` model** — deferred; per-occurrence assignment is derived
-  from Visits in Phase 1.
-- **Technician availability model (#4), invite entity (#5), notifications feed
-  (#6), skip-reason enum (#7), assignment history (#9)** — Pending schema items.
-- **`handle_new_user` trigger provenance** — commit SQL as a migration vs leave
-  Supabase-managed (a reproducibility gap).
+- **`RoundOccurrence` model** — deferred; per-occurrence assignment is derived from
+  Visits in Phase 1.
+- **Technician availability model (#4)** — availability status enum + leave date;
+  technician self-mark "unable to attend" trigger undesigned (OQ#13 / MOB-2).
+- **Notifications feed entity (#6)** — push vs in-app (MOB-3).
+- **Skip-reason enum (#7)** — currently free `String` on `Visit`.
+- **Assignment history (#9)** — per-round assignment history.
 - **Auth hardening** — add `audience`/`issuer` checks (and app-role/claims
   validation) before production.
-- **App roles in JWT (DP-ROLES)** — read app role from `Profile` per request vs
-  custom JWT claims.
-- **Technician self-mark "unable to attend"** (OQ#13 / MOB-2) — trigger undesigned.
+- **App roles in JWT (DP-ROLES)** — read app role from `Profile` per request
+  (current approach) vs encode as custom JWT claims (avoids per-request DB lookup).
 - **Mobile app scope (MOB-1)** — confirm "B2C" naming vs a future customer app.
-- **Notifications push vs in-app (MOB-3).**
+- **`handle_new_user` trigger cleanup** — the trigger should be dropped in Supabase
+  now that `POST /auth/signup` handles profile creation; SQL provided in
+  `docs/sql/drop_handle_new_user.sql`.
 
 ---
 
-*Source documents: `PROGRESS.md`, `prisma/schema.prisma`, `docs/designFindings.md`, `docs/RoundFlow_Context_and_Roadmap_v1.md`.*
+*Source documents: `PROGRESS.md`, `prisma/schema.prisma`, `prisma/tenant/schema.prisma`,
+`docs/designFindings.md`, `docs/RoundFlow_Context_and_Roadmap_v1.md`, `src/` (codebase).*

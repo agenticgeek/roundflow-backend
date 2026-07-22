@@ -298,7 +298,7 @@ setupRouter.post(
       email: optString(body.email, "email") ?? null,
       fullAddress: requireString(body.fullAddress, "fullAddress"),
       postcode: requireString(body.postcode, "postcode"),
-      serviceAreaId: optId(body.serviceAreaId, "serviceAreaId") ?? null,
+      serviceAreaId: requireString(body.serviceAreaId, "serviceAreaId"),
       propertyType: optString(body.propertyType, "propertyType") ?? null,
       price: assertPositive(requireNumber(body.price, "price"), "price"),
       cleaningFrequency: optString(body.cleaningFrequency, "cleaningFrequency") ?? null,
