@@ -16,6 +16,7 @@ if (!FRONTEND_URL) {
   console.error("FATAL: FRONTEND_URL env var is required");
   process.exit(1);
 }
+const ALLOWED_ORIGINS = FRONTEND_URL.split(",").map((u) => u.trim());
 
 if (!process.env.INVITE_BASE_URL) {
   console.error("FATAL: INVITE_BASE_URL env var is required");
@@ -24,7 +25,7 @@ if (!process.env.INVITE_BASE_URL) {
 
 const app = express();
 
-app.use(cors({ origin: FRONTEND_URL, credentials: true }));
+app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 app.use(express.json());
 
 app.get("/health", (_req: Request, res: Response) => {
