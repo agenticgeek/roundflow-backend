@@ -6,6 +6,7 @@ import {
   PhotoType,
   NoteType,
   PropertyType,
+  RoundStatus,
   Prisma,
 } from "../generated/tenant-client";
 import type {
@@ -18,6 +19,16 @@ import type {
 import { UserRole } from "@prisma/client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
+
+// Human-readable labels for CleaningFrequency values — used when naming
+// auto-created rounds in the frequency-change reassignment flow (FR-FREQ-4).
+const FREQUENCY_LABELS: Record<CleaningFrequency, string> = {
+  FORTNIGHTLY: "Fortnightly",
+  FOUR_WEEKLY: "Four Weekly",
+  SIX_WEEKLY: "Six Weekly",
+  EIGHT_WEEKLY: "Eight Weekly",
+  MONTHLY: "Monthly",
+};
 
 // ---------------------------------------------------------------------------
 // M2 — Customers & Properties (Screens 14 & 15, modals M4/M9/M19/M20).
@@ -66,6 +77,7 @@ export interface PropertyUpdateInput {
   accessNotes?: string | null;
   riskNotes?: string | null;
   roundId?: string | null;
+  cleaningFrequency?: CleaningFrequency;
 }
 
 export interface CustomerUpdateInput {
@@ -141,6 +153,7 @@ export interface ServicePlanView {
   price: number | null;
   cleanMethod: string | null;
   paymentMethod: PaymentMethod | null;
+  cleaningFrequency: CleaningFrequency | null;
   status: LifecycleStatus;
   nextDueDate: Date | null;
   lastCompleted: Date | null;
@@ -387,7 +400,7 @@ class CustomerService implements ICustomerService {
         postcode: property.postcode,
         roundId: property.roundId,
         roundName: property.round?.name ?? null,
-        frequency: property.round?.frequency ?? null,
+        frequency: plan?.cleaningFrequency ?? property.round?.frequency ?? null,
         price: this.num(plan?.price),
         technicianId: nextVisit?.technicianId ?? null,
         technicianName: nextVisit?.technician?.name ?? null,
@@ -504,6 +517,7 @@ class CustomerService implements ICustomerService {
           price: this.num(plan.price),
           cleanMethod: plan.cleanMethod,
           paymentMethod: plan.paymentMethod,
+          cleaningFrequency: plan.cleaningFrequency,
           status: plan.status,
           nextDueDate: plan.nextDueDate,
           lastCompleted: plan.lastCompleted,
@@ -643,7 +657,14 @@ class CustomerService implements ICustomerService {
         null
       : null;
 
-    if (input.roundId) await this.assertRoundExists(input.roundId);
+    // FR-FREQ-1: when switching rounds via the customer edit form, sync the
+    // service plan frequency to the new round's cadence.
+    let roundFrequency: CleaningFrequency | undefined = undefined;
+    if (input.roundId) {
+      const round = await this.prisma.round.findUnique({ where: { id: input.roundId } });
+      if (!round) throw new AppError(404, `Round not found: ${input.roundId}`);
+      if (round.frequency) roundFrequency = round.frequency;
+    }
 
     return this.prisma.$transaction(async (tx) => {
       await tx.customer.update({
@@ -670,6 +691,7 @@ class CustomerService implements ICustomerService {
             price: input.price,
             cleanMethod: input.cleanMethod,
             paymentMethod: input.paymentMethod,
+            cleaningFrequency: roundFrequency,
           },
         });
       }
@@ -687,7 +709,13 @@ class CustomerService implements ICustomerService {
     _profileId: string,
     input: PropertyCreateInput
   ): Promise<{ customerId: string; propertyId: string; servicePlanId: string; assigned: boolean }> {
-    if (input.roundId) await this.assertRoundExists(input.roundId);
+    // FR-FREQ-1: when assigning to a round on creation, inherit its frequency.
+    let roundFrequency: CleaningFrequency | null = null;
+    if (input.roundId) {
+      const round = await this.prisma.round.findUnique({ where: { id: input.roundId } });
+      if (!round) throw new AppError(404, `Round not found: ${input.roundId}`);
+      roundFrequency = round.frequency;
+    }
     await this.assertServiceAreaExists(input.serviceAreaId);
 
     return this.prisma.$transaction(async (tx) => {
@@ -716,6 +744,7 @@ class CustomerService implements ICustomerService {
           cleanMethod: input.cleanMethod ?? null,
           paymentMethod: input.paymentMethod ?? null,
           nextDueDate: input.nextDueDate ?? null,
+          cleaningFrequency: roundFrequency,
           status: LifecycleStatus.ACTIVE,
         },
       });
@@ -733,23 +762,109 @@ class CustomerService implements ICustomerService {
     propertyId: string,
     input: PropertyUpdateInput
   ): Promise<Property> {
-    const existing = await this.prisma.property.findUnique({ where: { id: propertyId } });
+    const existing = await this.prisma.property.findUnique({
+      where: { id: propertyId },
+      include: {
+        round: { include: { roundTechnicians: true } },
+        servicePlans: {
+          where: { status: { not: LifecycleStatus.CANCELLED } },
+          orderBy: { createdAt: "desc" as const },
+        },
+      },
+    });
     if (!existing) throw new AppError(404, "Property not found");
-    if (input.roundId) await this.assertRoundExists(input.roundId);
+
+    const plan =
+      existing.servicePlans.find(
+        (p) => p.status === LifecycleStatus.ACTIVE || p.status === LifecycleStatus.PAUSED
+      ) ?? existing.servicePlans[0] ?? null;
+
     if (input.serviceAreaId) await this.assertServiceAreaExists(input.serviceAreaId);
 
-    return this.prisma.property.update({
-      where: { id: propertyId },
-      data: {
-        addressLine: input.addressLine,
-        postcode: input.postcode,
-        propertyName: input.propertyName,
-        propertyType: (input.propertyType as PropertyType) ?? null,
-        serviceAreaId: input.serviceAreaId,
-        accessNotes: input.accessNotes,
-        riskNotes: input.riskNotes,
-        roundId: input.roundId,
-      },
+    // Determine the target round and whether the service plan frequency needs updating.
+    let targetRoundId: string | null = existing.roundId;
+    let newFrequency: CleaningFrequency | undefined = undefined; // undefined = no plan update
+    let caseB = false; // FR-FREQ-4: must create a new round inside the transaction
+
+    if (input.roundId !== undefined) {
+      // Explicit round assignment / unassignment (FR-FREQ-1)
+      if (input.roundId === null) {
+        targetRoundId = null;
+      } else {
+        const round = await this.prisma.round.findUnique({ where: { id: input.roundId } });
+        if (!round) throw new AppError(404, `Round not found: ${input.roundId}`);
+        targetRoundId = round.id;
+        if (round.frequency) newFrequency = round.frequency;
+      }
+    } else if (input.cleaningFrequency !== undefined) {
+      // Frequency change (FR-FREQ-2..6) — mutually exclusive with explicit roundId.
+      newFrequency = input.cleaningFrequency;
+      if (!existing.roundId) {
+        // FR-FREQ-5: no round assigned — just update the plan field, no round change.
+      } else if (existing.round?.frequency === input.cleaningFrequency) {
+        // FR-FREQ-6: frequency matches current round — just update the plan field.
+      } else {
+        // FR-FREQ-2: frequency differs from current round → find or create a matching round.
+        const matchingRound = await this.prisma.round.findFirst({
+          where: {
+            frequency: input.cleaningFrequency,
+            serviceAreaId: existing.serviceAreaId,
+            status: RoundStatus.ACTIVE,
+            NOT: { id: existing.roundId },
+          },
+        });
+        if (matchingRound) {
+          targetRoundId = matchingRound.id; // FR-FREQ-3 (Case A): reuse existing round
+        } else {
+          caseB = true; // FR-FREQ-4 (Case B): create new round in the transaction below
+        }
+      }
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      if (caseB && existing.round) {
+        // FR-FREQ-4: create a new round by copying the current one with the new frequency.
+        const label = FREQUENCY_LABELS[input.cleaningFrequency!];
+        const newRound = await tx.round.create({
+          data: {
+            name: `${existing.round.name} (${label})`,
+            frequency: input.cleaningFrequency!,
+            serviceAreaId: existing.round.serviceAreaId,
+            defaultDay: existing.round.defaultDay,
+            status: RoundStatus.ACTIVE,
+          },
+        });
+        if (existing.round.roundTechnicians.length > 0) {
+          await tx.roundTechnician.createMany({
+            data: existing.round.roundTechnicians.map((rt) => ({
+              roundId: newRound.id,
+              technicianId: rt.technicianId,
+            })),
+          });
+        }
+        targetRoundId = newRound.id;
+      }
+
+      if (plan && newFrequency !== undefined) {
+        await tx.servicePlan.update({
+          where: { id: plan.id },
+          data: { cleaningFrequency: newFrequency },
+        });
+      }
+
+      return tx.property.update({
+        where: { id: propertyId },
+        data: {
+          addressLine: input.addressLine,
+          postcode: input.postcode,
+          propertyName: input.propertyName,
+          propertyType: (input.propertyType as PropertyType) ?? undefined,
+          serviceAreaId: input.serviceAreaId,
+          accessNotes: input.accessNotes,
+          riskNotes: input.riskNotes,
+          roundId: targetRoundId,
+        },
+      });
     });
   }
 

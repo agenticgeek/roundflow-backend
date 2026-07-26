@@ -135,7 +135,9 @@ src/
 │   ├── http.ts                 # Route helpers: h(), asObject(), asArray(),
 │   │                           #   requireString(), requireNumber(), optString(), optId(), etc.
 │   └── validation.ts           # Domain validators: assertPositive(), assertPositiveInt(),
-│                               #   validateWorkingDays(), optPaymentMethod(), etc.
+│                               #   validateWorkingDays(), optPaymentMethod(),
+│                               #   requireCleaningFrequency(), optDayOfWeek(),
+│                               #   optRoundStatus(), etc.
 ├── middleware/
 │   ├── requireAuth.ts          # JWKS/ES256 Bearer verification → req.user; 401 on fail
 │   ├── requireTenantAccess.ts  # JWT→Profile→Tenant.schemaName → req.tenantPrisma; 403 on fail
@@ -150,6 +152,9 @@ src/
 │   ├── properties.ts           # POST /properties, PATCH /properties/:id,
 │   │                           #   POST/GET /properties/:id/notes,
 │   │                           #   POST /properties/:id/pause, POST /properties/:id/resume
+│   ├── rounds.ts               # GET /rounds, POST /rounds,
+│   │                           #   GET /rounds/:id, PATCH /rounds/:id,
+│   │                           #   PUT /rounds/:id/technicians
 │   └── settings.ts             # /settings/business-profile, /settings/round-settings,
 │                               #   /settings/services(/:id), /settings/service-areas(/:id),
 │                               #   /settings/technicians(/:id), /settings/payment,
@@ -159,7 +164,10 @@ src/
     ├── setup.service.ts        # ISetupService + SetupService (all 12 setup steps)
     ├── customer.service.ts     # ICustomerService: getCustomers, getCustomerDetail,
     │                           #   updateCustomer, createProperty, updateProperty,
-    │                           #   pauseService, resumeService, getNotes, addNote
+    │                           #   pauseService, resumeService, getNotes, addNote;
+    │                           #   FR-FREQ-1..6 logic in updateProperty + updateCustomer
+    ├── round.service.ts        # IRoundService: listRounds, createRound, getRound,
+    │                           #   updateRound, setTechnicians
     └── settings.service.ts     # ISettingsService: all settings section reads/writes
 ```
 **Intended layout** (as domains land): one `routes/<domain>.ts` + one
@@ -245,7 +253,11 @@ yet in code). All non-`/health` routes require a Bearer JWT.
 | PATCH | `/settings/message-templates` | JWT + Tenant (ADMIN/MGR) | SettingsService (stub) | **Built** |
 | GET | `/openapi.json` | No | — | **Built** |
 | GET | `/docs` | No | swagger-ui-express | **Built** |
-| — | Rounds + assignment (Add Round wizard, multi-tech allocation) | JWT + Tenant | RoundService (planned) | **Planned** |
+| GET | `/rounds` | JWT + Tenant | RoundService | **Built** |
+| POST | `/rounds` | JWT + Tenant (ADMIN/MGR) | RoundService | **Built** |
+| GET | `/rounds/:id` | JWT + Tenant | RoundService | **Built** |
+| PATCH | `/rounds/:id` | JWT + Tenant (ADMIN/MGR) | RoundService | **Built** |
+| PUT | `/rounds/:id/technicians` | JWT + Tenant (ADMIN/MGR) | RoundService | **Built** |
 | — | Visit generation (cron) + Visit reads | JWT + Tenant / cron | VisitService (planned) | **Planned** |
 | — | Round Planner reads (calendar/map/list) | JWT + Tenant | RoundService (planned) | **Planned** |
 | — | Today's Work + Reassign / Push Missed | JWT + Tenant | VisitService (planned) | **Planned** |
@@ -449,14 +461,15 @@ Under normal operation these are equal. When a property is first assigned to a r
 inherits the round's cadence (FR-FREQ-1).
 
 #### Trigger point
-The reassignment logic fires whenever `ServicePlan.cleaningFrequency` is updated
-to a value that differs from `Property.round.frequency`. Concretely, this is
-triggered by:
-- `PATCH /customers/:id` (Customer Detail edit — updates Customer + Property + ServicePlan)
-- A future dedicated `PATCH /service-plans/:id` route
+The full FR-FREQ-2..6 reassignment logic fires when `PATCH /properties/:id` receives
+a `cleaningFrequency` field that differs from the property's current round frequency.
+`CustomerService.updateProperty` detects the divergence and runs the algorithm.
 
-The service layer is responsible for detecting the change and executing the
-reassignment; routes stay thin.
+`PATCH /customers/:id` covers only FR-FREQ-1: when the request includes a `roundId`,
+`CustomerService.updateCustomer` syncs `ServicePlan.cleaningFrequency` to the new
+round's frequency. It does **not** trigger the auto-reassignment path.
+
+Routes stay thin; all detection and logic lives in the service layer.
 
 #### Reassignment algorithm (FR-FREQ-2 through FR-FREQ-6)
 Run atomically in a single Prisma transaction.
@@ -485,8 +498,8 @@ if roundB found:                                   // Case A (FR-FREQ-3)
 
 else:                                              // Case B (FR-FREQ-4)
     freqLabel = human-readable label for F_B
-                (FORTNIGHTLY→"Fortnightly", FOUR_WEEKLY→"4-Weekly",
-                 SIX_WEEKLY→"6-Weekly", EIGHT_WEEKLY→"8-Weekly", MONTHLY→"Monthly")
+                (FORTNIGHTLY→"Fortnightly", FOUR_WEEKLY→"Four Weekly",
+                 SIX_WEEKLY→"Six Weekly", EIGHT_WEEKLY→"Eight Weekly", MONTHLY→"Monthly")
     create roundB:
         name          = "<Round A name> (<freqLabel>)"
                         e.g. "North London (Fortnightly)"
@@ -515,15 +528,6 @@ else:                                              // Case B (FR-FREQ-4)
   `Property.roundId` + `ServicePlan.cleaningFrequency` updates all run in one
   transaction. A failure rolls back completely; no partial state.
 
-#### Code gap — `serviceAreaId` currently optional in routes
-`POST /properties` and Setup step 9 (`POST /setup/step/9`) currently accept
-`serviceAreaId` via `optId()` — making it optional at the HTTP layer. This
-contradicts FR-CUST-3a. Both routes need to be updated to use `requireString()` for
-`serviceAreaId` (and validate that the ID exists in the tenant's `ServiceArea` table)
-before the frequency-reassignment feature is built. The corresponding service inputs
-(`PropertyCreateInput`, `SetupPropertyInput`) also need `serviceAreaId: string`
-changed from `string | null` to `string`.
-
 ---
 
 ## 4. Auth Design
@@ -534,7 +538,7 @@ changed from `string | null` to `string`.
 - **JWT verification:** tokens are **ES256** (asymmetric). `requireAuth` fetches
   public keys from the Supabase **JWKS endpoint** via `jwks-rsa` (10h cache,
   rate-limited), resolves by `kid`, and calls `jwt.verify(..., { algorithms:
-  ["ES256"] })`. Attaches `req.user = { supabaseUserId, email, role }`.
+  ["ES256"] })`. Attaches `req.user = { supabaseUserId, email }`.
 - **Tenant resolution:** `requireTenantAccess` loads `Profile` (with `Tenant`) by
   `supabaseUserId`, calls `getTenantPrismaForSchema(tenant.schemaName)`, and attaches
   the result as `req.tenantPrisma` and `req.profile`. Returns 401 if no `req.user`,
@@ -628,30 +632,17 @@ changed from `string | null` to `string`.
 ## 8. Deferred Design Decisions
 Items not-yet-designed / pending:
 
-- **Frequency-reassignment service** — `PATCH /customers/:id` (and the future
-  `PATCH /service-plans/:id`) must implement the FR-FREQ algorithm (§3.5). Not yet
-  built. Both open questions (naming convention, null serviceAreaId) are now resolved
-  — see §3.5. Prerequisite: make `serviceAreaId` required in `POST /properties` and
-  `POST /setup/step/9` (code gap noted in §3.5).
-- **Mobile completion delivery** — native app (React Native/Expo) vs mobile web
-  (blocks the mobile build).
-- **GHL automation trigger mechanism** — contact-field-sync-and-watch vs direct
-  API call (blocks messaging/payment automation design).
+- **Mobile completion delivery (DP-MOBILE)** — React Native/Expo app is Phase 2; all
+  mobile FE tickets are deferred.
+- **GHL automation trigger mechanism (DP-GHL)** — contact-field-sync-and-watch vs
+  direct API call (blocks messaging/payment automation design).
 - **`RoundOccurrence` model** — deferred; per-occurrence assignment is derived from
   Visits in Phase 1.
 - **Technician availability model (#4)** — availability status enum + leave date;
   technician self-mark "unable to attend" trigger undesigned (OQ#13 / MOB-2).
-- **Notifications feed entity (#6)** — push vs in-app (MOB-3).
+- **Notifications feed entity (#6)** — push vs in-app (DP-NOTIF).
 - **Skip-reason enum (#7)** — currently free `String` on `Visit`.
 - **Assignment history (#9)** — per-round assignment history.
-- **Auth hardening** — add `audience`/`issuer` checks (and app-role/claims
-  validation) before production.
-- **App roles in JWT (DP-ROLES)** — read app role from `Profile` per request
-  (current approach) vs encode as custom JWT claims (avoids per-request DB lookup).
-- **Mobile app scope (MOB-1)** — confirm "B2C" naming vs a future customer app.
-- **`handle_new_user` trigger cleanup** — the trigger should be dropped in Supabase
-  now that `POST /auth/signup` handles profile creation; SQL provided in
-  `docs/sql/drop_handle_new_user.sql`.
 
 ---
 

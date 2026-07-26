@@ -21,10 +21,11 @@ RoundFlow Phase 1 delivers a **standalone web + mobile FSM platform** for a sing
 UK window-cleaning business, running the full operational loop end-to-end for one
 client — properties and service plans, auto-generated visits organised into
 rounds, live workday execution on a technician mobile app, and GoCardless-first
-payments with a debt board. Supabase provides data + auth; GHL is a
-messaging/payments utility. Getting the schema, auth, and service architecture
-right in Phase 1 **unlocks Phase 2** (multi-tenant, GHL-Marketplace-installable):
-the `profileId` service seam and `ghlContactId` join point are already in place.
+payments with a debt board. Supabase provides data + auth; GHL is a messaging/payments utility.
+**Schema-per-tenant multi-tenancy is live from day one** — each tenant gets an
+isolated `t_<20-hex>` PostgreSQL schema provisioned atomically at signup. The
+`profileId` service seam and `ghlContactId` join point are already in place,
+positioning Phase 1 for Phase 2 (GHL Marketplace listing + OAuth install flow).
 
 ## Operational Loop
 Every milestone delivers a working slice of the product spine:
@@ -72,7 +73,7 @@ Two locked assignment rules run through the scheduling milestones (see
 ---
 
 ## M1 — Setup Wizard · 🟡 In Progress
-**Goal:** A first-run admin can configure the business through the 8-step wizard and mark setup complete.
+**Goal:** A first-run admin can configure the business through the 12-step wizard and mark setup complete (steps 2 & 5 are deferred stubs).
 **Depends on:** M0
 
 ### Backend tickets
@@ -82,10 +83,14 @@ Two locked assignment rules run through the scheduling milestones (see
 - [x] **[BE-M1-04]** Step 6 & 7 — Technicians (invite-pending) + Service Areas (GET + POST) (Screen 6 steps 6, 7). `labels: backend, setup`
 - [x] **[BE-M1-05]** Step 8 — first Round (`status=ACTIVE`); steps 2 & 5 deferred stubs (Screen 6 steps 8, 2, 5). `labels: backend, setup`
 - [x] **[BE-M1-06]** `POST /setup/complete` + `assertSetupIncomplete` guard (403 / 400 / 409). `labels: backend, setup`
+- [x] **[BE-M1-08]** Step 9 — Add Properties: Customer + Property + ServicePlan in a single transaction; `roundId` required + must be ACTIVE (FR-SETUP-9). `labels: backend, setup`
+- [x] **[BE-M1-09]** Step 10 — Assign Technicians: set `RoundTechnician` rows (replace semantics); rejects inactive technicians + duplicate roundIds (FR-SETUP-10). `labels: backend, setup`
+- [x] **[BE-M1-10]** Step 11 — Activate System: generate `Visit` records for `startDate + cycleWeeks`; 409 guard if already complete (FR-SETUP-11). `labels: backend, setup`
+- [x] **[BE-M1-11]** Step 12 — Review & Launch: read-only checklist derived from steps 1–11 completion state (FR-SETUP-12). `labels: backend, setup`
 - [ ] **[BE-M1-07]** Integration test — `/setup/*` over HTTP with a real token (currently only proven via `/auth/me` + direct-DB). `labels: backend, setup`
 
 ### Frontend tickets
-- [ ] **[FE-M1-01]** Setup Wizard shell — 8-step stepper, Back/Continue, progress from `GET /setup/status` (Screen 6). `labels: frontend, setup`
+- [ ] **[FE-M1-01]** Setup Wizard shell — 12-step stepper, Back/Continue, progress from `GET /setup/status` (Screen 6). `labels: frontend, setup`
 - [ ] **[FE-M1-02]** Step 1 — Business Profile form (Screen 6 step 1). `labels: frontend, setup`
 - [ ] **[FE-M1-03]** Step 2 — Payment Setup deferred-stub screen (Screen 6 step 2). `labels: frontend, setup`
 - [ ] **[FE-M1-04]** Step 3 — Service Catalogue editor (Screen 6 step 3 / Screen 24). `labels: frontend, setup`
@@ -94,10 +99,13 @@ Two locked assignment rules run through the scheduling milestones (see
 - [ ] **[FE-M1-07]** Step 6 — Technician Management (add invite-pending technicians) (Screen 6 step 6). `labels: frontend, setup`
 - [ ] **[FE-M1-08]** Step 7 — Service Areas (Screen 6 step 7). `labels: frontend, setup`
 - [ ] **[FE-M1-09]** Step 8 — Assign Round (create the first round) (Screen 6 step 8). `labels: frontend, setup`
-- [ ] **[FE-M1-10]** Review & complete → `POST /setup/complete`; gate app entry on `setupCompleted`. `labels: frontend, setup`
+- [ ] **[FE-M1-10]** Step 12 — Review & Launch checklist → `POST /setup/complete`; gate app entry on `setupCompleted` (Screen 6 step 12). `labels: frontend, setup`
+- [ ] **[FE-M1-11]** Step 9 — Add Properties: Customer + Property + ServicePlan form; round picker from ACTIVE rounds (Screen 6 step 9). `labels: frontend, setup`
+- [ ] **[FE-M1-12]** Step 10 — Assign Technicians: tech multi-picker per ACTIVE round (Screen 6 step 10). `labels: frontend, setup`
+- [ ] **[FE-M1-13]** Step 11 — Activate System: date-range picker → trigger visit generation; show count of visits created (Screen 6 step 11). `labels: frontend, setup`
 
 ### Definition of Done
-- All required steps (1, 3, 4, 6, 7, 8) completable via the UI against the API; `setupCompleted` flips true; the wizard locks (403) after completion; steps 2 & 5 render as deferred.
+- All required steps (1, 3, 4, 6, 7, 8, 9, 10, 11) completable via the UI against the API; `setupCompleted` flips true; the wizard locks (403) after completion; steps 2 & 5 render as deferred; step 12 is the read-only review screen.
 
 ---
 
@@ -105,7 +113,7 @@ Two locked assignment rules run through the scheduling milestones (see
 **Goal:** Admin can create customers + properties (Add Property flow), browse the customer list, and view/edit the full customer record.
 **Depends on:** M1
 
-> Backend complete and PR-reviewed (2026-07-21). 5 findings from senior review resolved (F1–F5): `optId` FK normalisation, `Decimal.add()` money accumulation, TECHNICIAN financial-field projection, `paymentStatus` "none" default, `pauseEndDate` guard. Frontend tickets not yet started.
+> Backend complete and PR-reviewed (2026-07-21). 5 findings from senior review resolved (F1–F5): `optId` FK normalisation, `Decimal.add()` money accumulation, TECHNICIAN financial-field projection, `paymentStatus` "none" default, `pauseEndDate` guard. BE-M2-07 + BE-M2-08 completed 2026-07-26 (round assignment + FR-FREQ logic). Frontend tickets not yet started.
 
 ### Backend tickets
 - [x] **[BE-M2-01]** Customer service+routes — create/read/update + list with filters (Screen 14). `labels: backend, customers`
@@ -114,7 +122,8 @@ Two locked assignment rules run through the scheduling milestones (see
 - [x] **[BE-M2-04]** ServicePlan create/read for a property (price, cleanMethod, paymentMethod, next-due) (Screen 15 Service Plan tab). `labels: backend, service-plans`
 - [x] **[BE-M2-05]** Customer Detail aggregate read — property info + payment & status + tab data (Screen 15). `labels: backend, customers`
 - [x] **[BE-M2-06]** Pause / Resume service — `LifecycleStatus` transitions (M9). `labels: backend, customers`
-- [ ] **[BE-M2-07]** Assign Property to Round + "Save & Assign Later" (unassigned) (Screen 31). `labels: backend, rounds`
+- [x] **[BE-M2-07]** Assign Property to Round + "Save & Assign Later" (unassigned) (Screen 31). `labels: backend, rounds`
+- [x] **[BE-M2-08]** Frequency change on `ServicePlan` → automatic round reassignment (FR-FREQ-2/3/4): find or create an ACTIVE round matching the new frequency + `serviceAreaId`; copy `RoundTechnician` assignments to any newly created round; no-op if unassigned (FR-FREQ-5) or frequency unchanged (FR-FREQ-6). `labels: backend, rounds`
 
 ### Frontend tickets
 - [ ] **[FE-M2-01]** Customers & Properties list — summary KPIs + round/status filters (Screen 14). `labels: frontend, customers`
@@ -126,20 +135,21 @@ Two locked assignment rules run through the scheduling milestones (see
 - [ ] **[FE-M2-07]** Customer Detail — Notes & Risk tab (Screen 15). `labels: frontend, customers`
 - [ ] **[FE-M2-08]** Customer Detail — Photos tab (Screen 15). `labels: frontend, customers`
 - [ ] **[FE-M2-09]** Edit Customer + Pause/Resume Service confirm (M9). `labels: frontend, customers`
+- [ ] **[FE-M2-10]** Service Plan — frequency picker (FR-FREQ-1); auto-reassignment confirmation flow when the chosen frequency differs from the current round's frequency (FR-FREQ-2). `labels: frontend, service-plans`
 
 ### Definition of Done
-- Admin can add a customer+property (assigned or unassigned), find it in the list, open the detail with all six tabs, edit it, and attach a service plan. Covers FR-CUST-1..6.
+- Admin can add a customer+property (assigned or unassigned), find it in the list, open the detail with all six tabs, edit it, and attach a service plan; changing a property's frequency automatically reassigns it to the correct round. Covers FR-CUST-1..6, FR-FREQ-1..6.
 
 ---
 
-## M3 — Visit Generation & Round Planner · 🔴 Not Started
+## M3 — Visit Generation & Round Planner · 🟡 In Progress
 **Goal:** Visits auto-generate from service plans on the round cadence, and the admin can plan rounds and assign technicians (multi-tech, per-occurrence).
 **Depends on:** M2
 
 ### Backend tickets
 - [ ] **[BE-M3-01]** Visit generation cron — create `Visit`s from `ServicePlan` next-due + `Round` cadence; **new visits start `technicianId=null`** (per-occurrence rule, SRS FR-ROUND-10). `labels: backend, visits`
 - [ ] **[BE-M3-02]** Payment-hold gating in generation (respect `Visit.paymentHold`) (FR-VISIT-1). `labels: backend, visits`
-- [ ] **[BE-M3-03]** Round create (Add Round wizard) + read (Round + **derived** assigned technicians) (Screen 30). `labels: backend, rounds`
+- [x] **[BE-M3-03]** Round create (Add Round wizard) + read (Round + **derived** assigned technicians) (Screen 30). `labels: backend, rounds`
 - [ ] **[BE-M3-04]** Round Planner reads — calendar/list/map data (stops, value, completion %, holds, issues) (Screens 8–11). `labels: backend, rounds`
 - [ ] **[BE-M3-05]** Multi-tech allocation — set `Visit.technicianId` per job for an occurrence (manual division, SRS FR-ROUND-9). `labels: backend, rounds`
 - [ ] **[BE-M3-06]** Upcoming Property Recurrences — list unassigned upcoming occurrences + per-row assign (M14). `labels: backend, rounds`
@@ -186,7 +196,7 @@ Two locked assignment rules run through the scheduling milestones (see
 
 ## M5 — Mobile Technician App · 🔴 Not Started
 **Goal:** A technician can onboard, see today's jobs, and execute each visit (start / complete / skip / access-issue / cash / photos).
-**Depends on:** M3 (visits exist). ⚠️ **Blocked** on the native-vs-mobile-web decision (DP-MOBILE) before FE work.
+**Depends on:** M3 (visits exist). BE tickets (BE-M5-*) are Phase 1. **All FE tickets (FE-M5-*) are Phase 2** — the mobile app is a React Native native app (iOS + Android); DP-MOBILE resolved.
 
 ### Backend tickets
 - [x] **[BE-M5-01]** Technician invite/onboarding — `TenantInvite` entity + `POST /invites` + `POST /invites/:token/accept` (tech-link idempotent; cross-tenant guards) (done 2026-07-21). `labels: backend, mobile`
@@ -329,6 +339,7 @@ Two locked assignment rules run through the scheduling milestones (see
 - Advanced analytics / BI.
 - Customer-facing portal.
 - First-class **`RoundOccurrence`** model (Phase 1 derives occurrences from Visits — see SDS §3.4).
+- **Mobile Technician App FE** — React Native native app (iOS + Android); all `FE-M5-*` tickets. Phase 1 delivers the BE endpoints (`BE-M5-*`) only. (DP-MOBILE resolved.)
 
 ---
 
@@ -337,17 +348,18 @@ From `PROGRESS.md` Decisions Pending + `designFindings.md` OQ#13 / MOB-1/2/3.
 
 | Open question | Blocks / affects |
 |---------------|------------------|
-| **Mobile completion delivery** (native vs mobile web) — DP-MOBILE | **M5** (all FE-M5-*) |
 | **GHL automation trigger mechanism** (contact-field-sync vs direct API) — DP-GHL | **M8** (BE-M8-01+); payment automation in **M6** |
+| **Notification provider** — DP-NOTIF: push notifications required (FR-MOBILE-9) but provider undecided (Firebase or equivalent); schema for notification entity undefined | **M5** (BE-M5-07, FE-M5-06) |
 | **Skip-reason enum** (#7) — currently free `String` | **M5** (BE-M5-04) |
-| **Technician invite entity** (#5) — `TenantInvite` model exists; accept flow pending | **M5** (BE-M5-01), schema-per-tenant remaining steps |
-| **Notifications feed entity** (#6) + push-vs-in-app (MOB-3) | **M5** (BE-M5-07, FE-M5-06) |
-| **Technician availability model** (#4) + self-mark "unavailable" (OQ#13/MOB-2) | **M9** (BE-M9-02); reassignment in **M4** |
 | **Per-round assignment history** (#9) | **M3/M4** (Screen 30 "Recent Activity") |
-| **App roles in JWT** (DP-ROLES) — Supabase claim vs `Profile` role | Role-based authz from **M2** onward; **M9** (BE-M9-03) |
+| ~~**Mobile completion delivery** (native vs mobile web) — DP-MOBILE~~ | ✅ **Resolved 2026-07-16** — React Native native app (iOS + Android); FE-M5-* deferred to Phase 2 |
+| ~~**App roles in JWT** (DP-ROLES) — Supabase claim vs `Profile` role~~ | ✅ **Resolved 2026-07-21** — `req.user.role` removed; app role resolved from `Profile.role` via `requireTenantAccess` on every request; FR-AUTH-8 added |
+| ~~**Technician invite entity** (#5)~~ | ✅ **Resolved 2026-07-21** — `TenantInvite` model + full invite/accept flow live (BE-M5-01 done) |
+| ~~**Technician availability model** (#4) + self-mark "unavailable" (OQ#13)~~ | ✅ **Resolved 2026-07-16** — technician self-marks Unavailable from mobile (Phase 2); admin views + reassigns from web admin (Phase 1 — BE-M9-02) |
+| ~~**Notifications feed entity** (#6) + push-vs-in-app (MOB-3)~~ | Partially resolved — push + in-app + email notification types confirmed; provider open → DP-NOTIF above |
+| ~~**Mobile app scope / "B2C" naming** (MOB-1)~~ | ✅ **Resolved** — mobile app is technician-facing only; "B2C" label in design file is a mistake |
 | ~~**`handle_new_user` trigger provenance** — DP-TRIGGER~~ | ✅ **Resolved 2026-07-21** — trigger dropped; `POST /auth/signup` is the provisioning path |
 | ~~**Auth hardening** (`audience`/`issuer`) — DP-AUTHHARD~~ | ✅ **Resolved** — `requireAuth` validates issuer + audience (commit c816192) |
-| **Mobile app scope / "B2C" naming** (MOB-1) | **M5** scope |
 
 ---
 

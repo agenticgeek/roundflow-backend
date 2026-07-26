@@ -10,6 +10,7 @@ import {
   optIsoDate,
   parseIsoDate,
   requireNoteType,
+  optCleaningFrequency,
 } from "../lib/validation";
 import {
   createCustomerService,
@@ -78,6 +79,7 @@ propertiesRouter.patch(
       accessNotes: optString(body.accessNotes, "accessNotes"),
       riskNotes: optString(body.riskNotes, "riskNotes"),
       roundId: optId(body.roundId, "roundId"), // null = unassign; id = assign/reassign
+      cleaningFrequency: optCleaningFrequency(body.cleaningFrequency),
     };
     res.json(await svc(req).updateProperty(actorIdOf(req), req.params.id, input));
   })

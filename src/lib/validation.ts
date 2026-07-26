@@ -1,4 +1,4 @@
-import { DayOfWeek, PaymentMethod, NoteType } from "../generated/tenant-client";
+import { DayOfWeek, PaymentMethod, NoteType, CleaningFrequency, RoundStatus } from "../generated/tenant-client";
 import { AppError } from "./app-error";
 
 // Shared request-value validators used by both the /setup and /settings routers,
@@ -76,4 +76,36 @@ export function requireNoteType(v: unknown): NoteType {
     return v as NoteType;
   }
   throw new AppError(400, `"type" must be one of: ${Object.values(NoteType).join(", ")}`);
+}
+
+// ---- M3 (Rounds) domain validators ----------------------------------------
+
+export function requireCleaningFrequency(v: unknown): CleaningFrequency {
+  if (typeof v === "string" && (Object.values(CleaningFrequency) as string[]).includes(v)) {
+    return v as CleaningFrequency;
+  }
+  throw new AppError(400, `"frequency" must be one of: ${Object.values(CleaningFrequency).join(", ")}`);
+}
+
+export function optCleaningFrequency(v: unknown): CleaningFrequency | undefined {
+  if (v === undefined) return undefined;
+  return requireCleaningFrequency(v);
+}
+
+export function optDayOfWeek(v: unknown): DayOfWeek | null | undefined {
+  if (v === undefined) return undefined;
+  if (v === null) return null;
+  if (typeof v === "string" && (Object.values(DayOfWeek) as string[]).includes(v)) {
+    return v as DayOfWeek;
+  }
+  throw new AppError(400, `"defaultDay" must be one of: ${Object.values(DayOfWeek).join(", ")}`);
+}
+
+// undefined = omit filter (list all); null/"" treated as omit (query-param safe).
+export function optRoundStatus(v: unknown): RoundStatus | undefined {
+  if (v === undefined || v === null || v === "") return undefined;
+  if (typeof v === "string" && (Object.values(RoundStatus) as string[]).includes(v)) {
+    return v as RoundStatus;
+  }
+  throw new AppError(400, `"status" must be one of: ${Object.values(RoundStatus).join(", ")}`);
 }
