@@ -144,3 +144,14 @@ propertiesRouter.post(
     res.status(201).json(await svc(req).addNote(actorIdOf(req), req.params.id, input));
   })
 );
+
+// ==========================================================================
+// DELETE /properties/:id — soft-delete property (CANCELLED + cancels plans)
+// ==========================================================================
+propertiesRouter.delete(
+  "/:id",
+  h(async (req, res) => {
+    await svc(req).deleteProperty(actorIdOf(req), req.params.id);
+    res.status(204).send();
+  })
+);

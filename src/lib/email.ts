@@ -13,6 +13,32 @@ function escapeHtml(s: string): string {
     .replace(/'/g, "&#39;");
 }
 
+export async function sendTemplatedEmail({
+  to,
+  subject,
+  body,
+  variables,
+}: {
+  to: string;
+  subject: string;
+  body: string;
+  variables: Record<string, string>;
+}): Promise<void> {
+  const rendered = body.replace(/\{\{(\w+)\}\}/g, (_, key) => {
+    const val = variables[key];
+    return val !== undefined ? escapeHtml(val) : `{{${key}}}`;
+  });
+  const safeSubject = subject.replace(/\{\{(\w+)\}\}/g, (_, key) => variables[key] ?? `{{${key}}}`);
+
+  await resend.emails.send({
+    from: FROM,
+    to,
+    subject: safeSubject,
+    html: `<p style="font-family:sans-serif;line-height:1.6">${rendered.replace(/\n/g, "<br>")}</p>`,
+    text: body.replace(/\{\{(\w+)\}\}/g, (_, key) => variables[key] ?? `{{${key}}}`),
+  });
+}
+
 export async function sendInviteEmail({
   to,
   inviteUrl,

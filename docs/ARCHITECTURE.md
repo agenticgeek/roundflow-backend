@@ -15,7 +15,7 @@ RoundFlow is a multi-tenant SaaS backend for UK window-cleaning businesses. Each
 | ORM | Prisma (two separate clients — see §5) |
 | Database | PostgreSQL via Supabase (hosted) |
 | Identity provider | Supabase Auth (ES256 JWTs, JWKS) |
-| Email | Resend (transactional invite emails) |
+| Email | Resend (transactional email — invite emails + customer-facing templated emails) |
 | Deployment | Railway |
 | API docs | Swagger UI (`/docs`) |
 
@@ -363,7 +363,7 @@ This means service code never touches `res` — it throws, the route handler pro
 ### What GHL is in RoundFlow
 
 GHL (GoHighLevel) is a **utility**, not the platform. RoundFlow does not run inside GHL. GHL is used for:
-- **Outbound messaging** to customers: SMS, WhatsApp, Email — sent via GHL's messaging infrastructure
+- **Outbound messaging** to customers: SMS, WhatsApp (sent via GHL's messaging infrastructure). **Email** is sent directly via **Resend** (not GHL) — see `src/lib/email.ts`.
 - **Payment flow assistance**: GoCardless and Stripe payment links surfaced through GHL workflows
 
 A single GHL account serves all RoundFlow tenants (not one GHL sub-account per tenant). Every `Customer` and `Property` record carries a `ghlContactId` column from day one, which is the join key between RoundFlow and GHL.
@@ -386,7 +386,7 @@ flowchart TB
 
     subgraph GHL["GoHighLevel"]
         CONTACT["GHL Contact\n(ghlContactId join key)"]
-        WF["GHL Workflow\nSMS · WhatsApp · Email\nPayment links"]
+        WF["GHL Workflow\nSMS · WhatsApp\nPayment links"]
         CONTACT --> WF
     end
 

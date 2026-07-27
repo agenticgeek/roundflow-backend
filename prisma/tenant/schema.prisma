@@ -461,6 +461,7 @@ model MessageTemplate {
   id        String          @id @default(cuid())
   name      String
   channel   MessageChannel?
+  subject   String?         // email subject line; null for SMS/WhatsApp
   body      String
   messages  Message[]
   createdAt DateTime        @default(now())

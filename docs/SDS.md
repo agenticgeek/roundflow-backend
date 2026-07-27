@@ -131,7 +131,8 @@ src/
 │   ├── tenant-prisma-manager.ts# LRU pool of TenantPrismaClient; getTenantPrismaForSchema()
 │   ├── tenant-provisioning.ts  # provisionTenantSchema(): creates schema + replays
 │   │                           #   all prisma/tenant/migrations/*.sql in a transaction
-│   ├── email.ts                # sendInviteEmail() via Resend (HTML-escaped, URL-encoded)
+│   ├── email.ts                # sendInviteEmail() + sendTemplatedEmail() via Resend
+│   │                           #   (HTML-escaped values, {{variable}} rendering)
 │   ├── http.ts                 # Route helpers: h(), asObject(), asArray(),
 │   │                           #   requireString(), requireNumber(), optString(), optId(), etc.
 │   └── validation.ts           # Domain validators: assertPositive(), assertPositiveInt(),
@@ -168,7 +169,8 @@ src/
     │                           #   FR-FREQ-1..6 logic in updateProperty + updateCustomer
     ├── round.service.ts        # IRoundService: listRounds, createRound, getRound,
     │                           #   updateRound, setTechnicians
-    └── settings.service.ts     # ISettingsService: all settings section reads/writes
+    └── settings.service.ts     # ISettingsService: all settings section reads/writes;
+                                #   MessageTemplate CRUD + replaceTemplates (for step 5)
 ```
 **Intended layout** (as domains land): one `routes/<domain>.ts` + one
 `services/<domain>.service.ts` per domain, following the thin-route /
@@ -212,7 +214,7 @@ yet in code). All non-`/health` routes require a Bearer JWT.
 | GET/POST | `/setup/step/2` (Payment — deferred stub) | JWT + Tenant | — | **Built** |
 | GET/POST | `/setup/step/3` (Service Catalogue) | JWT + Tenant | SetupService | **Built** |
 | GET/POST | `/setup/step/4` (Round Settings) | JWT + Tenant | SetupService | **Built** |
-| GET/POST | `/setup/step/5` (SMS Templates — deferred stub) | JWT + Tenant | — | **Built** |
+| GET/POST | `/setup/step/5` (Message Templates — SMS/WhatsApp/Email) | JWT + Tenant | SettingsService | **Built** |
 | GET/POST | `/setup/step/6` (Technicians) | JWT + Tenant | SetupService | **Built** |
 | GET/POST | `/setup/step/7` (Service Areas) | JWT + Tenant | SetupService | **Built** |
 | GET/POST | `/setup/step/8` (First Round) | JWT + Tenant | SetupService | **Built** |
@@ -230,6 +232,10 @@ yet in code). All non-`/health` routes require a Bearer JWT.
 | POST | `/properties/:id/resume` | JWT + Tenant (ADMIN/MGR) | CustomerService | **Built** |
 | GET | `/properties/:id/notes` | JWT + Tenant | CustomerService | **Built** |
 | POST | `/properties/:id/notes` | JWT + Tenant (ADMIN/MGR) | CustomerService | **Built** |
+| POST | `/customers` | JWT + Tenant (ADMIN/MGR) | CustomerService | **Built** |
+| DELETE | `/customers/:id` | JWT + Tenant (ADMIN/MGR) | CustomerService | **Built** |
+| POST | `/customers/:id/properties` | JWT + Tenant (ADMIN/MGR) | CustomerService | **Built** |
+| DELETE | `/properties/:id` | JWT + Tenant (ADMIN/MGR) | CustomerService | **Built** |
 | GET | `/settings/business-profile` | JWT + Tenant | SettingsService | **Built** |
 | PATCH | `/settings/business-profile` | JWT + Tenant (ADMIN/MGR) | SettingsService | **Built** |
 | GET | `/settings/round-settings` | JWT + Tenant | SettingsService | **Built** |
@@ -250,7 +256,9 @@ yet in code). All non-`/health` routes require a Bearer JWT.
 | PATCH | `/settings/payment` | JWT + Tenant (ADMIN/MGR) | SettingsService | **Built** |
 | POST | `/settings/payment/:provider/connect` | JWT + Tenant (ADMIN/MGR) | SettingsService | **Built** |
 | GET | `/settings/message-templates` | JWT + Tenant | SettingsService | **Built** |
-| PATCH | `/settings/message-templates` | JWT + Tenant (ADMIN/MGR) | SettingsService (stub) | **Built** |
+| POST | `/settings/message-templates` | JWT + Tenant (ADMIN/MGR) | SettingsService | **Built** |
+| PATCH | `/settings/message-templates/:id` | JWT + Tenant (ADMIN/MGR) | SettingsService | **Built** |
+| DELETE | `/settings/message-templates/:id` | JWT + Tenant (ADMIN/MGR) | SettingsService | **Built** |
 | GET | `/openapi.json` | No | — | **Built** |
 | GET | `/docs` | No | swagger-ui-express | **Built** |
 | GET | `/rounds` | JWT + Tenant | RoundService | **Built** |
@@ -258,8 +266,10 @@ yet in code). All non-`/health` routes require a Bearer JWT.
 | GET | `/rounds/:id` | JWT + Tenant | RoundService | **Built** |
 | PATCH | `/rounds/:id` | JWT + Tenant (ADMIN/MGR) | RoundService | **Built** |
 | PUT | `/rounds/:id/technicians` | JWT + Tenant (ADMIN/MGR) | RoundService | **Built** |
+| GET | `/rounds/:id/planner/occurrences` | JWT + Tenant | RoundService | **Built** |
+| GET | `/rounds/:id/planner/occurrences/:date` | JWT + Tenant | RoundService | **Built** |
 | — | Visit generation (cron) + Visit reads | JWT + Tenant / cron | VisitService (planned) | **Planned** |
-| — | Round Planner reads (calendar/map/list) | JWT + Tenant | RoundService (planned) | **Planned** |
+| — | Round Planner map view + Today's Work (per-technician day view) | JWT + Tenant | RoundService (planned) | **Planned** |
 | — | Today's Work + Reassign / Push Missed | JWT + Tenant | VisitService (planned) | **Planned** |
 | — | Debt / Payment Risk Board | JWT + Tenant | DebtService (planned) | **Planned** |
 | — | Invoices (generate/preview/send) | JWT + Tenant | InvoiceService (planned) | **Planned** |
@@ -371,7 +381,7 @@ Holds all operational data for one business. Deployed per-tenant as `t_<20-hex>`
 **Messaging**
 - **Message** — fields: `channel` (`MessageChannel`), `direction`, `body`,
   `scheduledFor?`, `sentAt?`, `creditCost?`.
-- **MessageTemplate** — reusable template (`name`, `channel?`, `body`).
+- **MessageTemplate** — reusable template (`name`, `channel?` (SMS/WHATSAPP/EMAIL), `subject?` (email subject line), `body`). Email templates rendered via `sendTemplatedEmail()` with `{{variable}}` substitution.
 
 **Catalogue / config**
 - **Service** — catalogue entry. Fields: `name`, `category` (`ServiceCategory`),

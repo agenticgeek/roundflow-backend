@@ -86,9 +86,7 @@ From `RoundFlow_Context_and_Roadmap_v1.md` (Phase 2/3) and design decisions:
 - Customer-facing portal (the mobile app is technician-facing only — see MOB-1).
 - GHL Custom Objects as the data layer, GHL Workflows as business logic, GHL
   Custom Pages/iframe delivery, GHL OAuth as primary auth (all retired).
-- Setup Wizard **Step 2 (Payment Setup)** and **Step 5 (SMS Templates)** are
-  **deferred stubs** in Phase 1 (Payment configured separately; SMS templates
-  managed via GHL).
+- Setup Wizard **Step 2 (Payment Setup)** is a **deferred stub** in Phase 1 (Payment configured separately). Step 5 (Message Templates) is now fully built — SMS/WhatsApp/Email templates are stored in the DB and email is sent via Resend.
 
 ---
 
@@ -161,7 +159,7 @@ Supabase `auth.users`).
 | FR-AUTH-7 | Staff are onboarded via **invite links** (`POST /invites`, `POST /invites/:token/accept`). Accepting an invite creates a `Profile` and marks the invite accepted atomically; cross-tenant and cross-email acceptance SHALL be rejected with 403. | PROGRESS (invites.ts) | Must |
 | FR-AUTH-8 | **Role-based access control (RBAC)** SHALL be enforced on every protected route via `Profile.role` read from the database on each request — never from the JWT. Three roles exist: **ADMIN** (full access), **MANAGER** (full access), **TECHNICIAN** (read-only; all mutations blocked with 403). Role changes take effect on the next request with no token refresh required. The enforcement chain is: `requireAuth` (identity) → `requireTenantAccess` (loads `Profile`, wires `req.profile.role`) → `requireBusinessAccess` / `requireRole` (gates on role). | PROGRESS (requireRole.ts, requireTenantAccess.ts) | Must |
 
-### FR-SETUP — Setup Wizard (12 steps; steps 2 & 5 deferred)
+### FR-SETUP — Setup Wizard (12 steps; step 2 deferred)
 Full-screen first-run wizard (Screen 6), 12 steps. Backend implemented as `/setup/*`
 behind `requireAuth` + `requireTenantAccess`. Step completion is **derived** (not
 stored); a `setupCompleted` flag on `BusinessSettings` gates the wizard.
@@ -173,7 +171,7 @@ All mutating step endpoints are blocked (403) once `setupCompleted=true`.
 | FR-SETUP-2 | Step 2 — **Payment Setup** (GoCardless, BACS/bank): **deferred stub** ("Payment setup is configured separately"), no DB write. | Screen 6 step 2 | Won't (Phase 1) |
 | FR-SETUP-3 | Step 3 — **Service Catalogue**: create/replace `Service` entries (name, category, description, defaultPrice, active). Complete when ≥1 Service exists. | Screen 6 step 3; Screen 24 | Must |
 | FR-SETUP-4 | Step 4 — **Round Settings**: default cycle length, working days → upsert `BusinessSettings`. Complete when `defaultCycleLength` is set. | Screen 6 step 4 | Must |
-| FR-SETUP-5 | Step 5 — **SMS/WhatsApp Templates**: **deferred stub** ("SMS templates are managed via GHL"), no DB write. | Screen 6 step 5 | Won't (Phase 1) |
+| FR-SETUP-5 | Step 5 — **Message Templates** (SMS / WhatsApp / Email): create/edit message templates stored in `MessageTemplate` table. Each template has `name`, `channel` (SMS / WHATSAPP / EMAIL), `body`, and `subject?` (required for email). `POST /setup/step/5` does a bulk replace. Complete when ≥1 template saved. Email sending uses **Resend** (`sendTemplatedEmail()`). | Screen 6 step 5; `email.ts` | Must |
 | FR-SETUP-6 | Step 6 — **Technician Management**: create invite-pending `Technician`(s) (`profileId=null`). Complete when ≥1 Technician exists. | Screen 6 step 6 | Must |
 | FR-SETUP-7 | Step 7 — **Service Areas**: create `ServiceArea`(s). Complete when ≥1 ServiceArea exists. | Screen 6 step 7 | Must |
 | FR-SETUP-8 | Step 8 — **Assign Round**: create the first `Round` with `status=ACTIVE`. Complete when ≥1 ACTIVE Round exists. | Screen 6 step 8 | Must |
@@ -194,6 +192,8 @@ All mutating step endpoints are blocked (403) once `setupCompleted=true`.
 | FR-CUST-4 | A property MAY be created **without a round assignment** via "Save & Assign Later" and assigned later from the customer record (`Property.roundId` nullable). Service area must still be set at creation time (see FR-CUST-3a). | Screen 31; OQ#8 | Must |
 | FR-CUST-5 | Customer Detail actions: Edit Customer, **Pause/Resume Service** (M9), Send Message, Generate Invoice (M4 from a visit row). | Screen 15; M4; M9 | Should |
 | FR-CUST-6 | Notes & Risk: capture property access notes and **risk notes** (surfaced prominently to technicians). | Screen 15; mobile Screen 7 | Must |
+| FR-CUST-7 | **Standalone customer create**: `POST /customers` creates a `Customer` record (name, phone?, email?, paymentMethod?) without a property. Properties are added subsequently via `POST /customers/:id/properties` (which creates Property + ServicePlan atomically and inherits round frequency — FR-FREQ-1). | Backend (2026-07-28) | Must |
+| FR-CUST-8 | **Soft-delete**: `DELETE /customers/:id` sets the customer to `CANCELLED` and cancels all active service plans + properties (cascade). `DELETE /properties/:id` sets the property to `CANCELLED` and cancels its active service plans. Historical visits and payments are untouched. | Backend (2026-07-28) | Must |
 
 ### FR-ROUND — Rounds & Scheduling
 | ID | Requirement | Source | Priority |
@@ -282,7 +282,7 @@ moved to an appropriate round.
 | FR-SETTINGS-1 | Provide a **Settings** area (two-column nav) with sections: Business Profile, Payment Setup, Round Settings, SMS Templates, Technician Mgmt, Service Areas, Service Catalogue. | Screen 23 | Should |
 | FR-SETTINGS-2 | **Business Profile** settings: Business Name, Phone, Email, Service Area, Default Working Days, Timezone, Currency (edit/save). | Screen 23 | Should |
 | FR-SETTINGS-3 | **Service Catalogue** settings: services table with category tags, description, default price, active toggle, edit/delete. | Screen 24 | Should |
-| FR-SETTINGS-4 | Payment Setup & SMS Templates settings correspond to the deferred Setup steps (Payment configured separately; SMS via GHL). | Screen 23; Setup steps 2/5 | Could |
+| FR-SETTINGS-4 | Payment Setup settings correspond to the deferred Setup step 2 (configured separately). Message Templates settings (`GET/POST/PATCH/:id/DELETE /settings/message-templates`) provide full per-item CRUD for SMS, WhatsApp, and Email templates. | Screen 23; Setup step 2 | Should |
 
 ### FR-MOBILE — Mobile Technician App
 The mobile app is **technician-facing only** (not customer-facing; the "B2C" label in the design file is a mistake — MOB-1 resolved). A separate customer-facing app is out of scope for Phase 1.
@@ -340,6 +340,7 @@ The mobile app is **technician-facing only** (not customer-facing; the "B2C" lab
 - **NFR-SEC-7:** Transactional email (invite emails) uses **Resend**. The
   `businessName` field (user-supplied) is HTML-escaped before interpolation; the
   invite URL is encoded with `encodeURI` before embedding in the email body.
+- **NFR-SEC-8:** Templated customer emails (sent via `sendTemplatedEmail()` in `src/lib/email.ts`) render `{{variable_name}}` placeholders by HTML-escaping all variable values before substitution, preventing injection via customer-controlled data fields.
 
 ### 5.3 Multi-Tenancy Architecture
 - **NFR-MT-1 — Model:** RoundFlow uses **schema-per-tenant** isolation (not

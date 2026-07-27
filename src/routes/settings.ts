@@ -4,7 +4,7 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
-import { validateWorkingDays, assertPositiveInt } from "../lib/validation";
+import { validateWorkingDays, assertPositiveInt, requireMessageChannel, optMessageChannel } from "../lib/validation";
 import {
   asObject,
   h,
@@ -313,7 +313,7 @@ settingsRouter.post(
 );
 
 // ==========================================================================
-// Section 7 — SMS Templates (deferred stub)
+// Section 7 — Message Templates (SMS / WhatsApp / Email via Resend)
 // ==========================================================================
 
 settingsRouter.get(
@@ -322,11 +322,42 @@ settingsRouter.get(
     res.json(await svc(req).getMessageTemplates(actorIdOf(req)));
   })
 );
-settingsRouter.patch(
+
+settingsRouter.post(
   "/message-templates",
   h(async (req, res) => {
     await svc(req).assertSetupComplete(actorIdOf(req));
-    // Deferred stub — no DB write; returns the same deferred payload.
-    res.json(await svc(req).getMessageTemplates(actorIdOf(req)));
+    const body = asObject(req.body);
+    const input = {
+      name: requireString(body.name, "name"),
+      channel: requireMessageChannel(body.channel),
+      body: requireString(body.body, "body"),
+      subject: optString(body.subject, "subject"),
+    };
+    res.status(201).json(await svc(req).createMessageTemplate(actorIdOf(req), input));
+  })
+);
+
+settingsRouter.patch(
+  "/message-templates/:id",
+  h(async (req, res) => {
+    await svc(req).assertSetupComplete(actorIdOf(req));
+    const body = asObject(req.body);
+    const input = {
+      name: optReqString(body.name, "name"),
+      channel: optMessageChannel(body.channel),
+      body: optReqString(body.body, "body"),
+      subject: optString(body.subject, "subject"),
+    };
+    res.json(await svc(req).updateMessageTemplate(actorIdOf(req), req.params.id, input));
+  })
+);
+
+settingsRouter.delete(
+  "/message-templates/:id",
+  h(async (req, res) => {
+    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).deleteMessageTemplate(actorIdOf(req), req.params.id);
+    res.status(204).send();
   })
 );

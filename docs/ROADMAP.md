@@ -73,7 +73,7 @@ Two locked assignment rules run through the scheduling milestones (see
 ---
 
 ## M1 — Setup Wizard · 🟡 In Progress
-**Goal:** A first-run admin can configure the business through the 12-step wizard and mark setup complete (steps 2 & 5 are deferred stubs).
+**Goal:** A first-run admin can configure the business through the 12-step wizard and mark setup complete (step 2 is a deferred stub; step 5 (Message Templates) is now fully built).
 **Depends on:** M0
 
 ### Backend tickets
@@ -81,12 +81,13 @@ Two locked assignment rules run through the scheduling milestones (see
 - [x] **[BE-M1-02]** Step 1 & 4 — Business Profile / Round Settings (GET + POST `BusinessSettings` singleton) (Screen 6 steps 1, 4). `labels: backend, setup`
 - [x] **[BE-M1-03]** Step 3 — Service Catalogue (GET + create/replace) (Screen 6 step 3). `labels: backend, setup`
 - [x] **[BE-M1-04]** Step 6 & 7 — Technicians (invite-pending) + Service Areas (GET + POST) (Screen 6 steps 6, 7). `labels: backend, setup`
-- [x] **[BE-M1-05]** Step 8 — first Round (`status=ACTIVE`); steps 2 & 5 deferred stubs (Screen 6 steps 8, 2, 5). `labels: backend, setup`
+- [x] **[BE-M1-05]** Step 8 — first Round (`status=ACTIVE`); step 2 deferred stub (step 5 un-deferred — see BE-M1-12) (Screen 6 steps 8, 2, 5). `labels: backend, setup`
 - [x] **[BE-M1-06]** `POST /setup/complete` + `assertSetupIncomplete` guard (403 / 400 / 409). `labels: backend, setup`
 - [x] **[BE-M1-08]** Step 9 — Add Properties: Customer + Property + ServicePlan in a single transaction; `roundId` required + must be ACTIVE (FR-SETUP-9). `labels: backend, setup`
 - [x] **[BE-M1-09]** Step 10 — Assign Technicians: set `RoundTechnician` rows (replace semantics); rejects inactive technicians + duplicate roundIds (FR-SETUP-10). `labels: backend, setup`
 - [x] **[BE-M1-10]** Step 11 — Activate System: generate `Visit` records for `startDate + cycleWeeks`; 409 guard if already complete (FR-SETUP-11). `labels: backend, setup`
 - [x] **[BE-M1-11]** Step 12 — Review & Launch: read-only checklist derived from steps 1–11 completion state (FR-SETUP-12). `labels: backend, setup`
+- [x] **[BE-M1-12]** Step 5 — Message Templates (SMS / WhatsApp / Email via Resend): real GET + POST (bulk replace semantics); `subject String?` migration added; step complete when ≥1 template saved. `labels: backend, setup, email`
 - [ ] **[BE-M1-07]** Integration test — `/setup/*` over HTTP with a real token (currently only proven via `/auth/me` + direct-DB). `labels: backend, setup`
 
 ### Frontend tickets
@@ -95,7 +96,7 @@ Two locked assignment rules run through the scheduling milestones (see
 - [ ] **[FE-M1-03]** Step 2 — Payment Setup deferred-stub screen (Screen 6 step 2). `labels: frontend, setup`
 - [ ] **[FE-M1-04]** Step 3 — Service Catalogue editor (Screen 6 step 3 / Screen 24). `labels: frontend, setup`
 - [ ] **[FE-M1-05]** Step 4 — Round Settings form (Screen 6 step 4). `labels: frontend, setup`
-- [ ] **[FE-M1-06]** Step 5 — SMS Templates deferred-stub screen (Screen 6 step 5). `labels: frontend, setup`
+- [ ] **[FE-M1-06]** Step 5 — Message Templates (SMS / WhatsApp / Email); GET/POST against real `/setup/step/5` endpoint (Screen 6 step 5). `labels: frontend, setup`
 - [ ] **[FE-M1-07]** Step 6 — Technician Management (add invite-pending technicians) (Screen 6 step 6). `labels: frontend, setup`
 - [ ] **[FE-M1-08]** Step 7 — Service Areas (Screen 6 step 7). `labels: frontend, setup`
 - [ ] **[FE-M1-09]** Step 8 — Assign Round (create the first round) (Screen 6 step 8). `labels: frontend, setup`
@@ -105,7 +106,7 @@ Two locked assignment rules run through the scheduling milestones (see
 - [ ] **[FE-M1-13]** Step 11 — Activate System: date-range picker → trigger visit generation; show count of visits created (Screen 6 step 11). `labels: frontend, setup`
 
 ### Definition of Done
-- All required steps (1, 3, 4, 6, 7, 8, 9, 10, 11) completable via the UI against the API; `setupCompleted` flips true; the wizard locks (403) after completion; steps 2 & 5 render as deferred; step 12 is the read-only review screen.
+- All required steps (1, 3, 4, 5, 6, 7, 8, 9, 10, 11) completable via the UI against the API; `setupCompleted` flips true; the wizard locks (403) after completion; step 2 renders as deferred; step 5 (Message Templates) is now required and must be completed; step 12 is the read-only review screen.
 
 ---
 
@@ -113,7 +114,7 @@ Two locked assignment rules run through the scheduling milestones (see
 **Goal:** Admin can create customers + properties (Add Property flow), browse the customer list, and view/edit the full customer record.
 **Depends on:** M1
 
-> Backend complete and PR-reviewed (2026-07-21). 5 findings from senior review resolved (F1–F5): `optId` FK normalisation, `Decimal.add()` money accumulation, TECHNICIAN financial-field projection, `paymentStatus` "none" default, `pauseEndDate` guard. BE-M2-07 + BE-M2-08 completed 2026-07-26 (round assignment + FR-FREQ logic). Frontend tickets not yet started.
+> Backend complete and PR-reviewed (2026-07-21). 5 findings from senior review resolved (F1–F5): `optId` FK normalisation, `Decimal.add()` money accumulation, TECHNICIAN financial-field projection, `paymentStatus` "none" default, `pauseEndDate` guard. BE-M2-07 + BE-M2-08 completed 2026-07-26 (round assignment + FR-FREQ logic). Frontend tickets not yet started. BE-M2-09 completed 2026-07-28 (standalone customer CRUD + property-to-customer linking).
 
 ### Backend tickets
 - [x] **[BE-M2-01]** Customer service+routes — create/read/update + list with filters (Screen 14). `labels: backend, customers`
@@ -124,6 +125,7 @@ Two locked assignment rules run through the scheduling milestones (see
 - [x] **[BE-M2-06]** Pause / Resume service — `LifecycleStatus` transitions (M9). `labels: backend, customers`
 - [x] **[BE-M2-07]** Assign Property to Round + "Save & Assign Later" (unassigned) (Screen 31). `labels: backend, rounds`
 - [x] **[BE-M2-08]** Frequency change on `ServicePlan` → automatic round reassignment (FR-FREQ-2/3/4): find or create an ACTIVE round matching the new frequency + `serviceAreaId`; copy `RoundTechnician` assignments to any newly created round; no-op if unassigned (FR-FREQ-5) or frequency unchanged (FR-FREQ-6). `labels: backend, rounds`
+- [x] **[BE-M2-09]** Standalone customer create (`POST /customers`), customer soft-delete (`DELETE /customers/:id`), add-property-to-existing-customer (`POST /customers/:id/properties`), property soft-delete (`DELETE /properties/:id`). `labels: backend, customers, properties`
 
 ### Frontend tickets
 - [ ] **[FE-M2-01]** Customers & Properties list — summary KPIs + round/status filters (Screen 14). `labels: frontend, customers`
@@ -150,7 +152,7 @@ Two locked assignment rules run through the scheduling milestones (see
 - [ ] **[BE-M3-01]** Visit generation cron — create `Visit`s from `ServicePlan` next-due + `Round` cadence; **new visits start `technicianId=null`** (per-occurrence rule, SRS FR-ROUND-10). `labels: backend, visits`
 - [ ] **[BE-M3-02]** Payment-hold gating in generation (respect `Visit.paymentHold`) (FR-VISIT-1). `labels: backend, visits`
 - [x] **[BE-M3-03]** Round create (Add Round wizard) + read (Round + **derived** assigned technicians) (Screen 30). `labels: backend, rounds`
-- [ ] **[BE-M3-04]** Round Planner reads — calendar/list/map data (stops, value, completion %, holds, issues) (Screens 8–11). `labels: backend, rounds`
+- [x] **[BE-M3-04]** Round Planner reads — calendar/list/map data (stops, value, completion %, holds, issues) (Screens 8–11). `labels: backend, rounds`
 - [ ] **[BE-M3-05]** Multi-tech allocation — set `Visit.technicianId` per job for an occurrence (manual division, SRS FR-ROUND-9). `labels: backend, rounds`
 - [ ] **[BE-M3-06]** Upcoming Property Recurrences — list unassigned upcoming occurrences + per-row assign (M14). `labels: backend, rounds`
 - [ ] **[BE-M3-07]** Add properties to an existing round (Add Round step 3 / Screen 31). `labels: backend, rounds`

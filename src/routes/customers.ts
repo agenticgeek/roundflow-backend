@@ -2,11 +2,22 @@ import { Request, Router } from "express";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
-import { asObject, h, optString, optReqString, optReqNumber, optId } from "../lib/http";
-import { assertPositive, optPaymentMethod } from "../lib/validation";
+import {
+  asObject,
+  h,
+  requireString,
+  requireNumber,
+  optString,
+  optReqString,
+  optReqNumber,
+  optId,
+} from "../lib/http";
+import { assertPositive, optPaymentMethod, optIsoDate } from "../lib/validation";
 import {
   createCustomerService,
+  CustomerCreateInput,
   CustomerUpdateInput,
+  PropertyAddInput,
 } from "../services/customer.service";
 
 export const customersRouter = Router();
@@ -20,6 +31,23 @@ const svc = (req: Request) => createCustomerService(req.tenantPrisma!);
 // Thin routes: validate → call service → respond. No DB access here.
 // Returns the Supabase user ID of the acting caller (the profileId seam).
 const actorIdOf = (req: Request): string => req.user!.supabaseUserId;
+
+// ==========================================================================
+// POST /customers — create a standalone customer (no property yet)
+// ==========================================================================
+customersRouter.post(
+  "/",
+  h(async (req, res) => {
+    const body = asObject(req.body);
+    const input: CustomerCreateInput = {
+      name: requireString(body.name, "name"),
+      phone: optString(body.phone, "phone"),
+      email: optString(body.email, "email"),
+      paymentMethod: optPaymentMethod(body.paymentMethod),
+    };
+    res.status(201).json(await svc(req).createCustomer(actorIdOf(req), input));
+  })
+);
 
 // ==========================================================================
 // GET /customers — list + summary KPIs (Screen 14)
@@ -83,5 +111,44 @@ customersRouter.patch(
       paymentMethod: optPaymentMethod(body.paymentMethod),
     };
     res.json(await svc(req).updateCustomer(actorIdOf(req), req.params.id, input));
+  })
+);
+
+// ==========================================================================
+// DELETE /customers/:id — soft-delete customer (CANCELLED + cascades)
+// ==========================================================================
+customersRouter.delete(
+  "/:id",
+  h(async (req, res) => {
+    await svc(req).deleteCustomer(actorIdOf(req), req.params.id);
+    res.status(204).send();
+  })
+);
+
+// ==========================================================================
+// POST /customers/:id/properties — add a property to an existing customer
+// ==========================================================================
+customersRouter.post(
+  "/:id/properties",
+  h(async (req, res) => {
+    const body = asObject(req.body);
+    const price = requireNumber(body.price, "price");
+    assertPositive(price, "price");
+    const input: PropertyAddInput = {
+      addressLine: requireString(body.addressLine, "addressLine"),
+      postcode: requireString(body.postcode, "postcode").trim(),
+      propertyName: optString(body.propertyName, "propertyName"),
+      propertyType: optString(body.propertyType, "propertyType"),
+      serviceAreaId: requireString(body.serviceAreaId, "serviceAreaId"),
+      serviceId: optId(body.serviceId, "serviceId"),
+      price,
+      cleanMethod: optString(body.cleanMethod, "cleanMethod"),
+      paymentMethod: optPaymentMethod(body.paymentMethod),
+      nextDueDate: optIsoDate(body.nextDueDate, "nextDueDate"),
+      accessNotes: optString(body.accessNotes, "accessNotes"),
+      riskNotes: optString(body.riskNotes, "riskNotes"),
+      roundId: optId(body.roundId, "roundId"),
+    };
+    res.status(201).json(await svc(req).addPropertyToCustomer(actorIdOf(req), req.params.id, input));
   })
 );

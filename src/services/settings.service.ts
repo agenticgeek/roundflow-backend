@@ -1,9 +1,10 @@
-import { ServiceCategory, PaymentTiming } from "../generated/tenant-client";
+import { ServiceCategory, PaymentTiming, MessageChannel } from "../generated/tenant-client";
 import type {
   BusinessSettings,
   Service,
   ServiceArea,
   Technician,
+  MessageTemplate,
 } from "../generated/tenant-client";
 import type { Profile } from "@prisma/client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
@@ -103,6 +104,30 @@ export interface DeferredStub {
   source: string;
 }
 
+export interface MessageTemplateInput {
+  name: string;
+  channel: MessageChannel;
+  body: string;
+  subject?: string | null;
+}
+
+export interface MessageTemplateUpdateInput {
+  name?: string;
+  channel?: MessageChannel;
+  body?: string;
+  subject?: string | null;
+}
+
+export interface MessageTemplateView {
+  id: string;
+  name: string;
+  channel: MessageChannel | null;
+  subject: string | null;
+  body: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 // The service contract. Routes depend on this abstraction, never on the
 // concrete class — so Phase 2 (multi-tenancy) can bind a different
 // implementation (one that resolves a tenant from profileId and scopes every
@@ -172,8 +197,12 @@ export interface ISettingsService {
     provider: "gocardless" | "stripe"
   ): Promise<{ status: string; connectUrl?: string }>;
 
-  // SMS Templates (deferred stub — GHL owns messaging in Phase 2)
-  getMessageTemplates(profileId: string): Promise<DeferredStub>;
+  // Message Templates (SMS / WhatsApp / Email via Resend)
+  getMessageTemplates(profileId: string): Promise<MessageTemplateView[]>;
+  createMessageTemplate(profileId: string, input: MessageTemplateInput): Promise<MessageTemplateView>;
+  updateMessageTemplate(profileId: string, id: string, input: MessageTemplateUpdateInput): Promise<MessageTemplateView>;
+  deleteMessageTemplate(profileId: string, id: string): Promise<void>;
+  replaceTemplates(profileId: string, templates: MessageTemplateInput[]): Promise<MessageTemplateView[]>;
 }
 
 // PHASE 2 TENANT SEAM — honest assessment:
@@ -530,11 +559,86 @@ class SettingsService implements ISettingsService {
     return { status: "connected" };
   }
 
-  // ---- SMS Templates (deferred) ----
+  // ---- Message Templates ----
 
-  async getMessageTemplates(_profileId: string): Promise<DeferredStub> {
-    return { status: "deferred", source: "ghl" };
+  async getMessageTemplates(_profileId: string): Promise<MessageTemplateView[]> {
+    const rows = await this.prisma.messageTemplate.findMany({ orderBy: { createdAt: "asc" } });
+    return rows.map(toTemplateView);
   }
+
+  async createMessageTemplate(
+    _profileId: string,
+    input: MessageTemplateInput
+  ): Promise<MessageTemplateView> {
+    const row = await this.prisma.messageTemplate.create({
+      data: {
+        name: input.name,
+        channel: input.channel,
+        body: input.body,
+        subject: input.subject ?? null,
+      },
+    });
+    return toTemplateView(row);
+  }
+
+  async updateMessageTemplate(
+    _profileId: string,
+    id: string,
+    input: MessageTemplateUpdateInput
+  ): Promise<MessageTemplateView> {
+    if (!(await this.prisma.messageTemplate.findUnique({ where: { id } }))) {
+      throw new AppError(404, "Message template not found");
+    }
+    const row = await this.prisma.messageTemplate.update({
+      where: { id },
+      data: {
+        name: input.name,
+        channel: input.channel,
+        body: input.body,
+        subject: input.subject,
+      },
+    });
+    return toTemplateView(row);
+  }
+
+  async deleteMessageTemplate(_profileId: string, id: string): Promise<void> {
+    if (!(await this.prisma.messageTemplate.findUnique({ where: { id } }))) {
+      throw new AppError(404, "Message template not found");
+    }
+    await this.prisma.messageTemplate.delete({ where: { id } });
+  }
+
+  async replaceTemplates(
+    _profileId: string,
+    templates: MessageTemplateInput[]
+  ): Promise<MessageTemplateView[]> {
+    const rows = await this.prisma.$transaction(async (tx) => {
+      await tx.messageTemplate.deleteMany();
+      if (templates.length === 0) return [];
+      await tx.messageTemplate.createMany({
+        data: templates.map((t) => ({
+          name: t.name,
+          channel: t.channel,
+          body: t.body,
+          subject: t.subject ?? null,
+        })),
+      });
+      return tx.messageTemplate.findMany({ orderBy: { createdAt: "asc" } });
+    });
+    return rows.map(toTemplateView);
+  }
+}
+
+function toTemplateView(t: MessageTemplate): MessageTemplateView {
+  return {
+    id: t.id,
+    name: t.name,
+    channel: t.channel,
+    subject: t.subject,
+    body: t.body,
+    createdAt: t.createdAt.toISOString(),
+    updatedAt: t.updatedAt.toISOString(),
+  };
 }
 
 export function createSettingsService(prisma: TenantPrismaClient): ISettingsService {

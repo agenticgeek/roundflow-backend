@@ -27,6 +27,11 @@ import {
   RoundTechnicianAssignment,
   ActivationInput,
 } from "../services/setup.service";
+import {
+  createSettingsService,
+  MessageTemplateInput,
+} from "../services/settings.service";
+import { requireMessageChannel } from "../lib/validation";
 
 export const setupRouter = Router();
 setupRouter.use(requireAuth);
@@ -46,10 +51,7 @@ const svc = (req: Request) => createSetupService(req.tenantPrisma!);
 // tenantId resolver; do not conflate the two.
 const actorIdOf = (req: Request): string => req.user!.supabaseUserId;
 
-const STEP5_DEFERRED = {
-  status: "deferred",
-  reason: "SMS templates are managed via GHL",
-} as const;
+const settingsSvc = (req: Request) => createSettingsService(req.tenantPrisma!);
 
 // ---- status --------------------------------------------------------------
 
@@ -192,13 +194,27 @@ setupRouter.post(
   })
 );
 
-// ---- Step 5: SMS Templates (deferred) ------------------------------------
+// ---- Step 5: Message Templates (SMS / WhatsApp / Email) ------------------
 
-setupRouter.get("/step/5", h(async (_req, res) => res.json(STEP5_DEFERRED)));
+setupRouter.get(
+  "/step/5",
+  h(async (req, res) => {
+    res.json(await settingsSvc(req).getMessageTemplates(actorIdOf(req)));
+  })
+);
 setupRouter.post(
   "/step/5",
-  h(async (_req, res) => {
-    res.json(STEP5_DEFERRED); // deferred stub — no DB write, no setup-lock guard
+  h(async (req, res) => {
+    const profileId = actorIdOf(req);
+    await svc(req).assertSetupIncomplete(profileId);
+    const raw = asArray<Record<string, unknown>>(req.body, "templates");
+    const templates: MessageTemplateInput[] = raw.map((t) => ({
+      name: requireString(t.name, "name"),
+      channel: requireMessageChannel(t.channel),
+      body: requireString(t.body, "body"),
+      subject: optString(t.subject, "subject"),
+    }));
+    res.json(await settingsSvc(req).replaceTemplates(profileId, templates));
   })
 );
 

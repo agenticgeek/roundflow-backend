@@ -1,4 +1,4 @@
-import { DayOfWeek, PaymentMethod, NoteType, CleaningFrequency, RoundStatus } from "../generated/tenant-client";
+import { DayOfWeek, PaymentMethod, NoteType, CleaningFrequency, RoundStatus, MessageChannel } from "../generated/tenant-client";
 import { AppError } from "./app-error";
 
 // Shared request-value validators used by both the /setup and /settings routers,
@@ -108,4 +108,16 @@ export function optRoundStatus(v: unknown): RoundStatus | undefined {
     return v as RoundStatus;
   }
   throw new AppError(400, `"status" must be one of: ${Object.values(RoundStatus).join(", ")}`);
+}
+
+export function requireMessageChannel(v: unknown): MessageChannel {
+  if (typeof v === "string" && (Object.values(MessageChannel) as string[]).includes(v)) {
+    return v as MessageChannel;
+  }
+  throw new AppError(400, `"channel" must be one of: ${Object.values(MessageChannel).join(", ")}`);
+}
+
+export function optMessageChannel(v: unknown): MessageChannel | undefined {
+  if (v === undefined) return undefined;
+  return requireMessageChannel(v);
 }

@@ -273,6 +273,7 @@ class SetupService implements ISetupService {
       activeRoundCount,
       setupPropertyCount,
       visitCount,
+      messageTemplateCount,
     ] = await Promise.all([
       this.getSettings(),
       this.prisma.service.count(),
@@ -281,6 +282,7 @@ class SetupService implements ISetupService {
       this.prisma.round.count({ where: { status: RoundStatus.ACTIVE } }),
       this.prisma.property.count({ where: { roundId: { not: null } } }),
       this.prisma.visit.count({ where: { status: VisitStatus.SCHEDULED } }),
+      this.prisma.messageTemplate.count(),
     ]);
 
     // Step 10: all ACTIVE rounds must have ≥1 technician assigned.
@@ -303,7 +305,7 @@ class SetupService implements ISetupService {
       step(2, settings?.paymentRule != null),
       step(3, serviceCount > 0),
       step(4, settings?.defaultCycleLength != null),
-      step(5, false, true), // SMS Templates — deferred
+      step(5, messageTemplateCount > 0),
       step(6, technicianCount > 0),
       step(7, serviceAreaCount > 0),
       step(8, activeRoundCount > 0),

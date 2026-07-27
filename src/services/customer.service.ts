@@ -10,6 +10,7 @@ import {
   Prisma,
 } from "../generated/tenant-client";
 import type {
+  Customer,
   Property,
   ServicePlan,
   PropertyNote,
@@ -47,6 +48,29 @@ export interface CustomerListFilters {
   status?: string; // ACTIVE | PAUSED | CANCELLED | HOLD
   page?: number;     // 1-based, default 1
   pageSize?: number; // default 50, max 100
+}
+
+export interface CustomerCreateInput {
+  name: string;
+  phone?: string | null;
+  email?: string | null;
+  paymentMethod?: PaymentMethod | null;
+}
+
+export interface PropertyAddInput {
+  addressLine: string;
+  postcode: string;
+  propertyName?: string | null;
+  propertyType?: string | null;
+  serviceAreaId: string;
+  serviceId?: string | null;
+  price: number;
+  cleanMethod?: string | null;
+  paymentMethod?: PaymentMethod | null;
+  nextDueDate?: Date | null;
+  accessNotes?: string | null;
+  riskNotes?: string | null;
+  roundId?: string | null;
 }
 
 export interface PropertyCreateInput {
@@ -248,21 +272,29 @@ export interface ICustomerService {
     customerId: string,
     viewerRole: UserRole
   ): Promise<CustomerDetail>;
+  createCustomer(profileId: string, input: CustomerCreateInput): Promise<Customer>;
   updateCustomer(
     profileId: string,
     customerId: string,
     input: CustomerUpdateInput
   ): Promise<{ customerId: string; propertyId: string | null; servicePlanId: string | null }>;
+  deleteCustomer(profileId: string, customerId: string): Promise<void>;
 
   createProperty(
     profileId: string,
     input: PropertyCreateInput
   ): Promise<{ customerId: string; propertyId: string; servicePlanId: string; assigned: boolean }>;
+  addPropertyToCustomer(
+    profileId: string,
+    customerId: string,
+    input: PropertyAddInput
+  ): Promise<{ propertyId: string; servicePlanId: string; assigned: boolean }>;
   updateProperty(
     profileId: string,
     propertyId: string,
     input: PropertyUpdateInput
   ): Promise<Property>;
+  deleteProperty(profileId: string, propertyId: string): Promise<void>;
   pauseService(profileId: string, propertyId: string, input: PauseInput): Promise<ServicePlan>;
   resumeService(profileId: string, propertyId: string): Promise<ServicePlan>;
   getNotes(profileId: string, propertyId: string): Promise<PropertyNote[]>;
@@ -629,6 +661,20 @@ class CustomerService implements ICustomerService {
     };
   }
 
+  // ---- create standalone customer ----
+
+  async createCustomer(_profileId: string, input: CustomerCreateInput): Promise<Customer> {
+    return this.prisma.customer.create({
+      data: {
+        name: input.name,
+        phone: input.phone ?? null,
+        email: input.email ?? null,
+        paymentMethod: input.paymentMethod ?? null,
+        status: LifecycleStatus.ACTIVE,
+      },
+    });
+  }
+
   // ---- M19: edit customer (Customer + Property + ServicePlan, atomic) ----
 
   async updateCustomer(
@@ -703,6 +749,33 @@ class CustomerService implements ICustomerService {
     });
   }
 
+  // ---- soft-delete customer (CANCELLED + cascades to properties + plans) ----
+
+  async deleteCustomer(_profileId: string, customerId: string): Promise<void> {
+    if (!(await this.prisma.customer.findUnique({ where: { id: customerId } }))) {
+      throw new AppError(404, "Customer not found");
+    }
+    await this.prisma.$transaction(async (tx) => {
+      const propertyIds = (
+        await tx.property.findMany({ where: { customerId }, select: { id: true } })
+      ).map((p) => p.id);
+      if (propertyIds.length > 0) {
+        await tx.servicePlan.updateMany({
+          where: { propertyId: { in: propertyIds }, status: { not: LifecycleStatus.CANCELLED } },
+          data: { status: LifecycleStatus.CANCELLED },
+        });
+        await tx.property.updateMany({
+          where: { id: { in: propertyIds } },
+          data: { status: LifecycleStatus.CANCELLED },
+        });
+      }
+      await tx.customer.update({
+        where: { id: customerId },
+        data: { status: LifecycleStatus.CANCELLED },
+      });
+    });
+  }
+
   // ---- M6: create property (Customer + Property + ServicePlan, atomic) ----
 
   async createProperty(
@@ -754,6 +827,71 @@ class CustomerService implements ICustomerService {
         servicePlanId: plan.id,
         assigned: input.roundId != null,
       };
+    });
+  }
+
+  // ---- add property to existing customer (Property + ServicePlan, atomic) ----
+
+  async addPropertyToCustomer(
+    _profileId: string,
+    customerId: string,
+    input: PropertyAddInput
+  ): Promise<{ propertyId: string; servicePlanId: string; assigned: boolean }> {
+    if (!(await this.prisma.customer.findUnique({ where: { id: customerId } }))) {
+      throw new AppError(404, "Customer not found");
+    }
+    let roundFrequency: CleaningFrequency | null = null;
+    if (input.roundId) {
+      const round = await this.prisma.round.findUnique({ where: { id: input.roundId } });
+      if (!round) throw new AppError(404, `Round not found: ${input.roundId}`);
+      roundFrequency = round.frequency;
+    }
+    await this.assertServiceAreaExists(input.serviceAreaId);
+
+    return this.prisma.$transaction(async (tx) => {
+      const property = await tx.property.create({
+        data: {
+          customerId,
+          addressLine: input.addressLine,
+          postcode: input.postcode,
+          propertyName: input.propertyName ?? null,
+          propertyType: (input.propertyType as PropertyType) ?? null,
+          serviceAreaId: input.serviceAreaId,
+          accessNotes: input.accessNotes ?? null,
+          riskNotes: input.riskNotes ?? null,
+          roundId: input.roundId ?? null,
+          status: LifecycleStatus.ACTIVE,
+        },
+      });
+      const plan = await tx.servicePlan.create({
+        data: {
+          propertyId: property.id,
+          serviceId: input.serviceId ?? null,
+          price: input.price,
+          cleanMethod: input.cleanMethod ?? null,
+          paymentMethod: input.paymentMethod ?? null,
+          nextDueDate: input.nextDueDate ?? null,
+          cleaningFrequency: roundFrequency,
+          status: LifecycleStatus.ACTIVE,
+        },
+      });
+      return { propertyId: property.id, servicePlanId: plan.id, assigned: input.roundId != null };
+    });
+  }
+
+  // ---- soft-delete property (CANCELLED + cancels active service plans) ----
+
+  async deleteProperty(_profileId: string, propertyId: string): Promise<void> {
+    await this.assertPropertyExists(propertyId);
+    await this.prisma.$transaction(async (tx) => {
+      await tx.servicePlan.updateMany({
+        where: { propertyId, status: { not: LifecycleStatus.CANCELLED } },
+        data: { status: LifecycleStatus.CANCELLED },
+      });
+      await tx.property.update({
+        where: { id: propertyId },
+        data: { status: LifecycleStatus.CANCELLED },
+      });
     });
   }
 
