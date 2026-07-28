@@ -21,7 +21,7 @@ export interface RoundCreateInput {
 
 export interface RoundUpdateInput {
   name?: string;
-  frequency?: CleaningFrequency;
+  frequency?: CleaningFrequency | null; // null = clear frequency
   serviceAreaId?: string | null; // null = unassign service area
   defaultDay?: DayOfWeek | null;
   description?: string | null;
@@ -190,6 +190,11 @@ class RoundService implements IRoundService {
     return this.toDetail(round);
   }
 
+  private async assertRoundExists(roundId: string): Promise<void> {
+    const r = await this.prisma.round.findUnique({ where: { id: roundId }, select: { id: true } });
+    if (!r) throw new AppError(404, "Round not found");
+  }
+
   // ---- update ----
 
   async updateRound(
@@ -197,9 +202,7 @@ class RoundService implements IRoundService {
     roundId: string,
     input: RoundUpdateInput
   ): Promise<RoundDetail> {
-    if (!(await this.prisma.round.findUnique({ where: { id: roundId } }))) {
-      throw new AppError(404, "Round not found");
-    }
+    await this.assertRoundExists(roundId);
     if (input.serviceAreaId) await this.assertServiceAreaExists(input.serviceAreaId);
 
     const round = await this.prisma.round.update({
@@ -225,29 +228,29 @@ class RoundService implements IRoundService {
     roundId: string,
     technicianIds: string[]
   ): Promise<RoundDetail> {
-    if (!(await this.prisma.round.findUnique({ where: { id: roundId } }))) {
-      throw new AppError(404, "Round not found");
-    }
+    await this.assertRoundExists(roundId);
 
     const uniqueIds = [...new Set(technicianIds)];
 
-    if (uniqueIds.length > 0) {
-      const found = await this.prisma.technician.findMany({
-        where: { id: { in: uniqueIds } },
-      });
-      if (found.length !== uniqueIds.length) {
-        throw new AppError(404, "One or more technicians not found");
-      }
-      const inactive = found.filter((t) => !t.active);
-      if (inactive.length > 0) {
-        throw new AppError(
-          400,
-          `Cannot assign inactive technician(s): ${inactive.map((t) => t.id).join(", ")}`
-        );
-      }
-    }
-
+    // Validate + replace inside one transaction to avoid TOCTOU (a technician
+    // deactivated between pre-check and write would otherwise be silently assigned).
     const round = await this.prisma.$transaction(async (tx) => {
+      if (uniqueIds.length > 0) {
+        const found = await tx.technician.findMany({
+          where: { id: { in: uniqueIds } },
+          select: { id: true, active: true },
+        });
+        if (found.length !== uniqueIds.length) {
+          throw new AppError(404, "One or more technicians not found");
+        }
+        const inactive = found.filter((t) => !t.active);
+        if (inactive.length > 0) {
+          throw new AppError(
+            400,
+            `Cannot assign inactive technician(s): ${inactive.map((t) => t.id).join(", ")}`
+          );
+        }
+      }
       await tx.roundTechnician.deleteMany({ where: { roundId } });
       if (uniqueIds.length > 0) {
         await tx.roundTechnician.createMany({
@@ -271,16 +274,25 @@ class RoundService implements IRoundService {
     from?: Date,
     to?: Date
   ): Promise<OccurrenceSummary[]> {
-    if (!(await this.prisma.round.findUnique({ where: { id: roundId }, select: { id: true } }))) {
-      throw new AppError(404, "Round not found");
+    await this.assertRoundExists(roundId);
+
+    if (from && to && from > to) {
+      throw new AppError(400, '"from" must be before "to"');
+    }
+    // Cap to 90 days to prevent unbounded full-table scans.
+    const MAX_RANGE_MS = 90 * 24 * 60 * 60 * 1000;
+    if (from && to && to.getTime() - from.getTime() > MAX_RANGE_MS) {
+      throw new AppError(400, "Date range must not exceed 90 days");
+    }
+    // Require at least one bound so callers can't scan all visits.
+    if (!from && !to) {
+      throw new AppError(400, "At least one of \"from\" or \"to\" is required");
     }
 
     const visits = await this.prisma.visit.findMany({
       where: {
         roundId,
-        ...(from || to
-          ? { date: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) } }
-          : {}),
+        date: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) },
       },
       select: {
         date: true,
@@ -304,21 +316,14 @@ class RoundService implements IRoundService {
       bucket.push(v);
     }
 
-    return Array.from(byDate.entries()).map(([date, vs]) => {
-      const completedCount = vs.filter((v) => v.status === VisitStatus.COMPLETED).length;
-      const totalValue = vs.reduce((acc, v) => acc + v.price.toNumber(), 0);
-      const holdCount = vs.filter((v) => v.paymentHold).length;
-      const issueCount = vs.reduce((acc, v) => acc + v._count.issues, 0);
-      return {
-        date,
-        stopCount: vs.length,
-        totalValue,
-        completedCount,
-        completionPct: vs.length > 0 ? Math.round((completedCount / vs.length) * 100) : 0,
-        holdCount,
-        issueCount,
-      };
-    });
+    return Array.from(byDate.entries()).map(([date, vs]) =>
+      this.aggregateStats(date, vs.length, {
+        completedCount: vs.filter((v) => v.status === VisitStatus.COMPLETED).length,
+        totalValue: vs.reduce((acc, v) => acc + v.price.toNumber(), 0),
+        holdCount: vs.filter((v) => v.paymentHold).length,
+        issueCount: vs.reduce((acc, v) => acc + v._count.issues, 0),
+      })
+    );
   }
 
   // ---- planner — single occurrence (list/map view) ----
@@ -335,10 +340,13 @@ class RoundService implements IRoundService {
     if (!round) throw new AppError(404, "Round not found");
 
     const dayStart = new Date(`${date}T00:00:00.000Z`);
-    const dayEnd = new Date(`${date}T23:59:59.999Z`);
+    if (isNaN(dayStart.getTime())) {
+      throw new AppError(400, '"date" is not a valid calendar date');
+    }
+    const dayEnd = new Date(dayStart.getTime() + 86_400_000); // exclusive: next midnight
 
     const visits = await this.prisma.visit.findMany({
-      where: { roundId, date: { gte: dayStart, lte: dayEnd } },
+      where: { roundId, date: { gte: dayStart, lt: dayEnd } },
       include: visitDetailInclude,
       orderBy: { property: { addressLine: "asc" } },
     });
@@ -381,7 +389,7 @@ class RoundService implements IRoundService {
       propertyName: v.property.propertyName,
       addressLine: v.property.addressLine,
       postcode: v.property.postcode,
-      customerName: v.property.customer.name,
+      customerName: v.property.customer?.name ?? null,
       price: v.price.toNumber(),
       status: v.status,
       paymentHold: v.paymentHold,
@@ -392,19 +400,27 @@ class RoundService implements IRoundService {
     };
   }
 
-  private toSummary(stops: PlannerStop[]): Omit<OccurrenceSummary, "date"> {
-    const completedCount = stops.filter((s) => s.status === VisitStatus.COMPLETED).length;
-    const totalValue = stops.reduce((acc, s) => acc + s.price, 0);
-    const holdCount = stops.filter((s) => s.paymentHold).length;
-    const issueCount = stops.reduce((acc, s) => acc + s.issues.length, 0);
+  private aggregateStats(
+    date: string,
+    stopCount: number,
+    counts: { completedCount: number; totalValue: number; holdCount: number; issueCount: number }
+  ): OccurrenceSummary {
     return {
-      stopCount: stops.length,
-      totalValue,
-      completedCount,
-      completionPct: stops.length > 0 ? Math.round((completedCount / stops.length) * 100) : 0,
-      holdCount,
-      issueCount,
+      date,
+      stopCount,
+      ...counts,
+      completionPct: stopCount > 0 ? Math.round((counts.completedCount / stopCount) * 100) : 0,
     };
+  }
+
+  private toSummary(stops: PlannerStop[]): Omit<OccurrenceSummary, "date"> {
+    const { date: _d, ...rest } = this.aggregateStats("", stops.length, {
+      completedCount: stops.filter((s) => s.status === VisitStatus.COMPLETED).length,
+      totalValue: stops.reduce((acc, s) => acc + s.price, 0),
+      holdCount: stops.filter((s) => s.paymentHold).length,
+      issueCount: stops.reduce((acc, s) => acc + s.issues.length, 0),
+    });
+    return rest;
   }
 
   private async assertServiceAreaExists(id: string): Promise<void> {

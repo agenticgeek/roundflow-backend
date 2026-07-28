@@ -502,22 +502,43 @@ class SetupService implements ISetupService {
     if (input.filter((a) => a.isDefault === true).length > 1) {
       throw new AppError(400, "Only one service area can be marked as default.");
     }
-    // Replace the whole set — re-posting step 7 must not append duplicates.
-    // Safe within the wizard: Rounds/Properties that reference ServiceArea are
-    // created after step 7, and only once setup is complete —
-    // assertSetupIncomplete blocks this POST after completion, so no live FK
-    // reference to a deleted area can exist here.
+    // Upsert by name so re-posting step 7 after step 8 doesn't delete referenced areas.
+    // Areas whose names are absent from the new input are deleted only if unreferenced.
     return this.prisma.$transaction(async (tx) => {
-      await tx.serviceArea.deleteMany({});
-      if (input.length > 0) {
-        await tx.serviceArea.createMany({
-          data: input.map((a) => ({
-            name: a.name,
-            postcodeSector: a.postcodeSector ?? null,
-            isDefault: a.isDefault ?? false,
-          })),
-        });
+      const existing = await tx.serviceArea.findMany({ select: { id: true, name: true } });
+      const incomingNames = new Set(input.map((a) => a.name));
+
+      // Remove areas not in the new input — only allowed if unreferenced.
+      for (const area of existing.filter((e) => !incomingNames.has(e.name))) {
+        const [roundRefs, propRefs] = await Promise.all([
+          tx.round.count({ where: { serviceAreaId: area.id } }),
+          tx.property.count({ where: { serviceAreaId: area.id } }),
+        ]);
+        if (roundRefs > 0 || propRefs > 0) {
+          throw new AppError(
+            409,
+            `Cannot remove service area "${area.name}" — it is referenced by existing rounds or properties. ` +
+            `Rename it instead, or remove the reference first.`
+          );
+        }
+        await tx.serviceArea.delete({ where: { id: area.id } });
       }
+
+      // Upsert each incoming area by name.
+      for (const a of input) {
+        const match = existing.find((e) => e.name === a.name);
+        const data = {
+          name: a.name,
+          postcodeSector: a.postcodeSector ?? null,
+          isDefault: a.isDefault ?? false,
+        };
+        if (match) {
+          await tx.serviceArea.update({ where: { id: match.id }, data });
+        } else {
+          await tx.serviceArea.create({ data });
+        }
+      }
+
       return tx.serviceArea.findMany({ orderBy: { createdAt: "asc" } });
     });
   }
@@ -546,12 +567,7 @@ class SetupService implements ISetupService {
       throw new AppError(400, `Invalid frequency: ${input.frequency}`);
     }
     if (input.serviceAreaId) {
-      const area = await this.prisma.serviceArea.findUnique({
-        where: { id: input.serviceAreaId },
-      });
-      if (!area) {
-        throw new AppError(400, `serviceAreaId not found: ${input.serviceAreaId}`);
-      }
+      await this.assertServiceAreaExists(input.serviceAreaId);
     }
 
     const data = {
@@ -616,19 +632,14 @@ class SetupService implements ISetupService {
     ) {
       throw new AppError(400, `Invalid paymentMethod: ${input.paymentMethod}`);
     }
-    const area = await this.prisma.serviceArea.findUnique({
-      where: { id: input.serviceAreaId },
-    });
-    if (!area) throw new AppError(400, `serviceAreaId not found: ${input.serviceAreaId}`);
-    if (input.roundId) {
-      // M-1: Require ACTIVE status — a DRAFT round never appears in step 10's
-      // ACTIVE-round query, so properties assigned to it would be orphaned from
-      // technician coverage checks.
-      const round = await this.prisma.round.findUnique({ where: { id: input.roundId } });
-      if (!round) throw new AppError(400, `roundId not found: ${input.roundId}`);
-      if (round.status !== RoundStatus.ACTIVE) {
-        throw new AppError(400, "roundId must reference an ACTIVE round");
-      }
+    await this.assertServiceAreaExists(input.serviceAreaId);
+    // M-1: Require ACTIVE status — a DRAFT round never appears in step 10's
+    // ACTIVE-round query, so properties assigned to it would be orphaned from
+    // technician coverage checks.
+    const round = await this.prisma.round.findUnique({ where: { id: input.roundId } });
+    if (!round) throw new AppError(400, `roundId not found: ${input.roundId}`);
+    if (round.status !== RoundStatus.ACTIVE) {
+      throw new AppError(400, "roundId must reference an ACTIVE round");
     }
     if (input.price < 0) throw new AppError(400, "price must be >= 0");
 
@@ -668,6 +679,11 @@ class SetupService implements ISetupService {
   }
 
   // ── Step 10: Assign Technicians to Rounds ───────────────────────────────
+
+  private async assertServiceAreaExists(id: string): Promise<void> {
+    const area = await this.prisma.serviceArea.findUnique({ where: { id }, select: { id: true } });
+    if (!area) throw new AppError(400, `serviceAreaId not found: ${id}`);
+  }
 
   private async buildStep10Result(): Promise<Step10Result> {
     const [rounds, technicians] = await Promise.all([

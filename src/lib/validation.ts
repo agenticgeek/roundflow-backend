@@ -1,4 +1,4 @@
-import { DayOfWeek, PaymentMethod, NoteType, CleaningFrequency, RoundStatus, MessageChannel } from "../generated/tenant-client";
+import { DayOfWeek, PaymentMethod, NoteType, CleaningFrequency, RoundStatus, MessageChannel, PropertyType } from "../generated/tenant-client";
 import { AppError } from "./app-error";
 
 // Shared request-value validators used by both the /setup and /settings routers,
@@ -41,6 +41,14 @@ export function assertPositive(v: number, field: string): number {
   return v;
 }
 
+/** Assert a numeric value is zero or positive (e.g. a defaultPrice for free services). */
+export function assertNonNegative(v: number, field: string): number {
+  if (!Number.isFinite(v) || v < 0) {
+    throw new AppError(400, `${field} must be zero or a positive number`);
+  }
+  return v;
+}
+
 /** Parse a required ISO date string → Date; throws AppError(400) if invalid. */
 export function parseIsoDate(v: unknown, field: string): Date {
   if (typeof v !== "string" || v.trim() === "") {
@@ -70,6 +78,16 @@ export function optPaymentMethod(v: unknown): PaymentMethod | null | undefined {
   throw new AppError(400, `Invalid paymentMethod: ${String(v)}`);
 }
 
+/** Optional PropertyType: undefined = omitted, null = clear, else validate enum. */
+export function optPropertyType(v: unknown): PropertyType | null | undefined {
+  if (v === undefined) return undefined;
+  if (v === null) return null;
+  if (typeof v === "string" && (Object.values(PropertyType) as string[]).includes(v)) {
+    return v as PropertyType;
+  }
+  throw new AppError(400, `Invalid propertyType: ${String(v)}`);
+}
+
 /** Required NoteType (INTERNAL | RISK_WARNING | CUSTOMER). */
 export function requireNoteType(v: unknown): NoteType {
   if (typeof v === "string" && (Object.values(NoteType) as string[]).includes(v)) {
@@ -87,8 +105,9 @@ export function requireCleaningFrequency(v: unknown): CleaningFrequency {
   throw new AppError(400, `"frequency" must be one of: ${Object.values(CleaningFrequency).join(", ")}`);
 }
 
-export function optCleaningFrequency(v: unknown): CleaningFrequency | undefined {
+export function optCleaningFrequency(v: unknown): CleaningFrequency | null | undefined {
   if (v === undefined) return undefined;
+  if (v === null) return null;
   return requireCleaningFrequency(v);
 }
 

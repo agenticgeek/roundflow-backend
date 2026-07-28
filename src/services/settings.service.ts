@@ -1,4 +1,4 @@
-import { ServiceCategory, PaymentTiming, MessageChannel } from "../generated/tenant-client";
+import { ServiceCategory, PaymentTiming, MessageChannel, RoundStatus, LifecycleStatus } from "../generated/tenant-client";
 import type {
   BusinessSettings,
   Service,
@@ -385,7 +385,7 @@ class SettingsService implements ISettingsService {
   async getServiceAreas(_profileId: string): Promise<ServiceAreaWithRounds[]> {
     const areas = await this.prisma.serviceArea.findMany({
       orderBy: { createdAt: "asc" },
-      include: { rounds: { select: { id: true, name: true } } },
+      include: { rounds: { where: { status: RoundStatus.ACTIVE }, select: { id: true, name: true } } },
     });
     // linkedRounds is a derived, read-only field (not stored).
     return areas.map(({ rounds, ...rest }) => ({
@@ -448,11 +448,12 @@ class SettingsService implements ISettingsService {
   async deleteServiceArea(_profileId: string, id: string): Promise<void> {
     const existing = await this.prisma.serviceArea.findUnique({ where: { id } });
     if (!existing) throw new AppError(404, "Service area not found");
-    const [roundRefs, propertyRefs] = await Promise.all([
+    const [roundRefs, propertyRefs, techRefs] = await Promise.all([
       this.prisma.round.count({ where: { serviceAreaId: id } }),
-      this.prisma.property.count({ where: { serviceAreaId: id } }),
+      this.prisma.property.count({ where: { serviceAreaId: id, status: LifecycleStatus.ACTIVE } }),
+      this.prisma.technicianServiceArea.count({ where: { serviceAreaId: id } }),
     ]);
-    if (roundRefs > 0 || propertyRefs > 0) {
+    if (roundRefs > 0 || propertyRefs > 0 || techRefs > 0) {
       throw new AppError(409, "Service area is in use and cannot be deleted");
     }
     await this.prisma.serviceArea.delete({ where: { id } });

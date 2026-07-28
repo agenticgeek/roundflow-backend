@@ -4,7 +4,7 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
-import { validateWorkingDays, assertPositiveInt, requireMessageChannel, optMessageChannel } from "../lib/validation";
+import { validateWorkingDays, assertPositiveInt, assertPositive, assertNonNegative, requireMessageChannel, optMessageChannel } from "../lib/validation";
 import {
   asObject,
   h,
@@ -153,7 +153,7 @@ settingsRouter.post(
     const body = asObject(req.body);
     const input: ServiceCreateInput = {
       name: requireString(body.name, "name"),
-      defaultPrice: requireNumber(body.defaultPrice, "defaultPrice"),
+      defaultPrice: assertNonNegative(requireNumber(body.defaultPrice, "defaultPrice"), "defaultPrice"),
       category: optCategory(body.category),
       description: optString(body.description, "description"),
       active: optBool(body.active, "active"),
@@ -166,9 +166,11 @@ settingsRouter.patch(
   h(async (req, res) => {
     await svc(req).assertSetupComplete(actorIdOf(req));
     const body = asObject(req.body);
+    const price = optReqNumber(body.defaultPrice, "defaultPrice");
+    if (price !== undefined) assertNonNegative(price, "defaultPrice");
     const input: ServiceUpdateInput = {
       name: optReqString(body.name, "name"),
-      defaultPrice: optReqNumber(body.defaultPrice, "defaultPrice"),
+      defaultPrice: price,
       category: optCategory(body.category),
       description: optString(body.description, "description"),
       active: optBool(body.active, "active"),

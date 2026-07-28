@@ -114,7 +114,7 @@ Two locked assignment rules run through the scheduling milestones (see
 **Goal:** Admin can create customers + properties (Add Property flow), browse the customer list, and view/edit the full customer record.
 **Depends on:** M1
 
-> Backend complete and PR-reviewed (2026-07-21). 5 findings from senior review resolved (F1–F5): `optId` FK normalisation, `Decimal.add()` money accumulation, TECHNICIAN financial-field projection, `paymentStatus` "none" default, `pauseEndDate` guard. BE-M2-07 + BE-M2-08 completed 2026-07-26 (round assignment + FR-FREQ logic). Frontend tickets not yet started. BE-M2-09 completed 2026-07-28 (standalone customer CRUD + property-to-customer linking).
+> Backend complete and PR-reviewed (2026-07-21). 5 findings from senior review resolved (F1–F5): `optId` FK normalisation, `Decimal.add()` money accumulation, TECHNICIAN financial-field projection, `paymentStatus` "none" default, `pauseEndDate` guard. BE-M2-07 + BE-M2-08 completed 2026-07-26 (round assignment + FR-FREQ logic). BE-M2-09 completed 2026-07-28 (standalone customer CRUD + property-to-customer linking). Full domain audit (2026-07-28) across service areas, round planner, and customers/properties — all high/medium/low findings fixed; regression pass resolved 9 additional issues (SA-R1/R2/R7, RP-type/boundary, C-R3/R6/R10). Frontend tickets not yet started.
 
 ### Backend tickets
 - [x] **[BE-M2-01]** Customer service+routes — create/read/update + list with filters (Screen 14). `labels: backend, customers`

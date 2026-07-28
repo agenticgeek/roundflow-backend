@@ -2,6 +2,7 @@ import { Request, Router } from "express";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
+import { AppError } from "../lib/app-error";
 import {
   asObject,
   h,
@@ -12,7 +13,7 @@ import {
   optReqNumber,
   optId,
 } from "../lib/http";
-import { assertPositive, optPaymentMethod, optIsoDate } from "../lib/validation";
+import { assertPositive, optPaymentMethod, optPropertyType, optIsoDate } from "../lib/validation";
 import {
   createCustomerService,
   CustomerCreateInput,
@@ -26,7 +27,10 @@ customersRouter.use(requireTenantAccess);
 // Authorization: reads allowed for any known role; mutations require ADMIN/MANAGER.
 customersRouter.use(requireBusinessAccess());
 
-const svc = (req: Request) => createCustomerService(req.tenantPrisma!);
+const svc = (req: Request) => {
+  if (!req.tenantPrisma) throw new AppError(500, "Tenant client not initialised");
+  return createCustomerService(req.tenantPrisma);
+};
 
 // Thin routes: validate → call service → respond. No DB access here.
 // Returns the Supabase user ID of the acting caller (the profileId seam).
@@ -101,7 +105,7 @@ customersRouter.patch(
       // Property
       addressLine: optReqString(body.addressLine, "addressLine"),
       postcode: optReqString(body.postcode, "postcode"),
-      propertyType: optString(body.propertyType, "propertyType"),
+      propertyType: optPropertyType(body.propertyType),
       accessNotes: optString(body.accessNotes, "accessNotes"),
       riskNotes: optString(body.riskNotes, "riskNotes"),
       roundId: optId(body.roundId, "roundId"), // null = unassign (OQ-CP4)
@@ -135,10 +139,10 @@ customersRouter.post(
     const price = requireNumber(body.price, "price");
     assertPositive(price, "price");
     const input: PropertyAddInput = {
-      addressLine: requireString(body.addressLine, "addressLine"),
+      addressLine: requireString(body.addressLine, "addressLine").trim(),
       postcode: requireString(body.postcode, "postcode").trim(),
       propertyName: optString(body.propertyName, "propertyName"),
-      propertyType: optString(body.propertyType, "propertyType"),
+      propertyType: optPropertyType(body.propertyType),
       serviceAreaId: requireString(body.serviceAreaId, "serviceAreaId"),
       serviceId: optId(body.serviceId, "serviceId"),
       price,

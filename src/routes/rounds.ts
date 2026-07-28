@@ -21,7 +21,10 @@ roundsRouter.use(requireBusinessAccess());
 
 // Thin routes: validate → call service → respond. No DB access here.
 const actorIdOf = (req: Request): string => req.user!.supabaseUserId;
-const svc = (req: Request) => createRoundService(req.tenantPrisma!);
+const svc = (req: Request) => {
+  if (!req.tenantPrisma) throw new AppError(500, "Tenant client not initialised");
+  return createRoundService(req.tenantPrisma);
+};
 
 // ==========================================================================
 // GET /rounds — list rounds; ?status=ACTIVE|DRAFT|ARCHIVED (optional filter)
@@ -88,8 +91,21 @@ roundsRouter.patch(
 roundsRouter.get(
   "/:id/planner/occurrences",
   h(async (req, res) => {
-    const from = optIsoDate(req.query.from, "from") ?? undefined;
-    const to = optIsoDate(req.query.to, "to") ?? undefined;
+    const dateOnly = /^\d{4}-\d{2}-\d{2}$/;
+    const rawFrom = req.query.from;
+    const rawTo = req.query.to;
+    if (rawFrom !== undefined && (typeof rawFrom !== "string" || !dateOnly.test(rawFrom))) {
+      throw new AppError(400, '"from" must be a YYYY-MM-DD date');
+    }
+    if (rawTo !== undefined && (typeof rawTo !== "string" || !dateOnly.test(rawTo))) {
+      throw new AppError(400, '"to" must be a YYYY-MM-DD date');
+    }
+    // After the guards above rawFrom/rawTo are guaranteed strings (or undefined).
+    const fromStr = rawFrom as string | undefined;
+    const toStr = rawTo as string | undefined;
+    // Visits are stored as midnight UTC timestamps; lte: midnight of 'to' is inclusive for that day.
+    const from = fromStr ? new Date(`${fromStr}T00:00:00.000Z`) : undefined;
+    const to = toStr ? new Date(`${toStr}T00:00:00.000Z`) : undefined;
     res.json(await svc(req).listOccurrences(actorIdOf(req), req.params.id, from, to));
   })
 );

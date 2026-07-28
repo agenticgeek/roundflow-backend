@@ -61,7 +61,7 @@ export interface PropertyAddInput {
   addressLine: string;
   postcode: string;
   propertyName?: string | null;
-  propertyType?: string | null;
+  propertyType?: PropertyType | null;
   serviceAreaId: string;
   serviceId?: string | null;
   price: number;
@@ -80,7 +80,7 @@ export interface PropertyCreateInput {
   addressLine: string;
   postcode: string;
   propertyName?: string | null;
-  propertyType?: string | null;
+  propertyType?: PropertyType | null;
   serviceAreaId: string;
   serviceId?: string | null;
   price: number;
@@ -96,12 +96,12 @@ export interface PropertyUpdateInput {
   addressLine?: string;
   postcode?: string;
   propertyName?: string | null;
-  propertyType?: string | null;
+  propertyType?: PropertyType | null;
   serviceAreaId?: string | null;
   accessNotes?: string | null;
   riskNotes?: string | null;
   roundId?: string | null;
-  cleaningFrequency?: CleaningFrequency;
+  cleaningFrequency?: CleaningFrequency | null;
 }
 
 export interface CustomerUpdateInput {
@@ -112,7 +112,7 @@ export interface CustomerUpdateInput {
   // Property
   addressLine?: string;
   postcode?: string;
-  propertyType?: string | null;
+  propertyType?: PropertyType | null;
   accessNotes?: string | null;
   riskNotes?: string | null;
   roundId?: string | null;
@@ -381,10 +381,15 @@ class CustomerService implements ICustomerService {
           },
         },
       }),
-      this.prisma.property.count({
-        where: { visits: { some: { paymentHold: true, status: { in: OPEN_VISIT } } } },
+      this.prisma.customer.count({
+        where: {
+          properties: { some: { visits: { some: { paymentHold: true, status: { in: OPEN_VISIT } } } } },
+        },
       }),
-      this.prisma.payment.aggregate({ _sum: { amount: true }, where: { status: { in: DUE_PAYMENT } } }),
+      this.prisma.payment.aggregate({
+        _sum: { amount: true },
+        where: { status: { in: DUE_PAYMENT }, customer: { status: LifecycleStatus.ACTIVE } },
+      }),
     ]);
 
     // Shared include for both list paths.
@@ -499,32 +504,35 @@ class CustomerService implements ICustomerService {
   ): Promise<CustomerDetail> {
     // TECHNICIAN viewers must not see financial data (debt + processor ids).
     const hideFinancials = viewerRole === UserRole.TECHNICIAN;
-    const customer = await this.prisma.customer.findUnique({
-      where: { id: customerId },
-      include: {
-        payments: { orderBy: { createdAt: "desc" } },
-        properties: {
-          orderBy: { createdAt: "asc" },
-          include: {
-            round: true,
-            serviceArea: true,
-            servicePlans: { orderBy: { createdAt: "desc" }, include: { service: true } },
-            notes: { orderBy: { createdAt: "desc" } },
-            photos: { where: { type: PhotoType.PROPERTY }, orderBy: { createdAt: "desc" } },
-            visits: {
-              orderBy: { date: "desc" },
-              include: {
-                round: true,
-                technician: true,
-                invoice: true,
-                payment: true,
-                issues: true,
+    const [customer, settings] = await Promise.all([
+      this.prisma.customer.findUnique({
+        where: { id: customerId },
+        include: {
+          payments: { orderBy: { createdAt: "desc" } },
+          properties: {
+            orderBy: { createdAt: "asc" },
+            include: {
+              round: true,
+              serviceArea: true,
+              servicePlans: { orderBy: { createdAt: "desc" }, include: { service: true } },
+              notes: { orderBy: { createdAt: "desc" } },
+              photos: { where: { type: PhotoType.PROPERTY }, orderBy: { createdAt: "desc" } },
+              visits: {
+                orderBy: { date: "desc" },
+                include: {
+                  round: true,
+                  technician: true,
+                  invoice: true,
+                  payment: true,
+                  issues: true,
+                },
               },
             },
           },
         },
-      },
-    });
+      }),
+      this.prisma.businessSettings.findFirst(),
+    ]);
     if (!customer) throw new AppError(404, "Customer not found");
 
     // Phase 1: one active property per customer.
@@ -538,7 +546,6 @@ class CustomerService implements ICustomerService {
         null
       : null;
 
-    const settings = await this.prisma.businessSettings.findFirst();
     const paymentRule = settings?.paymentRule ?? null;
 
     const servicePlanView: ServicePlanView | null = plan
@@ -561,7 +568,7 @@ class CustomerService implements ICustomerService {
 
     const visits = property?.visits ?? [];
     const scheduled = visits
-      .filter((v) => v.status === VisitStatus.SCHEDULED)
+      .filter((v) => OPEN_VISIT.includes(v.status))
       .sort((a, b) => a.date.getTime() - b.date.getTime());
     const nextScheduled = scheduled[0] ?? null;
     const onHold = visits.some((v) => v.paymentHold && OPEN_VISIT.includes(v.status));
@@ -605,7 +612,7 @@ class CustomerService implements ICustomerService {
         : null,
       servicePlan: servicePlanView,
       standingInfo: {
-        frequency: property?.round?.frequency ?? null,
+        frequency: plan?.cleaningFrequency ?? property?.round?.frequency ?? null,
         assignedRound: property?.round?.name ?? null,
         technicianName,
         paymentStatus: this.derivePaymentStatus(onHold, customer.payments[0]?.status),
@@ -703,44 +710,57 @@ class CustomerService implements ICustomerService {
         null
       : null;
 
-    // FR-FREQ-1: when switching rounds via the customer edit form, sync the
-    // service plan frequency to the new round's cadence.
-    let roundFrequency: CleaningFrequency | undefined = undefined;
-    if (input.roundId) {
-      const round = await this.prisma.round.findUnique({ where: { id: input.roundId } });
-      if (!round) throw new AppError(404, `Round not found: ${input.roundId}`);
-      if (round.frequency) roundFrequency = round.frequency;
+    // FR-FREQ-1: when switching rounds, sync service plan frequency to the new
+    // round's cadence. Unassigning (null) clears it; undefined = no change.
+    let roundFrequency: CleaningFrequency | null | undefined = undefined;
+    if (input.roundId !== undefined) {
+      if (input.roundId === null) {
+        roundFrequency = null; // unassigning — clear the inherited frequency
+      } else {
+        const round = await this.prisma.round.findUnique({ where: { id: input.roundId } });
+        if (!round) throw new AppError(404, `Round not found: ${input.roundId}`);
+        roundFrequency = round.frequency ?? null;
+      }
     }
 
     return this.prisma.$transaction(async (tx) => {
-      await tx.customer.update({
-        where: { id: customer.id },
-        data: { name: input.name, phone: input.phone, email: input.email },
-      });
+      // Build data objects only with defined fields so Prisma skips unchanged columns.
+      const customerData: Partial<Prisma.CustomerUpdateInput> = {};
+      if (input.name !== undefined) customerData.name = input.name;
+      if (input.phone !== undefined) customerData.phone = input.phone;
+      if (input.email !== undefined) customerData.email = input.email;
+      if (Object.keys(customerData).length > 0) {
+        await tx.customer.update({ where: { id: customer.id }, data: customerData });
+      }
+
       if (property) {
-        await tx.property.update({
-          where: { id: property.id },
-          data: {
-            addressLine: input.addressLine,
-            postcode: input.postcode,
-            propertyType: (input.propertyType as PropertyType) ?? null,
-            accessNotes: input.accessNotes,
-            riskNotes: input.riskNotes,
-            roundId: input.roundId,
-          },
-        });
+        const propertyData: Partial<Prisma.PropertyUpdateInput> = {};
+        if (input.addressLine !== undefined) propertyData.addressLine = input.addressLine;
+        if (input.postcode !== undefined) propertyData.postcode = input.postcode;
+        if (input.propertyType !== undefined) propertyData.propertyType = input.propertyType ?? null;
+        if (input.accessNotes !== undefined) propertyData.accessNotes = input.accessNotes;
+        if (input.riskNotes !== undefined) propertyData.riskNotes = input.riskNotes;
+        if (input.roundId !== undefined) {
+          propertyData.round = input.roundId === null
+            ? { disconnect: true }
+            : { connect: { id: input.roundId } };
+        }
+        if (Object.keys(propertyData).length > 0) {
+          await tx.property.update({ where: { id: property.id }, data: propertyData });
+        }
       }
+
       if (plan) {
-        await tx.servicePlan.update({
-          where: { id: plan.id },
-          data: {
-            price: input.price,
-            cleanMethod: input.cleanMethod,
-            paymentMethod: input.paymentMethod,
-            cleaningFrequency: roundFrequency,
-          },
-        });
+        const planData: Partial<Prisma.ServicePlanUpdateInput> = {};
+        if (input.price !== undefined) planData.price = input.price;
+        if (input.cleanMethod !== undefined) planData.cleanMethod = input.cleanMethod;
+        if (input.paymentMethod !== undefined) planData.paymentMethod = input.paymentMethod;
+        if (roundFrequency !== undefined) planData.cleaningFrequency = roundFrequency;
+        if (Object.keys(planData).length > 0) {
+          await tx.servicePlan.update({ where: { id: plan.id }, data: planData });
+        }
       }
+
       return {
         customerId: customer.id,
         propertyId: property?.id ?? null,
@@ -752,14 +772,17 @@ class CustomerService implements ICustomerService {
   // ---- soft-delete customer (CANCELLED + cascades to properties + plans) ----
 
   async deleteCustomer(_profileId: string, customerId: string): Promise<void> {
-    if (!(await this.prisma.customer.findUnique({ where: { id: customerId } }))) {
-      throw new AppError(404, "Customer not found");
-    }
     await this.prisma.$transaction(async (tx) => {
+      const c = await tx.customer.findUnique({ where: { id: customerId }, select: { id: true } });
+      if (!c) throw new AppError(404, "Customer not found");
       const propertyIds = (
         await tx.property.findMany({ where: { customerId }, select: { id: true } })
       ).map((p) => p.id);
       if (propertyIds.length > 0) {
+        await tx.visit.updateMany({
+          where: { propertyId: { in: propertyIds }, status: { in: [...OPEN_VISIT] } },
+          data: { status: VisitStatus.SKIPPED },
+        });
         await tx.servicePlan.updateMany({
           where: { propertyId: { in: propertyIds }, status: { not: LifecycleStatus.CANCELLED } },
           data: { status: LifecycleStatus.CANCELLED },
@@ -778,55 +801,71 @@ class CustomerService implements ICustomerService {
 
   // ---- M6: create property (Customer + Property + ServicePlan, atomic) ----
 
+  // Private helper shared by createProperty and addPropertyToCustomer.
+  // FR-FREQ-1 round frequency lookup is done by the caller before the transaction.
+  private async resolveRoundFrequency(roundId: string | null | undefined): Promise<CleaningFrequency | null> {
+    if (!roundId) return null;
+    const round = await this.prisma.round.findUnique({ where: { id: roundId } });
+    if (!round) throw new AppError(404, `Round not found: ${roundId}`);
+    return round.frequency;
+  }
+
+  private async createPropertyAndPlan(
+    tx: Parameters<Parameters<TenantPrismaClient["$transaction"]>[0]>[0],
+    customerId: string,
+    input: PropertyAddInput,
+    roundFrequency: CleaningFrequency | null
+  ): Promise<{ propertyId: string; servicePlanId: string }> {
+    const property = await tx.property.create({
+      data: {
+        customerId,
+        addressLine: input.addressLine,
+        postcode: input.postcode,
+        propertyName: input.propertyName ?? null,
+        propertyType: input.propertyType ?? null,
+        serviceAreaId: input.serviceAreaId,
+        accessNotes: input.accessNotes ?? null,
+        riskNotes: input.riskNotes ?? null,
+        roundId: input.roundId ?? null,
+        status: LifecycleStatus.ACTIVE,
+      },
+    });
+    const plan = await tx.servicePlan.create({
+      data: {
+        propertyId: property.id,
+        serviceId: input.serviceId ?? null,
+        price: input.price,
+        cleanMethod: input.cleanMethod ?? null,
+        paymentMethod: input.paymentMethod ?? null,
+        nextDueDate: input.nextDueDate ?? null,
+        cleaningFrequency: roundFrequency,
+        status: LifecycleStatus.ACTIVE,
+      },
+    });
+    return { propertyId: property.id, servicePlanId: plan.id };
+  }
+
   async createProperty(
     _profileId: string,
     input: PropertyCreateInput
   ): Promise<{ customerId: string; propertyId: string; servicePlanId: string; assigned: boolean }> {
-    // FR-FREQ-1: when assigning to a round on creation, inherit its frequency.
-    let roundFrequency: CleaningFrequency | null = null;
-    if (input.roundId) {
-      const round = await this.prisma.round.findUnique({ where: { id: input.roundId } });
-      if (!round) throw new AppError(404, `Round not found: ${input.roundId}`);
-      roundFrequency = round.frequency;
-    }
+    const roundFrequency = await this.resolveRoundFrequency(input.roundId);
     await this.assertServiceAreaExists(input.serviceAreaId);
 
     return this.prisma.$transaction(async (tx) => {
       const customer = await tx.customer.create({
-        data: { name: input.customerName, phone: input.phone ?? null, email: input.email ?? null },
-      });
-      const property = await tx.property.create({
         data: {
-          customerId: customer.id,
-          addressLine: input.addressLine,
-          postcode: input.postcode,
-          propertyName: input.propertyName ?? null,
-          propertyType: (input.propertyType as PropertyType) ?? null,
-          serviceAreaId: input.serviceAreaId,
-          accessNotes: input.accessNotes ?? null,
-          riskNotes: input.riskNotes ?? null,
-          roundId: input.roundId ?? null,
-          status: LifecycleStatus.ACTIVE,
-        },
-      });
-      const plan = await tx.servicePlan.create({
-        data: {
-          propertyId: property.id,
-          serviceId: input.serviceId ?? null,
-          price: input.price,
-          cleanMethod: input.cleanMethod ?? null,
+          name: input.customerName,
+          phone: input.phone ?? null,
+          email: input.email ?? null,
           paymentMethod: input.paymentMethod ?? null,
-          nextDueDate: input.nextDueDate ?? null,
-          cleaningFrequency: roundFrequency,
           status: LifecycleStatus.ACTIVE,
         },
       });
-      return {
-        customerId: customer.id,
-        propertyId: property.id,
-        servicePlanId: plan.id,
-        assigned: input.roundId != null,
-      };
+      const { propertyId, servicePlanId } = await this.createPropertyAndPlan(
+        tx, customer.id, input, roundFrequency
+      );
+      return { customerId: customer.id, propertyId, servicePlanId, assigned: input.roundId != null };
     });
   }
 
@@ -837,45 +876,19 @@ class CustomerService implements ICustomerService {
     customerId: string,
     input: PropertyAddInput
   ): Promise<{ propertyId: string; servicePlanId: string; assigned: boolean }> {
-    if (!(await this.prisma.customer.findUnique({ where: { id: customerId } }))) {
-      throw new AppError(404, "Customer not found");
+    const customer = await this.prisma.customer.findUnique({ where: { id: customerId } });
+    if (!customer) throw new AppError(404, "Customer not found");
+    if (customer.status === LifecycleStatus.CANCELLED) {
+      throw new AppError(409, "Cannot add a property to a cancelled customer");
     }
-    let roundFrequency: CleaningFrequency | null = null;
-    if (input.roundId) {
-      const round = await this.prisma.round.findUnique({ where: { id: input.roundId } });
-      if (!round) throw new AppError(404, `Round not found: ${input.roundId}`);
-      roundFrequency = round.frequency;
-    }
+    const roundFrequency = await this.resolveRoundFrequency(input.roundId);
     await this.assertServiceAreaExists(input.serviceAreaId);
 
     return this.prisma.$transaction(async (tx) => {
-      const property = await tx.property.create({
-        data: {
-          customerId,
-          addressLine: input.addressLine,
-          postcode: input.postcode,
-          propertyName: input.propertyName ?? null,
-          propertyType: (input.propertyType as PropertyType) ?? null,
-          serviceAreaId: input.serviceAreaId,
-          accessNotes: input.accessNotes ?? null,
-          riskNotes: input.riskNotes ?? null,
-          roundId: input.roundId ?? null,
-          status: LifecycleStatus.ACTIVE,
-        },
-      });
-      const plan = await tx.servicePlan.create({
-        data: {
-          propertyId: property.id,
-          serviceId: input.serviceId ?? null,
-          price: input.price,
-          cleanMethod: input.cleanMethod ?? null,
-          paymentMethod: input.paymentMethod ?? null,
-          nextDueDate: input.nextDueDate ?? null,
-          cleaningFrequency: roundFrequency,
-          status: LifecycleStatus.ACTIVE,
-        },
-      });
-      return { propertyId: property.id, servicePlanId: plan.id, assigned: input.roundId != null };
+      const { propertyId, servicePlanId } = await this.createPropertyAndPlan(
+        tx, customerId, input, roundFrequency
+      );
+      return { propertyId, servicePlanId, assigned: input.roundId != null };
     });
   }
 
@@ -884,6 +897,10 @@ class CustomerService implements ICustomerService {
   async deleteProperty(_profileId: string, propertyId: string): Promise<void> {
     await this.assertPropertyExists(propertyId);
     await this.prisma.$transaction(async (tx) => {
+      await tx.visit.updateMany({
+        where: { propertyId, status: { in: [...OPEN_VISIT] } },
+        data: { status: VisitStatus.SKIPPED },
+      });
       await tx.servicePlan.updateMany({
         where: { propertyId, status: { not: LifecycleStatus.CANCELLED } },
         data: { status: LifecycleStatus.CANCELLED },
@@ -921,7 +938,7 @@ class CustomerService implements ICustomerService {
 
     // Determine the target round and whether the service plan frequency needs updating.
     let targetRoundId: string | null = existing.roundId;
-    let newFrequency: CleaningFrequency | undefined = undefined; // undefined = no plan update
+    let newFrequency: CleaningFrequency | null | undefined = undefined; // undefined = no plan update
     let caseB = false; // FR-FREQ-4: must create a new round inside the transaction
 
     if (input.roundId !== undefined) {
@@ -937,7 +954,9 @@ class CustomerService implements ICustomerService {
     } else if (input.cleaningFrequency !== undefined) {
       // Frequency change (FR-FREQ-2..6) — mutually exclusive with explicit roundId.
       newFrequency = input.cleaningFrequency;
-      if (!existing.roundId) {
+      if (existing.roundId && !existing.serviceAreaId) {
+        throw new AppError(409, "Property has no service area; cannot auto-reassign round on frequency change");
+      } else if (!existing.roundId) {
         // FR-FREQ-5: no round assigned — just update the plan field, no round change.
       } else if (existing.round?.frequency === input.cleaningFrequency) {
         // FR-FREQ-6: frequency matches current round — just update the plan field.
@@ -963,9 +982,16 @@ class CustomerService implements ICustomerService {
       if (caseB && existing.round) {
         // FR-FREQ-4: create a new round by copying the current one with the new frequency.
         const label = FREQUENCY_LABELS[input.cleaningFrequency!];
+        const baseName = `${existing.round.name} (${label})`;
+        // Ensure the generated name is unique — a round with this name may already exist.
+        const nameConflict = await tx.round.findFirst({
+          where: { name: baseName, serviceAreaId: existing.round.serviceAreaId },
+          select: { id: true },
+        });
+        const roundName = nameConflict ? `${baseName} 2` : baseName;
         const newRound = await tx.round.create({
           data: {
-            name: `${existing.round.name} (${label})`,
+            name: roundName,
             frequency: input.cleaningFrequency!,
             serviceAreaId: existing.round.serviceAreaId,
             defaultDay: existing.round.defaultDay,
@@ -996,7 +1022,7 @@ class CustomerService implements ICustomerService {
           addressLine: input.addressLine,
           postcode: input.postcode,
           propertyName: input.propertyName,
-          propertyType: (input.propertyType as PropertyType) ?? undefined,
+          propertyType: input.propertyType ?? undefined,
           serviceAreaId: input.serviceAreaId,
           accessNotes: input.accessNotes,
           riskNotes: input.riskNotes,
@@ -1070,12 +1096,7 @@ class CustomerService implements ICustomerService {
 
   // ---- shared guards ----
 
-  private async assertRoundExists(id: string): Promise<void> {
-    if (!(await this.prisma.round.findUnique({ where: { id } }))) {
-      throw new AppError(404, `Round not found: ${id}`);
-    }
-  }
-  private async assertServiceAreaExists(id: string): Promise<void> {
+private async assertServiceAreaExists(id: string): Promise<void> {
     if (!(await this.prisma.serviceArea.findUnique({ where: { id } }))) {
       throw new AppError(404, `Service area not found: ${id}`);
     }

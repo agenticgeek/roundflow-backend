@@ -7,6 +7,7 @@ import { asObject, h, requireString, requireNumber, optString, optReqString, opt
 import {
   assertPositive,
   optPaymentMethod,
+  optPropertyType,
   optIsoDate,
   parseIsoDate,
   requireNoteType,
@@ -26,7 +27,10 @@ propertiesRouter.use(requireBusinessAccess());
 
 // Thin routes: validate → call service → respond. No DB access here.
 const actorIdOf = (req: Request): string => req.user!.supabaseUserId;
-const svc = (req: Request) => createCustomerService(req.tenantPrisma!);
+const svc = (req: Request) => {
+  if (!req.tenantPrisma) throw new AppError(500, "Tenant client not initialised");
+  return createCustomerService(req.tenantPrisma);
+};
 
 // ==========================================================================
 // POST /properties — M6 Add Property (Customer + Property + ServicePlan, atomic)
@@ -41,10 +45,10 @@ propertiesRouter.post(
       phone: optString(body.phone, "phone"),
       email: optString(body.email, "email"),
       // Property (step 1)
-      addressLine: requireString(body.addressLine, "addressLine"),
+      addressLine: requireString(body.addressLine, "addressLine").trim(),
       postcode: requireString(body.postcode, "postcode").trim(),
       propertyName: optString(body.propertyName, "propertyName"),
-      propertyType: optString(body.propertyType, "propertyType"),
+      propertyType: optPropertyType(body.propertyType),
       serviceAreaId: requireString(body.serviceAreaId, "serviceAreaId"),
       // Service Plan (step 2)
       serviceId: optId(body.serviceId, "serviceId"),
@@ -71,10 +75,10 @@ propertiesRouter.patch(
   h(async (req, res) => {
     const body = asObject(req.body);
     const input: PropertyUpdateInput = {
-      addressLine: optReqString(body.addressLine, "addressLine"),
-      postcode: optReqString(body.postcode, "postcode"),
+      addressLine: optReqString(body.addressLine, "addressLine")?.trim(),
+      postcode: optReqString(body.postcode, "postcode")?.trim(),
       propertyName: optString(body.propertyName, "propertyName"),
-      propertyType: optString(body.propertyType, "propertyType"),
+      propertyType: optPropertyType(body.propertyType),
       serviceAreaId: optId(body.serviceAreaId, "serviceAreaId"),
       accessNotes: optString(body.accessNotes, "accessNotes"),
       riskNotes: optString(body.riskNotes, "riskNotes"),

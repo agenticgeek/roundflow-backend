@@ -256,6 +256,7 @@ setupRouter.post(
     const profileId = actorIdOf(req);
     await svc(req).assertSetupIncomplete(profileId);
     const raw = asArray<Record<string, unknown>>(req.body, "serviceAreas");
+    if (raw.length === 0) throw new AppError(400, "At least one service area is required.");
     const input: ServiceAreaInput[] = raw.map((a, i) => ({
       name: requireString(a.name, `serviceAreas[${i}].name`),
       postcodeSector: a.postcodeSector as string | undefined,
