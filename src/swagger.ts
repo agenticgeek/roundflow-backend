@@ -188,7 +188,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       companyNumber: { type: "string", nullable: true },
       vatRegistration: { type: "string", nullable: true },
       vatRegistered: { type: "boolean" },
-      defaultWorkingDays: { type: "array", items: { type: "string" } },
+      defaultWorkingDays: { type: "array", items: { type: "string", enum: ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"] } },
       timezone: { type: "string", nullable: true },
       currency: { type: "string", nullable: true },
       defaultCycleLength: {
@@ -475,7 +475,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       companyNumber: { type: "string" },
       vatRegistered: { type: "boolean" },
       vatRegistration: { type: "string" },
-      defaultWorkingDays: { type: "array", items: { type: "string" } },
+      defaultWorkingDays: { type: "array", items: { type: "string", enum: ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"] } },
       timezone: { type: "string" },
       currency: { type: "string" },
     },
@@ -494,7 +494,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     required: ["defaultCycleLength"],
     properties: {
       defaultCycleLength: { type: "integer", description: "Cycle length in days." },
-      defaultWorkingDays: { type: "array", items: { type: "string" } },
+      defaultWorkingDays: { type: "array", items: { type: "string", enum: ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"] } },
     },
     example: { defaultCycleLength: 28 },
   },
@@ -592,7 +592,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       vatRegistration: { type: "string", nullable: true },
       timezone: { type: "string", nullable: true },
       currency: { type: "string", nullable: true },
-      defaultWorkingDays: { type: "array", items: { type: "string" } },
+      defaultWorkingDays: { type: "array", items: { type: "string", enum: ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"] } },
     },
     example: { businessName: "Northumberland Window Cleaning", currency: "GBP" },
   },
@@ -602,7 +602,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     description: "Partial update — round-settings fields only.",
     properties: {
       defaultCycleLength: { type: "integer", nullable: true, description: "Cycle length in days." },
-      defaultWorkingDays: { type: "array", items: { type: "string" } },
+      defaultWorkingDays: { type: "array", items: { type: "string", enum: ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"] } },
     },
     example: { defaultCycleLength: 28 },
   },
@@ -934,7 +934,6 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     properties: {
       name: { type: "string", minLength: 1, description: "Full name for the admin Profile." },
       companyName: {
-        type: "string",
         description: "Optional — accepted but not persisted here; collected by Setup Wizard step 1.",
       },
     },
@@ -1075,7 +1074,7 @@ const paths: OpenAPIV3.PathsObject = {
         {
           name: "apikey",
           in: "header",
-          required: true,
+          required: false,
           description: "Supabase anon (publishable) key.",
           schema: { type: "string", default: SUPABASE_ANON_KEY },
         },
@@ -1722,6 +1721,27 @@ const paths: OpenAPIV3.PathsObject = {
   // Customers (M2) — reads: any known role; mutations: ADMIN/MANAGER
   // =====================================================================
   "/customers": {
+    post: {
+      tags: ["Customers"],
+      summary: "Create a standalone customer (no property)",
+      description: "Creates a Customer record without an attached property. Use POST /properties to create a Customer+Property+ServicePlan in one shot.",
+      requestBody: jsonBody({
+        type: "object",
+        required: ["name"],
+        properties: {
+          name: { type: "string", minLength: 1 },
+          phone: { type: "string", nullable: true },
+          email: { type: "string", nullable: true },
+          paymentMethod: { ...nullableRef("PaymentMethod") },
+        },
+      }),
+      responses: {
+        "201": jsonResponse("Created customer.", ref("CustomerListRow")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
     get: {
       tags: ["Customers"],
       summary: "List customers + summary KPIs (Screen 14)",
@@ -1771,6 +1791,16 @@ const paths: OpenAPIV3.PathsObject = {
         "404": ERR[404],
       },
     },
+    delete: {
+      tags: ["Customers"],
+      summary: "Soft-delete customer (status → CANCELLED, cascades to properties)",
+      responses: {
+        "204": { description: "Deleted." },
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
   },
 
   // =====================================================================
@@ -1809,6 +1839,16 @@ const paths: OpenAPIV3.PathsObject = {
       responses: {
         "200": jsonResponse("Updated property.", ref("Property")),
         "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+    delete: {
+      tags: ["Properties"],
+      summary: "Soft-delete property (status → CANCELLED, cancels service plan)",
+      responses: {
+        "204": { description: "Deleted." },
         "401": ERR[401],
         "403": ERR[403],
         "404": ERR[404],

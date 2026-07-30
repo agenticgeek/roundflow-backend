@@ -75,7 +75,11 @@ customersRouter.get(
       await svc(req).getCustomers(
         actorIdOf(req),
         {
-          search: typeof req.query.search === "string" ? req.query.search : undefined,
+          search: (() => {
+            const s = typeof req.query.search === "string" ? req.query.search : undefined;
+            if (s !== undefined && s.includes("\0")) throw new AppError(400, "search must not contain null bytes");
+            return s;
+          })(),
           roundId: typeof req.query.roundId === "string" ? req.query.roundId : undefined,
           status: rawStatus as string | undefined,
           page: Number.isFinite(pageRaw) && pageRaw > 0 ? pageRaw : undefined,

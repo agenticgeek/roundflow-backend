@@ -153,7 +153,7 @@ settingsRouter.post(
     const body = asObject(req.body);
     const input: ServiceCreateInput = {
       name: requireString(body.name, "name"),
-      defaultPrice: assertNonNegative(requireNumber(body.defaultPrice, "defaultPrice"), "defaultPrice"),
+      defaultPrice: assertNonNegative(requireNumber(body.defaultPrice, "defaultPrice"), "defaultPrice", 9999.99),
       category: optCategory(body.category),
       description: optString(body.description, "description"),
       active: optBool(body.active, "active"),
@@ -167,7 +167,7 @@ settingsRouter.patch(
     await svc(req).assertSetupComplete(actorIdOf(req));
     const body = asObject(req.body);
     const price = optReqNumber(body.defaultPrice, "defaultPrice");
-    if (price !== undefined) assertNonNegative(price, "defaultPrice");
+    if (price !== undefined) assertNonNegative(price, "defaultPrice", 9999.99);
     const input: ServiceUpdateInput = {
       name: optReqString(body.name, "name"),
       defaultPrice: price,

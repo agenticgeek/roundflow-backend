@@ -42,9 +42,12 @@ export function assertPositive(v: number, field: string): number {
 }
 
 /** Assert a numeric value is zero or positive (e.g. a defaultPrice for free services). */
-export function assertNonNegative(v: number, field: string): number {
+export function assertNonNegative(v: number, field: string, max?: number): number {
   if (!Number.isFinite(v) || v < 0) {
     throw new AppError(400, `${field} must be zero or a positive number`);
+  }
+  if (max !== undefined && v > max) {
+    throw new AppError(400, `${field} must not exceed ${max}`);
   }
   return v;
 }
