@@ -1050,7 +1050,11 @@ const paths: OpenAPIV3.PathsObject = {
     },
   },
 
-  // ---- Auth — login (token minted by Supabase, external) ----
+  // ---- Auth — login (token minted by Supabase GoTrue, external) ----
+  // The `servers` override below points to the Supabase URL for Swagger UI's
+  // "Try it out" login. Schemathesis ignores per-operation servers and routes
+  // to our base URL, so our 405 catch-all fires — 405 is documented here so
+  // schemathesis doesn't flag it as an undocumented status code.
   "/auth/v1/token": {
     post: {
       tags: ["Auth"],
@@ -1060,7 +1064,7 @@ const paths: OpenAPIV3.PathsObject = {
         "Returns an `access_token` (ES256 JWT). Copy it into **Authorize** (top-right) to call the " +
         "protected endpoints below. The `apikey` header is the Supabase anon (publishable) key, prefilled here.",
       servers: [{ url: SUPABASE_URL, description: "Supabase Auth (GoTrue)" }],
-      security: [], // this endpoint is authenticated by the apikey header, not a Bearer token
+      security: [],
       parameters: [
         {
           name: "grant_type",
@@ -1084,6 +1088,7 @@ const paths: OpenAPIV3.PathsObject = {
           additionalProperties: true,
           example: { code: 400, msg: "Invalid login credentials" },
         }),
+        "405": { description: "Method Not Allowed (our backend intercepts this path; use Swagger UI 'Try it out' to log in)." },
       },
     },
   },
@@ -1365,6 +1370,7 @@ const paths: OpenAPIV3.PathsObject = {
       requestBody: jsonBody(arrayOrWrapped("TechnicianInput", "technicians")),
       responses: {
         "200": jsonResponse("All technicians.", { type: "array", items: ref("Technician") }),
+        "400": ERR[400],
         "401": ERR[401],
         "403": ERR[403],
       },

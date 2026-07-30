@@ -29,6 +29,18 @@ const app = express();
 app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 app.use(express.json());
 
+// Reject TRACE globally before any router runs. Without this, TRACE hits auth
+// middleware first and returns 401 instead of 405 on protected routes.
+// RFC 9110 §15.5.6 requires the Allow header on 405 responses.
+const ALLOWED_METHODS = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD";
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (req.method === "TRACE") {
+    res.set("Allow", ALLOWED_METHODS);
+    return res.status(405).json({ error: "Method Not Allowed" });
+  }
+  next();
+});
+
 app.get("/health", (_req: Request, res: Response) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
@@ -50,6 +62,7 @@ app.use("/docs", swaggerUi.serve, swaggerUi.setup(openApiDocument));
 // 405 handler — must be after all routes so unmatched methods on known paths return 405
 // instead of Express's default 404. Schemathesis and RFC 7231 both expect 405 here.
 app.use((_req: Request, res: Response) => {
+  res.set("Allow", ALLOWED_METHODS);
   res.status(405).json({ error: "Method Not Allowed" });
 });
 
