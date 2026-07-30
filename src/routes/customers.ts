@@ -59,6 +59,16 @@ customersRouter.post(
 customersRouter.get(
   "/",
   h(async (req, res) => {
+    const VALID_STATUSES = ["ACTIVE", "PAUSED", "CANCELLED", "HOLD"];
+    const rawStatus = req.query.status;
+    if (rawStatus !== undefined) {
+      if (typeof rawStatus !== "string") {
+        throw new AppError(400, "status must be a single query parameter");
+      }
+      if (!VALID_STATUSES.includes(rawStatus)) {
+        throw new AppError(400, `status must be one of: ${VALID_STATUSES.join(", ")}`);
+      }
+    }
     const pageRaw = Number(req.query.page);
     const pageSizeRaw = Number(req.query.pageSize);
     res.json(
@@ -67,7 +77,7 @@ customersRouter.get(
         {
           search: typeof req.query.search === "string" ? req.query.search : undefined,
           roundId: typeof req.query.roundId === "string" ? req.query.roundId : undefined,
-          status: typeof req.query.status === "string" ? req.query.status : undefined,
+          status: rawStatus as string | undefined,
           page: Number.isFinite(pageRaw) && pageRaw > 0 ? pageRaw : undefined,
           pageSize: Number.isFinite(pageSizeRaw) && pageSizeRaw > 0 ? pageSizeRaw : undefined,
         },

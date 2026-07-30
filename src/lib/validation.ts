@@ -81,11 +81,11 @@ export function optPaymentMethod(v: unknown): PaymentMethod | null | undefined {
 /** Optional PropertyType: undefined = omitted, null = clear, else validate enum. */
 export function optPropertyType(v: unknown): PropertyType | null | undefined {
   if (v === undefined) return undefined;
-  if (v === null) return null;
+  if (v === null || v === "") return null; // empty string = clear
   if (typeof v === "string" && (Object.values(PropertyType) as string[]).includes(v)) {
     return v as PropertyType;
   }
-  throw new AppError(400, `Invalid propertyType: ${String(v)}`);
+  throw new AppError(400, `Invalid propertyType: must be one of ${Object.values(PropertyType).join(", ")}`);
 }
 
 /** Required NoteType (INTERNAL | RISK_WARNING | CUSTOMER). */

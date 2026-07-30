@@ -345,11 +345,36 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     },
   },
 
+  MessageTemplateView: {
+    type: "object",
+    required: ["id", "name", "channel", "body", "createdAt", "updatedAt"],
+    properties: {
+      id: { type: "string" },
+      name: { type: "string" },
+      channel: { type: "string", nullable: true, enum: ["SMS", "WHATSAPP", "EMAIL", null] },
+      subject: { type: "string", nullable: true },
+      body: { type: "string" },
+      createdAt: { type: "string", format: "date-time" },
+      updatedAt: { type: "string", format: "date-time" },
+    },
+  },
+
+  MessageTemplateInput: {
+    type: "object",
+    required: ["name", "channel", "body"],
+    properties: {
+      name: { type: "string", minLength: 1 },
+      channel: { type: "string", enum: ["SMS", "WHATSAPP", "EMAIL"] },
+      body: { type: "string", minLength: 1 },
+      subject: { type: "string", nullable: true, description: "Required for EMAIL channel." },
+    },
+  },
+
   StepStatus: {
     type: "object",
     required: ["step", "complete", "deferred"],
     properties: {
-      step: { type: "integer", minimum: 1, maximum: 8 },
+      step: { type: "integer", minimum: 1, maximum: 12 },
       complete: { type: "boolean" },
       deferred: {
         type: "boolean",
@@ -587,7 +612,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     required: ["name", "defaultPrice"],
     properties: {
       name: { type: "string", minLength: 1 },
-      defaultPrice: { type: "number", description: "Sent as a number; returned as a string." },
+      defaultPrice: { type: "number", minimum: 0, description: "Sent as a number; returned as a string. Zero is valid for free services." },
       category: ref("ServiceCategory"),
       description: { type: "string", nullable: true },
       active: { type: "boolean" },
@@ -600,7 +625,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     description: "Partial update — all fields optional.",
     properties: {
       name: { type: "string", minLength: 1 },
-      defaultPrice: { type: "number" },
+      defaultPrice: { type: "number", minimum: 0 },
       category: ref("ServiceCategory"),
       description: { type: "string", nullable: true },
       active: { type: "boolean" },
@@ -828,7 +853,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
   // ---- M2: request bodies ----
   PropertyCreateInput: {
     type: "object",
-    required: ["customerName", "addressLine", "postcode", "price"],
+    required: ["customerName", "addressLine", "postcode", "price", "serviceAreaId"],
     properties: {
       customerName: { type: "string", minLength: 1 },
       phone: { type: "string", nullable: true },
@@ -836,10 +861,10 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       addressLine: { type: "string", minLength: 1 },
       postcode: { type: "string", minLength: 1 },
       propertyName: { type: "string", nullable: true },
-      propertyType: { type: "string", nullable: true },
-      serviceAreaId: { type: "string", nullable: true, description: "Must exist (404 if not)." },
+      propertyType: { type: "string", nullable: true, enum: ["HOUSE", "FLAT_APARTMENT", "COMMERCIAL", "OFFICE", "CONSERVATORY", null] },
+      serviceAreaId: { type: "string", description: "Required. Must exist (404 if not)." },
       serviceId: { type: "string", nullable: true },
-      price: { type: "number", description: "Positive number." },
+      price: { type: "number", description: "Positive number.", minimum: 0, exclusiveMinimum: true },
       cleanMethod: { type: "string", nullable: true },
       paymentMethod: nullableRef("PaymentMethod"),
       nextDueDate: { type: "string", format: "date", nullable: true },
@@ -856,7 +881,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       addressLine: { type: "string", minLength: 1 },
       postcode: { type: "string", minLength: 1 },
       propertyName: { type: "string", nullable: true },
-      propertyType: { type: "string", nullable: true },
+      propertyType: { type: "string", nullable: true, enum: ["HOUSE", "FLAT_APARTMENT", "COMMERCIAL", "OFFICE", "CONSERVATORY", null] },
       serviceAreaId: { type: "string", nullable: true },
       accessNotes: { type: "string", nullable: true },
       riskNotes: { type: "string", nullable: true },
@@ -872,11 +897,11 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       email: { type: "string", nullable: true },
       addressLine: { type: "string", minLength: 1 },
       postcode: { type: "string", minLength: 1 },
-      propertyType: { type: "string", nullable: true },
+      propertyType: { type: "string", nullable: true, enum: ["HOUSE", "FLAT_APARTMENT", "COMMERCIAL", "OFFICE", "CONSERVATORY", null] },
       accessNotes: { type: "string", nullable: true },
       riskNotes: { type: "string", nullable: true },
       roundId: { type: "string", nullable: true },
-      price: { type: "number" },
+      price: { type: "number", minimum: 0, exclusiveMinimum: true },
       cleanMethod: { type: "string", nullable: true },
       paymentMethod: nullableRef("PaymentMethod"),
     },
@@ -1296,18 +1321,29 @@ const paths: OpenAPIV3.PathsObject = {
     },
   },
 
-  // ---- Setup: Step 5 — SMS Templates (deferred) ----
+  // ---- Setup: Step 5 — Message Templates (SMS / WhatsApp / Email) ----
   "/setup/step/5": {
     get: {
       tags: ["Setup"],
-      summary: "Step 5 — SMS Templates (deferred)",
-      responses: { "200": jsonResponse("Deferred stub.", ref("DeferredStub")) },
+      summary: "Step 5 — get saved message templates",
+      responses: {
+        "200": jsonResponse("Saved templates.", { type: "array", items: ref("MessageTemplateView") }),
+        "401": ERR[401],
+        "403": ERR[403],
+        "500": ERR[500],
+      },
     },
     post: {
       tags: ["Setup"],
-      summary: "Step 5 — SMS Templates (deferred, no-op)",
-      description: "Deferred stub — performs no DB write.",
-      responses: deferredResponses(),
+      summary: "Step 5 — replace all message templates",
+      description: "Bulk-replaces all message templates with the posted array. Step complete when ≥1 template saved.",
+      requestBody: jsonBody(arrayOrWrapped("MessageTemplateInput", "templates")),
+      responses: {
+        "200": jsonResponse("Updated templates.", { type: "array", items: ref("MessageTemplateView") }),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+      },
     },
   },
 
@@ -1654,19 +1690,22 @@ const paths: OpenAPIV3.PathsObject = {
   "/settings/message-templates": {
     get: {
       tags: ["Settings"],
-      summary: "SMS templates (deferred)",
-      description: "Deferred — GHL owns messaging in Phase 2. No DB access.",
+      summary: "List message templates (SMS / WhatsApp / Email)",
+      description: "Returns all saved message templates ordered by creation date.",
       responses: {
-        "200": jsonResponse("Deferred stub.", ref("MessageTemplateDeferred")),
+        "200": jsonResponse("Message templates.", { type: "array", items: ref("MessageTemplateView") }),
         "401": ERR[401],
+        "403": ERR[403],
+        "500": ERR[500],
       },
     },
-    patch: {
+    post: {
       tags: ["Settings"],
-      summary: "SMS templates (deferred, no-op)",
-      description: "Deferred — returns the same payload, performs no DB write.",
+      summary: "Create a message template",
+      requestBody: jsonBody(ref("MessageTemplateInput")),
       responses: {
-        "200": jsonResponse("Deferred stub.", ref("MessageTemplateDeferred")),
+        "201": jsonResponse("Created template.", ref("MessageTemplateView")),
+        "400": ERR[400],
         "401": ERR[401],
         "403": ERR[403],
       },

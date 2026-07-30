@@ -47,12 +47,23 @@ app.get("/openapi.json", (_req: Request, res: Response) => {
 });
 app.use("/docs", swaggerUi.serve, swaggerUi.setup(openApiDocument));
 
+// 405 handler — must be after all routes so unmatched methods on known paths return 405
+// instead of Express's default 404. Schemathesis and RFC 7231 both expect 405 here.
+app.use((_req: Request, res: Response) => {
+  res.status(405).json({ error: "Method Not Allowed" });
+});
+
 // Centralised error handler. Must be last and take 4 args so Express treats it
 // as error-handling middleware. Route handlers forward errors via next(err).
 // Typed AppErrors carry their own status + message; anything else is a 500.
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   if (err instanceof AppError) {
     return res.status(err.statusCode).json({ error: err.message });
+  }
+  // express.json() body-parser SyntaxError (invalid JSON, null bytes, non-object strict-mode
+  // rejection). The middleware sets err.status=400 and err.body on the thrown SyntaxError.
+  if (err instanceof SyntaxError && (err as unknown as Record<string, unknown>).status === 400) {
+    return res.status(400).json({ error: "Invalid JSON in request body." });
   }
   console.error(err);
   res.status(500).json({ error: "Internal Server Error" });

@@ -4,6 +4,7 @@ dist/
 .env
 .env.*
 !.env.example
+.schemathesis/
 
 # Machine-local Claude Code settings (permissions, etc.)
 .claude/settings.local.json
