@@ -109,7 +109,7 @@ customersRouter.patch(
   h(async (req, res) => {
     const body = asObject(req.body);
     const price = optReqNumber(body.price, "price");
-    if (price !== undefined) assertPositive(price, "price");
+    if (price !== undefined) assertPositive(price, "price", 9999.99);
 
     const input: CustomerUpdateInput = {
       // Customer (name is required-non-null → optReqString rejects null/blank)
@@ -151,7 +151,7 @@ customersRouter.post(
   h(async (req, res) => {
     const body = asObject(req.body);
     const price = requireNumber(body.price, "price");
-    assertPositive(price, "price");
+    assertPositive(price, "price", 9999.99);
     const input: PropertyAddInput = {
       addressLine: requireString(body.addressLine, "addressLine").trim(),
       postcode: requireString(body.postcode, "postcode").trim(),

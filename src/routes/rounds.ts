@@ -3,7 +3,7 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
-import { asObject, h, requireString, optReqString, optString, optId } from "../lib/http";
+import { asObject, h, requireString, optReqString, optString, optId, optBool } from "../lib/http";
 import {
   requireCleaningFrequency,
   optCleaningFrequency,
@@ -11,7 +11,14 @@ import {
   optRoundStatus,
   optIsoDate,
 } from "../lib/validation";
-import { createRoundService, RoundCreateInput, RoundUpdateInput } from "../services/round.service";
+import {
+  createRoundService,
+  RoundCreateInput,
+  RoundUpdateInput,
+  ReassignInput,
+  PushMissedInput,
+} from "../services/round.service";
+import { parseIsoDate } from "../lib/validation";
 
 export const roundsRouter = Router();
 roundsRouter.use(requireAuth);
@@ -141,5 +148,61 @@ roundsRouter.put(
     res.json(
       await svc(req).setTechnicians(actorIdOf(req), req.params.id, body.technicianIds as string[])
     );
+  })
+);
+
+// ==========================================================================
+// GET /rounds/:id/today — today's panel for a specific round (Screen 13)
+// ==========================================================================
+roundsRouter.get(
+  "/:id/today",
+  h(async (req, res) => {
+    res.json(await svc(req).getTodayPanel(actorIdOf(req), req.params.id));
+  })
+);
+
+// ==========================================================================
+// POST /rounds/:id/reassign — reassign technician for today's visits (M15)
+//   Body: { fromTechnicianId, toTechnicianId, scope: "remaining"|"all",
+//           note?, notify }
+// ==========================================================================
+roundsRouter.post(
+  "/:id/reassign",
+  h(async (req, res) => {
+    const body = asObject(req.body);
+    const rawScope = requireString(body.scope, "scope");
+    if (rawScope !== "remaining" && rawScope !== "all") {
+      throw new AppError(400, '"scope" must be "remaining" or "all"');
+    }
+    const input: ReassignInput = {
+      fromTechnicianId: requireString(body.fromTechnicianId, "fromTechnicianId"),
+      toTechnicianId: requireString(body.toTechnicianId, "toTechnicianId"),
+      scope: rawScope,
+      note: optString(body.note, "note"),
+      notify: optBool(body.notify, "notify") ?? false,
+    };
+    res.json(await svc(req).reassignTechnician(actorIdOf(req), req.params.id, input));
+  })
+);
+
+// ==========================================================================
+// POST /rounds/:id/push-missed — push today's SCHEDULED visits to new date (M22)
+//   Body: { newDate: "YYYY-MM-DD", reason, technicianId?, notifyCustomers }
+// ==========================================================================
+roundsRouter.post(
+  "/:id/push-missed",
+  h(async (req, res) => {
+    const body = asObject(req.body);
+    const rawDate = requireString(body.newDate, "newDate");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
+      throw new AppError(400, '"newDate" must be a YYYY-MM-DD date');
+    }
+    const input: PushMissedInput = {
+      newDate: parseIsoDate(body.newDate, "newDate"),
+      reason: requireString(body.reason, "reason"),
+      technicianId: optId(body.technicianId, "technicianId"),
+      notifyCustomers: optBool(body.notifyCustomers, "notifyCustomers") ?? false,
+    };
+    res.json(await svc(req).pushMissedJobs(actorIdOf(req), req.params.id, input));
   })
 );

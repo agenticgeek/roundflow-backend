@@ -173,6 +173,7 @@ model BusinessSettings {
   gocardlessConnected Boolean        @default(false)
   stripeConnected     Boolean        @default(false)
   setupCompleted      Boolean        @default(false)
+  lastClosedDate      String?        // YYYY-MM-DD; set by POST /today/close to block re-close
   updatedAt           DateTime       @updatedAt
 }
 

@@ -271,31 +271,48 @@ Layout: centered content (no left stepper). Green check-circle icon at top centr
 
 ---
 
-### 12. Today's Work  
+### 12. Today's Work *(re-audited 2026-08-04)*
 **Section:** `/Today-s-Work` · Node `401:10172`  
 **Purpose:** Live operations monitor for the active workday. Shows real-time progress of all rounds in-flight.  
-**Elements:**
-- Live badge + timestamp, Close Day button (red, prominent)
-- KPI tiles: Scheduled Stops, In Progress (blue), Completed (green), Skipped (amber), Issues (red), Payment Holds (red), Value Completed
-- Search bar, "Show only problems" filter toggle
-- Rounds table: Status dot, Round name, Technician avatar+name, Progress bar (X/Y), Completed count, Skipped count, Issues count, Payment Holds, Value, ETA, Actions (⋮ menu)
-- **Technician Workload cards:** Avatar, name, completed/remaining, round name, issue count, on-track/behind indicator
+**Header:** Date + notification bell · **LIVE** badge + "Updated HH:MM" timestamp · refresh icon · **Close Day** button (red, top-right → M21).
 
-**Interactions:** Round row click → Round Details slide-out panel. Show only problems filters table.
+**KPI tiles (7):**
+| Tile | Colour |
+|---|---|
+| Scheduled Stops | grey |
+| In Progress | blue |
+| Completed | green |
+| Skipped | amber |
+| Issues | red |
+| Payment Holds | red |
+| Value Completed | grey (£ value) |
+
+**Controls:** search bar ("Search technician, property, or round…") · **Show only problems** toggle button · **Live ON** toggle (second variant of Screen 13 shows this).
+
+**Rounds table columns:** Status dot · Round · Technician (avatar + name) · Progress (bar + X/Y fraction) · Completed · Skipped · Issues · Payment Holds · Value · ETA · Actions (⋮).
+
+**Technician Workload cards (below table):** avatar initials · name · "N completed · N remaining" · round name · issue count (red) · "On track" / "Behind" indicator.
+
+**Interactions:** Round row click → Round Details panel (Screen 13). "Show only problems" hides rows with no issues/holds. Close Day → M21.
 
 ---
 
-### 13. Today's Work — Round Details Panel  
+### 13. Today's Work — Round Details Panel *(re-audited 2026-08-04)*
 **Section:** `/Today-s-Work` · Node `401:10634`  
 **Purpose:** Right-side drawer showing per-property job status for a selected round.  
-**Layout:** Slide-in panel overlaid on Today's Work list (main content visible behind).  
-**Elements:**
-- Round name + technician name + status badge (In Progress), X to close
-- Progress bar with fraction (2/5 completed)
-- Mini stat tiles: Completed (green), Skipped (amber), Issues (red)
-- Quick Actions: Reassign Technician, Push Missed Jobs
-- Jobs list: Property name, address, status badge (Completed / Scheduled / In Progress / Skipped), issue flags (Payment Hold, Gate locked)
-- **⟳ Update (2026-07-07):** *Reassign Technician* now opens a modal (M15) — *"Reassign remaining jobs from [tech] to another tech"*, target-technician selector, note field (*"Add a note about this reassignment…"*), *"Notify new technician of reassignment"* checkbox, **Reassign Jobs** button. Technicians on a round are not fixed and can be changed after creation (see Screen 30).
+**Layout:** Slide-in panel (480 px wide) overlaid on the right edge of Today's Work; main list remains visible behind it.
+
+**Panel header:** Round name (e.g. "Alnwick Monday") · technician avatar + name · **In Progress** status badge · X close button.
+
+**Progress block:** progress bar (teal fill, grey track) · "N/N completed" fraction.
+
+**Mini stat tiles (3):** Completed (green) · Skipped (amber) · Issues (red).
+
+**Quick Actions row:** **Reassign Technician** button (teal, primary → M15) · **Push Missed Jobs** button (outlined → M22).
+
+**Jobs list:** one row per property — customer name · address · status badge (`Completed` green / `Scheduled` grey / `In Progress` blue / `Skipped` amber) · issue flag sub-row where applicable (e.g. "⚠ Payment Hold" red · "⚠ Gate locked - no access" amber).
+
+**Backend mapping:** `GET /rounds/:id/today` (or similar) — must return round+technician header, progress counts (completed/skipped/issues), and per-visit stop list with statuses and issue flags.
 
 ---
 
@@ -809,15 +826,24 @@ Layout: centered content (no left stepper). Green check-circle icon at top centr
 
 ---
 
-### M15 — Reassign Technician *(NEW — 2026-07-07)*  
+### M15 — Reassign Technician *(re-audited 2026-08-04)*
 **Triggered from:** Today's Work > Round Details Panel > **Reassign Technician** (Screen 13)  
-**Frames:** in `/Today-s-Work` section (~`936:25925`)  
-**Purpose:** Move remaining jobs from one technician to another mid-day — supports change #3.  
+**Frames:** `936:30830` (empty state) · `936:31246` (filled/selected state) · section `936:25925`  
+**Purpose:** Move jobs from one technician to another mid-day — supports change #3.  
 **Elements:**
-- *"Reassign remaining jobs from [tech] to another tech"* + target-technician selector.
-- Note field: *"Add a note about this reassignment…"*
-- Checkbox: *"Notify new technician of reassignment"*.
-- **Reassign Jobs** (confirm) / Cancel.
+- **Round** — pre-filled read-only (e.g. "Alnwick Monday", teal chip).
+- **Current Technician** — pre-filled read-only (e.g. "James").
+- **New Technician** — dropdown "Select Technician" (required).
+- **Apply to** — radio group:
+  - `Remaining jobs only` — "Only move uncompleted jobs to the new technician" *(default)*
+  - `All jobs` — "Move all jobs including completed ones"
+- **Jobs Affected** — live count label (e.g. "3 jobs / Remaining jobs only").
+- **Note (Optional)** — textarea "Add a note about this reassignment…".
+- **Notify new technician of reassignment** — checkbox (pre-checked).
+- Info note: *"The new technician will receive all assigned jobs in their schedule. If you selected 'remaining jobs only', completed jobs will stay with the current technician."*
+- **Cancel** / **Reassign Jobs** (primary, teal).
+
+**Backend:** `POST /rounds/:id/reassign` — body: `{ fromTechnicianId, toTechnicianId, scope: "remaining" | "all", note?, notify: boolean }`. Returns updated visit list. Scope `"remaining"` moves only visits with status `SCHEDULED` or `IN_PROGRESS`; `"all"` moves every visit in the round for today.
 
 ---
 
@@ -867,6 +893,58 @@ Layout: centered content (no left stepper). Green check-circle icon at top centr
 **Purpose:** Add a timestamped, authored note to a property/customer.  
 **Elements:** **New Note** — type toggle **Internal** / **Risk Warning** / **Customer** — + Text Area ("Type your note here…"); Save / Cancel.  
 **Backend gap:** implies a **note entity** `{ type, body, author, createdAt }` per property — **no such model exists** (`Property.accessNotes`/`riskNotes` are single free-text strings). See the Customers & Properties schema-gaps note under Screen 15 (OQ-CP3).
+
+---
+
+### M21 — Close Operational Day *(NEW — 2026-08-04)*
+**Triggered from:** Today's Work (Screen 12) → **Close Day** button (top-right, red)  
+**Frames:** `936:28276` (default) · `936:28692` · `936:28805` · `936:29221` · `936:29750` · `936:30274` · `936:30760` (multiple states)  
+**Purpose:** Finalise the workday — review summary, decide what to do with unfinished jobs, and close the day.  
+**Elements:**
+- **Title:** "Close Operational Day" / "Review today's summary and finalize".
+- **Today's Summary grid:**
+  | Field | Colour |
+  |---|---|
+  | Completed Jobs | green |
+  | Skipped Jobs | amber |
+  | Outstanding | red |
+  | Issues | grey |
+  | Payment Holds | grey |
+  | Revenue (£) | grey |
+- **"What to do with N unfinished jobs?"** radio group (shown when `outstanding > 0`):
+  - `Push to tomorrow` — "Move all unfinished jobs to tomorrow's schedule" *(default)*
+  - `Mark as skipped` — "Record unfinished jobs as skipped for today"
+- **Warning banners** (conditional):
+  - "You have N unfinished jobs. Please decide how to handle them before closing the day." (amber, shown when `outstanding > 0`)
+  - "There are N active issues that may need follow-up." (amber, shown when `issues > 0`)
+- **"What happens when you close the day?"** info box (always shown):
+  - A close-of-day summary will be generated
+  - All technicians will be notified of completion
+  - Revenue and statistics will be finalized
+  - System will prepare for tomorrow's operations
+- **Cancel** / **Close Operational Day** (primary, teal).
+
+**Backend:** `POST /workday/close` — body: `{ unfinishedAction: "push_to_tomorrow" | "mark_as_skipped" }`. Returns summary object `{ completedJobs, skippedJobs, outstanding, issues, paymentHolds, revenue }`. When `unfinishedAction = "push_to_tomorrow"`, all `SCHEDULED` visits for today are cloned to tomorrow. When `"mark_as_skipped"`, they are set to `SKIPPED`. A summary/daily-close record should be persisted for Reports.
+
+---
+
+### M22 — Push Missed Jobs *(NEW — 2026-08-04)*
+**Triggered from:** Today's Work > Round Details Panel > **Push Missed Jobs** (Screen 13)  
+**Frames:** `936:31330` (empty state) · `936:31746` (filled state)  
+**Purpose:** Move unfinished visits for a specific round to a future date, optionally notifying customers.  
+**Elements:**
+- **Round** — pre-filled read-only (e.g. "Alnwick Monday").
+- **Missed Jobs** — count label + sub-label "These jobs will be moved to the new date" (e.g. "3 jobs").
+- **New Date** — date picker (required).
+- **Quick Select** buttons: `Tomorrow` · `Next Week` · `Next Round`.
+- **Reason** — dropdown ("Select Reason…", e.g. "Weather Conditions") — required.
+- **Assign Technician (Optional)** — dropdown ("Keep current technician" default).
+- **Notify customers** — checkbox (pre-checked).
+- **Message Preview** — collapsible section showing the message that will be sent.
+- Info note: *"All selected jobs will be moved. The current visits will be cancelled and new visits will be created for the selected date."*
+- **Cancel** / **Move Jobs** (primary, teal).
+
+**Backend:** `POST /rounds/:id/push-missed` — body: `{ newDate: string (YYYY-MM-DD), reason: string, technicianId?: string, notifyCustomers: boolean }`. Cancels all `SCHEDULED` visits in the round for today, creates new `Visit` records for `newDate` (same property/plan, status `SCHEDULED`). If `notifyCustomers = true`, queues notification messages.
 
 ---
 
@@ -1048,6 +1126,13 @@ Default-Area wiring, `TechnicianInvite` for Send App Invite).
 
 **2026-07-21 — Setup Wizard steps 9–12 deep audit (`RoundFlow-Admin`, Page 1, nodes `936:46253`–`936:47259`+).**
 Steps 9–12 live-inspected via Figma MCP plugin (fresh fetch, no cached nodes). Confirmed 34 total setup frames. Added full per-sub-step breakdown for step 9 (5 sub-steps, vertical left stepper), full field/state inventory for step 10 (Round Assignments table, Technician Workload panel, multi-tech schema gap flagged), step 11 (Generate Visits toggles, Start Date, Frequency/Cycle, Activate CTA), and step 12 (7-item checklist, Ready to Launch, What Happens Next). Key decisions recorded: step 9 does NOT reuse `POST /customers`/`POST /properties`; step 10 requires a new `RoundTechnician` join table (multi-tech per round); step 11 generates the first visit cycle; step 12 reuses existing `POST /setup/complete`. Figma screenshots captured for steps 9 (sub-step 01 two states), 10, 11, 12.
+
+**2026-08-04 — `/Today-s-Work` section fully audited (`RoundFlow-Admin`, section node `936:25925`).**
+Pre-M4 audit via Figma MCP plugin — screenshots captured for all frames. **Screens 12 and 13 expanded** with full field inventories (KPI tile colours, table columns, panel layout, job-row flag sub-rows). **Three new modals documented for the first time:**
+- **M21 (Close Operational Day)** — `936:28276`+ — Today's Summary grid (Completed/Skipped/Outstanding/Issues/PaymentHolds/Revenue), unfinished-jobs radio (Push to tomorrow · Mark as skipped), conditional warning banners, info box, **Close Operational Day** CTA. Backend: `POST /workday/close`.
+- **M15 (Reassign Technician)** — `936:30830`/`936:31246` — expanded from stub to full field inventory: round/current-tech pre-fill, New Technician dropdown, Apply-to radio (remaining only · all jobs), Jobs Affected live count, optional note, notify checkbox. Backend: `POST /rounds/:id/reassign`.
+- **M22 (Push Missed Jobs)** — `936:31330`/`936:31746` — round pre-fill, missed-jobs count, New Date picker + Quick Select (Tomorrow/Next Week/Next Round), Reason dropdown, optional tech override, Notify customers checkbox, Message Preview section. Backend: `POST /rounds/:id/push-missed`.
+Method: Figma MCP screenshots captured for all three modals and both main screens.
 
 **2026-07-16 — `/Customers-Properties` section fully audited (Rough page, section node `401:12908`).**
 Corrected the section reference: **`401:12909` is the list screen, not the section** — the

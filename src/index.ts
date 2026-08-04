@@ -10,6 +10,7 @@ import { settingsRouter } from "./routes/settings";
 import { customersRouter } from "./routes/customers";
 import { propertiesRouter } from "./routes/properties";
 import { roundsRouter } from "./routes/rounds";
+import { todayRouter } from "./routes/today";
 import { openApiDocument } from "./swagger";
 
 const FRONTEND_URL = process.env.FRONTEND_URL;
@@ -52,6 +53,7 @@ app.use("/settings", settingsRouter);
 app.use("/customers", customersRouter);
 app.use("/properties", propertiesRouter);
 app.use("/rounds", roundsRouter);
+app.use("/today", todayRouter);
 
 // API docs (public) — interactive UI at /docs, raw spec at /openapi.json.
 app.get("/openapi.json", (_req: Request, res: Response) => {

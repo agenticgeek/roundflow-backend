@@ -97,6 +97,51 @@ export interface OccurrenceDetail {
   summary: Omit<OccurrenceSummary, "date">;
 }
 
+// ---- M4 output types (BE-M4-02, BE-M4-03, BE-M4-04) ----------------------
+
+export interface TodayPanelStop {
+  visitId: string;
+  customerName: string | null;
+  addressLine: string;
+  status: VisitStatus;
+  paymentHold: boolean;
+  hasIssue: boolean;
+  issueFlag: string | null; // first issue note; null when no note text or no issues
+}
+
+export interface TodayPanel {
+  roundId: string;
+  roundName: string;
+  technicianId: string | null;
+  technicianName: string | null;
+  status: "not_started" | "in_progress" | "completed";
+  progress: { total: number; completed: number; skipped: number; issues: number };
+  stops: TodayPanelStop[];
+}
+
+export interface ReassignInput {
+  fromTechnicianId: string;
+  toTechnicianId: string;
+  scope: "remaining" | "all";
+  note?: string | null;
+  notify: boolean;
+}
+
+export interface ReassignResult {
+  updatedCount: number;
+}
+
+export interface PushMissedInput {
+  newDate: Date;
+  reason: string;
+  technicianId?: string | null;
+  notifyCustomers: boolean;
+}
+
+export interface PushMissedResult {
+  pushedCount: number;
+}
+
 // ---- Prisma payload types -------------------------------------------------
 
 const visitDetailInclude = {
@@ -125,6 +170,10 @@ export interface IRoundService {
   setTechnicians(profileId: string, roundId: string, technicianIds: string[]): Promise<RoundDetail>;
   listOccurrences(profileId: string, roundId: string, from?: Date, to?: Date): Promise<OccurrenceSummary[]>;
   getOccurrence(profileId: string, roundId: string, date: string): Promise<OccurrenceDetail>;
+  // M4 additions
+  getTodayPanel(profileId: string, roundId: string): Promise<TodayPanel>;
+  reassignTechnician(profileId: string, roundId: string, input: ReassignInput): Promise<ReassignResult>;
+  pushMissedJobs(profileId: string, roundId: string, input: PushMissedInput): Promise<PushMissedResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +476,151 @@ class RoundService implements IRoundService {
     if (!(await this.prisma.serviceArea.findUnique({ where: { id } }))) {
       throw new AppError(404, `Service area not found: ${id}`);
     }
+  }
+
+  // ---- M4: today panel (Screen 13) ----------------------------------------
+
+  async getTodayPanel(_profileId: string, roundId: string): Promise<TodayPanel> {
+    const round = await this.prisma.round.findUnique({
+      where: { id: roundId },
+      select: { id: true, name: true },
+    });
+    if (!round) throw new AppError(404, "Round not found");
+
+    const start = new Date();
+    start.setUTCHours(0, 0, 0, 0);
+    const end = new Date(start.getTime() + 86_400_000);
+
+    const visits = await this.prisma.visit.findMany({
+      where: { roundId, date: { gte: start, lt: end } },
+      include: {
+        property: { select: { addressLine: true, customer: { select: { name: true } } } },
+        technician: { select: { id: true, name: true } },
+        issues: { select: { id: true, note: true }, take: 1 },
+      },
+      orderBy: { property: { addressLine: "asc" } },
+    });
+
+    // Primary technician: prefer IN_PROGRESS, then SCHEDULED, then any
+    const primaryVisit =
+      visits.find((v) => v.status === VisitStatus.IN_PROGRESS) ??
+      visits.find((v) => v.status === VisitStatus.SCHEDULED) ??
+      visits[0] ??
+      null;
+
+    const completed = visits.filter((v) => v.status === VisitStatus.COMPLETED).length;
+    const skipped = visits.filter((v) => v.status === VisitStatus.SKIPPED).length;
+    const inProgress = visits.filter((v) => v.status === VisitStatus.IN_PROGRESS).length;
+
+    let panelStatus: "not_started" | "in_progress" | "completed";
+    if (visits.length === 0 || (completed === 0 && skipped === 0 && inProgress === 0)) {
+      panelStatus = "not_started";
+    } else if (completed + skipped === visits.length) {
+      panelStatus = "completed";
+    } else {
+      panelStatus = "in_progress";
+    }
+
+    return {
+      roundId: round.id,
+      roundName: round.name,
+      technicianId: primaryVisit?.technicianId ?? null,
+      technicianName: primaryVisit?.technician?.name ?? null,
+      status: panelStatus,
+      progress: {
+        total: visits.length,
+        completed,
+        skipped,
+        issues: visits.filter((v) => v.issues.length > 0).length,
+      },
+      stops: visits.map((v) => ({
+        visitId: v.id,
+        customerName: v.property.customer?.name ?? null,
+        addressLine: v.property.addressLine,
+        status: v.status,
+        paymentHold: v.paymentHold,
+        hasIssue: v.issues.length > 0,
+        issueFlag: v.issues[0]?.note ?? null,
+      })),
+    };
+  }
+
+  // ---- M4: reassign technician (M15) ---------------------------------------
+
+  async reassignTechnician(
+    _profileId: string,
+    roundId: string,
+    input: ReassignInput
+  ): Promise<ReassignResult> {
+    if (input.fromTechnicianId === input.toTechnicianId) {
+      throw new AppError(400, '"fromTechnicianId" and "toTechnicianId" must be different');
+    }
+
+    await this.assertRoundExists(roundId);
+
+    // Validate the target technician is active
+    const toTech = await this.prisma.technician.findUnique({
+      where: { id: input.toTechnicianId },
+      select: { id: true, active: true },
+    });
+    if (!toTech) throw new AppError(404, "Target technician not found");
+    if (!toTech.active) throw new AppError(400, "Target technician is inactive");
+
+    const start = new Date();
+    start.setUTCHours(0, 0, 0, 0);
+    const end = new Date(start.getTime() + 86_400_000);
+
+    const statusFilter: VisitStatus[] =
+      input.scope === "remaining"
+        ? [VisitStatus.SCHEDULED, VisitStatus.IN_PROGRESS]
+        : [VisitStatus.SCHEDULED, VisitStatus.IN_PROGRESS, VisitStatus.COMPLETED, VisitStatus.SKIPPED];
+
+    const result = await this.prisma.visit.updateMany({
+      where: {
+        roundId,
+        technicianId: input.fromTechnicianId,
+        date: { gte: start, lt: end },
+        status: { in: statusFilter },
+      },
+      data: { technicianId: input.toTechnicianId },
+    });
+
+    return { updatedCount: result.count };
+  }
+
+  // ---- M4: push missed jobs (M22) ------------------------------------------
+
+  async pushMissedJobs(
+    _profileId: string,
+    roundId: string,
+    input: PushMissedInput
+  ): Promise<PushMissedResult> {
+    await this.assertRoundExists(roundId);
+
+    const start = new Date();
+    start.setUTCHours(0, 0, 0, 0);
+    const end = new Date(start.getTime() + 86_400_000);
+
+    // newDate must be strictly after today to avoid silent no-ops or past-date corruption.
+    const newDateDay = new Date(input.newDate);
+    newDateDay.setUTCHours(0, 0, 0, 0);
+    if (newDateDay <= start) {
+      throw new AppError(400, '"newDate" must be after today');
+    }
+
+    const result = await this.prisma.visit.updateMany({
+      where: {
+        roundId,
+        date: { gte: start, lt: end },
+        status: VisitStatus.SCHEDULED,
+      },
+      data: {
+        date: input.newDate,
+        ...(input.technicianId !== undefined ? { technicianId: input.technicianId } : {}),
+      },
+    });
+
+    return { pushedCount: result.count };
   }
 }
 

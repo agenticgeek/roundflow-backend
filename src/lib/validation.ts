@@ -34,9 +34,12 @@ export function assertPositiveInt(v: number, field: string): number {
 
 /** Assert a numeric value is a positive number (e.g. a Decimal price). Allows
  *  non-integers (£35.50); throws AppError(400) otherwise. */
-export function assertPositive(v: number, field: string): number {
+export function assertPositive(v: number, field: string, max?: number): number {
   if (!Number.isFinite(v) || v <= 0) {
     throw new AppError(400, `${field} must be a positive number`);
+  }
+  if (max !== undefined && v > max) {
+    throw new AppError(400, `${field} must not exceed ${max}`);
   }
   return v;
 }

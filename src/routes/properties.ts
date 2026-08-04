@@ -52,7 +52,7 @@ propertiesRouter.post(
       serviceAreaId: requireString(body.serviceAreaId, "serviceAreaId"),
       // Service Plan (step 2)
       serviceId: optId(body.serviceId, "serviceId"),
-      price: assertPositive(requireNumber(body.price, "price"), "price"),
+      price: assertPositive(requireNumber(body.price, "price"), "price", 9999.99),
       cleanMethod: optString(body.cleanMethod, "cleanMethod"),
       paymentMethod: optPaymentMethod(body.paymentMethod),
       // Schedule (step 3)

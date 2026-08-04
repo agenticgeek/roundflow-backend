@@ -522,7 +522,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     required: ["name", "defaultPrice"],
     properties: {
       name: { type: "string", minLength: 1 },
-      defaultPrice: { type: "number", description: "Sent as a number; returned as a string." },
+      defaultPrice: { type: "number", minimum: 0, maximum: 9999.99, description: "Sent as a number; returned as a string." },
       category: ref("ServiceCategory"),
       description: { type: "string" },
       active: { type: "boolean" },
@@ -612,7 +612,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     required: ["name", "defaultPrice"],
     properties: {
       name: { type: "string", minLength: 1 },
-      defaultPrice: { type: "number", minimum: 0, description: "Sent as a number; returned as a string. Zero is valid for free services." },
+      defaultPrice: { type: "number", minimum: 0, maximum: 9999.99, description: "Sent as a number; returned as a string. Zero is valid for free services." },
       category: ref("ServiceCategory"),
       description: { type: "string", nullable: true },
       active: { type: "boolean" },
@@ -625,7 +625,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     description: "Partial update — all fields optional.",
     properties: {
       name: { type: "string", minLength: 1 },
-      defaultPrice: { type: "number", minimum: 0 },
+      defaultPrice: { type: "number", minimum: 0, maximum: 9999.99 },
       category: ref("ServiceCategory"),
       description: { type: "string", nullable: true },
       active: { type: "boolean" },
@@ -864,7 +864,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       propertyType: { type: "string", nullable: true, enum: ["HOUSE", "FLAT_APARTMENT", "COMMERCIAL", "OFFICE", "CONSERVATORY", null] },
       serviceAreaId: { type: "string", description: "Required. Must exist (404 if not)." },
       serviceId: { type: "string", nullable: true },
-      price: { type: "number", description: "Positive number.", minimum: 0, exclusiveMinimum: true },
+      price: { type: "number", description: "Positive number.", minimum: 0, exclusiveMinimum: true, maximum: 9999.99 },
       cleanMethod: { type: "string", nullable: true },
       paymentMethod: nullableRef("PaymentMethod"),
       nextDueDate: { type: "string", format: "date", nullable: true },
@@ -901,7 +901,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       accessNotes: { type: "string", nullable: true },
       riskNotes: { type: "string", nullable: true },
       roundId: { type: "string", nullable: true },
-      price: { type: "number", minimum: 0, exclusiveMinimum: true },
+      price: { type: "number", minimum: 0, exclusiveMinimum: true, maximum: 9999.99 },
       cleanMethod: { type: "string", nullable: true },
       paymentMethod: nullableRef("PaymentMethod"),
     },
@@ -909,10 +909,11 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
   PauseServiceInput: {
     type: "object",
     required: ["reason", "pauseStartDate"],
+    additionalProperties: false,
     properties: {
       reason: { type: "string", minLength: 1, description: "Required by the UI; not persisted (no column)." },
       pauseStartDate: { type: "string", format: "date" },
-      pauseEndDate: { type: "string", format: "date", nullable: true, description: "null = indefinite pause." },
+      pauseEndDate: { type: "string", format: "date", nullable: true, description: "null = indefinite pause. Must be after pauseStartDate when provided." },
     },
     example: { reason: "Customer Holiday/Away", pauseStartDate: "2026-05-22", pauseEndDate: "2026-06-22" },
   },
