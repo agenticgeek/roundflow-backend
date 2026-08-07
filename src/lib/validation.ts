@@ -146,3 +146,9 @@ export function optMessageChannel(v: unknown): MessageChannel | undefined {
   if (v === undefined) return undefined;
   return requireMessageChannel(v);
 }
+
+// ---- Invite helpers --------------------------------------------------------
+
+export function isValidEmail(v: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+}

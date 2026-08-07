@@ -290,6 +290,8 @@ model Technician {
   role             String?
   phone            String?
   active           Boolean                 @default(true)
+  email            String?                 @unique
+  notes            String?
   avatarUrl        String?
   serviceAreas     TechnicianServiceArea[]
   visits           Visit[]

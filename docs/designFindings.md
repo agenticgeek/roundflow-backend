@@ -512,14 +512,24 @@ Layout: centered content (no left stepper). Green check-circle icon at top centr
 
 ---
 
-### 26. Technician Detail *(re-audited 2026-07-08)*  
+### 26. Technician Detail *(re-audited 2026-08-05 — screenshot captured)*  
 **Section:** `/Technicians` · Node `936:62224` (`technician-detail-james`) · original Rough node `695:14580`  
+**Route:** `/technicians/:id` — full page (sidebar nav visible); not a slide-in panel.  
 **Purpose:** Full profile and performance record for a single technician.  
+**Layout:** Two-column — left: main content (Today's Activity + Performance), right: info + workload sidebar.  
 **Elements:**
-- **Header:** name, "Role · Area · Phone" (e.g. "Lead Technician · Alnwick · 07123 456789"), status pill (● In Progress), **Send Message** button, ← Back to Technicians.
-- **Today's Activity:** per-round progress (e.g. "Alnwick Monday 2/5 completed · £940", "Morpeth Wednesday 0/5 completed") + issue alert ("1 issue flagged on Alnwick Monday").
-- **Performance (This Month):** Value Completed (£4,100), Time on Job (180h), Revenue / Hour (£22.80), Complaints (1), Issues (2).
-- **Technician Info:** Full Name, Role, Phone, Email.
+- **Header:** ← Technicians breadcrumb · name (large, e.g. "James") · sub-header "Role · Area · Phone" (e.g. "Lead Technician · Alnwick · 07123 456789") · status pill (● In Progress) · **Send Message** button (top-right).
+- **Today's Activity** card: one row per assigned round — round name · "N/Y completed" · status pill (● In Progress) · value (£940). Issue alert row below: "⚠ 1 issue flagged on Alnwick Monday" (amber).
+- **Performance (This Month)** card: **VALUE COMPLETED** (£4,100) · **TIME ON JOB** (180h) · **REVENUE / HOUR** (£22.80) · **COMPLAINTS** (1, amber) · **ISSUES** (2, red).
+- **Technician Info** card (right column):
+  - Full Name · Role · Phone · Email
+  - **Default Area** (e.g. "Alnwick, Morpeth" — can be multiple)
+  - **App Status** (✓ Active green badge / Unavailable)
+  - **Member Since** (e.g. "Jan 2024")
+  - **Edit Details** link (bold, underlined — opens Edit Technician, Screen 29)
+- **Workload Summary** card (right column, below Technician Info):
+  - One row per assigned round: round name · teal progress bar (fill = completed/total) · "N jobs left" / "N jobs pending" label
+  - Footer: **"Total: N jobs remaining today"**
 
 ---
 
@@ -1126,6 +1136,9 @@ Default-Area wiring, `TechnicianInvite` for Send App Invite).
 
 **2026-07-21 — Setup Wizard steps 9–12 deep audit (`RoundFlow-Admin`, Page 1, nodes `936:46253`–`936:47259`+).**
 Steps 9–12 live-inspected via Figma MCP plugin (fresh fetch, no cached nodes). Confirmed 34 total setup frames. Added full per-sub-step breakdown for step 9 (5 sub-steps, vertical left stepper), full field/state inventory for step 10 (Round Assignments table, Technician Workload panel, multi-tech schema gap flagged), step 11 (Generate Visits toggles, Start Date, Frequency/Cycle, Activate CTA), and step 12 (7-item checklist, Ready to Launch, What Happens Next). Key decisions recorded: step 9 does NOT reuse `POST /customers`/`POST /properties`; step 10 requires a new `RoundTechnician` join table (multi-tech per round); step 11 generates the first visit cycle; step 12 reuses existing `POST /setup/complete`. Figma screenshots captured for steps 9 (sub-step 01 two states), 10, 11, 12.
+
+**2026-08-05 — Screen 26 (Technician Detail) re-audited via screenshot (node `936:62224`).**
+Previous docs were incomplete. Two gaps filled: (1) **Technician Info card** now includes `Default Area`, `App Status`, `Member Since`, and `Edit Details` link — all missing before. (2) **Workload Summary card** documented for the first time — per-round progress bar rows with jobs-left count and a "Total: N jobs remaining today" footer. Route confirmed as full page (`/technicians/:id`), not a master-detail panel.
 
 **2026-08-04 — `/Today-s-Work` section fully audited (`RoundFlow-Admin`, section node `936:25925`).**
 Pre-M4 audit via Figma MCP plugin — screenshots captured for all frames. **Screens 12 and 13 expanded** with full field inventories (KPI tile colours, table columns, panel layout, job-row flag sub-rows). **Three new modals documented for the first time:**

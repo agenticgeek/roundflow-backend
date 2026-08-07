@@ -7,15 +7,10 @@ import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireRole } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
 import { h, asObject, requireString, optString } from "../lib/http";
-import { sendInviteEmail } from "../lib/email";
+import { sendInviteEmail, INVITE_TTL_DAYS } from "../lib/email";
+import { isValidEmail } from "../lib/validation";
 
 export const invitesRouter = Router();
-
-const INVITE_TTL_DAYS = 7;
-
-function isValidEmail(v: string): boolean {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
-}
 
 function assertInviteUsable(invite: {
   acceptedAt: Date | null;

@@ -2,6 +2,8 @@ import { Resend } from "resend";
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
+export const INVITE_TTL_DAYS = 7;
+
 const FROM = process.env.EMAIL_FROM ?? "RoundFlow <invites@roundflow.app>";
 
 function escapeHtml(s: string): string {
