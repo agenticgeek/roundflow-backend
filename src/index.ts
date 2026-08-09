@@ -13,6 +13,7 @@ import { roundsRouter } from "./routes/rounds";
 import { todayRouter } from "./routes/today";
 import { techniciansRouter } from "./routes/technicians";
 import { openApiDocument } from "./swagger";
+import { migrateAllTenantSchemas } from "./lib/tenant-provisioning";
 
 const FRONTEND_URL = process.env.FRONTEND_URL;
 if (!FRONTEND_URL) {
@@ -87,8 +88,16 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
 });
 
 const PORT = Number(process.env.PORT) || 3000;
-app.listen(PORT, () => {
-  console.log(`RoundFlow backend listening on http://localhost:${PORT}`);
-});
+
+migrateAllTenantSchemas()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`RoundFlow backend listening on http://localhost:${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error("FATAL: tenant migration failed —", err);
+    process.exit(1);
+  });
 
 export { app };
