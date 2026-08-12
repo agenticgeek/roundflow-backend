@@ -519,5 +519,7 @@ model ActivityLog {
   id        String   @id @default(cuid())
   type      String
   message   String
+  actorId   String?
+  actorRole String?
   createdAt DateTime @default(now())
 }
