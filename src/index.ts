@@ -13,6 +13,7 @@ import { roundsRouter } from "./routes/rounds";
 import { todayRouter } from "./routes/today";
 import { techniciansRouter } from "./routes/technicians";
 import { invoicesRouter } from "./routes/invoices";
+import { debtRouter } from "./routes/debt";
 import { openApiDocument } from "./swagger";
 import { migrateAllTenantSchemas } from "./lib/tenant-provisioning";
 
@@ -59,6 +60,7 @@ app.use("/rounds", roundsRouter);
 app.use("/today", todayRouter);
 app.use("/technicians", techniciansRouter);
 app.use("/invoices", invoicesRouter);
+app.use("/debt", debtRouter);
 
 // API docs (public) — interactive UI at /docs, raw spec at /openapi.json.
 app.get("/openapi.json", (_req: Request, res: Response) => {

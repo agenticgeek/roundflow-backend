@@ -186,6 +186,7 @@ model Customer {
   ghlContactId  String?
   paymentMethod PaymentMethod?
   badDebt       Boolean         @default(false)
+  holdNextClean Boolean         @default(false)
   properties    Property[]
   invoices      Invoice[]
   payments      Payment[]
