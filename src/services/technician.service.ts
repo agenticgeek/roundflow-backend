@@ -203,19 +203,27 @@ class TechnicianService implements ITechnicianService {
       if (!area) throw new AppError(404, "Service area not found");
     }
 
-    const tech = await this.prisma.technician.create({
-      data: {
-        name: input.name ?? null,
-        phone: input.phone ?? null,
-        role: input.role ?? null,
-        email: input.email ?? null,
-        notes: input.notes ?? null,
-        ...(input.serviceAreaId
-          ? { serviceAreas: { create: { serviceAreaId: input.serviceAreaId } } }
-          : {}),
-      },
-      include: techInclude,
-    });
+    let tech;
+    try {
+      tech = await this.prisma.technician.create({
+        data: {
+          name: input.name ?? null,
+          phone: input.phone ?? null,
+          role: input.role ?? null,
+          email: input.email ?? null,
+          notes: input.notes ?? null,
+          ...(input.serviceAreaId
+            ? { serviceAreas: { create: { serviceAreaId: input.serviceAreaId } } }
+            : {}),
+        },
+        include: techInclude,
+      });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+        throw new AppError(409, "A technician with this email already exists");
+      }
+      throw err;
+    }
 
     return toRecord(tech);
   }

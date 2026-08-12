@@ -14,6 +14,15 @@ function todayRange(): { start: Date; end: Date } {
   return { start, end: new Date(start.getTime() + 86_400_000) };
 }
 
+// Returns the next Mon–Fri date after `date` (UTC). Skips Sat → Mon, Sun → Mon.
+function nextWorkingDay(date: Date): Date {
+  const next = new Date(date.getTime() + 86_400_000);
+  const dow = next.getUTCDay(); // 0=Sun, 6=Sat
+  if (dow === 6) return new Date(next.getTime() + 2 * 86_400_000); // Sat → Mon
+  if (dow === 0) return new Date(next.getTime() + 86_400_000);     // Sun → Mon
+  return next;
+}
+
 function deriveRoundStatus(
   total: number,
   completed: number,
@@ -145,7 +154,10 @@ class TodayService implements ITodayService {
       const settings = await tx.businessSettings.findFirst({
         select: { lastClosedDate: true },
       });
-      if (settings?.lastClosedDate === today) {
+      if (!settings) {
+        throw new AppError(409, "Business settings not configured — complete setup first");
+      }
+      if (settings.lastClosedDate === today) {
         throw new AppError(409, "Operational day has already been closed");
       }
 
@@ -170,11 +182,11 @@ class TodayService implements ITodayService {
 
       if (unfinishedIds.length > 0) {
         if (unfinishedAction === "push_to_tomorrow") {
-          const tomorrow = new Date(start.getTime() + 86_400_000);
-          // Reset IN_PROGRESS back to SCHEDULED so tomorrow they start fresh.
+          const nextDay = nextWorkingDay(start);
+          // Reset IN_PROGRESS back to SCHEDULED so the next working day starts fresh.
           await tx.visit.updateMany({
             where: { id: { in: unfinishedIds } },
-            data: { date: tomorrow, status: VisitStatus.SCHEDULED },
+            data: { date: nextDay, status: VisitStatus.SCHEDULED },
           });
         } else {
           await tx.visit.updateMany({
@@ -199,7 +211,7 @@ class TodayService implements ITodayService {
         outstanding: unfinishedAction === "push_to_tomorrow" ? unfinishedIds.length : 0,
         issues: visits.reduce((acc, v) => acc + v._count.issues, 0),
         paymentHolds: visits.filter((v) => v.paymentHold).length,
-        revenue: preCompleted.reduce((acc, v) => acc + v.price.toNumber(), 0),
+        revenue: preCompleted.reduce((acc, v) => acc.add(v.price), new Prisma.Decimal(0)).toNumber(),
       };
     });
   }
@@ -216,7 +228,8 @@ class TodayService implements ITodayService {
       paymentHolds: visits.filter((v) => v.paymentHold).length,
       valueCompleted: visits
         .filter((v) => v.status === VisitStatus.COMPLETED)
-        .reduce((acc, v) => acc + v.price.toNumber(), 0),
+        .reduce((acc, v) => acc.add(v.price), new Prisma.Decimal(0))
+        .toNumber(),
     };
   }
 
