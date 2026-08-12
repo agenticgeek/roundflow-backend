@@ -1,0 +1,1 @@
+ALTER TABLE "Customer" ADD COLUMN "holdNextClean" BOOLEAN NOT NULL DEFAULT false;
