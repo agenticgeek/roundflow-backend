@@ -18,6 +18,7 @@ import {
   ReassignInput,
   PushMissedInput,
 } from "../services/round.service";
+import { createReportsService } from "../services/reports.service";
 import { parseIsoDate } from "../lib/validation";
 
 export const roundsRouter = Router();
@@ -87,7 +88,14 @@ roundsRouter.patch(
       description: optString(body.description, "description"),
       status: optRoundStatus(body.status),
     };
-    res.json(await svc(req).updateRound(actorIdOf(req), req.params.id, input));
+    const result = await svc(req).updateRound(actorIdOf(req), req.params.id, input);
+    void createReportsService(req.tenantPrisma!).logActivity(
+      "ROUND_UPDATED",
+      `Round updated: ${req.params.id}`,
+      req.profile?.id,
+      req.profile?.role ?? undefined,
+    );
+    res.json(result);
   })
 );
 
@@ -145,9 +153,14 @@ roundsRouter.put(
     ) {
       throw new AppError(400, '"technicianIds" must be an array of strings.');
     }
-    res.json(
-      await svc(req).setTechnicians(actorIdOf(req), req.params.id, body.technicianIds as string[])
+    const result = await svc(req).setTechnicians(actorIdOf(req), req.params.id, body.technicianIds as string[]);
+    void createReportsService(req.tenantPrisma!).logActivity(
+      "TECHNICIAN_ASSIGNED",
+      `Technicians assigned to round: ${req.params.id}`,
+      req.profile?.id,
+      req.profile?.role ?? undefined,
     );
+    res.json(result);
   })
 );
 
@@ -181,7 +194,14 @@ roundsRouter.post(
       note: optString(body.note, "note"),
       notify: optBool(body.notify, "notify") ?? false,
     };
-    res.json(await svc(req).reassignTechnician(actorIdOf(req), req.params.id, input));
+    const result = await svc(req).reassignTechnician(actorIdOf(req), req.params.id, input);
+    void createReportsService(req.tenantPrisma!).logActivity(
+      "TECHNICIAN_REASSIGNED",
+      `Technician reassigned in round: ${req.params.id}`,
+      req.profile?.id,
+      req.profile?.role ?? undefined,
+    );
+    res.json(result);
   })
 );
 
@@ -203,6 +223,13 @@ roundsRouter.post(
       technicianId: optId(body.technicianId, "technicianId"),
       notifyCustomers: optBool(body.notifyCustomers, "notifyCustomers") ?? false,
     };
-    res.json(await svc(req).pushMissedJobs(actorIdOf(req), req.params.id, input));
+    const result = await svc(req).pushMissedJobs(actorIdOf(req), req.params.id, input);
+    void createReportsService(req.tenantPrisma!).logActivity(
+      "VISITS_PUSHED",
+      `Visits pushed to ${input.newDate.toISOString().slice(0, 10)} in round: ${req.params.id}`,
+      req.profile?.id,
+      req.profile?.role ?? undefined,
+    );
+    res.json(result);
   })
 );

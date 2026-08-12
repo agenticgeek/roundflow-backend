@@ -5,6 +5,7 @@ import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
 import { asObject, h, requireString } from "../lib/http";
 import { createTodayService } from "../services/today.service";
+import { createReportsService } from "../services/reports.service";
 
 export const todayRouter = Router();
 todayRouter.use(requireAuth);
@@ -43,6 +44,13 @@ todayRouter.post(
         '"unfinishedAction" must be "push_to_tomorrow" or "mark_as_skipped"'
       );
     }
-    res.json(await svc(req).closeDay(actorIdOf(req), raw));
+    const result = await svc(req).closeDay(actorIdOf(req), raw);
+    void createReportsService(req.tenantPrisma!).logActivity(
+      "DAY_CLOSED",
+      `Operational day closed (unfinished: ${raw})`,
+      req.profile?.id,
+      req.profile?.role ?? undefined,
+    );
+    res.json(result);
   })
 );
