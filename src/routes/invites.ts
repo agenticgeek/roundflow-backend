@@ -69,7 +69,10 @@ invitesRouter.post(
       });
     } catch (emailErr) {
       // Roll back the invite row so the admin can retry without hitting 409.
-      await prisma.tenantInvite.delete({ where: { id: invite.id } }).catch(() => {});
+      await prisma.tenantInvite.delete({ where: { id: invite.id } }).catch((rollbackErr) => {
+        console.error("[invites] Failed to roll back invite after email failure:", rollbackErr);
+        throw new AppError(503, "Email delivery failed and invite could not be cleaned up. Contact support to remove the pending invite before retrying.");
+      });
       throw new AppError(503, "Invite created but email delivery failed. Please try again.");
     }
 
@@ -168,10 +171,20 @@ invitesRouter.post(
     if (invite.technicianId) {
       const tenant = await prisma.tenant.findUnique({ where: { id: invite.tenantId } });
       if (tenant) {
-        await getTenantPrismaForSchema(tenant.schemaName).technician.update({
-          where: { id: invite.technicianId },
-          data: { profileId: profile.id },
-        });
+        try {
+          await getTenantPrismaForSchema(tenant.schemaName).technician.update({
+            where: { id: invite.technicianId },
+            data: { profileId: profile.id },
+          });
+        } catch (linkErr) {
+          // Profile and acceptedAt are already committed. The idempotency guard in this
+          // endpoint re-attempts the tech-link on the next call, so signing in again recovers.
+          console.error("[invites] Technician link failed after profile commit:", linkErr);
+          throw new AppError(
+            500,
+            "Account created but technician link failed. Please sign in again to complete setup."
+          );
+        }
       }
     }
 

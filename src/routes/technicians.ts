@@ -112,7 +112,10 @@ techniciansRouter.post(
           businessName: settings?.businessName,
         });
       } catch {
-        await prisma.tenantInvite.delete({ where: { id: invite.id } }).catch(() => {});
+        await prisma.tenantInvite.delete({ where: { id: invite.id } }).catch((rollbackErr) => {
+          console.error("[technicians] Failed to roll back invite after email failure:", rollbackErr);
+          throw new AppError(503, "Email delivery failed and invite could not be cleaned up. Use POST /invites to retry after the pending invite is cleared.");
+        });
         throw new AppError(
           503,
           "Technician created but invite email failed. Retry with POST /invites."
