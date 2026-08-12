@@ -18,6 +18,7 @@ import {
   PropertyCreateInput,
   PropertyUpdateInput,
 } from "../services/customer.service";
+import { createReportsService } from "../services/reports.service";
 
 export const propertiesRouter = Router();
 propertiesRouter.use(requireAuth);
@@ -63,7 +64,14 @@ propertiesRouter.post(
       // Assignment (step 5 / Screen 31) — null = Save & Assign Later (unassigned)
       roundId: optId(body.roundId, "roundId"),
     };
-    res.status(201).json(await svc(req).createProperty(actorIdOf(req), input));
+    const result = await svc(req).createProperty(actorIdOf(req), input);
+    void createReportsService(req.tenantPrisma!).logActivity(
+      "PROPERTY_ADDED",
+      `Property added: ${input.addressLine}, ${input.postcode}`,
+      req.profile?.id,
+      req.profile?.role ?? undefined,
+    );
+    res.status(201).json(result);
   })
 );
 
