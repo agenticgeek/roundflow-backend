@@ -8,3 +8,4 @@ dist/
 
 # Machine-local Claude Code settings (permissions, etc.)
 .claude/settings.local.json
+*.sh

@@ -14,6 +14,7 @@ import {
   optId,
 } from "../lib/http";
 import { assertPositive, optPaymentMethod, optPropertyType, optIsoDate } from "../lib/validation";
+import { createInvoiceService } from "../services/invoice.service";
 import {
   createCustomerService,
   CustomerCreateInput,
@@ -168,5 +169,14 @@ customersRouter.post(
       roundId: optId(body.roundId, "roundId"),
     };
     res.status(201).json(await svc(req).addPropertyToCustomer(actorIdOf(req), req.params.id, input));
+  })
+);
+
+// GET /customers/:id/invoices
+customersRouter.get(
+  "/:id/invoices",
+  h(async (req, res) => {
+    const invoices = await createInvoiceService(req.tenantPrisma!).listCustomerInvoices(req.params.id);
+    return res.json(invoices);
   })
 );
