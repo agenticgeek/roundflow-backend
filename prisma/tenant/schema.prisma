@@ -408,6 +408,7 @@ model Invoice {
   visit          Visit?        @relation(fields: [visitId], references: [id])
   amount         Decimal       @db.Decimal(10, 2)
   status         InvoiceStatus @default(DRAFT)
+  dueDate        DateTime?
   notes          String?
   sentToCustomer Boolean       @default(false)
   sentAt         DateTime?
