@@ -1,0 +1,75 @@
+name: Deploy — QA
+
+on:
+  push:
+    branches: [qa]
+
+env:
+  AWS_REGION: eu-north-1
+  ECR_REGISTRY: 574667603029.dkr.ecr.eu-north-1.amazonaws.com
+  ECR_REPOSITORY: roundflow
+
+jobs:
+  deploy:
+    name: Test → Migrate → Build → Deploy
+    runs-on: ubuntu-latest
+    environment: qa
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Run migrations
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DIRECT_URL: ${{ secrets.DIRECT_URL }}
+        run: npx prisma migrate deploy
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag & push image
+        run: |
+          IMAGE=$ECR_REGISTRY/$ECR_REPOSITORY
+          docker build -t $IMAGE:qa-${{ github.sha }} .
+          docker tag $IMAGE:qa-${{ github.sha }} $IMAGE:qa-latest
+          docker push $IMAGE:qa-${{ github.sha }}
+          docker push $IMAGE:qa-latest
+
+      - name: Deploy to QA EC2
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            aws ecr get-login-password --region eu-north-1 | \
+              docker login --username AWS --password-stdin 574667603029.dkr.ecr.eu-north-1.amazonaws.com
+            docker pull 574667603029.dkr.ecr.eu-north-1.amazonaws.com/roundflow:qa-latest
+            docker stop roundflow-qa || true
+            docker rm roundflow-qa || true
+            docker run -d \
+              --name roundflow-qa \
+              --env-file /home/ec2-user/.env.qa \
+              -p 3001:3000 \
+              --restart unless-stopped \
+              574667603029.dkr.ecr.eu-north-1.amazonaws.com/roundflow:qa-latest

@@ -1,0 +1,78 @@
+name: Deploy — Prod
+
+on:
+  push:
+    branches: [prod]
+
+env:
+  AWS_REGION: eu-north-1
+  ECR_REGISTRY: 574667603029.dkr.ecr.eu-north-1.amazonaws.com
+  ECR_REPOSITORY: roundflow
+
+jobs:
+  deploy:
+    name: Test → Migrate → Build → Deploy
+    runs-on: ubuntu-latest
+    environment: prod
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Run migrations
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DIRECT_URL: ${{ secrets.DIRECT_URL }}
+        run: npx prisma migrate deploy
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag & push image
+        run: |
+          IMAGE=$ECR_REGISTRY/$ECR_REPOSITORY
+          docker build -t $IMAGE:prod-${{ github.sha }} .
+          docker tag $IMAGE:prod-${{ github.sha }} $IMAGE:prod-latest
+          docker push $IMAGE:prod-${{ github.sha }}
+          docker push $IMAGE:prod-latest
+
+      - name: Download current ECS task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ secrets.ECS_TASK_DEFINITION }} \
+            --query taskDefinition > task-definition.json
+
+      - name: Update image in task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: roundflow
+          image: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:prod-${{ github.sha }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ secrets.ECS_SERVICE }}
+          cluster: ${{ secrets.ECS_CLUSTER }}
+          wait-for-service-stability: true

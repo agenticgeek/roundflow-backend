@@ -25,9 +25,9 @@ declare global {
 }
 
 // The Supabase project's auth issuer (the `iss` claim on its JWTs, and the base
-// of the JWKS endpoint). Kept as a single constant so it's easy to find/change
-// when the project moves — used for both JWKS fetch and issuer verification.
-const SUPABASE_ISSUER = "https://cixtfdnuwbmxvilkvihv.supabase.co/auth/v1";
+// of the JWKS endpoint). Set via SUPABASE_ISSUER env var — different per environment.
+const SUPABASE_ISSUER = process.env.SUPABASE_ISSUER;
+if (!SUPABASE_ISSUER) throw new Error("SUPABASE_ISSUER env var is required");
 
 // Supabase signs auth JWTs with ES256 (asymmetric, ECC P-256). We fetch the
 // public verification keys from the project's JWKS endpoint and cache them, so

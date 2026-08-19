@@ -1,0 +1,12 @@
+node_modules
+dist
+.env
+.env.*
+.git
+.github
+coverage
+*.log
+*.md
+docs
+test-cases.sh
+setup-tenant.sh

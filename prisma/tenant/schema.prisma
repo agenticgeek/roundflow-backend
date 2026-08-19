@@ -13,8 +13,9 @@
 // are plain String fields — the application enforces the relationship.
 
 generator client {
-  provider = "prisma-client-js"
-  output   = "../../src/generated/tenant-client"
+  provider      = "prisma-client-js"
+  output        = "../../src/generated/tenant-client"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
 }
 
 datasource db {
