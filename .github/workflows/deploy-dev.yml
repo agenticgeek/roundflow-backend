@@ -70,6 +70,6 @@ jobs:
             docker run -d \
               --name roundflow-dev \
               --env-file /home/ec2-user/.env.dev \
-              -p 3000:3000 \
+              -p 127.0.0.1:3000:3000 \
               --restart unless-stopped \
               574667603029.dkr.ecr.eu-north-1.amazonaws.com/roundflow:dev-latest
