@@ -949,14 +949,10 @@ function nextOccurrenceOfDay(from: Date, day: DayOfWeek): Date {
 
 function frequencyToWeeks(freq: CleaningFrequency): number {
   switch (freq) {
-    case CleaningFrequency.FORTNIGHTLY:   return 2;
     case CleaningFrequency.FOUR_WEEKLY:   return 4;
     case CleaningFrequency.SIX_WEEKLY:    return 6;
     case CleaningFrequency.EIGHT_WEEKLY:  return 8;
-    // L-2: MONTHLY is approximated as 4 weeks (28 days). This generates 13
-    // visits/year instead of 12. Use calendar-month arithmetic if exact billing
-    // cycles are required in a future milestone.
-    case CleaningFrequency.MONTHLY:       return 4;
+    case CleaningFrequency.TWELVE_WEEKLY: return 12;
   }
 }
 

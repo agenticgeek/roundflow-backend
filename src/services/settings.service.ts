@@ -246,6 +246,7 @@ type SettingsWritable = {
   debtHoldEnabled?: boolean;
   gocardlessConnected?: boolean;
   stripeConnected?: boolean;
+  preCleanReminderTimings?: string[];
 };
 
 // ---------------------------------------------------------------------------

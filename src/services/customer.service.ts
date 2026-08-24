@@ -24,11 +24,10 @@ import { AppError } from "../lib/app-error";
 // Human-readable labels for CleaningFrequency values — used when naming
 // auto-created rounds in the frequency-change reassignment flow (FR-FREQ-4).
 const FREQUENCY_LABELS: Record<CleaningFrequency, string> = {
-  FORTNIGHTLY: "Fortnightly",
   FOUR_WEEKLY: "Four Weekly",
   SIX_WEEKLY: "Six Weekly",
   EIGHT_WEEKLY: "Eight Weekly",
-  MONTHLY: "Monthly",
+  TWELVE_WEEKLY: "Twelve Weekly",
 };
 
 // ---------------------------------------------------------------------------
