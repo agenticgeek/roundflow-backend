@@ -457,6 +457,32 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       },
     },
   },
+
+  Visit: {
+    type: "object",
+    description: "A single ad-hoc (one-off) visit returned from POST /visits.",
+    required: ["id", "date", "status", "isOneOff", "price", "propertyId", "addressLine", "postcode", "customerId", "customerName"],
+    properties: {
+      id: { type: "string" },
+      date: { type: "string", format: "date", example: "2026-09-03" },
+      status: { type: "string", enum: ["SCHEDULED", "COMPLETED", "SKIPPED"], example: "SCHEDULED" },
+      isOneOff: { type: "boolean", example: true },
+      price: { type: "number", example: 45 },
+      notes: { type: "string", nullable: true },
+      paymentMethod: { type: "string", nullable: true, enum: ["GOCARDLESS", "STRIPE", "CASH", "BACS", "CHEQUE"] },
+      propertyId: { type: "string" },
+      addressLine: { type: "string", example: "12 Market Street" },
+      postcode: { type: "string", example: "NE66 1SS" },
+      customerId: { type: "string" },
+      customerName: { type: "string", example: "John Smith" },
+      roundId: { type: "string", nullable: true },
+      roundName: { type: "string", nullable: true },
+      serviceId: { type: "string", nullable: true },
+      serviceName: { type: "string", nullable: true },
+      technicianId: { type: "string", nullable: true },
+      technicianName: { type: "string", nullable: true },
+    },
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -995,6 +1021,35 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       name: { type: "string", minLength: 1, description: "Display name for the new Profile." },
     },
     example: { name: "James Fisher" },
+  },
+
+  VisitCreateInput: {
+    type: "object",
+    required: ["propertyId", "date", "price"],
+    properties: {
+      propertyId: { type: "string", description: "ID of an existing property." },
+      date: { type: "string", format: "date", description: "Visit date in YYYY-MM-DD format. Stored as midnight UTC.", example: "2026-09-03" },
+      price: { type: "number", minimum: 0.01, maximum: 9999.99, example: 45 },
+      serviceId: { type: "string", nullable: true, description: "Must be an active service. null = no service attached." },
+      technicianId: { type: "string", nullable: true },
+      roundId: { type: "string", nullable: true, description: "Attach to a round so the visit appears in the Round Planner. null = Today only." },
+      notes: { type: "string", nullable: true, example: "One-off gutter clean — customer rang in" },
+      paymentMethod: {
+        type: "string",
+        nullable: true,
+        enum: ["GOCARDLESS", "STRIPE", "CASH", "BACS", "CHEQUE"],
+      },
+    },
+    example: {
+      propertyId: "cle123abc",
+      date: "2026-09-03",
+      price: 45,
+      serviceId: "csv456def",
+      technicianId: "ctn789ghi",
+      roundId: null,
+      notes: "One-off gutter clean — customer rang in",
+      paymentMethod: "CASH",
+    },
   },
 };
 
@@ -1920,6 +1975,26 @@ const paths: OpenAPIV3.PathsObject = {
       },
     },
   },
+
+  // =====================================================================
+  // Visits — one-off (ad-hoc) jobs
+  // =====================================================================
+  "/visits": {
+    post: {
+      tags: ["Visits"],
+      summary: "Add One-off Job — create a single ad-hoc visit outside the recurring schedule",
+      description:
+        "Creates a visit with `isOneOff: true`. `roundId: null` means the visit appears in Today's Work only; supply a `roundId` to also show it in the Round Planner for that round. `servicePlanId` is always `null`. `status` is always `SCHEDULED`.",
+      requestBody: jsonBody(ref("VisitCreateInput")),
+      responses: {
+        "201": jsonResponse("Created visit.", ref("Visit")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -1974,6 +2049,7 @@ export const openApiDocument: OpenAPIV3.Document = {
     { name: "Invites", description: "Tenant invite flow — send, validate, and accept invites for new technicians/managers." },
     { name: "Customers", description: "M2 — customer/property list + aggregate detail (Screens 14/15). Reads: any role; mutations: ADMIN/MANAGER." },
     { name: "Properties", description: "M2 — property create/update, pause/resume, notes (Add Property, M9, M20)." },
+    { name: "Visits", description: "One-off (ad-hoc) visit creation. Reads: any role; mutations: ADMIN/MANAGER." },
   ],
   // Global default: all operations require the Bearer token unless they
   // override with `security: []` (e.g. /health).

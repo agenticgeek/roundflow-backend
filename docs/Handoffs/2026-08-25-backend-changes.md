@@ -116,8 +116,103 @@ TWO_HOURS_BEFORE    — reminder sent 2 hours before the clean
 
 ---
 
+---
+
+## 4. One-off Job — `POST /visits`
+
+**What changed:** New endpoint for creating a standalone, ad-hoc visit (not tied to a service plan or recurring schedule).
+
+**Endpoint:** `POST /visits`
+
+**Request body:**
+```json
+{
+  "propertyId": "cle123...",
+  "date": "2026-09-03",
+  "price": 45.00,
+  "serviceId": "csv456...",
+  "technicianId": "ctn789...",
+  "roundId": null,
+  "notes": "One-off gutter clean — customer rang in",
+  "paymentMethod": "CASH"
+}
+```
+
+| Field | Required | Notes |
+|---|---|---|
+| `propertyId` | **yes** | Must exist |
+| `date` | **yes** | `YYYY-MM-DD` format |
+| `price` | **yes** | `> 0`, max `9999.99` |
+| `serviceId` | no | Must be an active service; `null` = no service |
+| `technicianId` | no | Must have accepted their invite (see §5) |
+| `roundId` | no | Supply to show in Round Planner; `null` = Today's Work only |
+| `notes` | no | Free text |
+| `paymentMethod` | no | `GOCARDLESS \| STRIPE \| CASH \| BACS \| CHEQUE` |
+
+**Response (201):**
+```json
+{
+  "id": "clv...",
+  "date": "2026-09-03",
+  "status": "SCHEDULED",
+  "isOneOff": true,
+  "price": 45,
+  "notes": "One-off gutter clean — customer rang in",
+  "paymentMethod": "CASH",
+  "propertyId": "cle...",
+  "addressLine": "12 Market Street",
+  "postcode": "NE66 1SS",
+  "customerId": "cld...",
+  "customerName": "John Smith",
+  "roundId": null,
+  "roundName": null,
+  "serviceId": "csv...",
+  "serviceName": "Gutter Clean",
+  "technicianId": "ctn...",
+  "technicianName": "James Fisher"
+}
+```
+
+**Rules:**
+- `isOneOff` is always `true`, `status` is always `SCHEDULED` — not client-settable
+- The visit appears in `GET /today` on the matching date
+- If `roundId` is supplied, also appears in `GET /rounds/:id/planner/occurrences`
+
+**Action required:**
+- Wire the "Add One-off Job" quick action to `POST /visits`
+- On success, refresh the Today's Work / Round Planner view
+- Auth: `TECHNICIAN` role gets `403` — only `ADMIN`/`MANAGER` can create one-off jobs
+
+---
+
+## 5. Technician Assignment — Invite-Pending Validation
+
+**What changed:** Assigning a technician who has been invited but **has not yet accepted** now returns `400` instead of silently succeeding. This applies to three operations:
+
+| Endpoint | Operation |
+|---|---|
+| `PUT /rounds/:id/technicians` | Set the technician list for a round |
+| `POST /rounds/:id/reassign` | Reassign today's jobs to a different technician |
+| `POST /visits` | Create a one-off visit with a `technicianId` |
+
+**Error response (400):**
+```json
+{ "error": "Cannot assign technician(s) with a pending invite: ctn789..." }
+```
+or for reassign/visit:
+```json
+{ "error": "Technician has not accepted their invite" }
+```
+
+**Action required:**
+- When populating technician dropdowns for round assignment or one-off job creation, **only show technicians whose `appStatus` is `ACTIVE` or `INACTIVE`** — filter out `PENDING_INVITE`
+- `GET /technicians` already returns `appStatus` per technician — use that field to drive the filter
+- If the user somehow submits a pending technician, surface the 400 message directly
+
+---
+
 ## Swagger Docs
 
-All three changes are documented in the live Swagger UI:
+All changes are documented in the live Swagger UI:
 - **Dev:** https://api-dev.roundflow.ai/docs
 - **QA:** https://api-qa.roundflow.ai/docs
