@@ -34,6 +34,7 @@ export interface BusinessProfileUpdateInput {
 export interface RoundSettingsUpdateInput {
   defaultCycleLength?: number | null;
   defaultWorkingDays?: string[];
+  preCleanReminderTimings?: string[];
 }
 
 export interface ServiceCreateInput {
@@ -319,11 +320,10 @@ class SettingsService implements ISettingsService {
     _profileId: string,
     input: RoundSettingsUpdateInput
   ): Promise<BusinessSettings> {
-    // Round fields only. defaultCleanMethod / autoGenerateVisits (P1-nice) and
-    // preCleanReminder* (P2) are NOT in the schema yet — deliberately omitted.
     return this.writeSettings({
       defaultCycleLength: input.defaultCycleLength,
       defaultWorkingDays: input.defaultWorkingDays,
+      preCleanReminderTimings: input.preCleanReminderTimings,
     });
   }
 

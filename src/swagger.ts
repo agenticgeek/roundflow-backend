@@ -108,11 +108,10 @@ const enumSchemas: Record<string, OpenAPIV3.SchemaObject> = {
   RoundStatus: stringEnum(["ACTIVE", "DRAFT", "ARCHIVED"]),
   DayOfWeek: stringEnum(["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]),
   CleaningFrequency: stringEnum([
-    "FORTNIGHTLY",
     "FOUR_WEEKLY",
     "SIX_WEEKLY",
     "EIGHT_WEEKLY",
-    "MONTHLY",
+    "TWELVE_WEEKLY",
   ]),
   VisitStatus: stringEnum(["SCHEDULED", "IN_PROGRESS", "COMPLETED", "SKIPPED"]),
   PaymentStatus: stringEnum(["NOT_DUE", "PENDING", "PAID", "FAILED", "OVERDUE"]),
@@ -603,8 +602,14 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     properties: {
       defaultCycleLength: { type: "integer", nullable: true, description: "Cycle length in days." },
       defaultWorkingDays: { type: "array", items: { type: "string", enum: ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"] } },
+      preCleanReminderTimings: {
+        type: "array",
+        items: { type: "string", enum: ["EVENING_BEFORE", "TWO_HOURS_BEFORE"] },
+        maxItems: 2,
+        description: "Up to two reminder timings. Omit to leave unchanged.",
+      },
     },
-    example: { defaultCycleLength: 28 },
+    example: { defaultCycleLength: 28, preCleanReminderTimings: ["EVENING_BEFORE", "TWO_HOURS_BEFORE"] },
   },
 
   ServiceCreateInput: {
@@ -857,6 +862,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     properties: {
       customerName: { type: "string", minLength: 1 },
       phone: { type: "string", nullable: true },
+      landline: { type: "string", nullable: true },
       email: { type: "string", nullable: true },
       addressLine: { type: "string", minLength: 1 },
       postcode: { type: "string", minLength: 1 },
@@ -894,6 +900,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     properties: {
       name: { type: "string", minLength: 1 },
       phone: { type: "string", nullable: true },
+      landline: { type: "string", nullable: true },
       email: { type: "string", nullable: true },
       addressLine: { type: "string", minLength: 1 },
       postcode: { type: "string", minLength: 1 },

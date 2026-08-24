@@ -48,11 +48,10 @@ enum DayOfWeek {
 }
 
 enum CleaningFrequency {
-  FORTNIGHTLY
   FOUR_WEEKLY
   SIX_WEEKLY
   EIGHT_WEEKLY
-  MONTHLY
+  TWELVE_WEEKLY
 }
 
 enum VisitStatus {
@@ -174,14 +173,16 @@ model BusinessSettings {
   gocardlessConnected Boolean        @default(false)
   stripeConnected     Boolean        @default(false)
   setupCompleted      Boolean        @default(false)
-  lastClosedDate      String?        // YYYY-MM-DD; set by POST /today/close to block re-close
-  updatedAt           DateTime       @updatedAt
+  lastClosedDate           String?        // YYYY-MM-DD; set by POST /today/close to block re-close
+  preCleanReminderTimings  String[]
+  updatedAt                DateTime       @updatedAt
 }
 
 model Customer {
   id            String          @id @default(cuid())
   name          String
   phone         String?
+  landline      String?
   email         String?
   status        LifecycleStatus @default(ACTIVE)
   ghlContactId  String?

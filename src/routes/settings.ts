@@ -131,6 +131,7 @@ settingsRouter.patch(
     const input: RoundSettingsUpdateInput = {
       defaultCycleLength: optCycleLength(body.defaultCycleLength),
       defaultWorkingDays: optWorkingDays(body.defaultWorkingDays, "defaultWorkingDays"),
+      preCleanReminderTimings: optStringArray(body.preCleanReminderTimings, "preCleanReminderTimings"),
     };
     res.json(await svc(req).updateRoundSettings(actorIdOf(req), input));
   })
