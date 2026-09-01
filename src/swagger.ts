@@ -458,6 +458,54 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     },
   },
 
+  ComplaintMessage: {
+    type: "object",
+    description: "A message in a complaint thread.",
+    required: ["id", "direction", "channel", "body", "complaintId", "createdAt"],
+    properties: {
+      id: { type: "string" },
+      direction: { type: "string", enum: ["INBOUND", "OUTBOUND"], example: "OUTBOUND" },
+      channel: { type: "string", enum: ["SMS", "WHATSAPP", "EMAIL"], example: "EMAIL" },
+      body: { type: "string" },
+      complaintId: { type: "string" },
+      createdAt: dateTime,
+    },
+  },
+
+  Complaint: {
+    type: "object",
+    description: "A customer service complaint record.",
+    required: ["id", "status", "severity", "title", "customerId", "customerName", "createdAt"],
+    properties: {
+      id: { type: "string" },
+      status: { type: "string", enum: ["OPEN", "IN_REVIEW", "REVISIT_BOOKED", "RESOLVED"], example: "OPEN" },
+      severity: { type: "string", enum: ["LOW", "MEDIUM", "HIGH"], example: "MEDIUM" },
+      title: { type: "string", example: "Missed conservatory roof" },
+      description: { type: "string", nullable: true },
+      issueType: { type: "string", nullable: true, example: "Missed Clean" },
+      customerId: { type: "string" },
+      customerName: { type: "string", example: "David Harris" },
+      propertyId: { type: "string", nullable: true },
+      technicianId: { type: "string", nullable: true },
+      revisitDate: { type: "string", format: "date", nullable: true, example: "2026-09-10" },
+      createdAt: dateTime,
+    },
+    example: {
+      id: "cmp1abc",
+      status: "OPEN",
+      severity: "MEDIUM",
+      title: "Missed conservatory roof",
+      description: "Second time this month the conservatory roof was not cleaned.",
+      issueType: "Missed Clean",
+      customerId: "cld123",
+      customerName: "David Harris",
+      propertyId: "prp456",
+      technicianId: null,
+      revisitDate: null,
+      createdAt: "2026-09-01T09:14:00.000Z",
+    },
+  },
+
   Visit: {
     type: "object",
     description: "A single ad-hoc (one-off) visit returned from POST /visits.",
@@ -1021,6 +1069,53 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       name: { type: "string", minLength: 1, description: "Display name for the new Profile." },
     },
     example: { name: "James Fisher" },
+  },
+
+  ComplaintCreateInput: {
+    type: "object",
+    required: ["customerId", "title"],
+    properties: {
+      customerId: { type: "string", description: "ID of an existing customer." },
+      title: { type: "string", example: "Missed conservatory roof" },
+      description: { type: "string", nullable: true, example: "Second time this month the conservatory roof was not cleaned." },
+      issueType: { type: "string", nullable: true, example: "Missed Clean" },
+      severity: { type: "string", nullable: true, enum: ["LOW", "MEDIUM", "HIGH"], default: "LOW" },
+      propertyId: { type: "string", nullable: true },
+      technicianId: { type: "string", nullable: true, description: "Must have accepted their invite." },
+    },
+    example: {
+      customerId: "cld123abc",
+      title: "Missed conservatory roof",
+      description: "Second time this month the conservatory roof was not cleaned.",
+      issueType: "Missed Clean",
+      severity: "MEDIUM",
+      propertyId: "prp456def",
+      technicianId: null,
+    },
+  },
+
+  ScheduleRevisitInput: {
+    type: "object",
+    required: ["revisitDate"],
+    properties: {
+      revisitDate: { type: "string", format: "date", description: "Revisit date in YYYY-MM-DD format.", example: "2026-09-10" },
+    },
+  },
+
+  AssignTechnicianInput: {
+    type: "object",
+    required: ["technicianId"],
+    properties: {
+      technicianId: { type: "string", description: "Must have accepted their invite." },
+    },
+  },
+
+  AddMessageInput: {
+    type: "object",
+    required: ["body"],
+    properties: {
+      body: { type: "string", description: "The reply text to send." },
+    },
   },
 
   VisitCreateInput: {
@@ -1977,6 +2072,156 @@ const paths: OpenAPIV3.PathsObject = {
   },
 
   // =====================================================================
+  // Complaints
+  // =====================================================================
+  "/complaints": {
+    get: {
+      tags: ["Complaints"],
+      summary: "List Complaints — return all complaints, newest first",
+      description: "Optional query params: `status` (OPEN|IN_REVIEW|REVISIT_BOOKED|RESOLVED), `search` (title or customer name), `assignedTo=me` (filter to current user's technician). TECHNICIAN role receives 403.",
+      parameters: [
+        { name: "status", in: "query", required: false, schema: { type: "string", enum: ["OPEN", "IN_REVIEW", "REVISIT_BOOKED", "RESOLVED"] } },
+        { name: "search", in: "query", required: false, schema: { type: "string" }, description: "Case-insensitive search on title or customer name." },
+        { name: "assignedTo", in: "query", required: false, schema: { type: "string", enum: ["me"] }, description: "Pass `me` to return only complaints assigned to the calling user's technician record." },
+        { name: "technicianId", in: "query", required: false, schema: { type: "string" }, description: "Filter by specific technician ID. Ignored when `assignedTo=me`." },
+      ],
+      responses: {
+        "200": jsonResponse("Complaint list.", { type: "array", items: ref("Complaint") }),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+    post: {
+      tags: ["Complaints"],
+      summary: "Log Complaint — record a new customer service complaint",
+      description: "Creates a complaint with `status: OPEN`. All customer fields reference an existing customer record by `customerId`. TECHNICIAN role receives 403.",
+      requestBody: jsonBody(ref("ComplaintCreateInput")),
+      responses: {
+        "201": jsonResponse("Complaint created.", ref("Complaint")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/complaints/{id}": {
+    get: {
+      tags: ["Complaints"],
+      summary: "Get Complaint — fetch a single complaint by ID",
+      parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+      responses: {
+        "200": jsonResponse("Complaint detail.", ref("Complaint")),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/complaints/{id}/messages": {
+    get: {
+      tags: ["Complaints"],
+      summary: "List Messages — get the full message thread for a complaint",
+      parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+      responses: {
+        "200": jsonResponse("Message thread.", { type: "array", items: ref("ComplaintMessage") }),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+    post: {
+      tags: ["Complaints"],
+      summary: "Add Message — send an outbound reply on the complaint thread",
+      parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+      requestBody: jsonBody(ref("AddMessageInput")),
+      responses: {
+        "201": jsonResponse("Message created.", ref("ComplaintMessage")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/complaints/{id}/mark-in-review": {
+    post: {
+      tags: ["Complaints"],
+      summary: "Mark In Review — set complaint status to IN_REVIEW",
+      parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+      responses: {
+        "200": jsonResponse("Updated complaint.", ref("Complaint")),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/complaints/{id}/schedule-revisit": {
+    post: {
+      tags: ["Complaints"],
+      summary: "Schedule Revisit — book a revisit date and set status to REVISIT_BOOKED",
+      parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+      requestBody: jsonBody(ref("ScheduleRevisitInput")),
+      responses: {
+        "200": jsonResponse("Updated complaint.", ref("Complaint")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/complaints/{id}/resolve": {
+    post: {
+      tags: ["Complaints"],
+      summary: "Resolve — mark complaint as RESOLVED",
+      parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+      responses: {
+        "200": jsonResponse("Updated complaint.", ref("Complaint")),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/complaints/{id}/reopen": {
+    post: {
+      tags: ["Complaints"],
+      summary: "Reopen — reset a resolved complaint back to OPEN",
+      parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+      responses: {
+        "200": jsonResponse("Updated complaint.", ref("Complaint")),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/complaints/{id}/assign-technician": {
+    post: {
+      tags: ["Complaints"],
+      summary: "Assign Technician — link a technician to a complaint",
+      parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+      requestBody: jsonBody(ref("AssignTechnicianInput")),
+      responses: {
+        "200": jsonResponse("Updated complaint.", ref("Complaint")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  // =====================================================================
   // Visits — one-off (ad-hoc) jobs
   // =====================================================================
   "/visits": {
@@ -2050,6 +2295,7 @@ export const openApiDocument: OpenAPIV3.Document = {
     { name: "Customers", description: "M2 — customer/property list + aggregate detail (Screens 14/15). Reads: any role; mutations: ADMIN/MANAGER." },
     { name: "Properties", description: "M2 — property create/update, pause/resume, notes (Add Property, M9, M20)." },
     { name: "Visits", description: "One-off (ad-hoc) visit creation. Reads: any role; mutations: ADMIN/MANAGER." },
+    { name: "Complaints", description: "Customer service complaint queue — log, review, schedule revisits, resolve, reopen. All mutations: ADMIN/MANAGER only." },
   ],
   // Global default: all operations require the Bearer token unless they
   // override with `security: []` (e.g. /health).

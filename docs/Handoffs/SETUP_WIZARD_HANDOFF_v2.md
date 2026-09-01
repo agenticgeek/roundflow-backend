@@ -102,7 +102,7 @@ Examples throughout use the raw-array form.
 - **`DayOfWeek`** (steps 1/4 `defaultWorkingDays`, step 8 `defaultDay`):
   `MON` · `TUE` · `WED` · `THU` · `FRI` · `SAT` · `SUN`
 - **`CleaningFrequency`** (step 8 `frequency`, step 9 `cleaningFrequency`):
-  `FORTNIGHTLY` · `FOUR_WEEKLY` · `SIX_WEEKLY` · `EIGHT_WEEKLY` · `MONTHLY`
+  `FOUR_WEEKLY` · `SIX_WEEKLY` · `EIGHT_WEEKLY` · `TWELVE_WEEKLY`
 - **`PaymentTiming`** (step 2 `paymentRule`):
   `COLLECT_AFTER_VISIT` · `COLLECT_BEFORE_VISIT` · `COLLECT_ON_DATE`
 - **`PropertyType`** (step 9 `propertyType`, optional):
@@ -655,8 +655,9 @@ For each property in each included round:
 3. Loop stops when the next visit date exceeds `startDate + cycleWeeks * 7 days`.
 4. Properties with no active service plan are silently skipped.
 
-**`MONTHLY` note:** Approximated as 4 weeks (28 days). Generates 13 visits/year
-instead of 12. Calendar-month accuracy is a future milestone.
+**Frequency → interval:** `FOUR_WEEKLY` = 28 days, `SIX_WEEKLY` = 42, `EIGHT_WEEKLY` = 56,
+`TWELVE_WEEKLY` = 84. All intervals are exact multiples of 7 days, so a visit always
+falls on the round's `defaultDay`. Calendar-month scheduling is not supported.
 
 **Errors:**
 - `400` if `startDate` missing/invalid, `startDate` is in the past, `cycleWeeks` out of range, `generateAll: false` with missing/empty `roundIds`

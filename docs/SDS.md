@@ -508,11 +508,12 @@ if roundB found:                                   // Case A (FR-FREQ-3)
 
 else:                                              // Case B (FR-FREQ-4)
     freqLabel = human-readable label for F_B
-                (FORTNIGHTLY→"Fortnightly", FOUR_WEEKLY→"Four Weekly",
-                 SIX_WEEKLY→"Six Weekly", EIGHT_WEEKLY→"Eight Weekly", MONTHLY→"Monthly")
+                (FOUR_WEEKLY→"Four Weekly", SIX_WEEKLY→"Six Weekly",
+                 EIGHT_WEEKLY→"Eight Weekly", TWELVE_WEEKLY→"Twelve Weekly")
+                // implemented as FREQUENCY_LABELS in customer.service.ts
     create roundB:
         name          = "<Round A name> (<freqLabel>)"
-                        e.g. "North London (Fortnightly)"
+                        e.g. "North London (Twelve Weekly)"
         defaultDay    = Round A.defaultDay
         serviceAreaId = Round A.serviceAreaId
         status        = ACTIVE
