@@ -29,9 +29,9 @@ import type { OpenAPIV3 } from "openapi-types";
 // The anon key is the PUBLIC (publishable) key — safe to expose, NOT a secret.
 // ---------------------------------------------------------------------------
 
-const SUPABASE_URL = "https://cixtfdnuwbmxvilkvihv.supabase.co";
+const SUPABASE_URL = "https://suspoztkyfnnuyodbxov.supabase.co";
 const SUPABASE_ANON_KEY =
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNpeHRmZG51d2JteHZpbGt2aWh2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI5MzMwMjIsImV4cCI6MjA5ODUwOTAyMn0.c4q7N-ys7BlCdEgC1TKWXRl6bdpSUNirdIxTz8XqJN4";
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN1c3BvenRreWZubnV5b2RieG92Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcwNzkwODEsImV4cCI6MjEwMjY1NTA4MX0.cQsgFPWRXpITMwIvy7gi2zdfnLaV-jwzJAZY1iNi25k";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -175,6 +175,19 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     },
   },
 
+  BankDetails: {
+    type: "object",
+    description: "Bank transfer payment details printed in the invoice footer.",
+    required: ["accountName", "accountNumber", "sortCode"],
+    properties: {
+      accountName: { type: "string", minLength: 1, example: "Northumberland Window Cleaning Ltd" },
+      bankName: { type: "string", nullable: true, example: "Lloyds Bank" },
+      accountNumber: { type: "string", minLength: 1, example: "12345678" },
+      sortCode: { type: "string", minLength: 1, example: "30-80-12" },
+    },
+    example: { accountName: "Northumberland Window Cleaning Ltd", bankName: "Lloyds Bank", accountNumber: "12345678", sortCode: "30-80-12" },
+  },
+
   BusinessSettings: {
     type: "object",
     description: "The single business config row (Phase 1 is single-tenant).",
@@ -195,7 +208,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
         nullable: true,
         description: "Cycle length in days.",
       },
-      bankDetails: { type: "object", nullable: true, additionalProperties: true },
+      bankDetails: { ...nullableRef("BankDetails"), description: "Printed in the invoice footer for bank transfer customers." },
       paymentRule: nullableRef("PaymentTiming"),
       debtHoldEnabled: { type: "boolean" },
       vatInInvoices: { type: "boolean" },
@@ -551,6 +564,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       defaultWorkingDays: { type: "array", items: { type: "string", enum: ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"] } },
       timezone: { type: "string" },
       currency: { type: "string" },
+      bankDetails: { ...nullableRef("BankDetails"), description: "Pass null to clear. Omit to leave unchanged." },
     },
     example: {
       businessName: "Acme Window Co",
@@ -666,6 +680,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       timezone: { type: "string", nullable: true },
       currency: { type: "string", nullable: true },
       defaultWorkingDays: { type: "array", items: { type: "string", enum: ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"] } },
+      bankDetails: { ...nullableRef("BankDetails"), description: "Pass null to clear. Omit to leave unchanged." },
     },
     example: { businessName: "Northumberland Window Cleaning", currency: "GBP" },
   },
@@ -674,7 +689,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     type: "object",
     description: "Partial update — round-settings fields only.",
     properties: {
-      defaultCycleLength: { type: "integer", nullable: true, description: "Cycle length in days." },
+      defaultCycleLength: { type: "integer", nullable: true, minimum: 1, maximum: 365, description: "Cycle length in days." },
       defaultWorkingDays: { type: "array", items: { type: "string", enum: ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"] } },
       preCleanReminderTimings: {
         type: "array",
@@ -942,7 +957,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       postcode: { type: "string", minLength: 1 },
       propertyName: { type: "string", nullable: true },
       propertyType: { type: "string", nullable: true, enum: ["HOUSE", "FLAT_APARTMENT", "COMMERCIAL", "OFFICE", "CONSERVATORY", null] },
-      serviceAreaId: { type: "string", description: "Required. Must exist (404 if not)." },
+      serviceAreaId: { type: "string", minLength: 1, description: "Required. Must exist (404 if not)." },
       serviceId: { type: "string", nullable: true },
       price: { type: "number", description: "Positive number.", minimum: 0, exclusiveMinimum: true, maximum: 9999.99 },
       cleanMethod: { type: "string", nullable: true },
@@ -952,7 +967,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       riskNotes: { type: "string", nullable: true },
       roundId: { type: "string", nullable: true, description: "null = Save & Assign Later (unassigned); an id must exist (404 if not)." },
     },
-    example: { customerName: "John Smith", addressLine: "12 Market Street", postcode: "NE66 1SS", price: 35, cleanMethod: "Water Fed Pole", paymentMethod: "GOCARDLESS", roundId: null },
+    example: { customerName: "John Smith", addressLine: "12 Market Street", postcode: "NE66 1SS", price: 35, serviceAreaId: "csa_example", cleanMethod: "Water Fed Pole", paymentMethod: "GOCARDLESS", roundId: null },
   },
   PropertyUpdateInput: {
     type: "object",
@@ -1075,8 +1090,8 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     type: "object",
     required: ["customerId", "title"],
     properties: {
-      customerId: { type: "string", description: "ID of an existing customer." },
-      title: { type: "string", example: "Missed conservatory roof" },
+      customerId: { type: "string", minLength: 1, description: "ID of an existing customer." },
+      title: { type: "string", minLength: 1, example: "Missed conservatory roof" },
       description: { type: "string", nullable: true, example: "Second time this month the conservatory roof was not cleaned." },
       issueType: { type: "string", nullable: true, example: "Missed Clean" },
       severity: { type: "string", nullable: true, enum: ["LOW", "MEDIUM", "HIGH"], default: "LOW" },
@@ -1106,7 +1121,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     type: "object",
     required: ["technicianId"],
     properties: {
-      technicianId: { type: "string", description: "Must have accepted their invite." },
+      technicianId: { type: "string", minLength: 1, description: "Must have accepted their invite." },
     },
   },
 
@@ -1114,7 +1129,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     type: "object",
     required: ["body"],
     properties: {
-      body: { type: "string", description: "The reply text to send." },
+      body: { type: "string", minLength: 1, description: "The reply text to send." },
     },
   },
 
@@ -1122,7 +1137,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     type: "object",
     required: ["propertyId", "date", "price"],
     properties: {
-      propertyId: { type: "string", description: "ID of an existing property." },
+      propertyId: { type: "string", minLength: 1, description: "ID of an existing property." },
       date: { type: "string", format: "date", description: "Visit date in YYYY-MM-DD format. Stored as midnight UTC.", example: "2026-09-03" },
       price: { type: "number", minimum: 0.01, maximum: 9999.99, example: 45 },
       serviceId: { type: "string", nullable: true, description: "Must be an active service. null = no service attached." },
@@ -1245,6 +1260,7 @@ const paths: OpenAPIV3.PathsObject = {
           additionalProperties: true,
           example: { code: 400, msg: "Invalid login credentials" },
         }),
+        "401": jsonResponse("Missing or invalid `apikey` header.", { type: "object", additionalProperties: true, example: { message: "No API key found in request" } }),
         "405": { description: "Method Not Allowed (our backend intercepts this path; use Swagger UI 'Try it out' to log in)." },
       },
     },
@@ -2087,6 +2103,7 @@ const paths: OpenAPIV3.PathsObject = {
       ],
       responses: {
         "200": jsonResponse("Complaint list.", { type: "array", items: ref("Complaint") }),
+        "400": ERR[400],
         "401": ERR[401],
         "403": ERR[403],
       },

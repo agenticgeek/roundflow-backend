@@ -77,6 +77,24 @@ setupRouter.post(
     await svc(req).assertSetupIncomplete(profileId);
     const body = asObject(req.body);
     requireString(body.businessName, "businessName");
+    let bankDetails: BusinessProfileInput["bankDetails"] = undefined;
+    if (body.bankDetails !== undefined) {
+      if (body.bankDetails === null) {
+        bankDetails = null;
+      } else if (typeof body.bankDetails !== "object" || Array.isArray(body.bankDetails)) {
+        throw new AppError(400, '"bankDetails" must be an object or null');
+      } else {
+        const b = body.bankDetails as Record<string, unknown>;
+        const accountName = requireString(b.accountName, "bankDetails.accountName").trim();
+        if (!accountName) throw new AppError(400, '"bankDetails.accountName" must not be blank');
+        const accountNumber = requireString(b.accountNumber, "bankDetails.accountNumber").trim();
+        if (!accountNumber) throw new AppError(400, '"bankDetails.accountNumber" must not be blank');
+        const sortCode = requireString(b.sortCode, "bankDetails.sortCode").trim();
+        if (!sortCode) throw new AppError(400, '"bankDetails.sortCode" must not be blank');
+        const bankName = typeof b.bankName === "string" ? b.bankName : null;
+        bankDetails = { accountName, bankName, accountNumber, sortCode };
+      }
+    }
     const input: BusinessProfileInput = {
       businessName: body.businessName as string,
       phone: body.phone as string | undefined,
@@ -90,6 +108,7 @@ setupRouter.post(
         : undefined,
       timezone: body.timezone as string | undefined,
       currency: body.currency as string | undefined,
+      bankDetails,
     };
     res.json(await svc(req).saveBusinessProfile(profileId, input));
   })

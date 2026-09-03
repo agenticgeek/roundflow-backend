@@ -44,6 +44,9 @@ complaintsRouter.get(
       search: typeof req.query.search === "string" ? req.query.search : undefined,
     };
 
+    if (req.query.assignedTo !== undefined && req.query.assignedTo !== "me") {
+      throw new AppError(400, `"assignedTo" must be "me" when provided`);
+    }
     if (req.query.assignedTo === "me") {
       const tech = await req.tenantPrisma!.technician.findFirst({
         where: { profileId: req.profile!.id },

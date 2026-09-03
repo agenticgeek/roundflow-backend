@@ -7,6 +7,7 @@ import type {
   MessageTemplate,
 } from "../generated/tenant-client";
 import type { Profile } from "@prisma/client";
+import { Prisma as TenantPrisma } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 
@@ -19,6 +20,13 @@ import { AppError } from "../lib/app-error";
 // SetupService — same discipline (profileId-first, singleton seam, thin routes)
 // but no `assertSetupIncomplete` guard: Settings is always open.
 
+export interface BankDetails {
+  accountName: string;
+  bankName?: string | null;
+  accountNumber: string;
+  sortCode: string;
+}
+
 export interface BusinessProfileUpdateInput {
   businessName?: string | null;
   phone?: string | null;
@@ -29,6 +37,7 @@ export interface BusinessProfileUpdateInput {
   timezone?: string | null;
   currency?: string | null;
   defaultWorkingDays?: string[];
+  bankDetails?: BankDetails | null;
 }
 
 export interface RoundSettingsUpdateInput {
@@ -247,6 +256,7 @@ type SettingsWritable = {
   gocardlessConnected?: boolean;
   stripeConnected?: boolean;
   preCleanReminderTimings?: string[];
+  bankDetails?: TenantPrisma.InputJsonValue | typeof TenantPrisma.JsonNull;
 };
 
 // ---------------------------------------------------------------------------
@@ -308,6 +318,12 @@ class SettingsService implements ISettingsService {
       timezone: input.timezone,
       currency: input.currency,
       defaultWorkingDays: input.defaultWorkingDays,
+      bankDetails:
+        input.bankDetails === undefined
+          ? undefined
+          : input.bankDetails === null
+          ? TenantPrisma.JsonNull
+          : (input.bankDetails as unknown as TenantPrisma.InputJsonValue),
     });
   }
 
@@ -451,7 +467,7 @@ class SettingsService implements ISettingsService {
     if (!existing) throw new AppError(404, "Service area not found");
     const [roundRefs, propertyRefs, techRefs] = await Promise.all([
       this.prisma.round.count({ where: { serviceAreaId: id } }),
-      this.prisma.property.count({ where: { serviceAreaId: id, status: LifecycleStatus.ACTIVE } }),
+      this.prisma.property.count({ where: { serviceAreaId: id } }),
       this.prisma.technicianServiceArea.count({ where: { serviceAreaId: id } }),
     ]);
     if (roundRefs > 0 || propertyRefs > 0 || techRefs > 0) {
