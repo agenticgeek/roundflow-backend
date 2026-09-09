@@ -110,7 +110,7 @@ Two locked assignment rules run through the scheduling milestones (see
 - [ ] **[BE-M3-05]** Multi-tech allocation — set `Visit.technicianId` per job for an occurrence (manual division, SRS FR-ROUND-9). `labels: backend, rounds`
 - [ ] **[BE-M3-06]** Upcoming Property Recurrences — list unassigned upcoming occurrences + per-row assign (M14). `labels: backend, rounds`
 - [ ] **[BE-M3-07]** Add properties to an existing round (Add Round step 3 / Screen 31). `labels: backend, rounds`
-- [ ] **[BE-M3-08]** One-off job — create a standalone `Visit` (`isOneOff`) not tied to a plan (M2). `labels: backend, visits`
+- [x] **[BE-M3-08]** One-off job — `POST /visits` creates a standalone `Visit` (`isOneOff: true`, `servicePlanId: null`, `status: SCHEDULED`); validates property/service/technician/round existence; rejects technicians with pending invites; activity-logged; documented in Swagger. `labels: backend, visits`
 
 ### Definition of Done
 - Cron generates visits on cadence with each new occurrence **unassigned**; admin can create rounds, assign one or multiple technicians **per occurrence** manually, add properties to a round, and clear the "upcoming recurrences" queue. Verifies FR-ROUND-9/10 end-to-end.

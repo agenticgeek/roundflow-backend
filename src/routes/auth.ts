@@ -45,6 +45,10 @@ authRouter.post(
   h(async (req, res) => {
     const supabaseUserId = req.user!.supabaseUserId;
 
+    const body = req.body as Record<string, unknown>;
+    const name = requireString(body.name, "name").trim();
+    if (!name) throw new AppError(400, "name must not be blank");
+
     const existing = await prisma.profile.findUnique({
       where: { supabaseUserId },
       include: { tenant: true },
@@ -56,10 +60,6 @@ authRouter.post(
       await provisionTenantSchema(existing.tenant.schemaName);
       return res.json({ profile: existing, tenantId: existing.tenantId });
     }
-
-    const body = req.body as Record<string, unknown>;
-    const name = requireString(body.name, "name").trim();
-    if (!name) throw new AppError(400, "name must not be blank");
 
     // optString so Google OAuth callers can omit companyName.
     // Unused until tenant schema provisioning is implemented.

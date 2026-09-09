@@ -3,6 +3,7 @@ import express, { NextFunction, Request, Response } from "express";
 import cors from "cors";
 import swaggerUi from "swagger-ui-express";
 import { AppError } from "./lib/app-error";
+import { Prisma } from "@prisma/client";
 import { authRouter } from "./routes/auth";
 import { invitesRouter } from "./routes/invites";
 import { setupRouter } from "./routes/setup";
@@ -15,6 +16,8 @@ import { techniciansRouter } from "./routes/technicians";
 import { invoicesRouter } from "./routes/invoices";
 import { debtRouter } from "./routes/debt";
 import { reportsRouter } from "./routes/reports";
+import { visitsRouter } from "./routes/visits";
+import { complaintsRouter } from "./routes/complaints";
 import { openApiDocument } from "./swagger";
 import { migrateAllTenantSchemas } from "./lib/tenant-provisioning";
 
@@ -35,13 +38,49 @@ const app = express();
 app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 app.use(express.json());
 
-// Reject TRACE globally before any router runs. Without this, TRACE hits auth
-// middleware first and returns 401 instead of 405 on protected routes.
-// RFC 9110 §15.5.6 requires the Allow header on 405 responses.
+// ── Method guards ────────────────────────────────────────────────────────────
+// Two layers so auth middleware never sees a request with an unsupported method:
+//
+//  1. Global: block every non-standard method (TRACE, QUERY, PROPFIND, …) that
+//     isn't even in the HTTP spec we support. RFC 9110 §15.5.6 requires Allow.
+//  2. Per-path: for standard methods that are valid globally but not defined on
+//     a specific path (e.g. PUT /complaints), derive the allow-list from the
+//     OpenAPI spec and return 405 before auth middleware can respond with 401.
+
 const ALLOWED_METHODS = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD";
+const ALLOWED_METHODS_SET = new Set(ALLOWED_METHODS.split(", "));
+
+// Layer 1 — unknown/non-standard methods
 app.use((req: Request, res: Response, next: NextFunction) => {
-  if (req.method === "TRACE") {
+  if (!ALLOWED_METHODS_SET.has(req.method)) {
     res.set("Allow", ALLOWED_METHODS);
+    return res.status(405).json({ error: "Method Not Allowed" });
+  }
+  next();
+});
+
+// Layer 2 — valid method but not defined for this specific path.
+// Build a sorted map from the OpenAPI spec (most-specific paths first so
+// /complaints/{id}/messages is checked before /complaints/{id}).
+const HTTP_METHODS = new Set(["get", "post", "put", "patch", "delete", "head", "options"]);
+const pathMethodMap: Array<{ pattern: RegExp; allow: string }> = Object.entries(
+  (openApiDocument.paths ?? {}) as Record<string, Record<string, unknown>>
+)
+  .filter(([p]) => !p.startsWith("/auth/v1/")) // Supabase-hosted, not our server
+  .sort(([a], [b]) => b.split("/").length - a.split("/").length) // deeper paths first
+  .map(([path, item]) => {
+    const methods = Object.keys(item)
+      .filter((k) => HTTP_METHODS.has(k))
+      .map((m) => m.toUpperCase());
+    // OpenAPI {param} → regex segment
+    const pattern = new RegExp("^" + path.replace(/\{[^}]+\}/g, "[^/]+") + "$");
+    return { pattern, allow: methods.join(", ") };
+  });
+
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const entry = pathMethodMap.find(({ pattern }) => pattern.test(req.path));
+  if (entry && !entry.allow.split(", ").includes(req.method)) {
+    res.set("Allow", entry.allow);
     return res.status(405).json({ error: "Method Not Allowed" });
   }
   next();
@@ -63,6 +102,8 @@ app.use("/technicians", techniciansRouter);
 app.use("/invoices", invoicesRouter);
 app.use("/debt", debtRouter);
 app.use("/reports", reportsRouter);
+app.use("/visits", visitsRouter);
+app.use("/complaints", complaintsRouter);
 
 // API docs (public) — interactive UI at /docs, raw spec at /openapi.json.
 app.get("/openapi.json", (_req: Request, res: Response) => {
@@ -88,6 +129,11 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   // rejection). The middleware sets err.status=400 and err.body on the thrown SyntaxError.
   if (err instanceof SyntaxError && (err as unknown as Record<string, unknown>).status === 400) {
     return res.status(400).json({ error: "Invalid JSON in request body." });
+  }
+  // Prisma FK constraint violation — a referenced record still exists. Map to 409
+  // so callers know the operation is blocked by a dependency, not a server bug.
+  if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2003") {
+    return res.status(409).json({ error: "Cannot delete: record is referenced by other data." });
   }
   console.error(err);
   res.status(500).json({ error: "Internal Server Error" });

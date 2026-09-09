@@ -21,6 +21,7 @@ import type {
   RoundTechnician,
 } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
+import { Prisma as TenantPrisma } from "../generated/tenant-client";
 import { AppError } from "../lib/app-error";
 
 // ---------------------------------------------------------------------------
@@ -49,6 +50,7 @@ export interface BusinessProfileInput {
   defaultWorkingDays?: string[];
   timezone?: string | null;
   currency?: string | null;
+  bankDetails?: { accountName: string; bankName?: string | null; accountNumber: string; sortCode: string } | null;
 }
 
 export interface RoundSettingsInput {
@@ -364,6 +366,12 @@ class SetupService implements ISetupService {
     _profileId: string,
     input: BusinessProfileInput
   ): Promise<BusinessSettings> {
+    const bankDetails =
+      input.bankDetails === undefined
+        ? undefined
+        : input.bankDetails === null
+        ? TenantPrisma.JsonNull
+        : (input.bankDetails as unknown as TenantPrisma.InputJsonValue);
     const data = {
       businessName: input.businessName,
       phone: input.phone,
@@ -374,6 +382,7 @@ class SetupService implements ISetupService {
       defaultWorkingDays: input.defaultWorkingDays,
       timezone: input.timezone,
       currency: input.currency,
+      bankDetails,
     };
     return this.prisma.businessSettings.upsert({
       where: { uniqueId: "singleton" },
@@ -949,14 +958,10 @@ function nextOccurrenceOfDay(from: Date, day: DayOfWeek): Date {
 
 function frequencyToWeeks(freq: CleaningFrequency): number {
   switch (freq) {
-    case CleaningFrequency.FORTNIGHTLY:   return 2;
     case CleaningFrequency.FOUR_WEEKLY:   return 4;
     case CleaningFrequency.SIX_WEEKLY:    return 6;
     case CleaningFrequency.EIGHT_WEEKLY:  return 8;
-    // L-2: MONTHLY is approximated as 4 weeks (28 days). This generates 13
-    // visits/year instead of 12. Use calendar-month arithmetic if exact billing
-    // cycles are required in a future milestone.
-    case CleaningFrequency.MONTHLY:       return 4;
+    case CleaningFrequency.TWELVE_WEEKLY: return 12;
   }
 }
 

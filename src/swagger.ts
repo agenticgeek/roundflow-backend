@@ -29,9 +29,9 @@ import type { OpenAPIV3 } from "openapi-types";
 // The anon key is the PUBLIC (publishable) key — safe to expose, NOT a secret.
 // ---------------------------------------------------------------------------
 
-const SUPABASE_URL = "https://cixtfdnuwbmxvilkvihv.supabase.co";
+const SUPABASE_URL = "https://suspoztkyfnnuyodbxov.supabase.co";
 const SUPABASE_ANON_KEY =
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNpeHRmZG51d2JteHZpbGt2aWh2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI5MzMwMjIsImV4cCI6MjA5ODUwOTAyMn0.c4q7N-ys7BlCdEgC1TKWXRl6bdpSUNirdIxTz8XqJN4";
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN1c3BvenRreWZubnV5b2RieG92Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcwNzkwODEsImV4cCI6MjEwMjY1NTA4MX0.cQsgFPWRXpITMwIvy7gi2zdfnLaV-jwzJAZY1iNi25k";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -108,11 +108,10 @@ const enumSchemas: Record<string, OpenAPIV3.SchemaObject> = {
   RoundStatus: stringEnum(["ACTIVE", "DRAFT", "ARCHIVED"]),
   DayOfWeek: stringEnum(["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]),
   CleaningFrequency: stringEnum([
-    "FORTNIGHTLY",
     "FOUR_WEEKLY",
     "SIX_WEEKLY",
     "EIGHT_WEEKLY",
-    "MONTHLY",
+    "TWELVE_WEEKLY",
   ]),
   VisitStatus: stringEnum(["SCHEDULED", "IN_PROGRESS", "COMPLETED", "SKIPPED"]),
   PaymentStatus: stringEnum(["NOT_DUE", "PENDING", "PAID", "FAILED", "OVERDUE"]),
@@ -176,6 +175,19 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     },
   },
 
+  BankDetails: {
+    type: "object",
+    description: "Bank transfer payment details printed in the invoice footer.",
+    required: ["accountName", "accountNumber", "sortCode"],
+    properties: {
+      accountName: { type: "string", minLength: 1, example: "Northumberland Window Cleaning Ltd" },
+      bankName: { type: "string", nullable: true, example: "Lloyds Bank" },
+      accountNumber: { type: "string", minLength: 1, example: "12345678" },
+      sortCode: { type: "string", minLength: 1, example: "30-80-12" },
+    },
+    example: { accountName: "Northumberland Window Cleaning Ltd", bankName: "Lloyds Bank", accountNumber: "12345678", sortCode: "30-80-12" },
+  },
+
   BusinessSettings: {
     type: "object",
     description: "The single business config row (Phase 1 is single-tenant).",
@@ -196,7 +208,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
         nullable: true,
         description: "Cycle length in days.",
       },
-      bankDetails: { type: "object", nullable: true, additionalProperties: true },
+      bankDetails: { ...nullableRef("BankDetails"), description: "Printed in the invoice footer for bank transfer customers." },
       paymentRule: nullableRef("PaymentTiming"),
       debtHoldEnabled: { type: "boolean" },
       vatInInvoices: { type: "boolean" },
@@ -458,6 +470,80 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       },
     },
   },
+
+  ComplaintMessage: {
+    type: "object",
+    description: "A message in a complaint thread.",
+    required: ["id", "direction", "channel", "body", "complaintId", "createdAt"],
+    properties: {
+      id: { type: "string" },
+      direction: { type: "string", enum: ["INBOUND", "OUTBOUND"], example: "OUTBOUND" },
+      channel: { type: "string", enum: ["SMS", "WHATSAPP", "EMAIL"], example: "EMAIL" },
+      body: { type: "string" },
+      complaintId: { type: "string" },
+      createdAt: dateTime,
+    },
+  },
+
+  Complaint: {
+    type: "object",
+    description: "A customer service complaint record.",
+    required: ["id", "status", "severity", "title", "customerId", "customerName", "createdAt"],
+    properties: {
+      id: { type: "string" },
+      status: { type: "string", enum: ["OPEN", "IN_REVIEW", "REVISIT_BOOKED", "RESOLVED"], example: "OPEN" },
+      severity: { type: "string", enum: ["LOW", "MEDIUM", "HIGH"], example: "MEDIUM" },
+      title: { type: "string", example: "Missed conservatory roof" },
+      description: { type: "string", nullable: true },
+      issueType: { type: "string", nullable: true, example: "Missed Clean" },
+      customerId: { type: "string" },
+      customerName: { type: "string", example: "David Harris" },
+      propertyId: { type: "string", nullable: true },
+      technicianId: { type: "string", nullable: true },
+      revisitDate: { type: "string", format: "date", nullable: true, example: "2026-09-10" },
+      createdAt: dateTime,
+    },
+    example: {
+      id: "cmp1abc",
+      status: "OPEN",
+      severity: "MEDIUM",
+      title: "Missed conservatory roof",
+      description: "Second time this month the conservatory roof was not cleaned.",
+      issueType: "Missed Clean",
+      customerId: "cld123",
+      customerName: "David Harris",
+      propertyId: "prp456",
+      technicianId: null,
+      revisitDate: null,
+      createdAt: "2026-09-01T09:14:00.000Z",
+    },
+  },
+
+  Visit: {
+    type: "object",
+    description: "A single ad-hoc (one-off) visit returned from POST /visits.",
+    required: ["id", "date", "status", "isOneOff", "price", "propertyId", "addressLine", "postcode", "customerId", "customerName"],
+    properties: {
+      id: { type: "string" },
+      date: { type: "string", format: "date", example: "2026-09-03" },
+      status: { type: "string", enum: ["SCHEDULED", "COMPLETED", "SKIPPED"], example: "SCHEDULED" },
+      isOneOff: { type: "boolean", example: true },
+      price: { type: "number", example: 45 },
+      notes: { type: "string", nullable: true },
+      paymentMethod: { type: "string", nullable: true, enum: ["GOCARDLESS", "STRIPE", "CASH", "BACS", "CHEQUE"] },
+      propertyId: { type: "string" },
+      addressLine: { type: "string", example: "12 Market Street" },
+      postcode: { type: "string", example: "NE66 1SS" },
+      customerId: { type: "string" },
+      customerName: { type: "string", example: "John Smith" },
+      roundId: { type: "string", nullable: true },
+      roundName: { type: "string", nullable: true },
+      serviceId: { type: "string", nullable: true },
+      serviceName: { type: "string", nullable: true },
+      technicianId: { type: "string", nullable: true },
+      technicianName: { type: "string", nullable: true },
+    },
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -478,6 +564,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       defaultWorkingDays: { type: "array", items: { type: "string", enum: ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"] } },
       timezone: { type: "string" },
       currency: { type: "string" },
+      bankDetails: { ...nullableRef("BankDetails"), description: "Pass null to clear. Omit to leave unchanged." },
     },
     example: {
       businessName: "Acme Window Co",
@@ -593,6 +680,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       timezone: { type: "string", nullable: true },
       currency: { type: "string", nullable: true },
       defaultWorkingDays: { type: "array", items: { type: "string", enum: ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"] } },
+      bankDetails: { ...nullableRef("BankDetails"), description: "Pass null to clear. Omit to leave unchanged." },
     },
     example: { businessName: "Northumberland Window Cleaning", currency: "GBP" },
   },
@@ -601,10 +689,16 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     type: "object",
     description: "Partial update — round-settings fields only.",
     properties: {
-      defaultCycleLength: { type: "integer", nullable: true, description: "Cycle length in days." },
+      defaultCycleLength: { type: "integer", nullable: true, minimum: 1, maximum: 365, description: "Cycle length in days." },
       defaultWorkingDays: { type: "array", items: { type: "string", enum: ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"] } },
+      preCleanReminderTimings: {
+        type: "array",
+        items: { type: "string", enum: ["EVENING_BEFORE", "TWO_HOURS_BEFORE"] },
+        maxItems: 2,
+        description: "Up to two reminder timings. Omit to leave unchanged.",
+      },
     },
-    example: { defaultCycleLength: 28 },
+    example: { defaultCycleLength: 28, preCleanReminderTimings: ["EVENING_BEFORE", "TWO_HOURS_BEFORE"] },
   },
 
   ServiceCreateInput: {
@@ -857,12 +951,13 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     properties: {
       customerName: { type: "string", minLength: 1 },
       phone: { type: "string", nullable: true },
+      landline: { type: "string", nullable: true },
       email: { type: "string", nullable: true },
       addressLine: { type: "string", minLength: 1 },
       postcode: { type: "string", minLength: 1 },
       propertyName: { type: "string", nullable: true },
       propertyType: { type: "string", nullable: true, enum: ["HOUSE", "FLAT_APARTMENT", "COMMERCIAL", "OFFICE", "CONSERVATORY", null] },
-      serviceAreaId: { type: "string", description: "Required. Must exist (404 if not)." },
+      serviceAreaId: { type: "string", minLength: 1, description: "Required. Must exist (404 if not)." },
       serviceId: { type: "string", nullable: true },
       price: { type: "number", description: "Positive number.", minimum: 0, exclusiveMinimum: true, maximum: 9999.99 },
       cleanMethod: { type: "string", nullable: true },
@@ -872,7 +967,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       riskNotes: { type: "string", nullable: true },
       roundId: { type: "string", nullable: true, description: "null = Save & Assign Later (unassigned); an id must exist (404 if not)." },
     },
-    example: { customerName: "John Smith", addressLine: "12 Market Street", postcode: "NE66 1SS", price: 35, cleanMethod: "Water Fed Pole", paymentMethod: "GOCARDLESS", roundId: null },
+    example: { customerName: "John Smith", addressLine: "12 Market Street", postcode: "NE66 1SS", price: 35, serviceAreaId: "csa_example", cleanMethod: "Water Fed Pole", paymentMethod: "GOCARDLESS", roundId: null },
   },
   PropertyUpdateInput: {
     type: "object",
@@ -894,6 +989,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     properties: {
       name: { type: "string", minLength: 1 },
       phone: { type: "string", nullable: true },
+      landline: { type: "string", nullable: true },
       email: { type: "string", nullable: true },
       addressLine: { type: "string", minLength: 1 },
       postcode: { type: "string", minLength: 1 },
@@ -988,6 +1084,82 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       name: { type: "string", minLength: 1, description: "Display name for the new Profile." },
     },
     example: { name: "James Fisher" },
+  },
+
+  ComplaintCreateInput: {
+    type: "object",
+    required: ["customerId", "title"],
+    properties: {
+      customerId: { type: "string", minLength: 1, description: "ID of an existing customer." },
+      title: { type: "string", minLength: 1, example: "Missed conservatory roof" },
+      description: { type: "string", nullable: true, example: "Second time this month the conservatory roof was not cleaned." },
+      issueType: { type: "string", nullable: true, example: "Missed Clean" },
+      severity: { type: "string", nullable: true, enum: ["LOW", "MEDIUM", "HIGH"], default: "LOW" },
+      propertyId: { type: "string", nullable: true },
+      technicianId: { type: "string", nullable: true, description: "Must have accepted their invite." },
+    },
+    example: {
+      customerId: "cld123abc",
+      title: "Missed conservatory roof",
+      description: "Second time this month the conservatory roof was not cleaned.",
+      issueType: "Missed Clean",
+      severity: "MEDIUM",
+      propertyId: "prp456def",
+      technicianId: null,
+    },
+  },
+
+  ScheduleRevisitInput: {
+    type: "object",
+    required: ["revisitDate"],
+    properties: {
+      revisitDate: { type: "string", format: "date", description: "Revisit date in YYYY-MM-DD format.", example: "2026-09-10" },
+    },
+  },
+
+  AssignTechnicianInput: {
+    type: "object",
+    required: ["technicianId"],
+    properties: {
+      technicianId: { type: "string", minLength: 1, description: "Must have accepted their invite." },
+    },
+  },
+
+  AddMessageInput: {
+    type: "object",
+    required: ["body"],
+    properties: {
+      body: { type: "string", minLength: 1, description: "The reply text to send." },
+    },
+  },
+
+  VisitCreateInput: {
+    type: "object",
+    required: ["propertyId", "date", "price"],
+    properties: {
+      propertyId: { type: "string", minLength: 1, description: "ID of an existing property." },
+      date: { type: "string", format: "date", description: "Visit date in YYYY-MM-DD format. Stored as midnight UTC.", example: "2026-09-03" },
+      price: { type: "number", minimum: 0.01, maximum: 9999.99, example: 45 },
+      serviceId: { type: "string", nullable: true, description: "Must be an active service. null = no service attached." },
+      technicianId: { type: "string", nullable: true },
+      roundId: { type: "string", nullable: true, description: "Attach to a round so the visit appears in the Round Planner. null = Today only." },
+      notes: { type: "string", nullable: true, example: "One-off gutter clean — customer rang in" },
+      paymentMethod: {
+        type: "string",
+        nullable: true,
+        enum: ["GOCARDLESS", "STRIPE", "CASH", "BACS", "CHEQUE"],
+      },
+    },
+    example: {
+      propertyId: "cle123abc",
+      date: "2026-09-03",
+      price: 45,
+      serviceId: "csv456def",
+      technicianId: "ctn789ghi",
+      roundId: null,
+      notes: "One-off gutter clean — customer rang in",
+      paymentMethod: "CASH",
+    },
   },
 };
 
@@ -1088,6 +1260,7 @@ const paths: OpenAPIV3.PathsObject = {
           additionalProperties: true,
           example: { code: 400, msg: "Invalid login credentials" },
         }),
+        "401": jsonResponse("Missing or invalid `apikey` header.", { type: "object", additionalProperties: true, example: { message: "No API key found in request" } }),
         "405": { description: "Method Not Allowed (our backend intercepts this path; use Swagger UI 'Try it out' to log in)." },
       },
     },
@@ -1913,6 +2086,177 @@ const paths: OpenAPIV3.PathsObject = {
       },
     },
   },
+
+  // =====================================================================
+  // Complaints
+  // =====================================================================
+  "/complaints": {
+    get: {
+      tags: ["Complaints"],
+      summary: "List Complaints — return all complaints, newest first",
+      description: "Optional query params: `status` (OPEN|IN_REVIEW|REVISIT_BOOKED|RESOLVED), `search` (title or customer name), `assignedTo=me` (filter to current user's technician). TECHNICIAN role receives 403.",
+      parameters: [
+        { name: "status", in: "query", required: false, schema: { type: "string", enum: ["OPEN", "IN_REVIEW", "REVISIT_BOOKED", "RESOLVED"] } },
+        { name: "search", in: "query", required: false, schema: { type: "string" }, description: "Case-insensitive search on title or customer name." },
+        { name: "assignedTo", in: "query", required: false, schema: { type: "string", enum: ["me"] }, description: "Pass `me` to return only complaints assigned to the calling user's technician record." },
+        { name: "technicianId", in: "query", required: false, schema: { type: "string" }, description: "Filter by specific technician ID. Ignored when `assignedTo=me`." },
+      ],
+      responses: {
+        "200": jsonResponse("Complaint list.", { type: "array", items: ref("Complaint") }),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+    post: {
+      tags: ["Complaints"],
+      summary: "Log Complaint — record a new customer service complaint",
+      description: "Creates a complaint with `status: OPEN`. All customer fields reference an existing customer record by `customerId`. TECHNICIAN role receives 403.",
+      requestBody: jsonBody(ref("ComplaintCreateInput")),
+      responses: {
+        "201": jsonResponse("Complaint created.", ref("Complaint")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/complaints/{id}": {
+    get: {
+      tags: ["Complaints"],
+      summary: "Get Complaint — fetch a single complaint by ID",
+      parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+      responses: {
+        "200": jsonResponse("Complaint detail.", ref("Complaint")),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/complaints/{id}/messages": {
+    get: {
+      tags: ["Complaints"],
+      summary: "List Messages — get the full message thread for a complaint",
+      parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+      responses: {
+        "200": jsonResponse("Message thread.", { type: "array", items: ref("ComplaintMessage") }),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+    post: {
+      tags: ["Complaints"],
+      summary: "Add Message — send an outbound reply on the complaint thread",
+      parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+      requestBody: jsonBody(ref("AddMessageInput")),
+      responses: {
+        "201": jsonResponse("Message created.", ref("ComplaintMessage")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/complaints/{id}/mark-in-review": {
+    post: {
+      tags: ["Complaints"],
+      summary: "Mark In Review — set complaint status to IN_REVIEW",
+      parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+      responses: {
+        "200": jsonResponse("Updated complaint.", ref("Complaint")),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/complaints/{id}/schedule-revisit": {
+    post: {
+      tags: ["Complaints"],
+      summary: "Schedule Revisit — book a revisit date and set status to REVISIT_BOOKED",
+      parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+      requestBody: jsonBody(ref("ScheduleRevisitInput")),
+      responses: {
+        "200": jsonResponse("Updated complaint.", ref("Complaint")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/complaints/{id}/resolve": {
+    post: {
+      tags: ["Complaints"],
+      summary: "Resolve — mark complaint as RESOLVED",
+      parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+      responses: {
+        "200": jsonResponse("Updated complaint.", ref("Complaint")),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/complaints/{id}/reopen": {
+    post: {
+      tags: ["Complaints"],
+      summary: "Reopen — reset a resolved complaint back to OPEN",
+      parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+      responses: {
+        "200": jsonResponse("Updated complaint.", ref("Complaint")),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/complaints/{id}/assign-technician": {
+    post: {
+      tags: ["Complaints"],
+      summary: "Assign Technician — link a technician to a complaint",
+      parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+      requestBody: jsonBody(ref("AssignTechnicianInput")),
+      responses: {
+        "200": jsonResponse("Updated complaint.", ref("Complaint")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  // =====================================================================
+  // Visits — one-off (ad-hoc) jobs
+  // =====================================================================
+  "/visits": {
+    post: {
+      tags: ["Visits"],
+      summary: "Add One-off Job — create a single ad-hoc visit outside the recurring schedule",
+      description:
+        "Creates a visit with `isOneOff: true`. `roundId: null` means the visit appears in Today's Work only; supply a `roundId` to also show it in the Round Planner for that round. `servicePlanId` is always `null`. `status` is always `SCHEDULED`.",
+      requestBody: jsonBody(ref("VisitCreateInput")),
+      responses: {
+        "201": jsonResponse("Created visit.", ref("Visit")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -1967,6 +2311,8 @@ export const openApiDocument: OpenAPIV3.Document = {
     { name: "Invites", description: "Tenant invite flow — send, validate, and accept invites for new technicians/managers." },
     { name: "Customers", description: "M2 — customer/property list + aggregate detail (Screens 14/15). Reads: any role; mutations: ADMIN/MANAGER." },
     { name: "Properties", description: "M2 — property create/update, pause/resume, notes (Add Property, M9, M20)." },
+    { name: "Visits", description: "One-off (ad-hoc) visit creation. Reads: any role; mutations: ADMIN/MANAGER." },
+    { name: "Complaints", description: "Customer service complaint queue — log, review, schedule revisits, resolve, reopen. All mutations: ADMIN/MANAGER only." },
   ],
   // Global default: all operations require the Bearer token unless they
   // override with `security: []` (e.g. /health).

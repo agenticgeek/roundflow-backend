@@ -44,6 +44,7 @@ propertiesRouter.post(
       // Customer (step 1)
       customerName: requireString(body.customerName, "customerName"),
       phone: optString(body.phone, "phone"),
+      landline: optString(body.landline, "landline"),
       email: optString(body.email, "email"),
       // Property (step 1)
       addressLine: requireString(body.addressLine, "addressLine").trim(),

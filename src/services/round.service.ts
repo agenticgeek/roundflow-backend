@@ -287,10 +287,17 @@ class RoundService implements IRoundService {
       if (uniqueIds.length > 0) {
         const found = await tx.technician.findMany({
           where: { id: { in: uniqueIds } },
-          select: { id: true, active: true },
+          select: { id: true, active: true, profileId: true },
         });
         if (found.length !== uniqueIds.length) {
           throw new AppError(404, "One or more technicians not found");
+        }
+        const pending = found.filter((t) => t.profileId === null);
+        if (pending.length > 0) {
+          throw new AppError(
+            400,
+            `Cannot assign technician(s) with a pending invite: ${pending.map((t) => t.id).join(", ")}`
+          );
         }
         const inactive = found.filter((t) => !t.active);
         if (inactive.length > 0) {
@@ -558,12 +565,13 @@ class RoundService implements IRoundService {
 
     await this.assertRoundExists(roundId);
 
-    // Validate the target technician is active
+    // Validate the target technician is active and has accepted their invite
     const toTech = await this.prisma.technician.findUnique({
       where: { id: input.toTechnicianId },
-      select: { id: true, active: true },
+      select: { id: true, active: true, profileId: true },
     });
     if (!toTech) throw new AppError(404, "Target technician not found");
+    if (toTech.profileId === null) throw new AppError(400, "Target technician has not accepted their invite");
     if (!toTech.active) throw new AppError(400, "Target technician is inactive");
 
     const start = new Date();

@@ -20,6 +20,7 @@ import {
 import {
   createSettingsService,
   BusinessProfileUpdateInput,
+  BankDetails,
   RoundSettingsUpdateInput,
   ServiceCreateInput,
   ServiceUpdateInput,
@@ -55,6 +56,23 @@ const svc = (req: Request) => createSettingsService(req.tenantPrisma!);
 // tenantId resolver; do not conflate the two.
 const actorIdOf = (req: Request): string => req.user!.supabaseUserId;
 
+function parseBankDetails(v: unknown): BankDetails | null | undefined {
+  if (v === undefined) return undefined;
+  if (v === null) return null;
+  if (typeof v !== "object" || Array.isArray(v)) {
+    throw new AppError(400, '"bankDetails" must be an object or null');
+  }
+  const b = v as Record<string, unknown>;
+  const accountName = requireString(b.accountName, "bankDetails.accountName").trim();
+  if (!accountName) throw new AppError(400, '"bankDetails.accountName" must not be blank');
+  const accountNumber = requireString(b.accountNumber, "bankDetails.accountNumber").trim();
+  if (!accountNumber) throw new AppError(400, '"bankDetails.accountNumber" must not be blank');
+  const sortCode = requireString(b.sortCode, "bankDetails.sortCode").trim();
+  if (!sortCode) throw new AppError(400, '"bankDetails.sortCode" must not be blank');
+  const bankName = optString(b.bankName, "bankDetails.bankName") ?? null;
+  return { accountName, bankName, accountNumber, sortCode };
+}
+
 // Working-days array: omitted = untouched; otherwise every element must be a
 // valid DayOfWeek (shared validator).
 function optWorkingDays(v: unknown, field: string): string[] | undefined {
@@ -64,7 +82,10 @@ function optWorkingDays(v: unknown, field: string): string[] | undefined {
 // Cycle length: omitted = untouched; null clears; a number must be a positive integer.
 function optCycleLength(v: unknown): number | null | undefined {
   const n = optNumber(v, "defaultCycleLength");
-  if (typeof n === "number") assertPositiveInt(n, "defaultCycleLength");
+  if (typeof n === "number") {
+    assertPositiveInt(n, "defaultCycleLength");
+    if (n > 365) throw new AppError(400, "defaultCycleLength must be at most 365");
+  }
   return n;
 }
 function optCategory(v: unknown): ServiceCategory | undefined {
@@ -108,6 +129,7 @@ settingsRouter.patch(
       timezone: optString(body.timezone, "timezone"),
       currency: optString(body.currency, "currency"),
       defaultWorkingDays: optWorkingDays(body.defaultWorkingDays, "defaultWorkingDays"),
+      bankDetails: parseBankDetails(body.bankDetails),
     };
     res.json(await svc(req).updateBusinessProfile(actorIdOf(req), input));
   })
@@ -131,6 +153,15 @@ settingsRouter.patch(
     const input: RoundSettingsUpdateInput = {
       defaultCycleLength: optCycleLength(body.defaultCycleLength),
       defaultWorkingDays: optWorkingDays(body.defaultWorkingDays, "defaultWorkingDays"),
+      preCleanReminderTimings: (() => {
+        const arr = optStringArray(body.preCleanReminderTimings, "preCleanReminderTimings");
+        if (!arr) return arr;
+        if (arr.length > 2) throw new AppError(400, "preCleanReminderTimings must have at most 2 items");
+        const valid = ["EVENING_BEFORE", "TWO_HOURS_BEFORE"];
+        const bad = arr.find((v) => !valid.includes(v));
+        if (bad) throw new AppError(400, `preCleanReminderTimings contains invalid value: "${bad}". Must be one of: ${valid.join(", ")}`);
+        return arr;
+      })(),
     };
     res.json(await svc(req).updateRoundSettings(actorIdOf(req), input));
   })

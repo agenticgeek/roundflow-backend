@@ -211,17 +211,17 @@ All mutating step endpoints are blocked (403) once `setupCompleted=true`.
 
 ### FR-FREQ — Property Frequency & Automatic Round Reassignment
 A round has a `frequency` (`CleaningFrequency`) — how often its properties are
-cleaned (e.g. FORTNIGHTLY, FOUR_WEEKLY). Each property's `ServicePlan` also carries
-a `cleaningFrequency`. Normally these are the same. When an admin changes a
-property's frequency to differ from its round's, the property is automatically
-moved to an appropriate round.
+cleaned (`FOUR_WEEKLY`, `SIX_WEEKLY`, `EIGHT_WEEKLY`, `TWELVE_WEEKLY`). Each
+property's `ServicePlan` also carries a `cleaningFrequency`. Normally these are
+the same. When an admin changes a property's frequency to differ from its
+round's, the property is automatically moved to an appropriate round.
 
 | ID | Requirement | Source | Priority |
 |----|-------------|--------|----------|
 | FR-FREQ-1 | When a property is first assigned to a round, its `ServicePlan.cleaningFrequency` **SHALL be set to match `Round.frequency`** so the property inherits the round's cadence by default. | This spec | Must |
 | FR-FREQ-2 | When an admin changes a property's `cleaningFrequency` to a value **different** from its current round's `frequency`, the system SHALL automatically **reassign the property** to an appropriate round (see FR-FREQ-3 and FR-FREQ-4). The source round is left unchanged with its remaining properties. | This spec | Must |
 | FR-FREQ-3 | **Round reuse (Case A):** Before creating a new round, the system SHALL search for an existing ACTIVE round whose `frequency` matches the new property frequency **and** whose `serviceAreaId` matches the property's `serviceAreaId`. Because every property always has a service area (FR-CUST-3a), this match is always a concrete equality check — never a null comparison. If a match is found ("Round B"), the property is moved there. Round B's existing technician assignments are **left unchanged**. | This spec | Must |
-| FR-FREQ-4 | **Round creation (Case B):** If no matching ACTIVE round is found, the system SHALL create a new round ("Round B") by copying the property's current round's attributes (`name` suffixed with the new frequency label — e.g. "North London (Fortnightly)", `defaultDay`, `serviceAreaId`, `status: ACTIVE`) and setting `frequency` to the new value. The `RoundTechnician` assignments from the source round SHALL be **copied** to Round B. The property is then assigned to Round B. | This spec; OQ-FREQ-1 resolved | Must |
+| FR-FREQ-4 | **Round creation (Case B):** If no matching ACTIVE round is found, the system SHALL create a new round ("Round B") by copying the property's current round's attributes (`name` suffixed with the new frequency label — e.g. "North London (Twelve Weekly)", `defaultDay`, `serviceAreaId`, `status: ACTIVE`) and setting `frequency` to the new value. The `RoundTechnician` assignments from the source round SHALL be **copied** to Round B. The property is then assigned to Round B. | This spec; OQ-FREQ-1 resolved | Must |
 | FR-FREQ-5 | If the property is currently **without a round assignment** (`roundId = null`), changing `cleaningFrequency` only updates the `ServicePlan` field; no round lookup or creation occurs. (A property always has a service area per FR-CUST-3a, but may lack a round if it was saved with "Save & Assign Later".) | This spec | Must |
 | FR-FREQ-6 | If the new `cleaningFrequency` **equals** the current round's `frequency`, no round change occurs — only the `ServicePlan` field is updated. | This spec | Must |
 
@@ -431,8 +431,9 @@ The mobile app is **technician-facing only** (not customer-facing; the "B2C" lab
   payment logic depends on it).
 - **`designFindings.md` is the source of truth** for screens/flows; the old
   GHL-native dev brief is background domain context only.
-- **`MONTHLY` cleaning frequency is approximated as 4 weeks (28 days)**, generating
-  13 visits/year instead of 12. Calendar-month arithmetic is deferred.
+- **All cleaning frequencies are whole-week intervals** (`FOUR_WEEKLY` = 28 days,
+  `SIX_WEEKLY` = 42, `EIGHT_WEEKLY` = 56, `TWELVE_WEEKLY` = 84), so every generated
+  visit falls on the round's `defaultDay`. Calendar-month cadence is **not offered**.
 
 ---
 

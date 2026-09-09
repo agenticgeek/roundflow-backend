@@ -116,6 +116,7 @@ customersRouter.patch(
       // Customer (name is required-non-null → optReqString rejects null/blank)
       name: optReqString(body.name, "name"),
       phone: optString(body.phone, "phone"),
+      landline: optString(body.landline, "landline"),
       email: optString(body.email, "email"),
       // Property
       addressLine: optReqString(body.addressLine, "addressLine"),

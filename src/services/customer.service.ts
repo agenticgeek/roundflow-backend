@@ -24,11 +24,10 @@ import { AppError } from "../lib/app-error";
 // Human-readable labels for CleaningFrequency values — used when naming
 // auto-created rounds in the frequency-change reassignment flow (FR-FREQ-4).
 const FREQUENCY_LABELS: Record<CleaningFrequency, string> = {
-  FORTNIGHTLY: "Fortnightly",
   FOUR_WEEKLY: "Four Weekly",
   SIX_WEEKLY: "Six Weekly",
   EIGHT_WEEKLY: "Eight Weekly",
-  MONTHLY: "Monthly",
+  TWELVE_WEEKLY: "Twelve Weekly",
 };
 
 // ---------------------------------------------------------------------------
@@ -76,6 +75,7 @@ export interface PropertyAddInput {
 export interface PropertyCreateInput {
   customerName: string;
   phone?: string | null;
+  landline?: string | null;
   email?: string | null;
   addressLine: string;
   postcode: string;
@@ -108,6 +108,7 @@ export interface CustomerUpdateInput {
   // Customer
   name?: string;
   phone?: string | null;
+  landline?: string | null;
   email?: string | null;
   // Property
   addressLine?: string;
@@ -728,6 +729,7 @@ class CustomerService implements ICustomerService {
       const customerData: Partial<Prisma.CustomerUpdateInput> = {};
       if (input.name !== undefined) customerData.name = input.name;
       if (input.phone !== undefined) customerData.phone = input.phone;
+      if (input.landline !== undefined) customerData.landline = input.landline;
       if (input.email !== undefined) customerData.email = input.email;
       if (Object.keys(customerData).length > 0) {
         await tx.customer.update({ where: { id: customer.id }, data: customerData });
@@ -857,6 +859,7 @@ class CustomerService implements ICustomerService {
         data: {
           name: input.customerName,
           phone: input.phone ?? null,
+          landline: input.landline ?? null,
           email: input.email ?? null,
           paymentMethod: input.paymentMethod ?? null,
           status: LifecycleStatus.ACTIVE,

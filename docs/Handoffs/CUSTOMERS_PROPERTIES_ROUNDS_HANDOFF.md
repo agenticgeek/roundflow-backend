@@ -68,7 +68,7 @@ GET /customers
       "postcode": "NE66 1SS",
       "roundId": "clf...",
       "roundName": "Alnwick Monday",
-      "frequency": "FORTNIGHTLY",
+      "frequency": "FOUR_WEEKLY",
       "price": 35,
       "technicianId": "clg...",
       "technicianName": "James Fisher",
@@ -158,7 +158,7 @@ Returns all six Screen 15 tabs in one call.
     "price": 35,
     "cleanMethod": "Water Fed Pole",
     "paymentMethod": "GOCARDLESS",
-    "cleaningFrequency": "FORTNIGHTLY",
+    "cleaningFrequency": "FOUR_WEEKLY",
     "status": "ACTIVE",
     "nextDueDate": "2026-08-04T00:00:00.000Z",
     "lastCompleted": "2026-07-21T00:00:00.000Z",
@@ -167,7 +167,7 @@ Returns all six Screen 15 tabs in one call.
     "paymentRule": "COLLECT_AFTER_VISIT"
   },
   "standingInfo": {
-    "frequency": "FORTNIGHTLY",
+    "frequency": "FOUR_WEEKLY",
     "assignedRound": "Alnwick Monday",
     "technicianName": "James Fisher",
     "paymentStatus": "paid",
@@ -458,7 +458,7 @@ GET /rounds
   {
     "id": "clf...",
     "name": "Alnwick Monday",
-    "frequency": "FORTNIGHTLY",
+    "frequency": "FOUR_WEEKLY",
     "defaultDay": "MON",
     "status": "ACTIVE",
     "serviceAreaId": "clh...",
@@ -469,7 +469,7 @@ GET /rounds
 ]
 ```
 
-`frequency` ∈ `FORTNIGHTLY` · `FOUR_WEEKLY` · `SIX_WEEKLY` · `EIGHT_WEEKLY` · `MONTHLY`
+`frequency` ∈ `FOUR_WEEKLY` · `SIX_WEEKLY` · `EIGHT_WEEKLY` · `TWELVE_WEEKLY`
 `defaultDay` ∈ `MON` · `TUE` · `WED` · `THU` · `FRI` · `SAT` · `SUN` · `null`
 
 ---
@@ -480,7 +480,7 @@ GET /rounds
 POST /rounds
 {
   "name": "Alnwick Wednesday",   // required
-  "frequency": "FORTNIGHTLY",    // required
+  "frequency": "FOUR_WEEKLY",    // required
   "serviceAreaId": "clh...",     // required — must exist (404 if not)
   "defaultDay": "WED",           // optional
   "description": "..."           // optional
@@ -499,7 +499,7 @@ GET /rounds/:id
 → 200 {
   "id": "clf...",
   "name": "Alnwick Monday",
-  "frequency": "FORTNIGHTLY",
+  "frequency": "FOUR_WEEKLY",
   "defaultDay": "MON",
   "description": null,
   "status": "ACTIVE",
@@ -642,7 +642,7 @@ GET /rounds/:id/planner/occurrences/2026-07-21
 | Enum | Values |
 |---|---|
 | `LifecycleStatus` | `ACTIVE` `PAUSED` `CANCELLED` |
-| `CleaningFrequency` | `FORTNIGHTLY` `FOUR_WEEKLY` `SIX_WEEKLY` `EIGHT_WEEKLY` `MONTHLY` |
+| `CleaningFrequency` | `FOUR_WEEKLY` `SIX_WEEKLY` `EIGHT_WEEKLY` `TWELVE_WEEKLY` |
 | `RoundStatus` | `ACTIVE` `DRAFT` `ARCHIVED` |
 | `DayOfWeek` | `MON` `TUE` `WED` `THU` `FRI` `SAT` `SUN` |
 | `PropertyType` | `HOUSE` `FLAT_APARTMENT` `COMMERCIAL` `OFFICE` `CONSERVATORY` |

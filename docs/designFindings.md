@@ -431,36 +431,72 @@ Layout: centered content (no left stepper). Green check-circle icon at top centr
 
 ---
 
-### 20. Complaints  
-**Section:** `Complaints` · Node `592:8816`  
-**Purpose:** Customer service queue — log and track quality issues.  
+### 20. Complaints *(re-audited 2026-09-01)*
+**Section:** `Complaints` · Node `936:59915`
+**Purpose:** Customer service queue — log and track quality issues.
+**Layout:** Full-page. Header: *"Complaints / Customer service quality issues"* + cycle date top-right.
 **Elements:**
-- Cycle date + Log Complaint button (top right)
-- Tab: All
-- Search bar (customer or issue)
-- Complaint cards: coloured status badge (Open · In Review · Revisit Booked · Resolved), date, issue title, customer name + area, technician avatar, photo count, calendar icon (revisit date)
-- List sorted by recency; severity (Low / Medium / High) is not a sort factor
+- **"+ Log Complaint"** button (top right) → opens Log New Complaint modal (Screen 22)
+- Tabs: **All** · **My Work**
+- Search bar: "Search by customer or issue..."
+- Complaint cards (each card shows):
+  - Coloured status badge: `Open` (orange) · `In Review` (blue) · `Revisit Booked` (red) · `Resolved` (green)
+  - Logged date (top right of card)
+  - Issue title (bold)
+  - Customer name · location
+  - Technician name (person icon)
+  - **Message count** (speech bubble icon + number) — *not* photo count
+  - Revisit date (calendar icon) — only shown when status is Revisit Booked
+  - Priority badge (Low · Medium · High) visible on card
+- List sorted by recency; priority is not a sort factor
 
 ---
 
-### 21. Complaint Detail  
-**Section:** `Complaints` · Node `592:11810`  
-**Purpose:** Read and respond to an individual complaint; manage resolution workflow.  
-**Layout:** Two-panel split — left: complaints list (master), right: complaint detail (detail).  
+### 21. Complaint Detail *(re-audited 2026-09-01)*
+**Section:** `Complaints` · Node `936:60049`
+**Purpose:** Read and respond to an individual complaint; manage resolution workflow.
+**Layout:** Two-panel split — left: narrowed complaints list (master), right: complaint detail (detail).
 **Elements (right panel):**
-- ← Back to list
-- Customer name + address, status badge (Open), severity badge (Low / Medium / High)
-- Actions: Schedule Revisit · Mark In Review · Resolve
-- Tabs: Messages · Details
-- Messages tab: customer message thread, reply textarea (Ctrl+Enter to send), send icon button
-- Toast notification ("Marked for in-review!") visible at top
+- **← Back to list** link
+- Customer name + address · "Technician: [name]"
+- Status badge + Priority badge (Open/In Review/Revisit Booked/Resolved · Low/Medium/High)
+- **Action buttons (when complaint is open/active):** `Assign Technician` · `Schedule Revisit` (teal) · `Mark In Review` (orange outline) · `Resolve` (black outline)
+- **Tabs:** Messages (n) · Details
+
+**Messages tab:**
+- Customer message thread with timestamps (customer name · date, time)
+- "Reply to customer" textarea + send icon button; hint: "Ctrl + Enter to send"
+
+**Details tab:**
+- Issue Type · Priority · Date Reported · Technician Assigned · Round · Customer Phone · Customer Email · Property Address
+
+**Schedule Revisit (inline expand):**
+- Clicking "Schedule Revisit" expands an inline date picker (dd/mm/yyyy) + **Confirm** button directly below the customer address — no separate modal
+
+**Resolved state:**
+- Action buttons replaced with single **"Reopen Complaint"** button only
+- Message thread gains a green-background system message: *"Issue resolved — revisit completed successfully. Resolved by [name] · [timestamp]"*
+
+**Toast notifications:**
+- `"Complaint logged successfully"` — after logging a new complaint
+- `"Marked for in-review!"` — after clicking Mark In Review
+- `"Assigned to [name] successfully!"` — after assigning a technician
 
 ---
 
-### 22. Log New Complaint  
-**Section:** `Complaints` · Node `734:15063`  
-**Purpose:** Form to log a new customer complaint.  
-**Elements:** Customer selector, issue type, description textarea, severity (Low / Medium / High — no effect on list ordering), assign technician, submit.
+### 22. Log New Complaint *(re-audited 2026-09-01)*
+**Section:** `Complaints` · Node `936:60552`
+**Purpose:** Modal form to log a new customer complaint (not tied to an existing customer record — all fields are free-text).
+**Trigger:** "+ Log Complaint" button on the Complaints list.
+**Layout:** Modal overlay on top of the complaints list. Title: *"Log New Complaint / Record a customer service complaint"* + close (×) button.
+**Sections:**
+- **CUSTOMER DETAILS:** Customer name \* (required) · Property address · Phone number · Email address
+- **COMPLAINT DETAILS:** Issue type (dropdown: "Select issue type") · Description textarea \* (required: "Describe the issue in detail")
+- **PRIORITY LEVEL:** Low · **Medium** (default selected) · High — toggle buttons; no effect on list ordering
+- **VISIT INFORMATION:** Technician involved (dropdown) · Date (dd/mm/yy picker)
+- **Footer:** Cancel · **Log Complaint** (black, primary)
+
+**Note:** Customer fields are free-text entry — there is no search/select of an existing customer record.
 
 ---
 
