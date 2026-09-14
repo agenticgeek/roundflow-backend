@@ -519,6 +519,63 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     },
   },
 
+  // ---- Emergencies ----
+  EmergencyRow: {
+    type: "object",
+    required: ["id", "technicianId", "roundId", "remainingStops", "status", "reportedAt"],
+    properties: {
+      id: { type: "string" },
+      technicianId: { type: "string" },
+      technicianName: { type: "string", nullable: true, example: "James Wilson" },
+      roundId: { type: "string" },
+      roundName: { type: "string", example: "Alnwick Monday" },
+      remainingStops: { type: "integer", description: "Number of properties the technician could not reach.", example: 3 },
+      lastLocation: { type: "string", nullable: true, description: "Free-text last known location.", example: "Alnwick High St Hub" },
+      scheduledWindowEnd: { type: "string", format: "date-time", nullable: true, description: "When the service window closes.", example: "2026-09-15T20:30:00.000Z" },
+      notes: { type: "string", nullable: true },
+      status: { type: "string", enum: ["ACTIVE", "RESOLVED"], example: "ACTIVE" },
+      assignedTechnicianId: { type: "string", nullable: true, description: "Set when resolved — the technician who took over." },
+      assignedTechnicianName: { type: "string", nullable: true, example: "Sarah Jenkins" },
+      resolvedAt: { type: "string", format: "date-time", nullable: true },
+      reportedAt: { type: "string", format: "date-time", example: "2026-09-15T18:24:00.000Z" },
+    },
+    example: {
+      id: "emg1abc",
+      technicianId: "t1",
+      technicianName: "James Wilson",
+      roundId: "r1",
+      roundName: "Alnwick Monday",
+      remainingStops: 3,
+      lastLocation: "Alnwick High St Hub",
+      scheduledWindowEnd: "2026-09-15T20:30:00.000Z",
+      notes: null,
+      status: "ACTIVE",
+      assignedTechnicianId: null,
+      assignedTechnicianName: null,
+      resolvedAt: null,
+      reportedAt: "2026-09-15T18:24:00.000Z",
+    },
+  },
+
+  AvailableTechnicianRow: {
+    type: "object",
+    required: ["technicianId", "jobsRemaining", "availability"],
+    properties: {
+      technicianId: { type: "string" },
+      technicianName: { type: "string", nullable: true, example: "Sarah Jenkins" },
+      avatarUrl: { type: "string", nullable: true },
+      jobsRemaining: { type: "integer", description: "SCHEDULED or IN_PROGRESS visits for this technician today.", example: 0 },
+      availability: { type: "string", enum: ["AVAILABLE", "BUSY"], description: "AVAILABLE when jobsRemaining = 0, BUSY otherwise.", example: "AVAILABLE" },
+    },
+    example: {
+      technicianId: "t2",
+      technicianName: "Sarah Jenkins",
+      avatarUrl: null,
+      jobsRemaining: 0,
+      availability: "AVAILABLE",
+    },
+  },
+
   // ---- Dashboard ----
   DashboardKpis: {
     type: "object",
@@ -2345,6 +2402,118 @@ const paths: OpenAPIV3.PathsObject = {
   },
 
   // =====================================================================
+  // Emergencies
+  // =====================================================================
+  "/emergencies": {
+    get: {
+      tags: ["Emergencies"],
+      summary: "List emergencies",
+      description: "Returns all technician emergency reports, newest first. Filter by `status` to get only active or resolved ones. ADMIN/MANAGER only.",
+      parameters: [
+        {
+          name: "status",
+          in: "query",
+          required: false,
+          schema: { type: "string", enum: ["ACTIVE", "RESOLVED"] },
+          description: "Filter by status. Omit to return all.",
+        },
+      ],
+      responses: {
+        "200": jsonResponse("Emergency list.", { type: "array", items: ref("EmergencyRow") }),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+    post: {
+      tags: ["Emergencies"],
+      summary: "Report an emergency",
+      description: "Technician self-reports that they cannot complete a round. Creates an ACTIVE emergency record. Any authenticated user may call this (technicians included).",
+      requestBody: jsonBody({
+        type: "object",
+        required: ["technicianId", "roundId", "remainingStops"],
+        properties: {
+          technicianId: { type: "string", description: "The technician who cannot continue." },
+          roundId: { type: "string", description: "The round they were assigned to." },
+          remainingStops: { type: "integer", minimum: 0, description: "Properties not yet visited.", example: 3 },
+          lastLocation: { type: "string", nullable: true, example: "Alnwick High St Hub" },
+          scheduledWindowEnd: { type: "string", format: "date-time", nullable: true, description: "When the service window closes." },
+          notes: { type: "string", nullable: true },
+        },
+        example: {
+          technicianId: "t1",
+          roundId: "r1",
+          remainingStops: 3,
+          lastLocation: "Alnwick High St Hub",
+          scheduledWindowEnd: "2026-09-15T20:30:00.000Z",
+        },
+      }),
+      responses: {
+        "201": jsonResponse("Emergency created.", ref("EmergencyRow")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "404": errorResponse("Technician or round not found.", "Technician not found"),
+      },
+    },
+  },
+
+  "/emergencies/{id}": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Emergencies"],
+      summary: "Get emergency detail",
+      description: "Returns full detail for one emergency. ADMIN/MANAGER only.",
+      responses: {
+        "200": jsonResponse("Emergency detail.", ref("EmergencyRow")),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/emergencies/{id}/available-technicians": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Emergencies"],
+      summary: "List available technicians for reassignment",
+      description:
+        "Returns all active technicians except the one who reported the emergency, each with their remaining job count for today and a derived availability status. Feed this into the reassignment picker. ADMIN/MANAGER only.",
+      responses: {
+        "200": jsonResponse("Available technicians.", { type: "array", items: ref("AvailableTechnicianRow") }),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/emergencies/{id}/reassign": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    post: {
+      tags: ["Emergencies"],
+      summary: "Confirm reassignment",
+      description:
+        "Atomically: marks the emergency RESOLVED, sets `assignedTechnicianId`, and bulk-reassigns all remaining SCHEDULED/IN_PROGRESS visits on that round today from the original technician to the new one. 409 if the emergency is already resolved. ADMIN/MANAGER only.",
+      requestBody: jsonBody({
+        type: "object",
+        required: ["newTechnicianId"],
+        properties: {
+          newTechnicianId: { type: "string", description: "The technician taking over the remaining stops." },
+        },
+        example: { newTechnicianId: "t2" },
+      }),
+      responses: {
+        "200": jsonResponse("Resolved emergency.", ref("EmergencyRow")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": errorResponse("Emergency or technician not found.", "Emergency not found"),
+        "409": errorResponse("Emergency is already resolved.", "Emergency is already resolved"),
+      },
+    },
+  },
+
+  // =====================================================================
   // Dashboard — ADMIN/MANAGER only
   // =====================================================================
   "/dashboard/kpis": {
@@ -2511,6 +2680,7 @@ export const openApiDocument: OpenAPIV3.Document = {
     { name: "Visits", description: "One-off (ad-hoc) visit creation. Reads: any role; mutations: ADMIN/MANAGER." },
     { name: "Complaints", description: "Customer service complaint queue — log, review, schedule revisits, resolve, reopen. All mutations: ADMIN/MANAGER only." },
     { name: "Dashboard", description: "Dashboard screen data — KPI cards, alert counts, today's rounds, technician performance, and chart series. ADMIN/MANAGER only." },
+    { name: "Emergencies", description: "Technician emergency reporting and reassignment flow — report, list, inspect, pick a replacement, and confirm reassignment." },
   ],
   // Global default: all operations require the Bearer token unless they
   // override with `security: []` (e.g. /health).

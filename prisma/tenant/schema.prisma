@@ -107,6 +107,11 @@ enum ComplaintStatus {
   RESOLVED
 }
 
+enum EmergencyStatus {
+  ACTIVE
+  RESOLVED
+}
+
 enum ServiceCategory {
   DEFAULT
   WINDOW_CLEANING
@@ -277,6 +282,7 @@ model Round {
   properties       Property[]
   visits           Visit[]
   roundTechnicians RoundTechnician[]
+  emergencies      TechnicianEmergency[]
   createdAt        DateTime           @default(now())
   updatedAt        DateTime           @updatedAt
 
@@ -301,6 +307,8 @@ model Technician {
   messages         Message[]
   complaints       Complaint[]
   roundTechnicians RoundTechnician[]
+  emergencies      TechnicianEmergency[]   @relation("EmergencyReporter")
+  assignedEmergencies TechnicianEmergency[] @relation("EmergencyAssigned")
   createdAt        DateTime                @default(now())
   updatedAt        DateTime                @updatedAt
 }
@@ -524,4 +532,29 @@ model ActivityLog {
   actorId   String?
   actorRole String?
   createdAt DateTime @default(now())
+}
+
+// Technician self-reports they cannot complete a round mid-day.
+// Admin resolves by reassigning remaining visits to another technician.
+model TechnicianEmergency {
+  id                   String          @id @default(cuid())
+  technicianId         String
+  technician           Technician      @relation("EmergencyReporter", fields: [technicianId], references: [id])
+  roundId              String
+  round                Round           @relation(fields: [roundId], references: [id])
+  remainingStops       Int
+  lastLocation         String?
+  scheduledWindowEnd   DateTime?
+  notes                String?
+  status               EmergencyStatus @default(ACTIVE)
+  assignedTechnicianId String?
+  assignedTechnician   Technician?     @relation("EmergencyAssigned", fields: [assignedTechnicianId], references: [id])
+  resolvedAt           DateTime?
+  reportedAt           DateTime        @default(now())
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
+
+  @@index([technicianId])
+  @@index([roundId])
+  @@index([status])
 }
