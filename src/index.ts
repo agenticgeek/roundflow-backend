@@ -19,6 +19,7 @@ import { reportsRouter } from "./routes/reports";
 import { visitsRouter } from "./routes/visits";
 import { complaintsRouter } from "./routes/complaints";
 import { dashboardRouter } from "./routes/dashboard";
+import { emergenciesRouter } from "./routes/emergencies";
 import { openApiDocument } from "./swagger";
 import { migrateAllTenantSchemas } from "./lib/tenant-provisioning";
 
@@ -106,6 +107,7 @@ app.use("/reports", reportsRouter);
 app.use("/visits", visitsRouter);
 app.use("/complaints", complaintsRouter);
 app.use("/dashboard", dashboardRouter);
+app.use("/emergencies", emergenciesRouter);
 
 // API docs (public) — interactive UI at /docs, raw spec at /openapi.json.
 app.get("/openapi.json", (_req: Request, res: Response) => {
