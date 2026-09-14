@@ -519,6 +519,112 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     },
   },
 
+  // ---- Dashboard ----
+  DashboardKpis: {
+    type: "object",
+    required: ["jobsScheduledToday", "openComplaints", "openComplaintsByPriority", "cleanUnpaidAmount", "cleanUnpaidCount", "monthlyRevenue"],
+    properties: {
+      jobsScheduledToday: { type: "integer", description: "Visits scheduled for today (any non-cancelled status).", example: 48 },
+      openComplaints: { type: "integer", description: "Open complaints (not RESOLVED).", example: 2 },
+      openComplaintsByPriority: {
+        type: "object",
+        required: ["high", "medium", "low"],
+        properties: {
+          high: { type: "integer", example: 1 },
+          medium: { type: "integer", example: 1 },
+          low: { type: "integer", example: 0 },
+        },
+      },
+      cleanUnpaidAmount: { type: "number", description: "Sum of price for completed-but-unpaid visits this month.", example: 1240 },
+      cleanUnpaidCount: { type: "integer", description: "Distinct customers with unpaid visits this month.", example: 18 },
+      monthlyRevenue: { type: "number", description: "Sum of price for all completed visits this calendar month.", example: 12400 },
+    },
+    example: {
+      jobsScheduledToday: 48,
+      openComplaints: 2,
+      openComplaintsByPriority: { high: 1, medium: 1, low: 0 },
+      cleanUnpaidAmount: 1240,
+      cleanUnpaidCount: 18,
+      monthlyRevenue: 12400,
+    },
+  },
+
+  DashboardAlerts: {
+    type: "object",
+    required: ["skippedNeedingReview", "failedPayments", "complaintRevisitsDue"],
+    properties: {
+      skippedNeedingReview: { type: "integer", description: "Visits skipped today.", example: 4 },
+      failedPayments: { type: "integer", description: "Payments with status FAILED or OVERDUE.", example: 7 },
+      complaintRevisitsDue: { type: "integer", description: "Open complaints with a revisit date on or before end of this week.", example: 2 },
+    },
+    example: { skippedNeedingReview: 4, failedPayments: 7, complaintRevisitsDue: 2 },
+  },
+
+  DashboardRoundRow: {
+    type: "object",
+    required: ["roundId", "roundName", "status", "total", "completed", "skipped", "issueCount", "paymentHolds", "value"],
+    properties: {
+      roundId: { type: "string" },
+      roundName: { type: "string", example: "Alnwick Monday" },
+      technicianId: { type: "string", nullable: true },
+      technicianName: { type: "string", nullable: true, example: "James" },
+      status: { type: "string", enum: ["not_started", "in_progress", "complete"], example: "in_progress" },
+      total: { type: "integer", description: "Total visits in this round today.", example: 12 },
+      completed: { type: "integer", example: 8 },
+      skipped: { type: "integer", example: 1 },
+      issueCount: { type: "integer", example: 1 },
+      paymentHolds: { type: "integer", example: 0 },
+      value: { type: "number", description: "Sum of prices for all visits in round today.", example: 220 },
+      etaMinutes: { type: "integer", nullable: true, description: "Phase 2 stub — always null.", example: null },
+    },
+  },
+
+  TechnicianKpi: {
+    type: "object",
+    required: ["technicianId", "jobsCompleted", "valueCompleted", "openComplaints", "issueCount"],
+    properties: {
+      technicianId: { type: "string" },
+      technicianName: { type: "string", nullable: true, example: "James" },
+      jobsCompleted: { type: "integer", description: "Completed visits in the requested period.", example: 42 },
+      valueCompleted: { type: "number", description: "Sum of prices for completed visits in the period.", example: 840 },
+      openComplaints: { type: "integer", description: "Non-resolved complaints linked to this technician.", example: 1 },
+      issueCount: { type: "integer", description: "Issues raised on visits completed in the period.", example: 3 },
+      timeOnJobMinutes: { type: "integer", nullable: true, description: "Phase 2 stub — always null (no time-tracking schema yet).", example: null },
+      strikes: { type: "integer", nullable: true, description: "Phase 2 stub — always null.", example: null },
+      damages: { type: "integer", nullable: true, description: "Phase 2 stub — always null.", example: null },
+      upsells: { type: "integer", nullable: true, description: "Phase 2 stub — always null.", example: null },
+    },
+    example: {
+      technicianId: "t1",
+      technicianName: "James",
+      jobsCompleted: 42,
+      valueCompleted: 840,
+      openComplaints: 1,
+      issueCount: 3,
+      timeOnJobMinutes: null,
+      strikes: null,
+      damages: null,
+      upsells: null,
+    },
+  },
+
+  DashboardChartData: {
+    type: "object",
+    required: ["months", "valueCompleted", "issueCount", "revenuePerHour"],
+    properties: {
+      months: { type: "array", items: { type: "string" }, description: "Ordered month labels (e.g. 'Apr', 'May'). Same length as valueCompleted and issueCount.", example: ["Apr", "May", "Jun", "Jul", "Aug", "Sep"] },
+      valueCompleted: { type: "array", items: { type: "number" }, description: "Sum of completed-visit prices per month, parallel to months.", example: [1200, 1400, 980, 1100, 1600, 1340] },
+      issueCount: { type: "array", items: { type: "integer" }, description: "Issue count per month, parallel to months.", example: [3, 5, 2, 4, 6, 3] },
+      revenuePerHour: { type: "number", nullable: true, description: "Phase 2 stub — always null.", example: null },
+    },
+    example: {
+      months: ["Apr", "May", "Jun", "Jul", "Aug", "Sep"],
+      valueCompleted: [1200, 1400, 980, 1100, 1600, 1340],
+      issueCount: [3, 5, 2, 4, 6, 3],
+      revenuePerHour: null,
+    },
+  },
+
   Visit: {
     type: "object",
     description: "A single ad-hoc (one-off) visit returned from POST /visits.",
@@ -2239,6 +2345,97 @@ const paths: OpenAPIV3.PathsObject = {
   },
 
   // =====================================================================
+  // Dashboard — ADMIN/MANAGER only
+  // =====================================================================
+  "/dashboard/kpis": {
+    get: {
+      tags: ["Dashboard"],
+      summary: "Top metric cards",
+      description:
+        "Returns 6 KPI values derived from today's visits, open complaints, and this month's payment/revenue data. ADMIN/MANAGER only.",
+      responses: {
+        "200": jsonResponse("Dashboard KPIs.", ref("DashboardKpis")),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+
+  "/dashboard/alerts": {
+    get: {
+      tags: ["Dashboard"],
+      summary: "Alert card counts",
+      description:
+        "Three live-query counts: skipped visits today, failed/overdue payments (all time), and open complaints with a revisit due before end of this week. ADMIN/MANAGER only.",
+      responses: {
+        "200": jsonResponse("Alert counts.", ref("DashboardAlerts")),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+
+  "/dashboard/rounds": {
+    get: {
+      tags: ["Dashboard"],
+      summary: "Today's rounds table",
+      description:
+        "Returns one row per round that has visits scheduled today, with completion progress, issue count, and value. ADMIN/MANAGER only.",
+      responses: {
+        "200": jsonResponse("Round rows.", { type: "array", items: ref("DashboardRoundRow") }),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+
+  "/dashboard/technician-kpis": {
+    get: {
+      tags: ["Dashboard"],
+      summary: "Per-technician performance",
+      description:
+        "One row per active technician with jobs completed, value completed, open complaints, and issue count for the requested period. Phase-2 fields (timeOnJobMinutes, strikes, damages, upsells) are always null. ADMIN/MANAGER only.",
+      parameters: [
+        {
+          name: "period",
+          in: "query",
+          required: false,
+          schema: { type: "string", enum: ["monthly", "yearly"], default: "monthly" },
+          description: "Aggregation window. Defaults to `monthly` (current calendar month). `yearly` covers Jan 1 → Dec 31 of the current year.",
+        },
+      ],
+      responses: {
+        "200": jsonResponse("Technician KPI rows.", { type: "array", items: ref("TechnicianKpi") }),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+
+  "/dashboard/charts": {
+    get: {
+      tags: ["Dashboard"],
+      summary: "Monthly chart data (bar charts)",
+      description:
+        "Returns parallel arrays of month labels, value-of-work-completed, and issue count for the last 6 or 12 calendar months. All three arrays are the same length so they can be fed directly into a chart library. `revenuePerHour` is a Phase-2 stub (always null). ADMIN/MANAGER only.",
+      parameters: [
+        {
+          name: "range",
+          in: "query",
+          required: false,
+          schema: { type: "string", enum: ["6m", "12m"], default: "6m" },
+          description: "Number of months to include. Defaults to `6m` (last 6 calendar months including current).",
+        },
+      ],
+      responses: {
+        "200": jsonResponse("Chart data.", ref("DashboardChartData")),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+
+  // =====================================================================
   // Visits — one-off (ad-hoc) jobs
   // =====================================================================
   "/visits": {
@@ -2313,6 +2510,7 @@ export const openApiDocument: OpenAPIV3.Document = {
     { name: "Properties", description: "M2 — property create/update, pause/resume, notes (Add Property, M9, M20)." },
     { name: "Visits", description: "One-off (ad-hoc) visit creation. Reads: any role; mutations: ADMIN/MANAGER." },
     { name: "Complaints", description: "Customer service complaint queue — log, review, schedule revisits, resolve, reopen. All mutations: ADMIN/MANAGER only." },
+    { name: "Dashboard", description: "Dashboard screen data — KPI cards, alert counts, today's rounds, technician performance, and chart series. ADMIN/MANAGER only." },
   ],
   // Global default: all operations require the Bearer token unless they
   // override with `security: []` (e.g. /health).
