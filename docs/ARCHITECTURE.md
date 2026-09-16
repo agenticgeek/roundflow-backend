@@ -4,6 +4,10 @@
 
 RoundFlow is a multi-tenant SaaS backend for UK window-cleaning businesses. Each business (tenant) operates in complete isolation — they share the same Express/TypeScript process and the same PostgreSQL instance, but their operational data lives in a dedicated Postgres schema. The backend is deployed on Railway and communicates with a React frontend; it has no HTML rendering concerns.
 
+**Phase 1 target:** GHL-connected clients only. RoundFlow is sold as a private integration to businesses already on Agentum's GoHighLevel agency — not listed on the GHL Marketplace yet. GHL connection is required in Phase 1; marketplace listing and standalone mode are Phase 2.
+
+**Standalone capability:** The core app (rounds, visits, payments, debt, technicians) works without a GHL connection. The only features that require GHL are SMS, WhatsApp, and email messaging. GoCardless payments work standalone.
+
 ---
 
 ## 2. Technology Stack
@@ -15,7 +19,8 @@ RoundFlow is a multi-tenant SaaS backend for UK window-cleaning businesses. Each
 | ORM | Prisma (two separate clients — see §5) |
 | Database | PostgreSQL via Supabase (hosted) |
 | Identity provider | Supabase Auth (ES256 JWTs, JWKS) |
-| Email | Resend (transactional email — invite emails + customer-facing templated emails) |
+| Staff invite email | Supabase Auth (`admin.auth.inviteUserByEmail`) — same infrastructure as OTP + password reset |
+| Customer-facing email | GHL (same as SMS/WhatsApp — all customer comms route through GHL outbox) |
 | Deployment | Railway |
 | API docs | Swagger UI (`/docs`) |
 
@@ -358,69 +363,120 @@ This means service code never touches `res` — it throws, the route handler pro
 
 ---
 
-## 10. GHL Two-Way Sync (Planned)
+## 10. GHL Integration — Hybrid Architecture
+
+> **Decision made.** Full architecture documented in this section. Automation owner handoff: `docs/GHL_AUTOMATION_OWNER_HANDOFF.md`.
 
 ### What GHL is in RoundFlow
 
-GHL (GoHighLevel) is a **utility**, not the platform. RoundFlow does not run inside GHL. GHL is used for:
-- **Outbound messaging** to customers: SMS, WhatsApp (sent via GHL's messaging infrastructure). **Email** is sent directly via **Resend** (not GHL) — see `src/lib/email.ts`.
-- **Payment flow assistance**: GoCardless and Stripe payment links surfaced through GHL workflows
+GHL (GoHighLevel) is a **utility**, not the platform. RoundFlow does not run inside GHL. GHL handles:
+- **All outbound customer communications**: SMS, WhatsApp, and **Email** — reminders, payment chases, job completion notifications, invoice delivery. Configured once as GHL Workflows by the automation owner; fired by RoundFlow-written Contact fields/tags via the outbox worker.
+- **Inbound lead capture**: new leads tagged `ready-for-roundflow` in GHL are posted to RoundFlow via webhook, automatically creating `Customer` + `Property` records.
 
-A single GHL account serves all RoundFlow tenants (not one GHL sub-account per tenant). Every `Customer` and `Property` record carries a `ghlContactId` column from day one, which is the join key between RoundFlow and GHL.
+**Staff / internal email** (invite links, onboarding) uses **Supabase Auth** (`admin.auth.inviteUserByEmail()`) — the same infrastructure that sends OTP and password reset emails. Resend has been removed from the stack entirely.
 
-### The sync model
+**One GHL sub-account per tenant** — each business (tenant) has its own GHL location. `Tenant.ghlLocationId` is the unique identifier; tokens are stored per-tenant, encrypted at rest.
 
-The two-way sync works on the GHL **Contact** as the shared entity. Every `Customer` and `Property` in RoundFlow carries a `ghlContactId` column — this is the join key between the two systems.
+### Ownership boundary
+
+| Domain | System |
+|---|---|
+| Customers, Properties, Rounds, Visits, Payments, Debt, Technicians | **RoundFlow** (system of record — always) |
+| SMS / WhatsApp / Email delivery, lead capture, marketing sequences | **GHL** |
+| GoCardless Direct Debit mandates + charges | **RoundFlow backend** (GoCardless SDK — charge creation, mandate setup, webhook receiver) |
+| Stripe card fallback link generation | RoundFlow generates, GHL delivers |
+
+RoundFlow **never** treats GHL as a database. Every write happens in RoundFlow Postgres first; GHL is told about it afterward via the outbox.
+
+### Architecture: Outbox Pattern
+
+Route handlers and service methods do **not** call GHL directly. Instead, they write an `IntegrationOutbox` row in the same transaction as the operational write. A background worker drains the outbox and calls the GHL Adapter.
 
 ```mermaid
 flowchart TB
     subgraph RF["RoundFlow (Express backend)"]
         direction TB
-        RH[Route Handler]
-        SVC[Service\nDB write to tenant schema]
-        GHLMOD[GHLSync module\nafter DB commit]
-        WH["POST /webhooks/ghl\ninbound webhook"]
-        RH --> SVC --> GHLMOD
+        RH["Route Handler\ne.g. Complete Visit"]
+        SVC["Service\nDB write to tenant schema\n+ IntegrationOutbox row\n(same transaction)"]
+        WORKER["GHL Outbox Worker\n(cron, every 15s)\nsrc/workers/ghlOutbox.worker.ts"]
+        WH["POST /webhooks/ghl\nper-tenant secret verified\ninbound lead/event"]
+        RH --> SVC --> WORKER
         WH --> SVC
     end
 
-    subgraph GHL["GoHighLevel"]
+    subgraph GHL["GoHighLevel (per-tenant sub-account)"]
         CONTACT["GHL Contact\n(ghlContactId join key)"]
-        WF["GHL Workflow\nSMS · WhatsApp\nPayment links"]
+        WF["GHL Workflows\nSMS · WhatsApp · Email\nreminders + payment chase"]
         CONTACT --> WF
     end
 
-    GHLMOD -->|"write custom fields\n(outbound)"| CONTACT
-    WF -->|"event webhook\n(inbound)"| WH
+    subgraph ADAPTER["GHL Adapter  (src/integrations/ghl/)"]
+        direction LR
+        AC["contacts.ts\nupsertContact"]
+        AM["messages.ts\nsendMessage"]
+        AR["rateLimiter.ts"]
+    end
+
+    WORKER -->|"decrypt token\ncall adapter"| ADAPTER
+    ADAPTER -->|"update custom fields\nadd/remove tags"| CONTACT
+    WF -->|"event webhook\n?tenantId=X&secret=Y"| WH
 ```
 
-**RoundFlow → GHL (outbound)**
+### Planned schema additions (not yet in code — part of GHL integration work)
 
-When RoundFlow data changes (visit completed, payment collected, round scheduled), RoundFlow writes the relevant fields to the GHL Contact. This keeps GHL up to date so its workflows (SMS reminders, payment chase sequences) fire on accurate data.
+**Public schema `Tenant` model** gains:
 
-**GHL → RoundFlow (inbound)**
+```
+ghlLocationId       String?  @unique
+ghlCredentialType   GhlCredentialType?   // PIT | OAUTH
+ghlAccessToken      String?              // AES-256-GCM encrypted
+ghlRefreshToken     String?              // null for PIT
+ghlTokenExpiresAt   DateTime?
+ghlConnectionStatus GhlConnectionStatus? // CONNECTED | DISCONNECTED | ERROR
+ghlWebhookSecret    String?              // per-tenant, encrypted
+ghlConnectedAt      DateTime?
+ghlLastSyncError    String?
+```
 
-When a customer responds or a payment status changes inside GHL, RoundFlow needs to know. Two approaches are under consideration (DP-GHL, unresolved):
+**Tenant schema** gains two new models:
 
-| Option | Mechanism | Trade-offs |
+- `IntegrationOutbox` — queued outbound events (`visit.completed`, `payment.collected`, `debt.overdue`, `complaint.logged`, `round.scheduled`) with status `pending | sent | failed | dead`.
+- `WebhookEvent` — inbound event dedup table with `@@unique([source, externalId])`.
+
+**`Message` model** gains `ghlMessageId String?` and `ghlConversationId String?` to store GHL's response IDs.
+
+### New endpoints (part of GHL integration work)
+
+| Endpoint | Method | Purpose |
 |---|---|---|
-| A — Field-watch | Write a value to a GHL Contact custom field; a GHL Workflow watches for the change and fires a webhook to RoundFlow | No direct API call from RoundFlow; GHL orchestrates the trigger; harder to test |
-| B — Direct API | RoundFlow calls the GHL API directly when it needs to push/pull state | Simpler data flow; requires GHL API credentials per-request; RoundFlow owns the sync timing |
+| `/settings/ghl/connect` | POST | Validate PIT token + locationId, store encrypted, set status CONNECTED |
+| `/settings/ghl/status` | GET | Return connection status + last sync error (never the token) |
+| `/settings/ghl/disconnect` | POST | Clear token, set status DISCONNECTED |
+| `/webhooks/ghl` | POST | Receive inbound GHL events; verify per-tenant secret; ack 200 immediately, process async |
 
-### Where it plugs into the existing architecture
+### GoCardless (RoundFlow backend — full SDK integration)
 
-The GHL layer will sit alongside the service layer, not inside it. Services remain pure DB operations. A separate GHL integration module will:
+GoCardless runs entirely in RoundFlow using the GoCardless SDK. GHL is not involved in payment processing.
 
-1. Be called by route handlers or a background job after a service operation completes.
-2. Use `ghlContactId` on the Customer/Property to identify the GHL Contact.
-3. Read/write GHL Contact custom fields via the GHL API.
-4. On inbound webhooks from GHL, call the appropriate service method to update RoundFlow state.
+1. **Mandate setup** — GoCardless Billing Request Flow (hosted redirect) during Setup Wizard Step 2.
+2. **Webhook receiver** — `POST /webhooks/gocardless` (HMAC signature verification per GoCardless scheme). Handles `mandate_active`, `payment_confirmed`, `payment_failed`.
+3. **Charge creation** — triggered at `visit.completed`, same transaction moment as the GHL outbox row write. Independent side-effects, not coupled.
+4. On `payment_confirmed` → record `Payment` row + write `payment.collected` outbox event → GHL removes `debt-overdue` tag, updates `balance_owed`.
+5. On `payment_failed` → write `payment.failed` outbox event → GHL adds `payment-failed` tag → GHL chase sequence fires.
 
-### What is already in place
+**Outbox event types for GoCardless:**
 
-- `ghlContactId` column exists on `Customer` and `Property` from the initial schema — the join key is wired in before GHL integration code is written.
-- The service layer's interface pattern means GHL sync can be added without modifying service internals — it composes on top.
-- The trigger mechanism (DP-GHL) and detailed field mapping are deferred decisions.
+| Event | When written | GHL action |
+|---|---|---|
+| `payment.collected` | `payment_confirmed` webhook received | Remove `debt-overdue` tag, update `balance_owed` |
+| `payment.failed` | `payment_failed` webhook received | Add `payment-failed` tag → triggers GHL chase sequence |
+
+**Customer-facing confirmation message** (sent by GHL Workflow on `payment.collected`):
+> "Your payment of £XX is being collected by Direct Debit and will leave your account within 3 working days."
+
+**Balance computation** — `Customer.balanceOwed` is **not** a stored field. Compute at outbox-write time: `SUM(Invoice.amount WHERE status != CANCELLED) − SUM(Payment.amount WHERE status = CONFIRMED)`. Embed in `IntegrationOutbox.payload`. Never store a denormalised balance on the Customer row.
+
+> **⚠️ DEPLOY BLOCKER — GoCardless is currently live via Zapier for Mark.** The Zapier GoCardless flow must be **disabled at the same moment** RoundFlow's GoCardless webhook goes live. Running both simultaneously will double-charge customers. Coordinate directly with Mark for an explicit cutover — disable Zapier, enable RoundFlow webhook, monitor for 48 hours.
 
 ---
 
@@ -464,3 +520,22 @@ flowchart TD
 Tenant migrations are replayed every time a new tenant schema is provisioned. They are **not** run via `prisma migrate` — they are collected alphabetically and executed as raw SQL inside a transaction by `provisionTenantSchema`. This means every new tenant always gets the full current schema from day one.
 
 Existing tenant schemas are **not** automatically migrated when a new migration is added (that is a Phase 2 concern requiring a migration runner that iterates all `Tenant.schemaName` values and applies pending SQL).
+
+### Current tenant migration log
+
+| Migration | Purpose |
+|---|---|
+| `20260721000001_init_tenant` | Full initial tenant schema — all operational models + enums. |
+| `20260721000002_business_settings_unique_id` | Adds `BusinessSettings.uniqueId @unique @default("singleton")` — DB-enforced singleton. |
+| `20260721000003_setup_steps_9_12` | `PropertyType` enum; `Property.propertyType`; `ServicePlan.cleaningFrequency`; `RoundTechnician` join table. |
+| `20260726000000_message_template_subject` | Adds `MessageTemplate.subject String?` for email subject lines. |
+| `20260728000000_service_area_single_default_index` | Partial unique index — one default `ServiceArea` per tenant. |
+| `20260805000000_business_settings_last_closed_date` | Adds `BusinessSettings.lastClosedDate DateTime?`. |
+| `20260805000001_technician_email_notes` | Adds `Technician.email String?` and `Technician.notes String?`. |
+| `20260812000000_invoice_due_date` | Adds `Invoice.dueDate DateTime?`. |
+| `20260812000001_customer_hold_next_clean` | Adds `Customer.holdNextClean Boolean @default(false)`. |
+| `20260812000002_activity_log_actor` | Adds `ActivityLog.actorId String?`. |
+| `20260825000000_cleaning_frequency_4_6_8_12` | Extends `CleaningFrequency` enum values. |
+| `20260825000001_business_settings_pre_clean_reminder_timings` | Pre-clean reminder timing config on `BusinessSettings`. |
+| `20260825000002_customer_landline` | Adds `Customer.landline String?`. |
+| `20260915000000_technician_emergency` | `EmergencyStatus` enum + `TechnicianEmergency` model; emergency relations on `Technician` and `Round`. |

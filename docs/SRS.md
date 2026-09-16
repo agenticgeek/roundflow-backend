@@ -31,7 +31,8 @@ RoundFlow Phase 1 consists of:
 - A **Node.js / Express / TypeScript REST backend** with a **Supabase-hosted PostgreSQL**
   database (Prisma ORM) as the system of record for all operational data.
 - **Supabase Auth** for identity, and **GHL** (GoHighLevel) used as a *utility* for
-  messaging and to assist payment flows — not as the platform.
+  messaging and inbound lead capture — **one sub-account per tenant**, not as the platform.
+  Integration architecture decided (outbox pattern); implementation pending.
 
 Phase 1 targets **multiple tenants** using **schema-per-tenant isolation** (each
 business gets its own PostgreSQL schema). The GHL Marketplace listing and OAuth
@@ -47,7 +48,8 @@ install flow are Phase 2.
 | Database | PostgreSQL via Supabase | Transaction-mode pooler (port 6543) for app; direct connection (port 5432) for schema provisioning |
 | Auth | Supabase Auth | ES256 JWTs; JWKS public-key verification (`jwks-rsa`) |
 | JWT verification | `jsonwebtoken` + `jwks-rsa` | 10-hour JWKS cache; no shared secret on backend |
-| Email | Resend | Transactional email (invite emails) |
+| Staff invite email | Supabase Auth Admin SDK | `inviteUserByEmail()` — same infra as OTP + password reset. Resend removed. |
+| Customer email | GHL (outbox worker) | All customer comms (SMS / WhatsApp / Email) via GHL |
 | HTTP extras | `cors`, `dotenv` | CORS locked to `FRONTEND_URL` env var |
 | API docs | `swagger-ui-express` | Served at `/api-docs` |
 | Client-pool cache | `lru-cache` ^11 | LRU pool of per-tenant Prisma clients (max 100) |
@@ -86,7 +88,7 @@ From `RoundFlow_Context_and_Roadmap_v1.md` (Phase 2/3) and design decisions:
 - Customer-facing portal (the mobile app is technician-facing only — see MOB-1).
 - GHL Custom Objects as the data layer, GHL Workflows as business logic, GHL
   Custom Pages/iframe delivery, GHL OAuth as primary auth (all retired).
-- Setup Wizard **Step 2 (Payment Setup)** is a **deferred stub** in Phase 1 (Payment configured separately). Step 5 (Message Templates) is now fully built — SMS/WhatsApp/Email templates are stored in the DB and email is sent via Resend.
+- Setup Wizard **Step 2 (Payment Setup)** is a **deferred stub** in Phase 1 (Payment configured separately). Step 5 (Message Templates) is now fully built — SMS/WhatsApp/Email templates are stored in the DB and all customer email is delivered via GHL (Resend removed).
 
 ---
 
@@ -171,7 +173,7 @@ All mutating step endpoints are blocked (403) once `setupCompleted=true`.
 | FR-SETUP-2 | Step 2 — **Payment Setup** (GoCardless, BACS/bank): **deferred stub** ("Payment setup is configured separately"), no DB write. | Screen 6 step 2 | Won't (Phase 1) |
 | FR-SETUP-3 | Step 3 — **Service Catalogue**: create/replace `Service` entries (name, category, description, defaultPrice, active). Complete when ≥1 Service exists. | Screen 6 step 3; Screen 24 | Must |
 | FR-SETUP-4 | Step 4 — **Round Settings**: default cycle length, working days → upsert `BusinessSettings`. Complete when `defaultCycleLength` is set. | Screen 6 step 4 | Must |
-| FR-SETUP-5 | Step 5 — **Message Templates** (SMS / WhatsApp / Email): create/edit message templates stored in `MessageTemplate` table. Each template has `name`, `channel` (SMS / WHATSAPP / EMAIL), `body`, and `subject?` (required for email). `POST /setup/step/5` does a bulk replace. Complete when ≥1 template saved. Email sending uses **Resend** (`sendTemplatedEmail()`). | Screen 6 step 5; `email.ts` | Must |
+| FR-SETUP-5 | Step 5 — **Message Templates** (SMS / WhatsApp / Email): create/edit message templates stored in `MessageTemplate` table. Each template has `name`, `channel` (SMS / WHATSAPP / EMAIL), `body`, and `subject?` (required for email). `POST /setup/step/5` does a bulk replace. Complete when ≥1 template saved. Customer email is delivered via **GHL** (all three channels route through the GHL outbox). | Screen 6 step 5; `email.ts` | Must |
 | FR-SETUP-6 | Step 6 — **Technician Management**: create invite-pending `Technician`(s) (`profileId=null`). Complete when ≥1 Technician exists. | Screen 6 step 6 | Must |
 | FR-SETUP-7 | Step 7 — **Service Areas**: create `ServiceArea`(s). Complete when ≥1 ServiceArea exists. | Screen 6 step 7 | Must |
 | FR-SETUP-8 | Step 8 — **Assign Round**: create the first `Round` with `status=ACTIVE`. Complete when ≥1 ACTIVE Round exists. | Screen 6 step 8 | Must |
@@ -249,7 +251,7 @@ round's, the property is automatically moved to an appropriate round.
 |----|-------------|--------|----------|
 | FR-INVOICE-1 | **Generate Invoice** (M4) for a visit: summary (customer, property, visit date, amount, email), auto invoice number, notes, "Also send via email"; **Preview Invoice** (M5); success state (M10). | M4/M5/M10; schema `Invoice` | Should |
 | FR-INVOICE-2 | Payment SHALL be triggered automatically post-completion (success criterion); record `Payment` with method (GoCardless / Cash / Cheque / BACS / Stripe) and status. | Roadmap success criteria; schema `Payment` | Must |
-| FR-INVOICE-3 | **GoCardless** SHALL be the primary payment path; **Stripe** the card fallback (payment links). | Roadmap; schema `gocardlessId`/`stripeId` | Must |
+| FR-INVOICE-3 | **GoCardless** SHALL be the primary payment path (full SDK integration — mandate setup, charge creation at `visit.completed`, webhook receiver `POST /webhooks/gocardless`). **Stripe** card fallback via payment links. | Roadmap; schema `gocardlessId`/`stripeId` | Must |
 | FR-INVOICE-4 | **Cash/Cheque** payments SHALL be recordable (technician "Record cash payment"; `Payment.method`). | Mobile Screen 8; schema | Should |
 
 ### FR-COMPLAINT — Complaints
@@ -275,6 +277,28 @@ round's, the property is automatically moved to an appropriate round.
 | FR-TECH-3 | Technician cards SHALL show an **App Status** availability state (Active / Unavailable — e.g. "On leave <date> — N jobs require reassignment"). A technician marks themselves unavailable **from the mobile app**; the admin views this status on the web admin panel and can replace the unavailable technician with another available one. Marking Unavailable flags upcoming recurring jobs for reassignment. | Screen 25 update; Design Update #2; OQ#13 resolved | Should |
 | FR-TECH-4 | Provide **admin → technician messaging** (Screen 27): SMS/WhatsApp, character counter, credit cost, schedule-for-later, previous messages. | Screen 27 | Could |
 | FR-TECH-5 | Technicians are onboarded by **invite** (not self-signup); an invited technician has `profileId=null` until the invite is accepted. | Screen 6 step 6; schema; mobile Screen 2 | Must |
+
+### FR-DASH — Dashboard
+ADMIN/MANAGER only. All five endpoints are GET and make no state changes. Phase-2 stub fields (`timeOnJobMinutes`, `strikes`, `damages`, `upsells`, `revenuePerHour`) always return `null`; UI should reserve column space and show `—`.
+
+| ID | Requirement | Source | Priority |
+|----|-------------|--------|----------|
+| FR-DASH-1 | `GET /dashboard/kpis` SHALL return 6 aggregated KPIs: `jobsScheduledToday`, `openComplaints`, `openComplaintsByPriority` (high/medium/low), `cleanUnpaidAmount`, `cleanUnpaidCount`, `monthlyRevenue`. | Dashboard screen | Must |
+| FR-DASH-2 | `GET /dashboard/alerts` SHALL return 3 live alert counts: `skippedNeedingReview` (today's SKIPPED visits), `failedPayments` (FAILED/OVERDUE payments), `complaintRevisitsDue` (open complaints with `revisitDate ≤ end of week`). | Dashboard screen | Must |
+| FR-DASH-3 | `GET /dashboard/rounds` SHALL return today's rounds as an array with per-round stats: `total`, `completed`, `skipped`, `issueCount`, `paymentHolds`, `value`, `status` (`not_started`/`in_progress`/`complete`), `etaMinutes` (always `null`, Phase 2). | Dashboard screen | Must |
+| FR-DASH-4 | `GET /dashboard/technician-kpis?period=monthly\|yearly` SHALL return one row per active technician with `jobsCompleted`, `valueCompleted`, `openComplaints`, `issueCount` for the selected period. | Dashboard screen | Should |
+| FR-DASH-5 | `GET /dashboard/charts?range=6m\|12m` SHALL return three positionally-aligned arrays: `months` (3-letter labels), `valueCompleted`, `issueCount`. `revenuePerHour` always `null`. | Dashboard screen | Should |
+
+### FR-EMERG — Technician Emergency Notifications
+Mid-round emergency self-reporting and manager-led reassignment flow.
+
+| ID | Requirement | Source | Priority |
+|----|-------------|--------|----------|
+| FR-EMERG-1 | `POST /emergencies` SHALL allow any authenticated user to report a technician emergency. Required fields: `technicianId`, `roundId`, `remainingStops`. Optional: `lastLocation`, `scheduledWindowEnd`, `notes`. Response 201 with created `EmergencyRow`. | Emergency notifications screen | Must |
+| FR-EMERG-2 | `GET /emergencies?status=ACTIVE\|RESOLVED` SHALL return all emergencies for the tenant, filtered by optional `status`. ADMIN/MANAGER only. Ordered by `reportedAt DESC`. | Emergency list screen | Must |
+| FR-EMERG-3 | `GET /emergencies/:id` SHALL return a single `EmergencyRow` with all fields including `assignedTechnicianName`. ADMIN/MANAGER only. | Emergency detail | Must |
+| FR-EMERG-4 | `GET /emergencies/:id/available-technicians` SHALL return all active technicians except the reporter, each with `jobsRemaining` (today's SCHEDULED/IN_PROGRESS visits) and `availability` (`AVAILABLE` = 0 remaining, `BUSY` = has jobs). ADMIN/MANAGER only. | Reassignment panel | Must |
+| FR-EMERG-5 | `POST /emergencies/:id/reassign` with `{ newTechnicianId }` SHALL atomically: (1) mark emergency `RESOLVED`, set `assignedTechnicianId` + `resolvedAt`; (2) bulk-reassign all today's SCHEDULED/IN_PROGRESS visits in that round from the reporter to the replacement. 409 if already resolved. ADMIN/MANAGER only. | Reassignment confirm | Must |
 
 ### FR-SETTINGS — Settings
 | ID | Requirement | Source | Priority |
@@ -337,10 +361,8 @@ The mobile app is **technician-facing only** (not customer-facing; the "B2C" lab
   the accepting user's email matches the invite email **and** that the invite belongs
   to the same tenant as any existing Profile for that Supabase user — rejecting
   cross-tenant and cross-email replay with 403.
-- **NFR-SEC-7:** Transactional email (invite emails) uses **Resend**. The
-  `businessName` field (user-supplied) is HTML-escaped before interpolation; the
-  invite URL is encoded with `encodeURI` before embedding in the email body.
-- **NFR-SEC-8:** Templated customer emails (sent via `sendTemplatedEmail()` in `src/lib/email.ts`) render `{{variable_name}}` placeholders by HTML-escaping all variable values before substitution, preventing injection via customer-controlled data fields.
+- **NFR-SEC-7:** Transactional email (staff invite emails) uses **Supabase Auth Admin SDK** (`admin.auth.inviteUserByEmail()`). The `businessName` field (user-supplied) is HTML-escaped before interpolation; the invite URL is encoded with `encodeURI` before embedding in the email body.
+- **NFR-SEC-8:** Templated customer emails are delivered via the **GHL outbox** (not a direct SMTP call). Template variable values are HTML-escaped before being written to `IntegrationOutbox.payload`, preventing injection via customer-controlled data fields.
 
 ### 5.3 Multi-Tenancy Architecture
 - **NFR-MT-1 — Model:** RoundFlow uses **schema-per-tenant** isolation (not
@@ -410,9 +432,9 @@ The mobile app is **technician-facing only** (not customer-facing; the "B2C" lab
 |-------------|------|--------|
 | **Supabase Auth** | Identity: signup/login/OAuth/reset; issues ES256 JWTs. The `handle_new_user` trigger has been dropped; `POST /auth/signup` is the sole signup handler. | **Live** |
 | **Supabase Postgres** | System of record (Prisma ORM). Public schema + per-tenant schemas. | **Live** |
-| **Resend** | Transactional email — sends invite emails with HTML-escaped business name and encoded invite URL. | **Live** |
-| **GHL (GoHighLevel)** | Utility for **messaging** (SMS/WhatsApp/Email) and to **assist payment flows**; single GHL account. **Not** the platform. Trigger mechanism is an **open decision**. | **Deferred** (architected for; `ghlContactId` present; no integration code) |
-| **GoCardless** | Primary (direct-debit-first) payment provider. | **Deferred** (schema fields present; no code) |
+| ~~**Resend**~~ | ~~Transactional email~~ | **Removed** — replaced by Supabase Auth Admin SDK (staff invites) and GHL outbox (customer email). |
+| **GHL (GoHighLevel)** | Utility for **messaging** (SMS/WhatsApp/Email), payment chase sequences, and inbound lead capture. **One GHL sub-account per tenant.** Outbox pattern decided (see `ARCHITECTURE.md §10`). | **Planned** (`ghlContactId` present; adapter + outbox worker not yet built) |
+| **GoCardless** | Primary (direct-debit-first) payment provider. Full SDK integration in RoundFlow — mandate setup, charge creation at `visit.completed`, webhook receiver (`POST /webhooks/gocardless`). | **Planned** (schema fields present; no code yet) |
 | **Stripe** | Card payment fallback (payment links). | **Deferred** (schema fields present; no code) |
 | **Google OAuth** | "Continue with Google" sign-in via Supabase provider; backend uninvolved. | Configured (Supabase-side) |
 
@@ -421,14 +443,15 @@ The mobile app is **technician-facing only** (not customer-facing; the "B2C" lab
 ## 7. Constraints & Assumptions
 - **UK market:** GBP currency (£ throughout), UK postcodes / postcode sectors, UK
   phone formats, GoCardless-first (direct debit) payment culture.
+- **⚠️ GoCardless deploy blocker:** Mark's account currently processes GoCardless payments via Zapier. When RoundFlow's GoCardless backend (`POST /webhooks/gocardless`) goes live, the Zapier flow **must be disabled at the same time** — running both simultaneously will double-charge customers. Hard deployment pre-condition: disable Zapier, enable RoundFlow webhook, monitor 48 hours.
+- **Phase 1 target:** GHL-connected clients only — sold as a private integration to existing Agentum/GHL clients. GHL Marketplace listing is Phase 2. Standalone capability exists (payments, jobs, scheduling all work without GHL) but GHL is required for Phase 1 sales.
 - **Recurring round model:** no time slots; work is organised by round + cycle, not
   appointments.
 - **Backend is the system of record;** GHL is downstream. Every Customer/Property
   carries `ghlContactId` as the GHL join point from day one.
 - **Frontend is a separate repo;** it owns all UI and the auth UX.
 - **Mobile delivery form (native vs web) is TBD.**
-- **GHL automation trigger mechanism is TBD** (resolve before visit-generation /
-  payment logic depends on it).
+- **GHL automation trigger mechanism is resolved** — outbox pattern (write `IntegrationOutbox` row same-transaction as operational write; per-tenant worker drains to GHL Adapter every 15 s). See `ARCHITECTURE.md §10`.
 - **`designFindings.md` is the source of truth** for screens/flows; the old
   GHL-native dev brief is background domain context only.
 - **All cleaning frequencies are whole-week intervals** (`FOUR_WEEKLY` = 28 days,
@@ -443,7 +466,7 @@ From `designFindings.md` and `PROGRESS.md` Decisions Pending. Resolved questions
 | ID | Question | Blocks / Affects |
 |----|----------|------------------|
 | DP-NOTIF | **Notification provider**: push notifications are required (FR-MOBILE-9) but the provider is undecided — Firebase Cloud Messaging or an equivalent. Schema for a notifications entity (what generates them, how they are stored/delivered) is undefined. | FR-MOBILE-9 |
-| DP-GHL | GHL automation **trigger mechanism**: contact-field-sync-and-watch vs direct API call. | FR-INVOICE, messaging, visit-generation/payment logic |
+| ~~DP-GHL~~ | ~~GHL automation trigger mechanism~~ — **RESOLVED.** Outbox pattern decided. See `ARCHITECTURE.md §10`. | — |
 
 ---
 

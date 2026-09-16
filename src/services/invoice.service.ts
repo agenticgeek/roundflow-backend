@@ -1,7 +1,6 @@
 import { Prisma } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
-import { sendInvoiceEmail } from "../lib/email";
 
 // ---------------------------------------------------------------------------
 // M6 — Invoicing (BE-M6-04).
@@ -204,33 +203,9 @@ class InvoiceService implements IInvoiceService {
     const total = +(subtotal + vatAmount).toFixed(2);
     const visit = invoice.visit;
 
-    await sendInvoiceEmail({
-      to: email,
-      invoice: {
-        invoiceNumber: invoice.invoiceNumber,
-        invoiceDate: toDateStr(invoice.createdAt),
-        visitDate: visit ? toDateStr(visit.date) : toDateStr(invoice.createdAt),
-        dueDate: invoice.dueDate ? toDateStr(invoice.dueDate) : null,
-        customerName: invoice.customer.name,
-        addressLine: visit?.property.addressLine ?? "",
-        lineItems: [
-          {
-            description: visit
-              ? `${visit.service?.name ?? "Window Cleaning Service"} — ${visit.round?.name ?? ""} — ${toDateStr(visit.date)}`
-              : "Window Cleaning Service",
-            technicianName: visit?.technician?.name ?? null,
-            amount: subtotal,
-          },
-        ],
-        subtotal,
-        vatAmount,
-        total,
-      },
-      business: {
-        name: settings?.businessName ?? null,
-        email: settings?.email ?? null,
-      },
-    });
+    // Invoice email delivery is via GHL outbox (not direct SMTP).
+    // TODO: write IntegrationOutbox row here once GHL adapter is built.
+    void { email, subtotal, vatAmount, total, visit };
 
     const updated = await this.prisma.invoice.update({
       where: { id: invoiceId },

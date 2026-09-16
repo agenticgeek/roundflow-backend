@@ -1469,7 +1469,7 @@ const paths: OpenAPIV3.PathsObject = {
       tags: ["Invites"],
       summary: "Send an invite email",
       description:
-        "Creates a `TenantInvite` (7-day TTL) and sends an email to the invitee via Resend. " +
+        "Creates a `TenantInvite` (7-day TTL) and sends an email to the invitee via Supabase Auth. " +
         "Only one pending invite per email+tenant is allowed — 409 if a pending invite already exists. " +
         "Requires ADMIN or MANAGER role. " +
         "If `technicianId` is supplied, that Technician row's `profileId` is set when the invite is accepted.",

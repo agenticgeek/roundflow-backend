@@ -24,7 +24,7 @@
 - **Supabase Auth** — identity provider; issues ES256 JWTs. The backend replaces
   the retired `handle_new_user` trigger with `POST /auth/signup`, which creates the
   `Tenant` + `Profile` row and provisions the tenant schema atomically.
-- **GHL (utility, deferred)** — messaging + payment assistance; single account.
+- **GHL (utility, hybrid architecture decided)** — messaging + payment assistance; **one GHL sub-account per tenant**. See `ARCHITECTURE.md §10`.
 - **Deployment** — Railway (backend); Supabase (DB + Auth).
 
 ### 1.2 Component Interaction (text diagram)
@@ -89,8 +89,8 @@ against Supabase's JWKS endpoint → `requireTenantAccess` resolves
   it gets a 404, it calls `POST /auth/signup`.
 - **Supabase Auth + ES256 JWKS:** the project signs with ES256 (asymmetric), so
   the backend verifies via JWKS public keys — no shared secret stored.
-- **GHL as utility, not platform:** avoids building messaging/payments infra;
-  keeps RoundFlow's Postgres as the system of record.
+- **GHL as utility, not platform:** avoids building messaging/payments infra; keeps RoundFlow's Postgres as the system of record. GHL handles all three customer communication channels (SMS, WhatsApp, Email) — no separate email provider needed for customer comms.
+- **Supabase Auth for staff email (not Resend):** invite emails use `admin.auth.inviteUserByEmail()`, keeping all auth-related emails (invite, OTP, reset) under the same Supabase infrastructure. Resend has been removed.
 
 ---
 
@@ -106,7 +106,8 @@ against Supabase's JWKS endpoint → `requireTenantAccess` resolves
 | ORM (tenant schema) | `src/generated/tenant-client` 6.19.3 | LRU-pooled per `schemaName` |
 | Database | Supabase Postgres (`ap-northeast-1`) | |
 | Auth verify | `jsonwebtoken` + `jwks-rsa` | ES256; JWKS keys cached 10h |
-| Email | `resend` | Transactional (invite emails) |
+| Staff invite email | Supabase Auth Admin SDK | `admin.auth.inviteUserByEmail()` — same infra as OTP + reset |
+| Customer email | GHL (via outbox worker) | All customer comms (SMS / WhatsApp / Email) route through GHL |
 | Schema provisioning | `pg` (direct connection, port 5432) | Used only by `provisionTenantSchema` |
 | Client pool | `lru-cache` ^11 | Max 100 tenant clients; `$disconnect` on eviction |
 | API docs | `swagger-ui-express` | `/docs` (UI), `/openapi.json` (raw spec) |
@@ -131,8 +132,8 @@ src/
 │   ├── tenant-prisma-manager.ts# LRU pool of TenantPrismaClient; getTenantPrismaForSchema()
 │   ├── tenant-provisioning.ts  # provisionTenantSchema(): creates schema + replays
 │   │                           #   all prisma/tenant/migrations/*.sql in a transaction
-│   ├── email.ts                # sendInviteEmail() + sendTemplatedEmail() via Resend
-│   │                           #   (HTML-escaped values, {{variable}} rendering)
+│   ├── email.ts                # sendInviteEmail() via Supabase Auth Admin SDK
+│   │                           #   (Resend removed; customer emails route through GHL outbox)
 │   ├── http.ts                 # Route helpers: h(), asObject(), asArray(),
 │   │                           #   requireString(), requireNumber(), optString(), optId(), etc.
 │   └── validation.ts           # Domain validators: assertPositive(), assertPositiveInt(),
@@ -161,6 +162,15 @@ src/
 │                               #   /settings/technicians(/:id), /settings/payment,
 │                               #   /settings/payment/:provider/connect,
 │                               #   /settings/message-templates
+├── integrations/               # (planned — GHL integration work)
+│   └── ghl/
+│       ├── client.ts           # low-level HTTP wrapper (auth header, base URL, retry/backoff)
+│       ├── contacts.ts         # upsertContact, addTags, updateCustomFields
+│       ├── messages.ts         # sendMessage (SMS / WhatsApp / Email)
+│       ├── rateLimiter.ts      # per-tenant token bucket
+│       └── types.ts
+├── workers/                    # (planned — GHL integration work)
+│   └── ghlOutbox.worker.ts     # per-tenant IntegrationOutbox drain loop; see ARCHITECTURE.md §10
 └── services/
     ├── setup.service.ts        # ISetupService + SetupService (all 12 setup steps)
     ├── customer.service.ts     # ICustomerService: getCustomers, getCustomerDetail,
@@ -169,8 +179,19 @@ src/
     │                           #   FR-FREQ-1..6 logic in updateProperty + updateCustomer
     ├── round.service.ts        # IRoundService: listRounds, createRound, getRound,
     │                           #   updateRound, setTechnicians
-    └── settings.service.ts     # ISettingsService: all settings section reads/writes;
-                                #   MessageTemplate CRUD + replaceTemplates (for step 5)
+    ├── settings.service.ts     # ISettingsService: all settings section reads/writes;
+    │                           #   MessageTemplate CRUD + replaceTemplates (for step 5)
+    ├── today.service.ts        # TodayService: getTodaysWork (KPIs + rounds table)
+    ├── visit.service.ts        # VisitService: visit reads + status updates
+    ├── technician.service.ts   # TechnicianService: list, get, update, delete technicians
+    ├── invoice.service.ts      # InvoiceService: generate, preview, send invoices
+    ├── debt.service.ts         # DebtService: KPIs, board, remind, payment-link, bad-debt/hold flags
+    ├── complaint.service.ts    # ComplaintService: CRUD + status transitions + messaging thread
+    ├── reports.service.ts      # ReportsService: activity log, visit history, technician perf, revenue
+    ├── dashboard.service.ts    # DashboardService: getKpis, getAlerts, getTodaysRounds,
+    │                           #   getTechnicianKpis, getChartData
+    └── emergency.service.ts    # EmergencyService: reportEmergency, listEmergencies, getEmergency,
+                                #   getAvailableTechnicians, reassign (atomic tx)
 ```
 **Intended layout** (as domains land): one `routes/<domain>.ts` + one
 `services/<domain>.service.ts` per domain, following the thin-route /
@@ -268,14 +289,57 @@ yet in code). All non-`/health` routes require a Bearer JWT.
 | PUT | `/rounds/:id/technicians` | JWT + Tenant (ADMIN/MGR) | RoundService | **Built** |
 | GET | `/rounds/:id/planner/occurrences` | JWT + Tenant | RoundService | **Built** |
 | GET | `/rounds/:id/planner/occurrences/:date` | JWT + Tenant | RoundService | **Built** |
-| — | Visit generation (cron) + Visit reads | JWT + Tenant / cron | VisitService (planned) | **Planned** |
-| — | Round Planner map view + Today's Work (per-technician day view) | JWT + Tenant | RoundService (planned) | **Planned** |
-| — | Today's Work + Reassign / Push Missed | JWT + Tenant | VisitService (planned) | **Planned** |
-| — | Debt / Payment Risk Board | JWT + Tenant | DebtService (planned) | **Planned** |
-| — | Invoices (generate/preview/send) | JWT + Tenant | InvoiceService (planned) | **Planned** |
-| — | Complaints (log/review/revisit/resolve) | JWT + Tenant | ComplaintService (planned) | **Planned** |
-| — | Reports & History | JWT + Tenant | ReportService (planned) | **Planned** |
+| GET | `/today` | JWT + Tenant | TodayService | **Built** |
+| POST | `/today/close` | JWT + Tenant (ADMIN/MGR) | TodayService | **Built** |
+| GET | `/visits` | JWT + Tenant | VisitService | **Built** |
+| GET | `/visits/:id` | JWT + Tenant | VisitService | **Built** |
+| PATCH | `/visits/:id` | JWT + Tenant (ADMIN/MGR) | VisitService | **Built** |
+| GET | `/technicians` | JWT + Tenant | TechnicianService | **Built** |
+| GET | `/technicians/:id` | JWT + Tenant | TechnicianService | **Built** |
+| PATCH | `/technicians/:id` | JWT + Tenant (ADMIN/MGR) | TechnicianService | **Built** |
+| DELETE | `/technicians/:id` | JWT + Tenant (ADMIN/MGR) | TechnicianService | **Built** |
+| GET | `/invoices/preview` | JWT + Tenant | InvoiceService | **Built** |
+| GET | `/invoices/:id` | JWT + Tenant | InvoiceService | **Built** |
+| POST | `/invoices` | JWT + Tenant (ADMIN/MGR) | InvoiceService | **Built** |
+| POST | `/invoices/:id/send` | JWT + Tenant (ADMIN/MGR) | InvoiceService | **Built** |
+| GET | `/debt/kpis` | JWT + Tenant | DebtService | **Built** |
+| GET | `/debt/board` | JWT + Tenant | DebtService | **Built** |
+| POST | `/debt/:id/remind` | JWT + Tenant (ADMIN/MGR) | DebtService | **Built** |
+| POST | `/debt/:id/payment-link` | JWT + Tenant (ADMIN/MGR) | DebtService | **Built** |
+| PATCH | `/debt/:id/bad-debt` | JWT + Tenant (ADMIN/MGR) | DebtService | **Built** |
+| PATCH | `/debt/:id/hold` | JWT + Tenant (ADMIN/MGR) | DebtService | **Built** |
+| GET | `/complaints` | JWT + Tenant | ComplaintService | **Built** |
+| POST | `/complaints` | JWT + Tenant (ADMIN/MGR) | ComplaintService | **Built** |
+| GET | `/complaints/:id` | JWT + Tenant | ComplaintService | **Built** |
+| GET | `/complaints/:id/messages` | JWT + Tenant | ComplaintService | **Built** |
+| POST | `/complaints/:id/messages` | JWT + Tenant (ADMIN/MGR) | ComplaintService | **Built** |
+| POST | `/complaints/:id/mark-in-review` | JWT + Tenant (ADMIN/MGR) | ComplaintService | **Built** |
+| POST | `/complaints/:id/schedule-revisit` | JWT + Tenant (ADMIN/MGR) | ComplaintService | **Built** |
+| POST | `/complaints/:id/resolve` | JWT + Tenant (ADMIN/MGR) | ComplaintService | **Built** |
+| POST | `/complaints/:id/reopen` | JWT + Tenant (ADMIN/MGR) | ComplaintService | **Built** |
+| POST | `/complaints/:id/assign-technician` | JWT + Tenant (ADMIN/MGR) | ComplaintService | **Built** |
+| GET | `/reports/activity` | JWT + Tenant | ReportsService | **Built** |
+| GET | `/reports/visits` | JWT + Tenant | ReportsService | **Built** |
+| GET | `/reports/technicians` | JWT + Tenant | ReportsService | **Built** |
+| GET | `/reports/revenue` | JWT + Tenant | ReportsService | **Built** |
+| GET | `/reports/summary` | JWT + Tenant | ReportsService | **Built** |
+| GET | `/dashboard/kpis` | JWT + Tenant (ADMIN/MGR) | DashboardService | **Built** |
+| GET | `/dashboard/alerts` | JWT + Tenant (ADMIN/MGR) | DashboardService | **Built** |
+| GET | `/dashboard/rounds` | JWT + Tenant (ADMIN/MGR) | DashboardService | **Built** |
+| GET | `/dashboard/technician-kpis` | JWT + Tenant (ADMIN/MGR) | DashboardService | **Built** |
+| GET | `/dashboard/charts` | JWT + Tenant (ADMIN/MGR) | DashboardService | **Built** |
+| POST | `/emergencies` | JWT + Tenant (any role) | EmergencyService | **Built** |
+| GET | `/emergencies` | JWT + Tenant (ADMIN/MGR) | EmergencyService | **Built** |
+| GET | `/emergencies/:id` | JWT + Tenant (ADMIN/MGR) | EmergencyService | **Built** |
+| GET | `/emergencies/:id/available-technicians` | JWT + Tenant (ADMIN/MGR) | EmergencyService | **Built** |
+| POST | `/emergencies/:id/reassign` | JWT + Tenant (ADMIN/MGR) | EmergencyService | **Built** |
+| — | Visit generation cron | cron | VisitService (planned) | **Planned** |
 | — | Mobile: job list, visit actions, notifications | JWT + Tenant | MobileService (planned) | **Planned** |
+| POST | `/settings/ghl/connect` | JWT + Tenant (ADMIN/MGR) | GhlSettingsService (planned) | **Planned** |
+| GET | `/settings/ghl/status` | JWT + Tenant | GhlSettingsService (planned) | **Planned** |
+| POST | `/settings/ghl/disconnect` | JWT + Tenant (ADMIN/MGR) | GhlSettingsService (planned) | **Planned** |
+| POST | `/webhooks/ghl` | No auth (secret in URL) | GhlWebhookHandler (planned) | **Planned** |
+| POST | `/webhooks/gocardless` | No auth (HMAC verified) | GoCardlessWebhookHandler (planned) — handles `mandate_active`, `payment_confirmed`, `payment_failed` | **Planned** |
 
 ### 2.5 Data Access Pattern
 Two Prisma clients and one direct `pg` connection cover all DB access:
@@ -371,6 +435,12 @@ Holds all operational data for one business. Deployed per-tenant as `t_<20-hex>`
   `Technician?`, `Message[]`, `Photo[]`.
 - **Issue** — lightweight operational exception on a visit. Fields: `type`
   (`IssueType`), `note?`.
+- **TechnicianEmergency** — technician self-reported emergency mid-round. Fields:
+  `technicianId`, `roundId`, `remainingStops Int`, `lastLocation?`, `scheduledWindowEnd?`,
+  `notes?`, `status` (`EmergencyStatus`: `ACTIVE | RESOLVED`), `assignedTechnicianId?`
+  (replacement), `resolvedAt?`, `reportedAt`. Resolving atomically bulk-reassigns all
+  remaining `SCHEDULED`/`IN_PROGRESS` visits in that round to the replacement technician
+  via `prisma.$transaction`. Indexed on `technicianId`, `roundId`, `status`.
 
 **Billing**
 - **Invoice** — fields: `invoiceNumber` (unique within tenant schema), `amount`,
@@ -381,7 +451,7 @@ Holds all operational data for one business. Deployed per-tenant as `t_<20-hex>`
 **Messaging**
 - **Message** — fields: `channel` (`MessageChannel`), `direction`, `body`,
   `scheduledFor?`, `sentAt?`, `creditCost?`.
-- **MessageTemplate** — reusable template (`name`, `channel?` (SMS/WHATSAPP/EMAIL), `subject?` (email subject line), `body`). Email templates rendered via `sendTemplatedEmail()` with `{{variable}}` substitution.
+- **MessageTemplate** — reusable template (`name`, `channel?` (SMS/WHATSAPP/EMAIL), `subject?` (email subject line), `body`). Templates are written to `IntegrationOutbox` and delivered via GHL; `{{variable}}` values are HTML-escaped before being embedded in the payload.
 
 **Catalogue / config**
 - **Service** — catalogue entry. Fields: `name`, `category` (`ServiceCategory`),
@@ -389,10 +459,10 @@ Holds all operational data for one business. Deployed per-tenant as `t_<20-hex>`
 - **Photo** — linked to Property/Visit/Complaint. Fields: `url`, `type` (`PhotoType`).
 - **ActivityLog** — timestamped audit entries (`type`, `message`).
 
-**Enums (17):** `LifecycleStatus`, `RoundStatus`, `DayOfWeek`, `CleaningFrequency`,
+**Enums (18):** `LifecycleStatus`, `RoundStatus`, `DayOfWeek`, `CleaningFrequency`,
 `VisitStatus`, `PaymentStatus`, `PaymentMethod`, `PaymentTiming`, `MessageChannel`,
 `MessageDirection`, `Severity`, `ComplaintStatus`, `ServiceCategory`, `PropertyType`,
-`InvoiceStatus`, `IssueType`, `PhotoType`, `NoteType`.
+`InvoiceStatus`, `IssueType`, `PhotoType`, `NoteType`, `EmergencyStatus`.
 
 ### 3.2 Schema Decisions
 **Decided:**
@@ -435,8 +505,19 @@ single transaction.
 | Migration | Purpose |
 |-----------|---------|
 | `20260721000001_init_tenant` | Full initial tenant schema — all operational models + enums. |
-| `20260721000002_business_settings_unique_id` | Adds `BusinessSettings.uniqueId String @unique @default("singleton")` — DB-enforced singleton constraint. |
-| `20260721000003_setup_steps_9_12` | Creates `PropertyType` enum; alters `Property.propertyType` from `String?` to `PropertyType?`; adds `ServicePlan.cleaningFrequency`; creates `RoundTechnician` join table with FK constraints (`ON DELETE CASCADE`). |
+| `20260721000002_business_settings_unique_id` | Adds `BusinessSettings.uniqueId @unique @default("singleton")` — DB-enforced singleton. |
+| `20260721000003_setup_steps_9_12` | `PropertyType` enum; `Property.propertyType`; `ServicePlan.cleaningFrequency`; `RoundTechnician` join table. |
+| `20260726000000_message_template_subject` | Adds `MessageTemplate.subject String?` for email subject lines. |
+| `20260728000000_service_area_single_default_index` | Partial unique index — one default `ServiceArea` per tenant. |
+| `20260805000000_business_settings_last_closed_date` | Adds `BusinessSettings.lastClosedDate DateTime?`. |
+| `20260805000001_technician_email_notes` | Adds `Technician.email String?` and `Technician.notes String?`. |
+| `20260812000000_invoice_due_date` | Adds `Invoice.dueDate DateTime?`. |
+| `20260812000001_customer_hold_next_clean` | Adds `Customer.holdNextClean Boolean @default(false)`. |
+| `20260812000002_activity_log_actor` | Adds `ActivityLog.actorId String?`. |
+| `20260825000000_cleaning_frequency_4_6_8_12` | Extends `CleaningFrequency` enum values. |
+| `20260825000001_business_settings_pre_clean_reminder_timings` | Pre-clean reminder timing config on `BusinessSettings`. |
+| `20260825000002_customer_landline` | Adds `Customer.landline String?`. |
+| `20260915000000_technician_emergency` | `EmergencyStatus` enum + `TechnicianEmergency` model; emergency relations on `Technician` and `Round`. |
 
 *Process note: destructive `migrate dev` prompts can't be answered in a non-TTY
 environment, so breaking migrations are produced via `migrate diff` → `migrate
@@ -555,7 +636,7 @@ else:                                              // Case B (FR-FREQ-4)
   the result as `req.tenantPrisma` and `req.profile`. Returns 401 if no `req.user`,
   403 if no `Profile` found.
 - **Technician invite flow:** `POST /invites` creates a `TenantInvite` and sends an
-  invite email via Resend. `POST /invites/:token/accept` is called by the invitee
+  invite email via **Supabase Auth** (`admin.auth.inviteUserByEmail()`). `POST /invites/:token/accept` is called by the invitee
   after authenticating. It creates a `Profile` and marks the invite accepted
   atomically (Prisma transaction). If the invite has a `technicianId`, the
   corresponding `Technician.profileId` is linked after the transaction. The endpoint
@@ -575,27 +656,26 @@ else:                                              // Case B (FR-FREQ-4)
 
 ## 5. Integration Design
 
-### 5.1 GHL (deferred — architecture only)
-- **Role:** messaging (SMS/WhatsApp/Email) and assisting Stripe/GoCardless payment
-  flows, against a **single GHL account**. Not the data layer, business-logic
-  engine, delivery mechanism, or auth (that GHL-native architecture was retired).
-- **Trigger mechanism — OPEN DECISION:** either (a) write to a synced GHL Contact's
-  custom fields and let a GHL Workflow watch for the change, or (b) call the GHL
-  API directly. To be resolved before visit-generation/payment logic depends on it.
+### 5.1 GHL (architecture decided — implementation pending)
+- **Role:** messaging (SMS/WhatsApp/Email) and inbound lead capture. **One GHL sub-account per tenant** (one `ghlLocationId` per `Tenant` row). Not the data layer, business-logic engine, or auth.
+- **Integration model — DECIDED:** outbox pattern. Route handlers write `IntegrationOutbox` rows in the same DB transaction as operational writes. A background worker (`src/workers/ghlOutbox.worker.ts`) polls every 15s, iterates connected tenants, and drains each tenant's outbox via the GHL Adapter (`src/integrations/ghl/`). Full architecture: `ARCHITECTURE.md §10`.
+- **Authentication:** Phase 1 uses Private Integration Tokens (PIT). Each tenant pastes their token via `POST /settings/ghl/connect`; it is AES-256-GCM encrypted and stored on `Tenant.ghlAccessToken`. Phase 2 (marketplace) will add OAuth.
+- **Inbound webhooks:** `POST /webhooks/ghl?tenantId=X&secret=Y`. Each tenant has a unique `ghlWebhookSecret` generated at connect time. The GHL automation owner configures the webhook URL in GHL Workflows.
 - **Join point:** every `Customer`/`Property` carries `ghlContactId` from day one.
+- **Automation owner handoff:** `docs/GHL_AUTOMATION_OWNER_HANDOFF.md`.
 
-### 5.2 GoCardless / Stripe (deferred)
-- **GoCardless** = primary (direct-debit-first) provider; **Stripe** = card fallback
-  (payment links). Schema carries `Payment.gocardlessId` / `stripeId` and
-  `PaymentMethod` includes `GOCARDLESS`/`STRIPE`/`CASH`/`CHEQUE`/`BACS`.
-  `POST /settings/payment/:provider/connect` exists as a Phase-1 stub (boolean flag
-  only, no real OAuth). No provider integration code beyond the stub.
+### 5.2 GoCardless / Stripe
+- **GoCardless** = primary (direct-debit-first) provider. Full SDK integration in RoundFlow — mandate setup, charge creation, webhook receiver.
+- **Mandate setup:** GoCardless Billing Request Flow (hosted redirect) during Setup Wizard Step 2. `Customer.gocardlessId` stores the mandate ID.
+- **Charge creation:** triggered at `visit.completed` handler — same moment as GHL outbox row write. Independent side-effects, not coupled.
+- **Webhook receiver:** `POST /webhooks/gocardless` (HMAC verified). On `payment_confirmed` → create `Payment` row + write `payment.collected` outbox event (GHL removes `debt-overdue`, updates `balance_owed`). On `payment_failed` → write `payment.failed` outbox event (GHL adds `payment-failed` tag).
+- **Deploy blocker:** Mark's Zapier GoCardless flow must be disabled at the moment this goes live — both running simultaneously would double-charge customers.
+- **Stripe** = card fallback (payment links). Schema carries `Payment.gocardlessId` / `stripeId` and `PaymentMethod` includes `GOCARDLESS`/`STRIPE`/`CASH`/`CHEQUE`/`BACS`.
+- `POST /settings/payment/:provider/connect` exists as a Phase-1 stub (boolean flag only). No provider SDK integration beyond this stub.
 
-### 5.3 Resend (live)
-- **Role:** transactional email for invite delivery. `sendInviteEmail()` in
-  `src/lib/email.ts` sends via the Resend SDK. The `businessName` field
-  (user-supplied) is HTML-escaped before interpolation; the invite URL is encoded
-  with `encodeURI`.
+### 5.3 Email — Supabase Auth (staff) + GHL (customers)
+- **Staff invite email:** `sendInviteEmail()` in `src/lib/email.ts` is being migrated to Supabase Auth Admin SDK (`admin.auth.inviteUserByEmail()`). This keeps all internal auth-related email (invite, OTP, password reset) in one place — Supabase. Resend has been removed from the stack.
+- **Customer-facing email:** all customer communications (reminders, job completion, payment chase, invoice delivery) route through GHL via the outbox worker — the same path as SMS and WhatsApp. No separate email library is needed for customer comms.
 
 ### 5.4 Supabase Auth (live)
 - JWT issuance (ES256), JWKS endpoint for verification. `POST /auth/signup` replaces
@@ -632,7 +712,7 @@ else:                                              // Case B (FR-FREQ-4)
   cross-email (req.user.email ≠ invite.email) acceptance are explicitly rejected
   with 403 in `POST /invites/:token/accept`.
 - **Email injection prevention:** `businessName` is HTML-escaped; invite URL is
-  `encodeURI`-encoded before embedding in Resend email body.
+  `encodeURI`-encoded before passing to Supabase Auth `inviteUserByEmail()` as `redirectTo`.
 - **Credential handling:** secrets in `.env` (gitignored); `.env.example` documents
   keys without values; no secrets in code.
 - **Error hygiene:** typed `AppError` maps to its status; all else → generic 500
@@ -645,8 +725,7 @@ Items not-yet-designed / pending:
 
 - **Mobile completion delivery (DP-MOBILE)** — React Native/Expo app is Phase 2; all
   mobile FE tickets are deferred.
-- **GHL automation trigger mechanism (DP-GHL)** — contact-field-sync-and-watch vs
-  direct API call (blocks messaging/payment automation design).
+- ~~**GHL automation trigger mechanism (DP-GHL)**~~ — **RESOLVED.** Outbox pattern: RoundFlow writes `IntegrationOutbox` rows; worker drains to GHL Adapter. See `§5.1` and `ARCHITECTURE.md §10`.
 - **`RoundOccurrence` model** — deferred; per-occurrence assignment is derived from
   Visits in Phase 1.
 - **Technician availability model (#4)** — availability status enum + leave date;

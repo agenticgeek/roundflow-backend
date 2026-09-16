@@ -346,7 +346,7 @@ settingsRouter.post(
 );
 
 // ==========================================================================
-// Section 7 — Message Templates (SMS / WhatsApp / Email via Resend)
+// Section 7 — Message Templates (SMS / WhatsApp / Email via GHL)
 // ==========================================================================
 
 settingsRouter.get(

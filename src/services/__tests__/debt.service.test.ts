@@ -1,9 +1,6 @@
 import { it, expect, vi } from "vitest";
 
-vi.mock("../../lib/email", () => ({
-  sendInvoiceEmail: vi.fn().mockResolvedValue(undefined),
-  sendTemplatedEmail: vi.fn().mockResolvedValue(undefined),
-}));
+vi.mock("../../lib/email", () => ({}));
 
 import { createDebtService } from "../debt.service";
 

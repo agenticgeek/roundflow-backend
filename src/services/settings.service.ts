@@ -207,7 +207,7 @@ export interface ISettingsService {
     provider: "gocardless" | "stripe"
   ): Promise<{ status: string; connectUrl?: string }>;
 
-  // Message Templates (SMS / WhatsApp / Email via Resend)
+  // Message Templates (SMS / WhatsApp / Email via GHL)
   getMessageTemplates(profileId: string): Promise<MessageTemplateView[]>;
   createMessageTemplate(profileId: string, input: MessageTemplateInput): Promise<MessageTemplateView>;
   updateMessageTemplate(profileId: string, id: string, input: MessageTemplateUpdateInput): Promise<MessageTemplateView>;
