@@ -67,6 +67,7 @@ enum PaymentStatus {
   PAID
   FAILED
   OVERDUE
+  CANCELLED
 }
 
 enum PaymentMethod {
@@ -132,6 +133,7 @@ enum InvoiceStatus {
   DRAFT
   SENT
   PAID
+  VOID
 }
 
 enum IssueType {
@@ -151,6 +153,18 @@ enum NoteType {
   INTERNAL
   RISK_WARNING
   CUSTOMER
+}
+
+enum StripeSessionType {
+  ONE_TIME
+  SETUP
+}
+
+enum StripeSessionStatus {
+  PENDING
+  COMPLETE
+  EXPIRED
+  CANCELLED
 }
 
 // ── Models ─────────────────────────────────────────────────────────────────
@@ -175,9 +189,15 @@ model BusinessSettings {
   paymentRule         PaymentTiming?
   debtHoldEnabled     Boolean        @default(false)
   vatInInvoices       Boolean        @default(false)
-  gocardlessConnected Boolean        @default(false)
-  stripeConnected     Boolean        @default(false)
-  setupCompleted      Boolean        @default(false)
+  gocardlessConnected              Boolean @default(false)
+  gocardlessAccessTokenEncrypted   String?
+  gocardlessWebhookSecretEncrypted String?
+  gocardlessEnvironment            String?
+  stripeConnected              Boolean        @default(false)
+  stripePublishableKey         String?
+  stripeSecretKeyEncrypted     String?
+  stripeWebhookSecretEncrypted String?
+  setupCompleted               Boolean        @default(false)
   lastClosedDate           String?        // YYYY-MM-DD; set by POST /today/close to block re-close
   preCleanReminderTimings  String[]
   updatedAt                DateTime       @updatedAt
@@ -190,8 +210,13 @@ model Customer {
   landline      String?
   email         String?
   status        LifecycleStatus @default(ACTIVE)
-  ghlContactId  String?
-  paymentMethod PaymentMethod?
+  ghlContactId                 String?
+  stripeCustomerId             String?
+  stripeDefaultPaymentMethodId String?
+  gocardlessCustomerId         String?
+  gocardlessMandateId          String?
+  gocardlessMandateStatus      String?
+  paymentMethod                PaymentMethod?
   badDebt       Boolean         @default(false)
   holdNextClean Boolean         @default(false)
   properties    Property[]
@@ -438,9 +463,10 @@ model Payment {
   amount       Decimal       @db.Decimal(10, 2)
   method       PaymentMethod
   status       PaymentStatus @default(PENDING)
-  gocardlessId String?
-  stripeId     String?
-  contactedAt  DateTime?
+  gocardlessId     String?
+  stripeId         String?   // Stripe PaymentIntent ID (pi_xxx)
+  stripeReceiptUrl String?
+  contactedAt      DateTime?
   paidAt       DateTime?
   createdAt    DateTime      @default(now())
   updatedAt    DateTime      @updatedAt
@@ -557,4 +583,35 @@ model TechnicianEmergency {
   @@index([technicianId])
   @@index([roundId])
   @@index([status])
+}
+
+// Tracks every Stripe Checkout Session and SetupIntent. Separate from Payment
+// because a session can expire or be replaced before a payment record exists.
+model StripeSession {
+  id              String              @id @default(cuid())
+  stripeSessionId String              @unique  // cs_xxx (checkout) or seti_xxx (setup)
+  type            StripeSessionType
+  status          StripeSessionStatus @default(PENDING)
+  customerId      String
+  invoiceId       String?             // null for SETUP sessions
+  amountTotal     Decimal?            @db.Decimal(10, 2)
+  currency        String              @default("gbp")
+  url             String
+  expiresAt       DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime            @default(now())
+
+  @@index([customerId])
+  @@index([invoiceId])
+  @@index([status])
+}
+
+// Inbound webhook dedup — insert before processing; unique constraint rejects replays.
+model WebhookEvent {
+  id         String   @id @default(cuid())
+  source     String   // "stripe" | "ghl"
+  externalId String   // Stripe event ID or GHL event ID
+  receivedAt DateTime @default(now())
+
+  @@unique([source, externalId])
 }

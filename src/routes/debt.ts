@@ -5,6 +5,10 @@ import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireRole } from "../middleware/requireRole";
 import { h } from "../lib/http";
 import { createDebtService } from "../services/debt.service";
+import { decrypt } from "../lib/crypto";
+import { getStripeClient } from "../integrations/stripe/client";
+import { createOneTimeSession } from "../integrations/stripe/checkout";
+import { StripeSessionType } from "../generated/tenant-client";
 
 export const debtRouter = Router();
 debtRouter.use(requireAuth);
@@ -36,9 +40,53 @@ debtRouter.post("/:id/remind", h(async (req, res) => {
 }));
 
 // POST /debt/:id/payment-link
+// If Stripe is connected, creates a real Stripe Checkout Session and returns
+// the hosted URL. Falls back to the static pay.roundflow.app link otherwise.
 debtRouter.post("/:id/payment-link", h(async (req, res) => {
   const { message } = req.body ?? {};
   if (!message) return res.status(400).json({ error: "message is required" });
+
+  // Try Stripe checkout first
+  const bs = await req.tenantPrisma!.businessSettings.findFirst({
+    select: { stripeConnected: true, stripeSecretKeyEncrypted: true },
+  });
+  if (bs?.stripeConnected && bs.stripeSecretKeyEncrypted) {
+    const invoice = await req.tenantPrisma!.invoice.findUnique({ where: { id: req.params.id } });
+    if (invoice && invoice.status !== "PAID" && invoice.status !== "VOID") {
+      const existing = await req.tenantPrisma!.stripeSession.findFirst({
+        where: { invoiceId: invoice.id, status: "PENDING" },
+      });
+      const checkoutUrl = existing?.url ?? await (async () => {
+        const stripe = getStripeClient(decrypt(bs.stripeSecretKeyEncrypted!));
+        const FRONTEND = process.env.FRONTEND_URL?.split(",")[0].trim() ?? "";
+        const result = await createOneTimeSession(stripe, req.tenantPrisma!, {
+          tenantId: req.profile!.tenantId,
+          customerId: invoice.customerId,
+          invoiceId: invoice.id,
+          invoiceNumber: invoice.invoiceNumber,
+          amountPence: Math.round(Number(invoice.amount) * 100),
+          successUrl: `${FRONTEND}/invoices/${invoice.id}?payment=success`,
+          cancelUrl:  `${FRONTEND}/invoices/${invoice.id}?payment=cancelled`,
+        });
+        await req.tenantPrisma!.stripeSession.create({
+          data: {
+            stripeSessionId: result.stripeSessionId,
+            type: StripeSessionType.ONE_TIME,
+            customerId: invoice.customerId,
+            invoiceId: invoice.id,
+            amountTotal: invoice.amount,
+            currency: "gbp",
+            url: result.url,
+            expiresAt: result.expiresAt,
+          },
+        });
+        return result.url;
+      })();
+      const result = await svc(req).sendPaymentLink(req.params.id, message, checkoutUrl);
+      return res.json(result);
+    }
+  }
+
   const result = await svc(req).sendPaymentLink(req.params.id, message);
   return res.json(result);
 }));
