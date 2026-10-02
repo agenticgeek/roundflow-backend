@@ -11,6 +11,8 @@ function makePrisma() {
     propertyNote: { create: vi.fn() },
     photo: { create: vi.fn() },
     technician: { findUnique: vi.fn() },
+    invoice: { findMany: vi.fn() },
+    businessSettings: { findFirst: vi.fn().mockResolvedValue({ debtHoldEnabled: false, debtHoldMaxInvoices: null, debtHoldMaxAmount: null }) },
   } as unknown as Parameters<typeof createHomeService>[0];
 }
 
@@ -20,7 +22,7 @@ function makePrisma() {
 
 it("startVisit transitions SCHEDULED visit to IN_PROGRESS and records startedAt", async () => {
   const prisma = makePrisma();
-  (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1", status: "SCHEDULED" });
+  (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1", status: "SCHEDULED", property: { customerId: "c1" } });
   (prisma.visit.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1", status: "IN_PROGRESS" });
 
   await createJobTrackerService(prisma).startVisit("v1", "tech-profile-1");
@@ -33,7 +35,7 @@ it("startVisit transitions SCHEDULED visit to IN_PROGRESS and records startedAt"
 
 it("startVisit throws 409 when visit is already IN_PROGRESS", async () => {
   const prisma = makePrisma();
-  (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1", status: "IN_PROGRESS" });
+  (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1", status: "IN_PROGRESS", property: { customerId: "c1" } });
 
   await expect(createJobTrackerService(prisma).startVisit("v1", "tech-profile-1")).rejects.toMatchObject({ statusCode: 409 });
 });
