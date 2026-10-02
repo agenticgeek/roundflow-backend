@@ -20,8 +20,12 @@ import { visitsRouter } from "./routes/visits";
 import { complaintsRouter } from "./routes/complaints";
 import { dashboardRouter } from "./routes/dashboard";
 import { emergenciesRouter } from "./routes/emergencies";
+import { mobileRouter } from "./mobile";
 import { openApiDocument } from "./swagger";
 import { migrateAllTenantSchemas } from "./lib/tenant-provisioning";
+import { paymentsRouter } from "./routes/payments";
+import { stripeWebhookRouter } from "./routes/stripeWebhook";
+import { gocardlessWebhookRouter } from "./routes/gocardlessWebhook";
 
 const FRONTEND_URL = process.env.FRONTEND_URL;
 if (!FRONTEND_URL) {
@@ -38,6 +42,12 @@ if (!process.env.INVITE_BASE_URL) {
 const app = express();
 
 app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
+
+// Stripe webhook must receive the raw body for signature verification.
+// Must be mounted BEFORE express.json() which would parse and discard it.
+app.use("/webhooks/stripe", express.raw({ type: "application/json" }), stripeWebhookRouter);
+app.use("/webhooks/gocardless", express.raw({ type: "application/json" }), gocardlessWebhookRouter);
+
 app.use(express.json());
 
 // ── Method guards ────────────────────────────────────────────────────────────
@@ -108,6 +118,8 @@ app.use("/visits", visitsRouter);
 app.use("/complaints", complaintsRouter);
 app.use("/dashboard", dashboardRouter);
 app.use("/emergencies", emergenciesRouter);
+app.use("/payments", paymentsRouter);
+app.use("/mobile", mobileRouter);
 
 // API docs (public) — interactive UI at /docs, raw spec at /openapi.json.
 app.get("/openapi.json", (_req: Request, res: Response) => {

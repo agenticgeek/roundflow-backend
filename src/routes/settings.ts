@@ -1,5 +1,8 @@
+import { randomBytes } from "crypto";
 import { Request, Router } from "express";
 import { ServiceCategory, PaymentTiming } from "../generated/tenant-client";
+import { encrypt } from "../lib/crypto";
+import { getStripeClient } from "../integrations/stripe/client";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
@@ -334,14 +337,110 @@ settingsRouter.patch(
   })
 );
 settingsRouter.post(
-  "/payment/:provider/connect",
+  "/payment/gocardless/connect",
   h(async (req, res) => {
     await svc(req).assertSetupComplete(actorIdOf(req));
-    const provider = req.params.provider;
-    if (provider !== "gocardless" && provider !== "stripe") {
-      throw new AppError(400, `Unknown provider: ${provider}. Use "gocardless" or "stripe".`);
+    const body = asObject(req.body);
+    const accessToken = requireString(body.accessToken, "accessToken");
+    const environment = requireString(body.environment, "environment");
+
+    if (environment !== "sandbox" && environment !== "live") {
+      throw new AppError(400, 'environment must be "sandbox" or "live"');
     }
-    res.json(await svc(req).connectProvider(actorIdOf(req), provider));
+
+    // Validate token by hitting the GoCardless API
+    try {
+      const { getGcClient } = await import("../integrations/gocardless/client.js");
+      const client = getGcClient(accessToken, environment);
+      await client.creditors.list();
+    } catch {
+      throw new AppError(400, "GoCardless access token is invalid or could not be verified");
+    }
+
+    const webhookSecret = randomBytes(32).toString("hex");
+    await req.tenantPrisma!.businessSettings.updateMany({
+      data: {
+        gocardlessConnected: true,
+        gocardlessAccessTokenEncrypted: encrypt(accessToken),
+        gocardlessWebhookSecretEncrypted: encrypt(webhookSecret),
+        gocardlessEnvironment: environment,
+      },
+    });
+
+    const tenantId = req.profile!.tenantId;
+    const webhookUrl = `${process.env.PUBLIC_API_URL}/webhooks/gocardless?tenantId=${tenantId}&secret=${webhookSecret}`;
+    res.json({ status: "connected", webhookUrl });
+  })
+);
+
+settingsRouter.post(
+  "/payment/gocardless/disconnect",
+  h(async (req, res) => {
+    await svc(req).assertSetupComplete(actorIdOf(req));
+    await req.tenantPrisma!.businessSettings.updateMany({
+      data: {
+        gocardlessConnected: false,
+        gocardlessAccessTokenEncrypted: null,
+        gocardlessWebhookSecretEncrypted: null,
+        gocardlessEnvironment: null,
+      },
+    });
+    res.json({ status: "disconnected" });
+  })
+);
+
+settingsRouter.post(
+  "/payment/stripe/connect",
+  h(async (req, res) => {
+    await svc(req).assertSetupComplete(actorIdOf(req));
+    const body = asObject(req.body);
+    const secretKey    = requireString(body.secretKey,    "secretKey");
+    const publishableKey = requireString(body.publishableKey, "publishableKey");
+
+    if (!secretKey.startsWith("sk_")) {
+      throw new AppError(400, "secretKey must be a Stripe secret key (starts with sk_)");
+    }
+    if (!publishableKey.startsWith("pk_")) {
+      throw new AppError(400, "publishableKey must be a Stripe publishable key (starts with pk_)");
+    }
+
+    // Validate key by hitting Stripe API
+    try {
+      const stripe = getStripeClient(secretKey);
+      await stripe.balance.retrieve();
+    } catch {
+      throw new AppError(400, "Stripe secret key is invalid or could not be verified");
+    }
+
+    const webhookSecret = randomBytes(32).toString("hex");
+    await req.tenantPrisma!.businessSettings.updateMany({
+      data: {
+        stripeConnected: true,
+        stripePublishableKey: publishableKey,
+        stripeSecretKeyEncrypted:     encrypt(secretKey),
+        stripeWebhookSecretEncrypted: encrypt(webhookSecret),
+      },
+    });
+
+    const tenantId = req.profile!.tenantId;
+    const webhookUrl = `${process.env.PUBLIC_API_URL}/webhooks/stripe?tenantId=${tenantId}&secret=${webhookSecret}`;
+    res.json({ status: "connected", webhookUrl });
+  })
+);
+
+settingsRouter.post(
+  "/payment/stripe/disconnect",
+  h(async (req, res) => {
+    await svc(req).assertSetupComplete(actorIdOf(req));
+    await req.tenantPrisma!.businessSettings.updateMany({
+      data: {
+        stripeConnected: false,
+        stripePublishableKey: null,
+        stripeSecretKeyEncrypted: null,
+        stripeWebhookSecretEncrypted: null,
+      },
+    });
+    res.json({ status: "disconnected" });
   })
 );
 

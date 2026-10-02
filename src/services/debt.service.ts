@@ -66,16 +66,14 @@ export function createDebtService(prisma: TenantPrismaClient) {
         })
         .map(toItem);
     },
-    sendPaymentLink: async (invoiceId: string, _message: string) => {
+    sendPaymentLink: async (invoiceId: string, _message: string, overrideUrl?: string) => {
       const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId }, include: { customer: { select: { id: true, name: true, email: true } } } });
       if (!invoice) throw new AppError(404, "Invoice not found");
       if (!(invoice as any).customer.email) throw new AppError(400, "Customer has no email address");
-      const settings = await prisma.businessSettings.findFirst({ select: { businessName: true, email: true } });
-      const link = `https://pay.roundflow.app/i/${(invoice as any).invoiceNumber}`;
+      const link = overrideUrl ?? `https://pay.roundflow.app/i/${(invoice as any).invoiceNumber}`;
       const body = `${_message}\n\n${link}`;
       const msg = await prisma.message.create({ data: { channel: "EMAIL", direction: "OUTBOUND", body, customerId: (invoice as any).customerId, sentAt: new Date() } });
-      void settings;
-      return { id: msg.id };
+      return { id: msg.id, paymentUrl: link };
     },
     flagHold: async (invoiceId: string, _flag: boolean) => {
       const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });

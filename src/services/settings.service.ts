@@ -202,11 +202,6 @@ export interface ISettingsService {
     profileId: string,
     input: PaymentRulesUpdateInput
   ): Promise<BusinessSettings>;
-  connectProvider(
-    profileId: string,
-    provider: "gocardless" | "stripe"
-  ): Promise<{ status: string; connectUrl?: string }>;
-
   // Message Templates (SMS / WhatsApp / Email via GHL)
   getMessageTemplates(profileId: string): Promise<MessageTemplateView[]>;
   createMessageTemplate(profileId: string, input: MessageTemplateInput): Promise<MessageTemplateView>;
@@ -560,21 +555,6 @@ class SettingsService implements ISettingsService {
       vatInInvoices: input.vatInInvoices,
       debtHoldEnabled: input.debtHoldEnabled,
     });
-  }
-
-  async connectProvider(
-    _profileId: string,
-    provider: "gocardless" | "stripe"
-  ): Promise<{ status: string; connectUrl?: string }> {
-    // Phase-1 stub: flip the boolean; no OAuth, no URL. The response shape is
-    // provider-agnostic and swap-neutral for Phase 2 (where a real connectUrl
-    // will come from GHL) — see docs/SETTINGS_API_DESIGN.md §6.1.
-    await this.writeSettings(
-      provider === "gocardless"
-        ? { gocardlessConnected: true }
-        : { stripeConnected: true }
-    );
-    return { status: "connected" };
   }
 
   // ---- Message Templates ----

@@ -181,3 +181,71 @@ customersRouter.get(
     return res.json(invoices);
   })
 );
+
+// POST /customers/:id/mandate — start GoCardless redirect flow (mandate setup)
+customersRouter.post(
+  "/:id/mandate",
+  h(async (req, res) => {
+    const customer = await req.tenantPrisma!.customer.findUnique({ where: { id: req.params.id } });
+    if (!customer) throw new AppError(404, "Customer not found");
+    if (customer.gocardlessMandateStatus === "active") {
+      throw new AppError(409, "Customer already has an active GoCardless mandate");
+    }
+
+    const bs = await req.tenantPrisma!.businessSettings.findFirst({
+      select: { gocardlessConnected: true, gocardlessAccessTokenEncrypted: true, gocardlessEnvironment: true },
+    });
+    if (!bs?.gocardlessConnected || !bs.gocardlessAccessTokenEncrypted) {
+      throw new AppError(409, "GoCardless is not connected for this account");
+    }
+
+    const { decrypt } = await import("../lib/crypto.js");
+    const { getGcClient } = await import("../integrations/gocardless/client.js");
+    const { createRedirectFlow } = await import("../integrations/gocardless/mandate.js");
+
+    const client = getGcClient(decrypt(bs.gocardlessAccessTokenEncrypted), bs.gocardlessEnvironment ?? "sandbox");
+    const FRONTEND = process.env.FRONTEND_URL?.split(",")[0].trim() ?? "";
+    const { redirectUrl } = await createRedirectFlow(client, {
+      successRedirectUrl: `${FRONTEND}/customers/${customer.id}/mandate/success`,
+      sessionToken: customer.id,
+      description: "Direct Debit for window cleaning",
+    });
+
+    res.json({ url: redirectUrl });
+  })
+);
+
+// POST /customers/:id/mandate/complete — complete redirect flow after customer authorises
+customersRouter.post(
+  "/:id/mandate/complete",
+  h(async (req, res) => {
+    const body = asObject(req.body);
+    const redirectFlowId = requireString(body.redirectFlowId, "redirectFlowId");
+
+    const customer = await req.tenantPrisma!.customer.findUnique({ where: { id: req.params.id } });
+    if (!customer) throw new AppError(404, "Customer not found");
+
+    const bs = await req.tenantPrisma!.businessSettings.findFirst({
+      select: { gocardlessAccessTokenEncrypted: true, gocardlessEnvironment: true },
+    });
+    if (!bs?.gocardlessAccessTokenEncrypted) throw new AppError(409, "GoCardless is not connected");
+
+    const { decrypt } = await import("../lib/crypto.js");
+    const { getGcClient } = await import("../integrations/gocardless/client.js");
+    const { completeRedirectFlow } = await import("../integrations/gocardless/mandate.js");
+
+    const client = getGcClient(decrypt(bs.gocardlessAccessTokenEncrypted), bs.gocardlessEnvironment ?? "sandbox");
+    const { gcCustomerId, mandateId } = await completeRedirectFlow(client, redirectFlowId, customer.id);
+
+    await req.tenantPrisma!.customer.update({
+      where: { id: customer.id },
+      data: {
+        gocardlessCustomerId: gcCustomerId,
+        gocardlessMandateId: mandateId,
+        gocardlessMandateStatus: "pending_customer_approval",
+      },
+    });
+
+    res.json({ mandateId, status: "pending_customer_approval" });
+  })
+);
