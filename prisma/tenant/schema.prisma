@@ -308,6 +308,7 @@ model Round {
   visits           Visit[]
   roundTechnicians RoundTechnician[]
   emergencies      TechnicianEmergency[]
+  chatMessages     ChatMessage[]
   createdAt        DateTime           @default(now())
   updatedAt        DateTime           @updatedAt
 
@@ -371,6 +372,8 @@ model Visit {
   service       Service?       @relation(fields: [serviceId], references: [id])
   notes         String?
   skipReason    String?
+  startedAt     DateTime?
+  arrivedAt     DateTime?
   completedAt   DateTime?
   propertyId    String
   property      Property       @relation(fields: [propertyId], references: [id])
@@ -604,6 +607,23 @@ model StripeSession {
   @@index([customerId])
   @@index([invoiceId])
   @@index([status])
+}
+
+// In-app chat between technician and admin, scoped per round.
+// senderProfileId references public.Profile.id (cross-schema, plain String).
+// visitId is a plain reference (no FK) — used when type = WORK_PHOTOS.
+model ChatMessage {
+  id              String   @id @default(cuid())
+  roundId         String
+  round           Round    @relation(fields: [roundId], references: [id], onDelete: Cascade)
+  senderProfileId String
+  body            String?
+  type            String   @default("TEXT") // TEXT | WORK_PHOTOS
+  visitId         String?
+  createdAt       DateTime @default(now())
+
+  @@index([roundId, createdAt])
+  @@index([senderProfileId])
 }
 
 // Inbound webhook dedup — insert before processing; unique constraint rejects replays.

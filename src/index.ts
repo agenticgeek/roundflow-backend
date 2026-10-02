@@ -20,6 +20,7 @@ import { visitsRouter } from "./routes/visits";
 import { complaintsRouter } from "./routes/complaints";
 import { dashboardRouter } from "./routes/dashboard";
 import { emergenciesRouter } from "./routes/emergencies";
+import { mobileRouter } from "./mobile";
 import { openApiDocument } from "./swagger";
 import { migrateAllTenantSchemas } from "./lib/tenant-provisioning";
 import { paymentsRouter } from "./routes/payments";
@@ -118,6 +119,7 @@ app.use("/complaints", complaintsRouter);
 app.use("/dashboard", dashboardRouter);
 app.use("/emergencies", emergenciesRouter);
 app.use("/payments", paymentsRouter);
+app.use("/mobile", mobileRouter);
 
 // API docs (public) — interactive UI at /docs, raw spec at /openapi.json.
 app.get("/openapi.json", (_req: Request, res: Response) => {
