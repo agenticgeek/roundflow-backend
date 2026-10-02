@@ -187,7 +187,9 @@ model BusinessSettings {
   defaultCycleLength  Int?
   bankDetails         Json?
   paymentRule         PaymentTiming?
-  debtHoldEnabled     Boolean        @default(false)
+  debtHoldEnabled          Boolean        @default(false)
+  debtHoldMaxInvoices      Int?
+  debtHoldMaxAmount        Decimal?       @db.Decimal(10, 2)
   vatInInvoices       Boolean        @default(false)
   gocardlessConnected              Boolean @default(false)
   gocardlessAccessTokenEncrypted   String?

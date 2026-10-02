@@ -332,6 +332,8 @@ settingsRouter.patch(
       paymentRule: optPaymentTiming(body.paymentRule),
       vatInInvoices: optBool(body.vatInInvoices, "vatInInvoices"),
       debtHoldEnabled: optBool(body.debtHoldEnabled, "debtHoldEnabled"),
+      debtHoldMaxInvoices: body.debtHoldMaxInvoices !== undefined ? (body.debtHoldMaxInvoices === null ? null : Number(body.debtHoldMaxInvoices)) : undefined,
+      debtHoldMaxAmount: body.debtHoldMaxAmount !== undefined ? (body.debtHoldMaxAmount === null ? null : Number(body.debtHoldMaxAmount)) : undefined,
     };
     res.json(await svc(req).updatePaymentRules(actorIdOf(req), input));
   })

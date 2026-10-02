@@ -66,6 +66,15 @@ mobileRouter.patch("/visits/:id/skip", h(async (req, res) => {
   res.json({ status: "SKIPPED" });
 }));
 
+// PATCH /mobile/visits/:id/price
+mobileRouter.patch("/visits/:id/price", h(async (req, res) => {
+  const body = asObject(req.body);
+  const price = Number(requireString(String(body.price ?? ""), "price"));
+  if (isNaN(price)) throw new AppError(400, "price must be a number");
+  await tracker(req).adjustPrice(req.params.id, price);
+  res.json({ adjusted: true });
+}));
+
 // POST /mobile/visits/:id/access-issues
 mobileRouter.post("/visits/:id/access-issues", h(async (req, res) => {
   const body = asObject(req.body);

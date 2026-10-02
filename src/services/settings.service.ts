@@ -92,6 +92,8 @@ export interface PaymentRulesUpdateInput {
   paymentRule?: PaymentTiming | null;
   vatInInvoices?: boolean;
   debtHoldEnabled?: boolean;
+  debtHoldMaxInvoices?: number | null;
+  debtHoldMaxAmount?: number | null;
 }
 
 /** ServiceArea + a derived, read-only summary of Rounds that reference it. */
@@ -248,6 +250,8 @@ type SettingsWritable = {
   paymentRule?: PaymentTiming | null;
   vatInInvoices?: boolean;
   debtHoldEnabled?: boolean;
+  debtHoldMaxInvoices?: number | null;
+  debtHoldMaxAmount?: number | null;
   gocardlessConnected?: boolean;
   stripeConnected?: boolean;
   preCleanReminderTimings?: string[];
@@ -554,6 +558,8 @@ class SettingsService implements ISettingsService {
       paymentRule: input.paymentRule,
       vatInInvoices: input.vatInInvoices,
       debtHoldEnabled: input.debtHoldEnabled,
+      debtHoldMaxInvoices: input.debtHoldMaxInvoices,
+      debtHoldMaxAmount: input.debtHoldMaxAmount,
     });
   }
 
