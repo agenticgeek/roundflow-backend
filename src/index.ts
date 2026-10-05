@@ -26,6 +26,7 @@ import { migrateAllTenantSchemas } from "./lib/tenant-provisioning";
 import { paymentsRouter } from "./routes/payments";
 import { stripeWebhookRouter } from "./routes/stripeWebhook";
 import { gocardlessWebhookRouter } from "./routes/gocardlessWebhook";
+import { ghlWebhookRouter } from "./routes/ghlWebhook";
 
 const FRONTEND_URL = process.env.FRONTEND_URL;
 if (!FRONTEND_URL) {
@@ -47,6 +48,7 @@ app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 // Must be mounted BEFORE express.json() which would parse and discard it.
 app.use("/webhooks/stripe", express.raw({ type: "application/json" }), stripeWebhookRouter);
 app.use("/webhooks/gocardless", express.raw({ type: "application/json" }), gocardlessWebhookRouter);
+app.use("/webhooks/ghl", express.raw({ type: "application/json" }), ghlWebhookRouter);
 
 app.use(express.json());
 

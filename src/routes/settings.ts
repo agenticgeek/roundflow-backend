@@ -2,6 +2,7 @@ import { randomBytes } from "crypto";
 import { Request, Router } from "express";
 import { ServiceCategory, PaymentTiming } from "../generated/tenant-client";
 import { encrypt } from "../lib/crypto";
+import { prisma } from "../lib/prisma";
 import { buildGhlAuthUrl, exchangeGhlCode } from "../integrations/ghl/oauth";
 import { getStripeClient } from "../integrations/stripe/client";
 import { requireAuth } from "../middleware/requireAuth";
@@ -526,12 +527,18 @@ settingsRouter.get(
     const expiresAt = new Date(Date.now() + tokens.expires_in * 1000);
     await req.tenantPrisma!.businessSettings.updateMany({
       data: {
-        ghlConnected:            true,
-        ghlLocationId:           tokens.locationId,
+        ghlConnected:             true,
+        ghlLocationId:            tokens.locationId,
         ghlAccessTokenEncrypted:  encrypt(tokens.access_token),
         ghlRefreshTokenEncrypted: encrypt(tokens.refresh_token),
         ghlTokenExpiresAt:        expiresAt,
       },
+    });
+
+    // Stamp on global Tenant for fast webhook lookup by locationId
+    await prisma.tenant.update({
+      where: { id: req.profile!.tenantId },
+      data: { ghlLocationId: tokens.locationId },
     });
 
     const frontendUrl = process.env.FRONTEND_URL!;

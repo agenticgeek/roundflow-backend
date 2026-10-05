@@ -41,10 +41,11 @@ model Profile {
 // schemaName is the Postgres schema that holds all operational data for this
 // tenant (e.g. "t_cm8abc123def456").
 model Tenant {
-  id         String    @id @default(cuid())
-  schemaName String    @unique
-  createdAt  DateTime  @default(now())
-  profiles   Profile[]
+  id            String    @id @default(cuid())
+  schemaName    String    @unique
+  ghlLocationId String?   @unique
+  createdAt     DateTime  @default(now())
+  profiles      Profile[]
 }
 
 // Pending invitation for a TECHNICIAN (or MANAGER) to join a tenant.
