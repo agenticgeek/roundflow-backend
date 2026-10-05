@@ -15,14 +15,8 @@ export function requireRole(...roles: UserRole[]) {
   };
 }
 
-// Used by /setup and /settings routers. GETs are open to any authenticated
-// role; mutations require ADMIN or MANAGER.
+// Used by admin routers. All methods require ADMIN or MANAGER — technicians
+// use /mobile/* exclusively and must not access admin endpoints.
 export function requireBusinessAccess() {
-  return function (req: Request, res: Response, next: NextFunction) {
-    const roles =
-      req.method === "GET"
-        ? [UserRole.ADMIN, UserRole.MANAGER, UserRole.TECHNICIAN]
-        : [UserRole.ADMIN, UserRole.MANAGER];
-    return requireRole(...roles)(req, res, next);
-  };
+  return requireRole(UserRole.ADMIN, UserRole.MANAGER);
 }
