@@ -196,6 +196,7 @@ model BusinessSettings {
   gocardlessWebhookSecretEncrypted String?
   gocardlessEnvironment            String?
   stripeConnected              Boolean        @default(false)
+  stripeConnectAccountId       String?
   stripePublishableKey         String?
   stripeSecretKeyEncrypted     String?
   stripeWebhookSecretEncrypted String?

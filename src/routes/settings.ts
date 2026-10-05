@@ -5,6 +5,7 @@ import { encrypt } from "../lib/crypto";
 import { prisma } from "../lib/prisma";
 import { buildGhlAuthUrl, exchangeGhlCode } from "../integrations/ghl/oauth";
 import { getStripeClient } from "../integrations/stripe/client";
+import { buildStripeAuthUrl, exchangeStripeCode } from "../integrations/stripe/oauth";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
@@ -393,54 +394,54 @@ settingsRouter.post(
   })
 );
 
-settingsRouter.post(
-  "/payment/stripe/connect",
+// GET /settings/stripe/authorize — redirect the admin to Stripe Connect consent page
+settingsRouter.get(
+  "/stripe/authorize",
   h(async (req, res) => {
     await svc(req).assertSetupComplete(actorIdOf(req));
-    const body = asObject(req.body);
-    const secretKey    = requireString(body.secretKey,    "secretKey");
-    const publishableKey = requireString(body.publishableKey, "publishableKey");
+    const state = `${req.profile!.tenantId}:${randomBytes(8).toString("hex")}`;
+    res.redirect(buildStripeAuthUrl(state));
+  })
+);
 
-    if (!secretKey.startsWith("sk_")) {
-      throw new AppError(400, "secretKey must be a Stripe secret key (starts with sk_)");
-    }
-    if (!publishableKey.startsWith("pk_")) {
-      throw new AppError(400, "publishableKey must be a Stripe publishable key (starts with pk_)");
-    }
+// GET /settings/stripe/callback — Stripe redirects here after the admin authorises
+settingsRouter.get(
+  "/stripe/callback",
+  h(async (req, res) => {
+    const { code, state, error } = req.query as Record<string, string>;
+    if (error) throw new AppError(400, `Stripe authorisation denied: ${error}`);
+    if (!code || !state) throw new AppError(400, "Missing code or state from Stripe");
 
-    // Validate key by hitting Stripe API
-    try {
-      const stripe = getStripeClient(secretKey);
-      await stripe.balance.retrieve();
-    } catch {
-      throw new AppError(400, "Stripe secret key is invalid or could not be verified");
-    }
+    const tokens = await exchangeStripeCode(code);
 
     const webhookSecret = randomBytes(32).toString("hex");
     await req.tenantPrisma!.businessSettings.updateMany({
       data: {
-        stripeConnected: true,
-        stripePublishableKey: publishableKey,
-        stripeSecretKeyEncrypted:     encrypt(secretKey),
+        stripeConnected:             true,
+        stripeConnectAccountId:      tokens.stripe_user_id,
+        stripePublishableKey:        tokens.stripe_publishable_key,
+        stripeSecretKeyEncrypted:    encrypt(tokens.access_token),
         stripeWebhookSecretEncrypted: encrypt(webhookSecret),
       },
     });
 
     const tenantId = req.profile!.tenantId;
     const webhookUrl = `${process.env.PUBLIC_API_URL}/webhooks/stripe?tenantId=${tenantId}&secret=${webhookSecret}`;
-    res.json({ status: "connected", webhookUrl });
+    const frontendUrl = process.env.FRONTEND_URL!;
+    res.redirect(`${frontendUrl}/settings/integrations?stripe=connected&webhookUrl=${encodeURIComponent(webhookUrl)}`);
   })
 );
 
 settingsRouter.post(
-  "/payment/stripe/disconnect",
+  "/stripe/disconnect",
   h(async (req, res) => {
     await svc(req).assertSetupComplete(actorIdOf(req));
     await req.tenantPrisma!.businessSettings.updateMany({
       data: {
-        stripeConnected: false,
-        stripePublishableKey: null,
-        stripeSecretKeyEncrypted: null,
+        stripeConnected:             false,
+        stripeConnectAccountId:      null,
+        stripePublishableKey:        null,
+        stripeSecretKeyEncrypted:    null,
         stripeWebhookSecretEncrypted: null,
       },
     });
