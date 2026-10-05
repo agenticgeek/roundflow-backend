@@ -27,6 +27,8 @@ import { paymentsRouter } from "./routes/payments";
 import { stripeWebhookRouter } from "./routes/stripeWebhook";
 import { gocardlessWebhookRouter } from "./routes/gocardlessWebhook";
 import { ghlWebhookRouter } from "./routes/ghlWebhook";
+import cron from "node-cron";
+import { runVisitGeneration } from "./jobs/visitGeneration";
 
 const FRONTEND_URL = process.env.FRONTEND_URL;
 if (!FRONTEND_URL) {
@@ -163,6 +165,10 @@ migrateAllTenantSchemas()
   .then(() => {
     app.listen(PORT, () => {
       console.log(`RoundFlow backend listening on http://localhost:${PORT}`);
+    });
+    // Nightly at 01:00 UTC — generate next-cycle visits for all active rounds
+    cron.schedule("0 1 * * *", () => {
+      runVisitGeneration().catch((err) => console.error("[visitGen] nightly run failed:", err));
     });
   })
   .catch((err) => {
