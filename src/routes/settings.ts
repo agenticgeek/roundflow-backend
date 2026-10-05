@@ -2,6 +2,7 @@ import { randomBytes } from "crypto";
 import { Request, Router } from "express";
 import { ServiceCategory, PaymentTiming } from "../generated/tenant-client";
 import { encrypt } from "../lib/crypto";
+import { buildGhlAuthUrl, exchangeGhlCode } from "../integrations/ghl/oauth";
 import { getStripeClient } from "../integrations/stripe/client";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
@@ -493,5 +494,65 @@ settingsRouter.delete(
     await svc(req).assertSetupComplete(actorIdOf(req));
     await svc(req).deleteMessageTemplate(actorIdOf(req), req.params.id);
     res.status(204).send();
+  })
+);
+
+// ---------------------------------------------------------------------------
+// Section 8 — GHL OAuth
+// ---------------------------------------------------------------------------
+
+// GET /settings/ghl/authorize — redirect the admin to GHL's OAuth consent page
+settingsRouter.get(
+  "/ghl/authorize",
+  h(async (req, res) => {
+    await svc(req).assertSetupComplete(actorIdOf(req));
+    const state = `${req.profile!.tenantId}:${randomBytes(8).toString("hex")}`;
+    const redirectUri = `${process.env.PUBLIC_API_URL}/settings/ghl/callback`;
+    res.redirect(buildGhlAuthUrl(redirectUri, state));
+  })
+);
+
+// GET /settings/ghl/callback — GHL redirects here after the admin authorises
+settingsRouter.get(
+  "/ghl/callback",
+  h(async (req, res) => {
+    const { code, state, error } = req.query as Record<string, string>;
+    if (error) throw new AppError(400, `GHL authorisation denied: ${error}`);
+    if (!code || !state) throw new AppError(400, "Missing code or state from GHL");
+
+    const redirectUri = `${process.env.PUBLIC_API_URL}/settings/ghl/callback`;
+    const tokens = await exchangeGhlCode(code, redirectUri);
+
+    const expiresAt = new Date(Date.now() + tokens.expires_in * 1000);
+    await req.tenantPrisma!.businessSettings.updateMany({
+      data: {
+        ghlConnected:            true,
+        ghlLocationId:           tokens.locationId,
+        ghlAccessTokenEncrypted:  encrypt(tokens.access_token),
+        ghlRefreshTokenEncrypted: encrypt(tokens.refresh_token),
+        ghlTokenExpiresAt:        expiresAt,
+      },
+    });
+
+    const frontendUrl = process.env.FRONTEND_URL!;
+    res.redirect(`${frontendUrl}/settings/integrations?ghl=connected`);
+  })
+);
+
+// POST /settings/ghl/disconnect
+settingsRouter.post(
+  "/ghl/disconnect",
+  h(async (req, res) => {
+    await svc(req).assertSetupComplete(actorIdOf(req));
+    await req.tenantPrisma!.businessSettings.updateMany({
+      data: {
+        ghlConnected:            false,
+        ghlLocationId:           null,
+        ghlAccessTokenEncrypted:  null,
+        ghlRefreshTokenEncrypted: null,
+        ghlTokenExpiresAt:        null,
+      },
+    });
+    res.json({ status: "disconnected" });
   })
 );

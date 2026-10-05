@@ -199,6 +199,11 @@ model BusinessSettings {
   stripePublishableKey         String?
   stripeSecretKeyEncrypted     String?
   stripeWebhookSecretEncrypted String?
+  ghlConnected                 Boolean        @default(false)
+  ghlLocationId                String?
+  ghlAccessTokenEncrypted      String?
+  ghlRefreshTokenEncrypted     String?
+  ghlTokenExpiresAt            DateTime?
   setupCompleted               Boolean        @default(false)
   lastClosedDate           String?        // YYYY-MM-DD; set by POST /today/close to block re-close
   preCleanReminderTimings  String[]
