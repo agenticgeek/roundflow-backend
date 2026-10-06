@@ -1,12 +1,12 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
-import { requireRole } from "../middleware/requireRole";
+import { requireBusinessAccess } from "../middleware/requireRole";
 import { createReportsService } from "../services/reports.service";
 
 export const reportsRouter = Router();
 
-reportsRouter.use(requireAuth, requireTenantAccess, requireRole("ADMIN", "MANAGER"));
+reportsRouter.use(requireAuth, requireTenantAccess, requireBusinessAccess());
 
 reportsRouter.get("/activity", async (req, res, next) => {
   try {
@@ -37,9 +37,9 @@ reportsRouter.get("/technicians", async (req, res, next) => {
 
 reportsRouter.get("/revenue", async (req, res, next) => {
   try {
-    const { period = "last30", granularity = "daily" } = req.query as { period?: string; granularity?: string };
+    const { period = "last30" } = req.query as { period?: string };
     const svc = createReportsService((req as any).tenantPrisma);
-    const data = await svc.getRevenue(period, granularity);
+    const data = await svc.getRevenue(period);
     res.json(data);
   } catch (err) { next(err); }
 });

@@ -86,53 +86,11 @@ export interface CreateInvoiceInput {
   sendEmail: boolean;
 }
 
-export interface IInvoiceService {
-  previewInvoice(visitId: string): Promise<InvoicePreview>;
-  listCustomerInvoices(customerId: string): Promise<Array<{
-    id: string;
-    invoiceNumber: string;
-    status: string;
-    amount: number;
-    dueDate: Date | null;
-    sentToCustomer: boolean;
-    sentAt: Date | null;
-    createdAt: Date;
-    visitId: string | null;
-  }>>;
-  getInvoice(invoiceId: string): Promise<{
-    id: string;
-    invoiceNumber: string;
-    status: string;
-    amount: number;
-    dueDate: Date | null;
-    notes: string | null;
-    sentToCustomer: boolean;
-    sentAt: Date | null;
-    createdAt: Date;
-    customerId: string;
-    visitId: string | null;
-  }>;
-  sendInvoice(invoiceId: string): Promise<{
-    id: string;
-    invoiceNumber: string;
-    status: string;
-    sentToCustomer: boolean;
-    sentAt: Date | null;
-  }>;
-  createInvoice(input: CreateInvoiceInput): Promise<{
-    id: string;
-    invoiceNumber: string;
-    status: string;
-    sentToCustomer: boolean;
-    sentAt: Date | null;
-  }>;
-}
-
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
 
-class InvoiceService implements IInvoiceService {
+class InvoiceService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
   async listCustomerInvoices(customerId: string) {
@@ -194,19 +152,7 @@ class InvoiceService implements IInvoiceService {
     const email = invoice.customer.email;
     if (!email) throw new AppError(400, "Customer has no email address — cannot send invoice");
 
-    const settings = await this.prisma.businessSettings.findFirst({
-      select: { businessName: true, email: true, vatInInvoices: true },
-    });
-
-    const subtotal = invoice.amount.toNumber();
-    const vatAmount = settings?.vatInInvoices ? +(subtotal * 0.2).toFixed(2) : 0;
-    const total = +(subtotal + vatAmount).toFixed(2);
-    const visit = invoice.visit;
-
-    // Invoice email delivery is via GHL outbox (not direct SMTP).
-    // TODO: write IntegrationOutbox row here once GHL adapter is built.
-    void { email, subtotal, vatAmount, total, visit };
-
+    // ponytail: GHL outbox delivery stubbed until adapter is built
     const updated = await this.prisma.invoice.update({
       where: { id: invoiceId },
       data: { status: "SENT", sentToCustomer: true, sentAt: new Date() },
@@ -318,7 +264,7 @@ class InvoiceService implements IInvoiceService {
   }
 }
 
-export function createInvoiceService(prisma: TenantPrismaClient): IInvoiceService {
+export function createInvoiceService(prisma: TenantPrismaClient) {
   return new InvoiceService(prisma);
 }
 

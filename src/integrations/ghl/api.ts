@@ -98,6 +98,24 @@ export async function updateGhlContact(
   await assertGhlOk(res, "updateContact");
 }
 
+export async function addGhlTags(ctx: GhlTokenContext, contactId: string, tags: string[]): Promise<void> {
+  const res = await fetch(`${GHL_API}/contacts/${contactId}/tags`, {
+    method: "POST",
+    headers: ghlHeaders(ctx.accessToken),
+    body: JSON.stringify({ tags }),
+  });
+  await assertGhlOk(res, "addTags");
+}
+
+export async function removeGhlTags(ctx: GhlTokenContext, contactId: string, tags: string[]): Promise<void> {
+  const res = await fetch(`${GHL_API}/contacts/${contactId}/tags`, {
+    method: "DELETE",
+    headers: ghlHeaders(ctx.accessToken),
+    body: JSON.stringify({ tags }),
+  });
+  await assertGhlOk(res, "removeTags");
+}
+
 const CHANNEL_TYPE_MAP: Record<string, string> = {
   EMAIL:    "Email",
   SMS:      "SMS",

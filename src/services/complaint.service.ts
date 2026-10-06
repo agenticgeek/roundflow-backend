@@ -42,25 +42,12 @@ export interface MessageDetail {
   createdAt: string;
 }
 
-export interface IComplaintService {
-  listComplaints(profileId: string, filters: ComplaintListFilters): Promise<ComplaintDetail[]>;
-  getComplaint(profileId: string, complaintId: string): Promise<ComplaintDetail>;
-  logComplaint(profileId: string, input: ComplaintCreateInput): Promise<ComplaintDetail>;
-  markInReview(profileId: string, complaintId: string): Promise<ComplaintDetail>;
-  resolve(profileId: string, complaintId: string): Promise<ComplaintDetail>;
-  scheduleRevisit(profileId: string, complaintId: string, revisitDate: string): Promise<ComplaintDetail>;
-  reopen(profileId: string, complaintId: string): Promise<ComplaintDetail>;
-  assignTechnician(profileId: string, complaintId: string, technicianId: string): Promise<ComplaintDetail>;
-  getMessages(profileId: string, complaintId: string): Promise<MessageDetail[]>;
-  addMessage(profileId: string, complaintId: string, body: string): Promise<MessageDetail>;
-}
-
 const INCLUDE = { customer: true, property: true, technician: true } as const;
 
-class ComplaintService implements IComplaintService {
+class ComplaintService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
-  async listComplaints(_profileId: string, filters: ComplaintListFilters): Promise<ComplaintDetail[]> {
+  async listComplaints(filters: ComplaintListFilters): Promise<ComplaintDetail[]> {
     const where: Record<string, unknown> = {};
     if (filters.status) where.status = filters.status;
     if (filters.technicianId) where.technicianId = filters.technicianId;
@@ -80,7 +67,7 @@ class ComplaintService implements IComplaintService {
     return complaints.map((c: any) => this.toDetail(c));
   }
 
-  async getComplaint(_profileId: string, complaintId: string): Promise<ComplaintDetail> {
+  async getComplaint(complaintId: string): Promise<ComplaintDetail> {
     const complaint = await this.prisma.complaint.findUnique({
       where: { id: complaintId },
       include: INCLUDE,
@@ -89,7 +76,7 @@ class ComplaintService implements IComplaintService {
     return this.toDetail(complaint);
   }
 
-  async logComplaint(_profileId: string, input: ComplaintCreateInput): Promise<ComplaintDetail> {
+  async logComplaint(input: ComplaintCreateInput): Promise<ComplaintDetail> {
     const customer = await this.prisma.customer.findUnique({ where: { id: input.customerId } });
     if (!customer) throw new AppError(404, "Customer not found");
 
@@ -124,7 +111,7 @@ class ComplaintService implements IComplaintService {
     return this.toDetail(complaint);
   }
 
-  async markInReview(_profileId: string, complaintId: string): Promise<ComplaintDetail> {
+  async markInReview(complaintId: string): Promise<ComplaintDetail> {
     const existing = await this.prisma.complaint.findUnique({ where: { id: complaintId } });
     if (!existing) throw new AppError(404, "Complaint not found");
 
@@ -137,7 +124,7 @@ class ComplaintService implements IComplaintService {
     return this.toDetail(complaint);
   }
 
-  async scheduleRevisit(_profileId: string, complaintId: string, revisitDate: string): Promise<ComplaintDetail> {
+  async scheduleRevisit(complaintId: string, revisitDate: string): Promise<ComplaintDetail> {
     const existing = await this.prisma.complaint.findUnique({ where: { id: complaintId } });
     if (!existing) throw new AppError(404, "Complaint not found");
 
@@ -157,7 +144,7 @@ class ComplaintService implements IComplaintService {
     return this.toDetail(complaint);
   }
 
-  async reopen(_profileId: string, complaintId: string): Promise<ComplaintDetail> {
+  async reopen(complaintId: string): Promise<ComplaintDetail> {
     const existing = await this.prisma.complaint.findUnique({ where: { id: complaintId } });
     if (!existing) throw new AppError(404, "Complaint not found");
 
@@ -170,7 +157,7 @@ class ComplaintService implements IComplaintService {
     return this.toDetail(complaint);
   }
 
-  async resolve(_profileId: string, complaintId: string): Promise<ComplaintDetail> {
+  async resolve(complaintId: string): Promise<ComplaintDetail> {
     const existing = await this.prisma.complaint.findUnique({ where: { id: complaintId } });
     if (!existing) throw new AppError(404, "Complaint not found");
 
@@ -183,7 +170,7 @@ class ComplaintService implements IComplaintService {
     return this.toDetail(complaint);
   }
 
-  async assignTechnician(_profileId: string, complaintId: string, technicianId: string): Promise<ComplaintDetail> {
+  async assignTechnician(complaintId: string, technicianId: string): Promise<ComplaintDetail> {
     const existing = await this.prisma.complaint.findUnique({ where: { id: complaintId } });
     if (!existing) throw new AppError(404, "Complaint not found");
 
@@ -203,7 +190,7 @@ class ComplaintService implements IComplaintService {
     return this.toDetail(complaint);
   }
 
-  async getMessages(_profileId: string, complaintId: string): Promise<MessageDetail[]> {
+  async getMessages(complaintId: string): Promise<MessageDetail[]> {
     const existing = await this.prisma.complaint.findUnique({ where: { id: complaintId } });
     if (!existing) throw new AppError(404, "Complaint not found");
 
@@ -215,7 +202,7 @@ class ComplaintService implements IComplaintService {
     return messages.map((m: any) => this.toMessageDetail(m));
   }
 
-  async addMessage(_profileId: string, complaintId: string, body: string): Promise<MessageDetail> {
+  async addMessage(complaintId: string, body: string): Promise<MessageDetail> {
     const existing = await this.prisma.complaint.findUnique({ where: { id: complaintId } });
     if (!existing) throw new AppError(404, "Complaint not found");
 
@@ -260,6 +247,6 @@ class ComplaintService implements IComplaintService {
   }
 }
 
-export function createComplaintService(prisma: TenantPrismaClient): IComplaintService {
+export function createComplaintService(prisma: TenantPrismaClient) {
   return new ComplaintService(prisma);
 }

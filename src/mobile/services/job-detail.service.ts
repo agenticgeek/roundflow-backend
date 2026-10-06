@@ -2,7 +2,7 @@ import { InvoiceStatus, PaymentMethod, PaymentStatus, Prisma, VisitStatus } from
 import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
 import { AppError } from "../../lib/app-error";
 import type { ActivityLogEntry, OutstandingInvoice } from "../types";
-import { todayRange } from "./utils";
+import { todayRange } from "../../lib/dates";
 
 const visitDetailInclude = {
   property: {
@@ -36,12 +36,7 @@ export interface VisitDetail extends VisitDetailBase {
   debtAmount: number;
 }
 
-export interface IJobDetailService {
-  getVisitDetail(visitId: string): Promise<VisitDetail>;
-  collectDebtPayment(visitId: string): Promise<{ cleared: boolean; amountPaid: number }>;
-}
-
-class JobDetailService implements IJobDetailService {
+class JobDetailService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
   async getVisitDetail(visitId: string): Promise<VisitDetail> {
@@ -125,6 +120,6 @@ class JobDetailService implements IJobDetailService {
   }
 }
 
-export function createJobDetailService(prisma: TenantPrismaClient): IJobDetailService {
+export function createJobDetailService(prisma: TenantPrismaClient) {
   return new JobDetailService(prisma);
 }

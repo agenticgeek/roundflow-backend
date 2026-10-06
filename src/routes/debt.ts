@@ -1,19 +1,19 @@
 import { Router } from "express";
-import { UserRole } from "@prisma/client";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
-import { requireRole } from "../middleware/requireRole";
+import { requireBusinessAccess } from "../middleware/requireRole";
 import { h } from "../lib/http";
 import { createDebtService } from "../services/debt.service";
 import { decrypt } from "../lib/crypto";
 import { getStripeClient } from "../integrations/stripe/client";
 import { createOneTimeSession } from "../integrations/stripe/checkout";
 import { StripeSessionType } from "../generated/tenant-client";
+import { queueGhlEvent } from "../integrations/ghl/sync";
 
 export const debtRouter = Router();
 debtRouter.use(requireAuth);
 debtRouter.use(requireTenantAccess);
-debtRouter.use(requireRole(UserRole.ADMIN, UserRole.MANAGER));
+debtRouter.use(requireBusinessAccess());
 
 const svc = (req: any) => createDebtService(req.tenantPrisma!);
 
@@ -36,6 +36,10 @@ debtRouter.post("/:id/remind", h(async (req, res) => {
   const { channel, message } = req.body ?? {};
   if (!channel || !message) return res.status(400).json({ error: "channel and message are required" });
   const result = await svc(req).sendReminder(req.params.id, channel, message);
+  const invoice = await req.tenantPrisma!.invoice.findUnique({ where: { id: req.params.id }, select: { customerId: true } });
+  if (invoice?.customerId) {
+    queueGhlEvent(req.tenantPrisma!, "debt.overdue", invoice.customerId).catch(console.error);
+  }
   return res.json(result);
 }));
 

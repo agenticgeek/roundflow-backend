@@ -1,8 +1,7 @@
 import { Request, Router } from "express";
-import { UserRole } from "@prisma/client";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
-import { requireRole } from "../middleware/requireRole";
+import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
 import { h, asObject, requireString } from "../lib/http";
 import { decrypt } from "../lib/crypto";
@@ -14,7 +13,7 @@ import { prisma } from "../lib/prisma";
 export const paymentsRouter = Router();
 paymentsRouter.use(requireAuth);
 paymentsRouter.use(requireTenantAccess);
-paymentsRouter.use(requireRole(UserRole.ADMIN, UserRole.MANAGER));
+paymentsRouter.use(requireBusinessAccess());
 
 const FRONTEND_URL = process.env.FRONTEND_URL?.split(",")[0].trim() ?? "";
 

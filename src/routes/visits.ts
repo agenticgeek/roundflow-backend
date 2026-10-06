@@ -8,13 +8,13 @@ import { assertPositive, optPaymentMethod } from "../lib/validation";
 import { createVisitService, VisitCreateInput } from "../services/visit.service";
 import { createReportsService } from "../services/reports.service";
 import { PaymentMethod, PaymentStatus, VisitStatus } from "../generated/tenant-client";
+import { queueGhlEvent } from "../integrations/ghl/sync";
 
 export const visitsRouter = Router();
 visitsRouter.use(requireAuth);
 visitsRouter.use(requireTenantAccess);
 visitsRouter.use(requireBusinessAccess());
 
-const actorIdOf = (req: Request): string => req.user!.supabaseUserId;
 const svc = (req: Request) => {
   if (!req.tenantPrisma) throw new AppError(500, "Tenant client not initialised");
   return createVisitService(req.tenantPrisma);
@@ -41,7 +41,7 @@ visitsRouter.post(
       paymentMethod: optPaymentMethod(body.paymentMethod),
     };
 
-    const result = await svc(req).createVisit(actorIdOf(req), input);
+    const result = await svc(req).createVisit(input);
 
     void createReportsService(req.tenantPrisma!).logActivity(
       "ONE_OFF_JOB_ADDED",
@@ -158,6 +158,8 @@ visitsRouter.patch(
         });
       }
     }
+
+    queueGhlEvent(req.tenantPrisma!, "visit.completed", customerId).catch(console.error);
 
     return res.json({ id: updated.id, status: updated.status });
   })

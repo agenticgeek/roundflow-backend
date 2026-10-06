@@ -2,13 +2,7 @@ import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
 import { AppError } from "../../lib/app-error";
 import { buildVisitPhotoPath, createSignedUploadUrl } from "../../lib/storage.js";
 
-export interface IMediaService {
-  addVisitNote(visitId: string, text: string): Promise<void>;
-  addVisitPhoto(visitId: string, url: string, photoType: "BEFORE" | "AFTER"): Promise<void>;
-  getPhotoUploadUrl(visitId: string, photoType: "BEFORE" | "AFTER", mimeType: string, tenantId: string): Promise<{ signedUrl: string; path: string }>;
-}
-
-class MediaService implements IMediaService {
+class MediaService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
   async addVisitNote(visitId: string, text: string): Promise<void> {
@@ -37,6 +31,6 @@ class MediaService implements IMediaService {
   }
 }
 
-export function createMediaService(prisma: TenantPrismaClient): IMediaService {
+export function createMediaService(prisma: TenantPrismaClient) {
   return new MediaService(prisma);
 }

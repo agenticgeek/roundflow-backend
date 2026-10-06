@@ -9,7 +9,6 @@ export async function sendInviteEmail({
 }: {
   to: string;
   inviteUrl: string;
-  businessName?: string | null;
 }): Promise<void> {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error("SUPABASE_ISSUER and SUPABASE_SERVICE_ROLE_KEY must be set to send invite emails");

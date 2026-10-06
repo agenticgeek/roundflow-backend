@@ -82,7 +82,7 @@ export function createReportsService(prisma: TenantPrismaClient) {
         revenueImpact: s.revenue,
       }));
     },
-    getRevenue: async (period: string, _granularity: string) => {
+    getRevenue: async (period: string) => {
       const range = periodRange(period as Period);
       const visits = await prisma.visit.findMany({
         where: { date: range, status: "COMPLETED" },

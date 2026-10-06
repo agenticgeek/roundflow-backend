@@ -30,7 +30,7 @@ it("createRound stores TWELVE_WEEKLY frequency", async () => {
     status: RoundStatus.ACTIVE, defaultDay: null, description: null, serviceAreaId: "sa1",
     serviceArea: null, roundTechnicians: [], _count: { properties: 0 },
   });
-  const result = await createRoundService(prisma).createRound("user-1", {
+  const result = await createRoundService(prisma).createRound({
     name: "Round A",
     frequency: CleaningFrequency.TWELVE_WEEKLY,
     serviceAreaId: "sa1",
@@ -48,7 +48,7 @@ it("setTechnicians throws 400 when a technician has not accepted their invite", 
   ]);
 
   await expect(
-    createRoundService(prisma).setTechnicians("user-1", "r1", ["t1"])
+    createRoundService(prisma).setTechnicians("r1", ["t1"])
   ).rejects.toMatchObject({ statusCode: 400 });
 });
 
@@ -60,7 +60,7 @@ it("reassignTechnician throws 400 when target technician has not accepted their 
   });
 
   await expect(
-    createRoundService(prisma).reassignTechnician("user-1", "r1", {
+    createRoundService(prisma).reassignTechnician("r1", {
       fromTechnicianId: "t1",
       toTechnicianId: "t2",
       scope: "remaining",

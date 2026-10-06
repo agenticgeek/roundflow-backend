@@ -29,6 +29,7 @@ import { gocardlessWebhookRouter } from "./routes/gocardlessWebhook";
 import { ghlWebhookRouter } from "./routes/ghlWebhook";
 import cron from "node-cron";
 import { runVisitGeneration } from "./jobs/visitGeneration";
+import { runOutboxWorker } from "./jobs/outboxWorker";
 
 const FRONTEND_URL = process.env.FRONTEND_URL;
 if (!FRONTEND_URL) {
@@ -169,6 +170,10 @@ migrateAllTenantSchemas()
     // Nightly at 01:00 UTC — generate next-cycle visits for all active rounds
     cron.schedule("0 1 * * *", () => {
       runVisitGeneration().catch((err) => console.error("[visitGen] nightly run failed:", err));
+    });
+    // Every 30s — drain GHL outbox
+    cron.schedule("*/30 * * * * *", () => {
+      runOutboxWorker().catch((err) => console.error("[outbox] worker failed:", err));
     });
   })
   .catch((err) => {

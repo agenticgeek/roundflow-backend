@@ -161,78 +161,6 @@ export interface ActivationResult {
   visitsGenerated: number;
 }
 
-// The service contract. Routes depend on this abstraction, never on the
-// concrete class — so Phase 2 (multi-tenancy) can bind a different
-// implementation (e.g. one that scopes by tenant derived from profileId)
-// without any route changes.
-export interface ISetupService {
-  getStatus(profileId: string): Promise<SetupStatus>;
-  assertSetupIncomplete(profileId: string): Promise<void>;
-  completeSetup(profileId: string): Promise<void>;
-
-  saveBusinessProfile(
-    profileId: string,
-    input: BusinessProfileInput
-  ): Promise<BusinessSettings>;
-
-  // Reads the BusinessSettings singleton — backs GET /setup/step/1 and step/4
-  // (Business Profile + Round Settings live on the same row). Stays open after
-  // setup completes so the Settings screens can reuse it.
-  getBusinessSettings(profileId: string): Promise<BusinessSettings | null>;
-
-  getServices(profileId: string): Promise<Service[]>;
-  saveServices(profileId: string, input: ServiceInput[]): Promise<Service[]>;
-
-  saveRoundSettings(
-    profileId: string,
-    input: RoundSettingsInput
-  ): Promise<BusinessSettings>;
-
-  // Payment Setup (Setup step 2 — real, not a stub). Same BusinessSettings
-  // singleton; connect toggles are Phase-1 stubs (booleans, no real OAuth).
-  getPaymentSetup(profileId: string): Promise<BusinessSettings | null>;
-  savePaymentSetup(
-    profileId: string,
-    input: PaymentSetupInput
-  ): Promise<BusinessSettings>;
-
-  getTechnicians(profileId: string): Promise<Technician[]>;
-  saveTechnicians(
-    profileId: string,
-    input: TechnicianInput[]
-  ): Promise<Technician[]>;
-
-  getServiceAreas(profileId: string): Promise<ServiceArea[]>;
-  saveServiceAreas(
-    profileId: string,
-    input: ServiceAreaInput[]
-  ): Promise<ServiceArea[]>;
-
-  getActiveRounds(profileId: string): Promise<Round[]>;
-  saveFirstRound(profileId: string, input: FirstRoundInput): Promise<Round>;
-
-  // Step 9: Add Property (one-time setup; does not reuse /customers or /properties)
-  getSetupProperties(): Promise<SetupPropertyResult[]>;
-  addSetupProperty(input: SetupPropertyInput): Promise<SetupPropertyResult>;
-
-  // Step 10: Assign Technicians to Rounds
-  getSetupRoundAssignments(): Promise<Step10Result>;
-  assignTechniciansToRounds(
-    assignments: RoundTechnicianAssignment[]
-  ): Promise<Step10Result>;
-
-  // Step 11: Activate System & Generate Visits
-  getActivationStatus(): Promise<{ activated: boolean; visitsGenerated: number }>;
-  activateSystem(input: ActivationInput): Promise<ActivationResult>;
-
-  // Step 12: Review & Launch checklist (read-only; launch = POST /setup/complete)
-  getReviewChecklist(): Promise<{
-    checklist: Array<{ label: string; complete: boolean }>;
-    allComplete: boolean;
-  }>;
-}
-
-
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
@@ -259,14 +187,14 @@ export interface ISetupService {
 //
 // Phase 2 is a whole-schema migration + ~30 query edits, not a two-method swap.
 // The interface boundary and thin routes are correct and will not need changing.
-class SetupService implements ISetupService {
+class SetupService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
   private async getSettings(): Promise<BusinessSettings | null> {
     return this.prisma.businessSettings.findFirst();
   }
 
-  async getStatus(_profileId: string): Promise<SetupStatus> {
+  async getStatus(): Promise<SetupStatus> {
     const [
       settings,
       serviceCount,
@@ -331,7 +259,7 @@ class SetupService implements ISetupService {
     };
   }
 
-  async assertSetupIncomplete(_profileId: string): Promise<void> {
+  async assertSetupIncomplete(): Promise<void> {
     const settings = await this.getSettings();
     if (settings?.setupCompleted) {
       throw new AppError(
@@ -341,8 +269,8 @@ class SetupService implements ISetupService {
     }
   }
 
-  async completeSetup(profileId: string): Promise<void> {
-    const status = await this.getStatus(profileId);
+  async completeSetup(): Promise<void> {
+    const status = await this.getStatus();
     if (status.setupCompleted) {
       throw new AppError(409, "Setup is already complete.");
     }
@@ -363,7 +291,6 @@ class SetupService implements ISetupService {
   }
 
   async saveBusinessProfile(
-    _profileId: string,
     input: BusinessProfileInput
   ): Promise<BusinessSettings> {
     const bankDetails =
@@ -391,16 +318,15 @@ class SetupService implements ISetupService {
     });
   }
 
-  async getBusinessSettings(_profileId: string): Promise<BusinessSettings | null> {
+  async getBusinessSettings(): Promise<BusinessSettings | null> {
     return this.getSettings();
   }
 
-  async getServices(_profileId: string): Promise<Service[]> {
+  async getServices(): Promise<Service[]> {
     return this.prisma.service.findMany({ orderBy: { createdAt: "asc" } });
   }
 
   async saveServices(
-    _profileId: string,
     input: ServiceInput[]
   ): Promise<Service[]> {
     for (const s of input) {
@@ -431,7 +357,6 @@ class SetupService implements ISetupService {
   }
 
   async saveRoundSettings(
-    _profileId: string,
     input: RoundSettingsInput
   ): Promise<BusinessSettings> {
     const data = {
@@ -445,12 +370,11 @@ class SetupService implements ISetupService {
     });
   }
 
-  async getPaymentSetup(_profileId: string): Promise<BusinessSettings | null> {
+  async getPaymentSetup(): Promise<BusinessSettings | null> {
     return this.getSettings();
   }
 
   async savePaymentSetup(
-    _profileId: string,
     input: PaymentSetupInput
   ): Promise<BusinessSettings> {
     // Same singleton upsert as saveBusinessProfile. Connect toggles
@@ -469,12 +393,11 @@ class SetupService implements ISetupService {
     });
   }
 
-  async getTechnicians(_profileId: string): Promise<Technician[]> {
+  async getTechnicians(): Promise<Technician[]> {
     return this.prisma.technician.findMany({ orderBy: { createdAt: "asc" } });
   }
 
   async saveTechnicians(
-    _profileId: string,
     input: TechnicianInput[]
   ): Promise<Technician[]> {
     // Replace semantics — re-posting step 6 must not append duplicates. Delete
@@ -499,12 +422,11 @@ class SetupService implements ISetupService {
     });
   }
 
-  async getServiceAreas(_profileId: string): Promise<ServiceArea[]> {
+  async getServiceAreas(): Promise<ServiceArea[]> {
     return this.prisma.serviceArea.findMany({ orderBy: { createdAt: "asc" } });
   }
 
   async saveServiceAreas(
-    _profileId: string,
     input: ServiceAreaInput[]
   ): Promise<ServiceArea[]> {
     // At most one area may be flagged default. Reject before any DB write.
@@ -552,7 +474,7 @@ class SetupService implements ISetupService {
     });
   }
 
-  async getActiveRounds(_profileId: string): Promise<Round[]> {
+  async getActiveRounds(): Promise<Round[]> {
     return this.prisma.round.findMany({
       where: { status: RoundStatus.ACTIVE },
       orderBy: { createdAt: "asc" },
@@ -560,7 +482,6 @@ class SetupService implements ISetupService {
   }
 
   async saveFirstRound(
-    _profileId: string,
     input: FirstRoundInput
   ): Promise<Round> {
     if (
@@ -924,7 +845,7 @@ class SetupService implements ISetupService {
     checklist: Array<{ label: string; complete: boolean }>;
     allComplete: boolean;
   }> {
-    const status = await this.getStatus("");
+    const status = await this.getStatus();
     const checklist = [
       { label: "Business profile completed", complete: status.steps[0].complete },
       { label: "Payment setup configured", complete: status.steps[1].complete },
@@ -965,6 +886,6 @@ function frequencyToWeeks(freq: CleaningFrequency): number {
   }
 }
 
-export function createSetupService(prisma: TenantPrismaClient): ISetupService {
+export function createSetupService(prisma: TenantPrismaClient) {
   return new SetupService(prisma);
 }

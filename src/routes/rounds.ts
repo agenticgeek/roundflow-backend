@@ -28,7 +28,6 @@ roundsRouter.use(requireTenantAccess);
 roundsRouter.use(requireBusinessAccess());
 
 // Thin routes: validate → call service → respond. No DB access here.
-const actorIdOf = (req: Request): string => req.user!.supabaseUserId;
 const svc = (req: Request) => {
   if (!req.tenantPrisma) throw new AppError(500, "Tenant client not initialised");
   return createRoundService(req.tenantPrisma);
@@ -41,7 +40,7 @@ roundsRouter.get(
   "/",
   h(async (req, res) => {
     const status = optRoundStatus(req.query.status);
-    res.json(await svc(req).listRounds(actorIdOf(req), status));
+    res.json(await svc(req).listRounds(status));
   })
 );
 
@@ -59,7 +58,7 @@ roundsRouter.post(
       defaultDay: optDayOfWeek(body.defaultDay),
       description: optString(body.description, "description"),
     };
-    res.status(201).json(await svc(req).createRound(actorIdOf(req), input));
+    res.status(201).json(await svc(req).createRound(input));
   })
 );
 
@@ -69,7 +68,7 @@ roundsRouter.post(
 roundsRouter.get(
   "/:id",
   h(async (req, res) => {
-    res.json(await svc(req).getRound(actorIdOf(req), req.params.id));
+    res.json(await svc(req).getRound(req.params.id));
   })
 );
 
@@ -88,7 +87,7 @@ roundsRouter.patch(
       description: optString(body.description, "description"),
       status: optRoundStatus(body.status),
     };
-    const result = await svc(req).updateRound(actorIdOf(req), req.params.id, input);
+    const result = await svc(req).updateRound(req.params.id, input);
     void createReportsService(req.tenantPrisma!).logActivity(
       "ROUND_UPDATED",
       `Round updated: ${req.params.id}`,
@@ -121,7 +120,7 @@ roundsRouter.get(
     // Visits are stored as midnight UTC timestamps; lte: midnight of 'to' is inclusive for that day.
     const from = fromStr ? new Date(`${fromStr}T00:00:00.000Z`) : undefined;
     const to = toStr ? new Date(`${toStr}T00:00:00.000Z`) : undefined;
-    res.json(await svc(req).listOccurrences(actorIdOf(req), req.params.id, from, to));
+    res.json(await svc(req).listOccurrences(req.params.id, from, to));
   })
 );
 
@@ -136,7 +135,7 @@ roundsRouter.get(
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
       throw new AppError(400, '"date" must be a valid YYYY-MM-DD date');
     }
-    res.json(await svc(req).getOccurrence(actorIdOf(req), req.params.id, date));
+    res.json(await svc(req).getOccurrence(req.params.id, date));
   })
 );
 
@@ -153,7 +152,7 @@ roundsRouter.put(
     ) {
       throw new AppError(400, '"technicianIds" must be an array of strings.');
     }
-    const result = await svc(req).setTechnicians(actorIdOf(req), req.params.id, body.technicianIds as string[]);
+    const result = await svc(req).setTechnicians(req.params.id, body.technicianIds as string[]);
     void createReportsService(req.tenantPrisma!).logActivity(
       "TECHNICIAN_ASSIGNED",
       `Technicians assigned to round: ${req.params.id}`,
@@ -170,7 +169,7 @@ roundsRouter.put(
 roundsRouter.get(
   "/:id/today",
   h(async (req, res) => {
-    res.json(await svc(req).getTodayPanel(actorIdOf(req), req.params.id));
+    res.json(await svc(req).getTodayPanel(req.params.id));
   })
 );
 
@@ -194,7 +193,7 @@ roundsRouter.post(
       note: optString(body.note, "note"),
       notify: optBool(body.notify, "notify") ?? false,
     };
-    const result = await svc(req).reassignTechnician(actorIdOf(req), req.params.id, input);
+    const result = await svc(req).reassignTechnician(req.params.id, input);
     void createReportsService(req.tenantPrisma!).logActivity(
       "TECHNICIAN_REASSIGNED",
       `Technician reassigned in round: ${req.params.id}`,
@@ -223,7 +222,7 @@ roundsRouter.post(
       technicianId: optId(body.technicianId, "technicianId"),
       notifyCustomers: optBool(body.notifyCustomers, "notifyCustomers") ?? false,
     };
-    const result = await svc(req).pushMissedJobs(actorIdOf(req), req.params.id, input);
+    const result = await svc(req).pushMissedJobs(req.params.id, input);
     void createReportsService(req.tenantPrisma!).logActivity(
       "VISITS_PUSHED",
       `Visits pushed to ${input.newDate.toISOString().slice(0, 10)} in round: ${req.params.id}`,

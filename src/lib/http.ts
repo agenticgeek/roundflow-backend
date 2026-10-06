@@ -101,3 +101,4 @@ export function optStringArray(v: unknown, field: string): string[] | undefined 
   if (Array.isArray(v) && v.every((x) => typeof x === "string")) return v as string[];
   throw new AppError(400, `"${field}" must be an array of strings.`);
 }
+

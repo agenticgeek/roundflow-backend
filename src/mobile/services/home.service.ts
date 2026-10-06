@@ -1,7 +1,7 @@
 import { Prisma, VisitStatus } from "../../generated/tenant-client";
 import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
 import type { CompletionsSummary, MobileVisitRow, RoundSummary } from "../types";
-import { todayRange } from "./utils";
+import { todayRange } from "../../lib/dates";
 
 const visitMobileInclude = {
   property: {
@@ -39,13 +39,7 @@ function toRow(v: VisitMobile, position: number | null = null): MobileVisitRow {
   };
 }
 
-export interface IHomeService {
-  getTodayVisits(technicianProfileId: string): Promise<MobileVisitRow[]>;
-  getCompletions(technicianProfileId: string): Promise<CompletionsSummary>;
-  getRoundsSummary(technicianProfileId: string): Promise<RoundSummary[]>;
-}
-
-class HomeService implements IHomeService {
+class HomeService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
   async getTodayVisits(technicianProfileId: string): Promise<MobileVisitRow[]> {
@@ -148,6 +142,6 @@ class HomeService implements IHomeService {
   }
 }
 
-export function createHomeService(prisma: TenantPrismaClient): IHomeService {
+export function createHomeService(prisma: TenantPrismaClient) {
   return new HomeService(prisma);
 }

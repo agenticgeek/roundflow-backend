@@ -45,11 +45,6 @@ const svc = (req: Request) => createSetupService(req.tenantPrisma!);
 // Generic request helpers (asObject, asArray, h, requireString, requireNumber)
 // are shared via ../lib/http. Only route-local helpers live here.
 
-// Returns the Supabase user ID of the acting caller (from the verified JWT).
-// Named actorIdOf — not profileIdOf — because it returns supabaseUserId,
-// which is distinct from Profile.id (a cuid). Phase 2 will add a separate
-// tenantId resolver; do not conflate the two.
-const actorIdOf = (req: Request): string => req.user!.supabaseUserId;
 
 const settingsSvc = (req: Request) => createSettingsService(req.tenantPrisma!);
 
@@ -58,7 +53,7 @@ const settingsSvc = (req: Request) => createSettingsService(req.tenantPrisma!);
 setupRouter.get(
   "/status",
   h(async (req, res) => {
-    res.json(await svc(req).getStatus(actorIdOf(req)));
+    res.json(await svc(req).getStatus());
   })
 );
 
@@ -67,14 +62,13 @@ setupRouter.get(
 setupRouter.get(
   "/step/1",
   h(async (req, res) => {
-    res.json(await svc(req).getBusinessSettings(actorIdOf(req)));
+    res.json(await svc(req).getBusinessSettings());
   })
 );
 setupRouter.post(
   "/step/1",
   h(async (req, res) => {
-    const profileId = actorIdOf(req);
-    await svc(req).assertSetupIncomplete(profileId);
+    await svc(req).assertSetupIncomplete();
     const body = asObject(req.body);
     requireString(body.businessName, "businessName");
     let bankDetails: BusinessProfileInput["bankDetails"] = undefined;
@@ -110,7 +104,7 @@ setupRouter.post(
       currency: body.currency as string | undefined,
       bankDetails,
     };
-    res.json(await svc(req).saveBusinessProfile(profileId, input));
+    res.json(await svc(req).saveBusinessProfile(input));
   })
 );
 
@@ -122,14 +116,13 @@ setupRouter.post(
 setupRouter.get(
   "/step/2",
   h(async (req, res) => {
-    res.json(await svc(req).getPaymentSetup(actorIdOf(req)));
+    res.json(await svc(req).getPaymentSetup());
   })
 );
 setupRouter.post(
   "/step/2",
   h(async (req, res) => {
-    const profileId = actorIdOf(req);
-    await svc(req).assertSetupIncomplete(profileId);
+    await svc(req).assertSetupIncomplete();
     const body = asObject(req.body);
 
     let paymentRule: PaymentTiming | undefined;
@@ -151,7 +144,7 @@ setupRouter.post(
       stripeConnected:
         typeof body.stripeConnected === "boolean" ? body.stripeConnected : undefined,
     };
-    res.json(await svc(req).savePaymentSetup(profileId, input));
+    res.json(await svc(req).savePaymentSetup(input));
   })
 );
 
@@ -160,14 +153,13 @@ setupRouter.post(
 setupRouter.get(
   "/step/3",
   h(async (req, res) => {
-    res.json(await svc(req).getServices(actorIdOf(req)));
+    res.json(await svc(req).getServices());
   })
 );
 setupRouter.post(
   "/step/3",
   h(async (req, res) => {
-    const profileId = actorIdOf(req);
-    await svc(req).assertSetupIncomplete(profileId);
+    await svc(req).assertSetupIncomplete();
     const raw = asArray<Record<string, unknown>>(req.body, "services");
     const input: ServiceInput[] = raw.map((s, i) => ({
       name: requireString(s.name, `services[${i}].name`),
@@ -180,7 +172,7 @@ setupRouter.post(
       })(),
       active: typeof s.active === "boolean" ? s.active : undefined,
     }));
-    res.json(await svc(req).saveServices(profileId, input));
+    res.json(await svc(req).saveServices(input));
   })
 );
 
@@ -191,14 +183,13 @@ setupRouter.get(
   h(async (req, res) => {
     // Same BusinessSettings singleton as step 1; the frontend reads the
     // round-settings fields (defaultCycleLength / defaultWorkingDays) from it.
-    res.json(await svc(req).getBusinessSettings(actorIdOf(req)));
+    res.json(await svc(req).getBusinessSettings());
   })
 );
 setupRouter.post(
   "/step/4",
   h(async (req, res) => {
-    const profileId = actorIdOf(req);
-    await svc(req).assertSetupIncomplete(profileId);
+    await svc(req).assertSetupIncomplete();
     const body = asObject(req.body);
     const input: RoundSettingsInput = {
       defaultCycleLength: assertPositiveInt(
@@ -209,7 +200,7 @@ setupRouter.post(
         ? validateWorkingDays(body.defaultWorkingDays)
         : undefined,
     };
-    res.json(await svc(req).saveRoundSettings(profileId, input));
+    res.json(await svc(req).saveRoundSettings(input));
   })
 );
 
@@ -218,14 +209,13 @@ setupRouter.post(
 setupRouter.get(
   "/step/5",
   h(async (req, res) => {
-    res.json(await settingsSvc(req).getMessageTemplates(actorIdOf(req)));
+    res.json(await settingsSvc(req).getMessageTemplates());
   })
 );
 setupRouter.post(
   "/step/5",
   h(async (req, res) => {
-    const profileId = actorIdOf(req);
-    await svc(req).assertSetupIncomplete(profileId);
+    await svc(req).assertSetupIncomplete();
     const raw = asArray<Record<string, unknown>>(req.body, "templates");
     const templates: MessageTemplateInput[] = raw.map((t) => ({
       name: requireString(t.name, "name"),
@@ -233,7 +223,7 @@ setupRouter.post(
       body: requireString(t.body, "body"),
       subject: optString(t.subject, "subject"),
     }));
-    res.json(await settingsSvc(req).replaceTemplates(profileId, templates));
+    res.json(await settingsSvc(req).replaceTemplates(templates));
   })
 );
 
@@ -242,14 +232,13 @@ setupRouter.post(
 setupRouter.get(
   "/step/6",
   h(async (req, res) => {
-    res.json(await svc(req).getTechnicians(actorIdOf(req)));
+    res.json(await svc(req).getTechnicians());
   })
 );
 setupRouter.post(
   "/step/6",
   h(async (req, res) => {
-    const profileId = actorIdOf(req);
-    await svc(req).assertSetupIncomplete(profileId);
+    await svc(req).assertSetupIncomplete();
     const raw = asArray<Record<string, unknown>>(req.body, "technicians");
     const input: TechnicianInput[] = raw.map((t) => ({
       name: t.name as string | undefined,
@@ -257,7 +246,7 @@ setupRouter.post(
       phone: t.phone as string | undefined,
       active: typeof t.active === "boolean" ? t.active : undefined,
     }));
-    res.json(await svc(req).saveTechnicians(profileId, input));
+    res.json(await svc(req).saveTechnicians(input));
   })
 );
 
@@ -266,14 +255,13 @@ setupRouter.post(
 setupRouter.get(
   "/step/7",
   h(async (req, res) => {
-    res.json(await svc(req).getServiceAreas(actorIdOf(req)));
+    res.json(await svc(req).getServiceAreas());
   })
 );
 setupRouter.post(
   "/step/7",
   h(async (req, res) => {
-    const profileId = actorIdOf(req);
-    await svc(req).assertSetupIncomplete(profileId);
+    await svc(req).assertSetupIncomplete();
     const raw = asArray<Record<string, unknown>>(req.body, "serviceAreas");
     if (raw.length === 0) throw new AppError(400, "At least one service area is required.");
     const input: ServiceAreaInput[] = raw.map((a, i) => ({
@@ -281,7 +269,7 @@ setupRouter.post(
       postcodeSector: a.postcodeSector as string | undefined,
       isDefault: typeof a.isDefault === "boolean" ? a.isDefault : undefined,
     }));
-    res.json(await svc(req).saveServiceAreas(profileId, input));
+    res.json(await svc(req).saveServiceAreas(input));
   })
 );
 
@@ -290,14 +278,13 @@ setupRouter.post(
 setupRouter.get(
   "/step/8",
   h(async (req, res) => {
-    res.json(await svc(req).getActiveRounds(actorIdOf(req)));
+    res.json(await svc(req).getActiveRounds());
   })
 );
 setupRouter.post(
   "/step/8",
   h(async (req, res) => {
-    const profileId = actorIdOf(req);
-    await svc(req).assertSetupIncomplete(profileId);
+    await svc(req).assertSetupIncomplete();
     const body = asObject(req.body);
     const input: FirstRoundInput = {
       name: requireString(body.name, "name"),
@@ -305,7 +292,7 @@ setupRouter.post(
       frequency: body.frequency as string | undefined,
       serviceAreaId: body.serviceAreaId as string | undefined,
     };
-    res.json(await svc(req).saveFirstRound(profileId, input));
+    res.json(await svc(req).saveFirstRound(input));
   })
 );
 
@@ -323,8 +310,7 @@ setupRouter.get(
 setupRouter.post(
   "/step/9",
   h(async (req, res) => {
-    const profileId = actorIdOf(req);
-    await svc(req).assertSetupIncomplete(profileId);
+    await svc(req).assertSetupIncomplete();
     const body = asObject(req.body);
 
     const input: SetupPropertyInput = {
@@ -362,8 +348,7 @@ setupRouter.get(
 setupRouter.post(
   "/step/10",
   h(async (req, res) => {
-    const profileId = actorIdOf(req);
-    await svc(req).assertSetupIncomplete(profileId);
+    await svc(req).assertSetupIncomplete();
 
     const raw = asArray<Record<string, unknown>>(req.body, "assignments");
     const assignments: RoundTechnicianAssignment[] = raw.map((a, i) => {
@@ -393,8 +378,7 @@ setupRouter.get(
 setupRouter.post(
   "/step/11",
   h(async (req, res) => {
-    const profileId = actorIdOf(req);
-    await svc(req).assertSetupIncomplete(profileId);
+    await svc(req).assertSetupIncomplete();
     const body = asObject(req.body);
 
     const generateAll =
@@ -439,8 +423,7 @@ setupRouter.get(
 setupRouter.post(
   "/complete",
   h(async (req, res) => {
-    const profileId = actorIdOf(req);
-    await svc(req).completeSetup(profileId);
-    res.json(await svc(req).getStatus(profileId));
+    await svc(req).completeSetup();
+    res.json(await svc(req).getStatus());
   })
 );

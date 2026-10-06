@@ -5,6 +5,7 @@ import { prisma } from "../lib/prisma";
 import { getTenantPrismaForSchema } from "../lib/tenant-prisma-manager";
 import { decrypt } from "../lib/crypto";
 import { PaymentStatus } from "../generated/tenant-client";
+import { queueGhlEvent } from "../integrations/ghl/sync";
 
 export const gocardlessWebhookRouter = Router();
 
@@ -91,6 +92,10 @@ async function handleEvent(
         where: { gocardlessId: gcPaymentId },
         data: { status: PaymentStatus.PAID, paidAt: new Date() },
       });
+      const payment = await tp.payment.findFirst({ where: { gocardlessId: gcPaymentId }, select: { customerId: true } });
+      if (payment?.customerId) {
+        queueGhlEvent(tp, "payment.collected", payment.customerId).catch(console.error);
+      }
     } else if (action === "failed") {
       await tp.payment.updateMany({
         where: { gocardlessId: gcPaymentId },

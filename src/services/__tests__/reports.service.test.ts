@@ -93,7 +93,7 @@ it("getRevenue is a function", () => {
 it("getRevenue returns an array", async () => {
   const prisma = makePrisma();
   (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-  const result = await createReportsService(prisma).getRevenue("last30", "daily");
+  const result = await createReportsService(prisma).getRevenue("last30");
   expect(Array.isArray(result)).toBe(true);
 });
 
@@ -102,7 +102,7 @@ it("getRevenue items have date and amount fields", async () => {
   (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
     { date: new Date("2026-08-01"), price: { toNumber: () => 35 }, status: "COMPLETED" },
   ]);
-  const result = await createReportsService(prisma).getRevenue("last30", "daily");
+  const result = await createReportsService(prisma).getRevenue("last30");
   expect(result.length).toBeGreaterThan(0);
   expect("date" in result[0]).toBe(true);
   expect("amount" in result[0]).toBe(true);
@@ -114,7 +114,7 @@ it("getRevenue groups visits on the same day into one entry", async () => {
     { date: new Date("2026-08-01T09:00:00Z"), price: { toNumber: () => 35 }, status: "COMPLETED" },
     { date: new Date("2026-08-01T11:00:00Z"), price: { toNumber: () => 50 }, status: "COMPLETED" },
   ]);
-  const result = await createReportsService(prisma).getRevenue("last30", "daily");
+  const result = await createReportsService(prisma).getRevenue("last30");
   expect(result).toHaveLength(1);
   expect(result[0].amount).toBe(85);
 });
