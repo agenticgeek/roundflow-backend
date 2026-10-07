@@ -1,8 +1,7 @@
-import { Router } from "express";
-import { UserRole } from "@prisma/client";
+import { Request, Router } from "express";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
-import { requireRole } from "../middleware/requireRole";
+import { requireBusinessAccess } from "../middleware/requireRole";
 import { h } from "../lib/http";
 import { createEmergencyService } from "../services/emergency.service";
 import { AppError } from "../lib/app-error";
@@ -11,10 +10,10 @@ export const emergenciesRouter = Router();
 emergenciesRouter.use(requireAuth);
 emergenciesRouter.use(requireTenantAccess);
 
-const svc = (req: any) => createEmergencyService(req.tenantPrisma!);
+const svc = (req: Request) => createEmergencyService(req.tenantPrisma!);
 
 // GET /emergencies?status=ACTIVE|RESOLVED — ADMIN/MANAGER only
-emergenciesRouter.get("/", requireRole(UserRole.ADMIN, UserRole.MANAGER), h(async (req, res) => {
+emergenciesRouter.get("/", requireBusinessAccess(), h(async (req, res) => {
   const { status } = req.query;
   const parsed =
     status === "ACTIVE" ? "ACTIVE" :
@@ -24,19 +23,19 @@ emergenciesRouter.get("/", requireRole(UserRole.ADMIN, UserRole.MANAGER), h(asyn
 }));
 
 // POST /emergencies/:id/reassign — confirm reassignment, ADMIN/MANAGER only
-emergenciesRouter.post("/:id/reassign", requireRole(UserRole.ADMIN, UserRole.MANAGER), h(async (req, res) => {
+emergenciesRouter.post("/:id/reassign", requireBusinessAccess(), h(async (req, res) => {
   const { newTechnicianId } = req.body;
   if (!newTechnicianId) throw new AppError(400, "newTechnicianId is required");
   res.json(await svc(req).reassign(req.params.id, newTechnicianId));
 }));
 
 // GET /emergencies/:id/available-technicians — ADMIN/MANAGER only
-emergenciesRouter.get("/:id/available-technicians", requireRole(UserRole.ADMIN, UserRole.MANAGER), h(async (req, res) => {
+emergenciesRouter.get("/:id/available-technicians", requireBusinessAccess(), h(async (req, res) => {
   res.json(await svc(req).getAvailableTechnicians(req.params.id));
 }));
 
 // GET /emergencies/:id — single emergency detail, ADMIN/MANAGER only
-emergenciesRouter.get("/:id", requireRole(UserRole.ADMIN, UserRole.MANAGER), h(async (req, res) => {
+emergenciesRouter.get("/:id", requireBusinessAccess(), h(async (req, res) => {
   res.json(await svc(req).getEmergency(req.params.id));
 }));
 

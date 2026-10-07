@@ -1,4 +1,4 @@
-// @ts-ignore — gocardless-nodejs ships ESM as main but has a CJS build under require condition
+// @ts-expect-error — gocardless-nodejs ships ESM as main but has a CJS build under require condition
 import { GoCardlessClient, Environments } from "gocardless-nodejs";
 
 export function getGcClient(accessToken: string, environment: string): GoCardlessClient {

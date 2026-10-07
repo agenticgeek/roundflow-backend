@@ -27,7 +27,6 @@ propertiesRouter.use(requireTenantAccess);
 propertiesRouter.use(requireBusinessAccess());
 
 // Thin routes: validate → call service → respond. No DB access here.
-const actorIdOf = (req: Request): string => req.user!.supabaseUserId;
 const svc = (req: Request) => {
   if (!req.tenantPrisma) throw new AppError(500, "Tenant client not initialised");
   return createCustomerService(req.tenantPrisma);
@@ -65,7 +64,7 @@ propertiesRouter.post(
       // Assignment (step 5 / Screen 31) — null = Save & Assign Later (unassigned)
       roundId: optId(body.roundId, "roundId"),
     };
-    const result = await svc(req).createProperty(actorIdOf(req), input);
+    const result = await svc(req).createProperty(input);
     void createReportsService(req.tenantPrisma!).logActivity(
       "PROPERTY_ADDED",
       `Property added: ${input.addressLine}, ${input.postcode}`,
@@ -94,7 +93,7 @@ propertiesRouter.patch(
       roundId: optId(body.roundId, "roundId"), // null = unassign; id = assign/reassign
       cleaningFrequency: optCleaningFrequency(body.cleaningFrequency),
     };
-    res.json(await svc(req).updateProperty(actorIdOf(req), req.params.id, input));
+    res.json(await svc(req).updateProperty(req.params.id, input));
   })
 );
 
@@ -114,7 +113,7 @@ propertiesRouter.post(
       throw new AppError(400, "pauseEndDate must be after pauseStartDate");
     }
     res.json(
-      await svc(req).pauseService(actorIdOf(req), req.params.id, {
+      await svc(req).pauseService(req.params.id, {
         pauseStartDate,
         pauseEndDate,
       })
@@ -128,7 +127,7 @@ propertiesRouter.post(
 propertiesRouter.post(
   "/:id/resume",
   h(async (req, res) => {
-    res.json(await svc(req).resumeService(actorIdOf(req), req.params.id));
+    res.json(await svc(req).resumeService(req.params.id));
   })
 );
 
@@ -138,7 +137,7 @@ propertiesRouter.post(
 propertiesRouter.get(
   "/:id/notes",
   h(async (req, res) => {
-    res.json(await svc(req).getNotes(actorIdOf(req), req.params.id));
+    res.json(await svc(req).getNotes(req.params.id));
   })
 );
 
@@ -154,7 +153,7 @@ propertiesRouter.post(
       body: requireString(body.body, "body"),
       authorProfileId: req.profile?.id ?? null,
     };
-    res.status(201).json(await svc(req).addNote(actorIdOf(req), req.params.id, input));
+    res.status(201).json(await svc(req).addNote(req.params.id, input));
   })
 );
 
@@ -164,7 +163,7 @@ propertiesRouter.post(
 propertiesRouter.delete(
   "/:id",
   h(async (req, res) => {
-    await svc(req).deleteProperty(actorIdOf(req), req.params.id);
+    await svc(req).deleteProperty(req.params.id);
     res.status(204).send();
   })
 );

@@ -3,7 +3,7 @@ import { UserRole } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
-import { requireRole } from "../middleware/requireRole";
+import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
 import { asObject, h, optBool, optId, optReqString, optString } from "../lib/http";
 import { isValidEmail } from "../lib/validation";
@@ -17,7 +17,7 @@ import {
 export const techniciansRouter = Router();
 techniciansRouter.use(requireAuth);
 techniciansRouter.use(requireTenantAccess);
-techniciansRouter.use(requireRole(UserRole.ADMIN, UserRole.MANAGER));
+techniciansRouter.use(requireBusinessAccess());
 
 const svc = (req: Request) => createTechnicianService(req.tenantPrisma!);
 
@@ -101,15 +101,11 @@ techniciansRouter.post(
         },
       });
 
-      const settings = await req.tenantPrisma!.businessSettings.findFirst({
-        select: { businessName: true },
-      });
       const base = process.env.INVITE_BASE_URL!;
       try {
         await sendInviteEmail({
           to: email,
           inviteUrl: `${base}/accept-invite?token=${invite.token}`,
-          businessName: settings?.businessName,
         });
       } catch {
         await prisma.tenantInvite.delete({ where: { id: invite.id } }).catch((rollbackErr) => {

@@ -2,15 +2,7 @@ import { InvoiceStatus, IssueType, VisitStatus } from "../../generated/tenant-cl
 import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
 import { AppError } from "../../lib/app-error";
 
-export interface IJobTrackerService {
-  startVisit(visitId: string, technicianProfileId: string): Promise<void>;
-  markArrived(visitId: string): Promise<void>;
-  skipVisit(visitId: string, reason: string, description?: string): Promise<void>;
-  reportAccessIssue(visitId: string, issueType: IssueType, description: string): Promise<void>;
-  adjustPrice(visitId: string, price: number): Promise<void>;
-}
-
-class JobTrackerService implements IJobTrackerService {
+class JobTrackerService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
   async startVisit(visitId: string, _technicianProfileId: string): Promise<void> {
@@ -95,6 +87,6 @@ class JobTrackerService implements IJobTrackerService {
   }
 }
 
-export function createJobTrackerService(prisma: TenantPrismaClient): IJobTrackerService {
+export function createJobTrackerService(prisma: TenantPrismaClient) {
   return new JobTrackerService(prisma);
 }

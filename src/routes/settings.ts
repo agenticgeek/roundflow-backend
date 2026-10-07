@@ -4,13 +4,12 @@ import { ServiceCategory, PaymentTiming } from "../generated/tenant-client";
 import { encrypt } from "../lib/crypto";
 import { prisma } from "../lib/prisma";
 import { buildGhlAuthUrl, exchangeGhlCode } from "../integrations/ghl/oauth";
-import { getStripeClient } from "../integrations/stripe/client";
 import { buildStripeAuthUrl, exchangeStripeCode } from "../integrations/stripe/oauth";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
-import { validateWorkingDays, assertPositiveInt, assertPositive, assertNonNegative, requireMessageChannel, optMessageChannel } from "../lib/validation";
+import { validateWorkingDays, assertPositiveInt, assertNonNegative, requireMessageChannel, optMessageChannel } from "../lib/validation";
 import {
   asObject,
   h,
@@ -54,13 +53,7 @@ const svc = (req: Request) => createSettingsService(req.tenantPrisma!);
 //
 // Generic request helpers (asObject, h, requireString, requireNumber, and the
 // opt* validators) are shared via ../lib/http. Only route-local helpers — the
-// actor id and the domain-specific validators — live here.
-
-// Returns the Supabase user ID of the acting caller (from the verified JWT).
-// Named actorIdOf — not profileIdOf — because it returns supabaseUserId,
-// which is distinct from Profile.id (a cuid). Phase 2 will add a separate
-// tenantId resolver; do not conflate the two.
-const actorIdOf = (req: Request): string => req.user!.supabaseUserId;
+// domain-specific validators — live here.
 
 function parseBankDetails(v: unknown): BankDetails | null | undefined {
   if (v === undefined) return undefined;
@@ -117,13 +110,13 @@ function optPaymentTiming(v: unknown): PaymentTiming | null | undefined {
 settingsRouter.get(
   "/business-profile",
   h(async (req, res) => {
-    res.json(await svc(req).getBusinessProfile(actorIdOf(req)));
+    res.json(await svc(req).getSettings());
   })
 );
 settingsRouter.patch(
   "/business-profile",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete();
     const body = asObject(req.body);
     const input: BusinessProfileUpdateInput = {
       businessName: optString(body.businessName, "businessName"),
@@ -137,7 +130,7 @@ settingsRouter.patch(
       defaultWorkingDays: optWorkingDays(body.defaultWorkingDays, "defaultWorkingDays"),
       bankDetails: parseBankDetails(body.bankDetails),
     };
-    res.json(await svc(req).updateBusinessProfile(actorIdOf(req), input));
+    res.json(await svc(req).updateBusinessProfile(input));
   })
 );
 
@@ -148,13 +141,13 @@ settingsRouter.patch(
 settingsRouter.get(
   "/round-settings",
   h(async (req, res) => {
-    res.json(await svc(req).getRoundSettings(actorIdOf(req)));
+    res.json(await svc(req).getSettings());
   })
 );
 settingsRouter.patch(
   "/round-settings",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete();
     const body = asObject(req.body);
     const input: RoundSettingsUpdateInput = {
       defaultCycleLength: optCycleLength(body.defaultCycleLength),
@@ -169,7 +162,7 @@ settingsRouter.patch(
         return arr;
       })(),
     };
-    res.json(await svc(req).updateRoundSettings(actorIdOf(req), input));
+    res.json(await svc(req).updateRoundSettings(input));
   })
 );
 
@@ -180,13 +173,13 @@ settingsRouter.patch(
 settingsRouter.get(
   "/services",
   h(async (req, res) => {
-    res.json(await svc(req).getServices(actorIdOf(req)));
+    res.json(await svc(req).getServices());
   })
 );
 settingsRouter.post(
   "/services",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete();
     const body = asObject(req.body);
     const input: ServiceCreateInput = {
       name: requireString(body.name, "name"),
@@ -195,13 +188,13 @@ settingsRouter.post(
       description: optString(body.description, "description"),
       active: optBool(body.active, "active"),
     };
-    res.status(201).json(await svc(req).createService(actorIdOf(req), input));
+    res.status(201).json(await svc(req).createService(input));
   })
 );
 settingsRouter.patch(
   "/services/:id",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete();
     const body = asObject(req.body);
     const price = optReqNumber(body.defaultPrice, "defaultPrice");
     if (price !== undefined) assertNonNegative(price, "defaultPrice", 9999.99);
@@ -212,14 +205,14 @@ settingsRouter.patch(
       description: optString(body.description, "description"),
       active: optBool(body.active, "active"),
     };
-    res.json(await svc(req).updateService(actorIdOf(req), req.params.id, input));
+    res.json(await svc(req).updateService(req.params.id, input));
   })
 );
 settingsRouter.delete(
   "/services/:id",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
-    await svc(req).deleteService(actorIdOf(req), req.params.id);
+    await svc(req).assertSetupComplete();
+    await svc(req).deleteService(req.params.id);
     res.status(204).end();
   })
 );
@@ -231,40 +224,40 @@ settingsRouter.delete(
 settingsRouter.get(
   "/service-areas",
   h(async (req, res) => {
-    res.json(await svc(req).getServiceAreas(actorIdOf(req)));
+    res.json(await svc(req).getServiceAreas());
   })
 );
 settingsRouter.post(
   "/service-areas",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete();
     const body = asObject(req.body);
     const input: ServiceAreaCreateInput = {
       name: requireString(body.name, "name"),
       postcodeSector: optString(body.postcodeSector, "postcodeSector"),
       isDefault: optBool(body.isDefault, "isDefault"),
     };
-    res.status(201).json(await svc(req).createServiceArea(actorIdOf(req), input));
+    res.status(201).json(await svc(req).createServiceArea(input));
   })
 );
 settingsRouter.patch(
   "/service-areas/:id",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete();
     const body = asObject(req.body);
     const input: ServiceAreaUpdateInput = {
       name: optReqString(body.name, "name"),
       postcodeSector: optString(body.postcodeSector, "postcodeSector"),
       isDefault: optBool(body.isDefault, "isDefault"),
     };
-    res.json(await svc(req).updateServiceArea(actorIdOf(req), req.params.id, input));
+    res.json(await svc(req).updateServiceArea(req.params.id, input));
   })
 );
 settingsRouter.delete(
   "/service-areas/:id",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
-    await svc(req).deleteServiceArea(actorIdOf(req), req.params.id);
+    await svc(req).assertSetupComplete();
+    await svc(req).deleteServiceArea(req.params.id);
     res.status(204).end();
   })
 );
@@ -276,13 +269,13 @@ settingsRouter.delete(
 settingsRouter.get(
   "/technicians",
   h(async (req, res) => {
-    res.json(await svc(req).getTechnicians(actorIdOf(req)));
+    res.json(await svc(req).getTechnicians());
   })
 );
 settingsRouter.post(
   "/technicians",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete();
     const body = asObject(req.body);
     const input: TechnicianCreateInput = {
       name: optString(body.name, "name"),
@@ -290,13 +283,13 @@ settingsRouter.post(
       role: optString(body.role, "role"),
       active: optBool(body.active, "active"),
     };
-    res.status(201).json(await svc(req).createTechnician(actorIdOf(req), input));
+    res.status(201).json(await svc(req).createTechnician(input));
   })
 );
 settingsRouter.patch(
   "/technicians/:id",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete();
     const body = asObject(req.body);
     const input: TechnicianUpdateInput = {
       name: optString(body.name, "name"),
@@ -304,14 +297,14 @@ settingsRouter.patch(
       role: optString(body.role, "role"),
       active: optBool(body.active, "active"),
     };
-    res.json(await svc(req).updateTechnician(actorIdOf(req), req.params.id, input));
+    res.json(await svc(req).updateTechnician(req.params.id, input));
   })
 );
 settingsRouter.delete(
   "/technicians/:id",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
-    await svc(req).deleteTechnician(actorIdOf(req), req.params.id);
+    await svc(req).assertSetupComplete();
+    await svc(req).deleteTechnician(req.params.id);
     res.status(204).end();
   })
 );
@@ -323,13 +316,13 @@ settingsRouter.delete(
 settingsRouter.get(
   "/payment",
   h(async (req, res) => {
-    res.json(await svc(req).getPaymentSetup(actorIdOf(req)));
+    res.json(await svc(req).getSettings());
   })
 );
 settingsRouter.patch(
   "/payment",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete();
     const body = asObject(req.body);
     const input: PaymentRulesUpdateInput = {
       paymentRule: optPaymentTiming(body.paymentRule),
@@ -338,13 +331,13 @@ settingsRouter.patch(
       debtHoldMaxInvoices: body.debtHoldMaxInvoices !== undefined ? (body.debtHoldMaxInvoices === null ? null : Number(body.debtHoldMaxInvoices)) : undefined,
       debtHoldMaxAmount: body.debtHoldMaxAmount !== undefined ? (body.debtHoldMaxAmount === null ? null : Number(body.debtHoldMaxAmount)) : undefined,
     };
-    res.json(await svc(req).updatePaymentRules(actorIdOf(req), input));
+    res.json(await svc(req).updatePaymentRules(input));
   })
 );
 settingsRouter.post(
   "/payment/gocardless/connect",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete();
     const body = asObject(req.body);
     const accessToken = requireString(body.accessToken, "accessToken");
     const environment = requireString(body.environment, "environment");
@@ -381,7 +374,7 @@ settingsRouter.post(
 settingsRouter.post(
   "/payment/gocardless/disconnect",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete();
     await req.tenantPrisma!.businessSettings.updateMany({
       data: {
         gocardlessConnected: false,
@@ -398,7 +391,7 @@ settingsRouter.post(
 settingsRouter.get(
   "/stripe/authorize",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete();
     const state = `${req.profile!.tenantId}:${randomBytes(8).toString("hex")}`;
     res.redirect(buildStripeAuthUrl(state));
   })
@@ -435,7 +428,7 @@ settingsRouter.get(
 settingsRouter.post(
   "/stripe/disconnect",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete();
     await req.tenantPrisma!.businessSettings.updateMany({
       data: {
         stripeConnected:             false,
@@ -456,14 +449,14 @@ settingsRouter.post(
 settingsRouter.get(
   "/message-templates",
   h(async (req, res) => {
-    res.json(await svc(req).getMessageTemplates(actorIdOf(req)));
+    res.json(await svc(req).getMessageTemplates());
   })
 );
 
 settingsRouter.post(
   "/message-templates",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete();
     const body = asObject(req.body);
     const input = {
       name: requireString(body.name, "name"),
@@ -471,14 +464,14 @@ settingsRouter.post(
       body: requireString(body.body, "body"),
       subject: optString(body.subject, "subject"),
     };
-    res.status(201).json(await svc(req).createMessageTemplate(actorIdOf(req), input));
+    res.status(201).json(await svc(req).createMessageTemplate(input));
   })
 );
 
 settingsRouter.patch(
   "/message-templates/:id",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete();
     const body = asObject(req.body);
     const input = {
       name: optReqString(body.name, "name"),
@@ -486,15 +479,15 @@ settingsRouter.patch(
       body: optReqString(body.body, "body"),
       subject: optString(body.subject, "subject"),
     };
-    res.json(await svc(req).updateMessageTemplate(actorIdOf(req), req.params.id, input));
+    res.json(await svc(req).updateMessageTemplate(req.params.id, input));
   })
 );
 
 settingsRouter.delete(
   "/message-templates/:id",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
-    await svc(req).deleteMessageTemplate(actorIdOf(req), req.params.id);
+    await svc(req).assertSetupComplete();
+    await svc(req).deleteMessageTemplate(req.params.id);
     res.status(204).send();
   })
 );
@@ -507,7 +500,7 @@ settingsRouter.delete(
 settingsRouter.get(
   "/ghl/authorize",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete();
     const state = `${req.profile!.tenantId}:${randomBytes(8).toString("hex")}`;
     const redirectUri = `${process.env.PUBLIC_API_URL}/settings/ghl/callback`;
     res.redirect(buildGhlAuthUrl(redirectUri, state));
@@ -526,13 +519,15 @@ settingsRouter.get(
     const tokens = await exchangeGhlCode(code, redirectUri);
 
     const expiresAt = new Date(Date.now() + tokens.expires_in * 1000);
+    const webhookSecret = randomBytes(32).toString("hex");
     await req.tenantPrisma!.businessSettings.updateMany({
       data: {
-        ghlConnected:             true,
-        ghlLocationId:            tokens.locationId,
-        ghlAccessTokenEncrypted:  encrypt(tokens.access_token),
-        ghlRefreshTokenEncrypted: encrypt(tokens.refresh_token),
-        ghlTokenExpiresAt:        expiresAt,
+        ghlConnected:                true,
+        ghlLocationId:               tokens.locationId,
+        ghlAccessTokenEncrypted:     encrypt(tokens.access_token),
+        ghlRefreshTokenEncrypted:    encrypt(tokens.refresh_token),
+        ghlTokenExpiresAt:           expiresAt,
+        ghlWebhookSecretEncrypted:   encrypt(webhookSecret),
       },
     });
 
@@ -542,8 +537,10 @@ settingsRouter.get(
       data: { ghlLocationId: tokens.locationId },
     });
 
+    const tenantId = req.profile!.tenantId;
+    const webhookUrl = `${process.env.PUBLIC_API_URL}/webhooks/ghl?tenantId=${tenantId}&secret=${webhookSecret}`;
     const frontendUrl = process.env.FRONTEND_URL!;
-    res.redirect(`${frontendUrl}/settings/integrations?ghl=connected`);
+    res.redirect(`${frontendUrl}/settings/integrations?ghl=connected&webhookUrl=${encodeURIComponent(webhookUrl)}`);
   })
 );
 
@@ -555,7 +552,7 @@ settingsRouter.get(
 settingsRouter.post(
   "/ghl/connect-private",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete();
     const body       = asObject(req.body);
     const apiKey     = requireString(body.apiKey,     "apiKey");
     const locationId = requireString(body.locationId, "locationId");
@@ -574,14 +571,15 @@ settingsRouter.post(
       throw new AppError(400, "GHL API key or location ID is invalid");
     }
 
+    const webhookSecret = randomBytes(32).toString("hex");
     await req.tenantPrisma!.businessSettings.updateMany({
       data: {
-        ghlConnected:            true,
-        ghlLocationId:           locationId,
-        ghlAccessTokenEncrypted: encrypt(apiKey),
-        // Private keys never expire — clear any stale OAuth refresh state
-        ghlRefreshTokenEncrypted: null,
-        ghlTokenExpiresAt:        null,
+        ghlConnected:              true,
+        ghlLocationId:             locationId,
+        ghlAccessTokenEncrypted:   encrypt(apiKey),
+        ghlRefreshTokenEncrypted:  null,
+        ghlTokenExpiresAt:         null,
+        ghlWebhookSecretEncrypted: encrypt(webhookSecret),
       },
     });
 
@@ -591,7 +589,9 @@ settingsRouter.post(
       data:  { ghlLocationId: locationId },
     });
 
-    res.json({ status: "connected", method: "private" });
+    const tenantId = req.profile!.tenantId;
+    const webhookUrl = `${process.env.PUBLIC_API_URL}/webhooks/ghl?tenantId=${tenantId}&secret=${webhookSecret}`;
+    res.json({ status: "connected", method: "private", webhookUrl });
   })
 );
 
@@ -599,14 +599,15 @@ settingsRouter.post(
 settingsRouter.post(
   "/ghl/disconnect",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete(actorIdOf(req));
+    await svc(req).assertSetupComplete();
     await req.tenantPrisma!.businessSettings.updateMany({
       data: {
-        ghlConnected:            false,
-        ghlLocationId:           null,
-        ghlAccessTokenEncrypted:  null,
-        ghlRefreshTokenEncrypted: null,
-        ghlTokenExpiresAt:        null,
+        ghlConnected:              false,
+        ghlLocationId:             null,
+        ghlAccessTokenEncrypted:   null,
+        ghlRefreshTokenEncrypted:  null,
+        ghlTokenExpiresAt:         null,
+        ghlWebhookSecretEncrypted: null,
       },
     });
     res.json({ status: "disconnected" });

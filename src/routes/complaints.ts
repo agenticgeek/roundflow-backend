@@ -7,14 +7,13 @@ import { asObject, h, requireString, optString, optId } from "../lib/http";
 import { createComplaintService, ComplaintCreateInput, ComplaintListFilters } from "../services/complaint.service";
 import { createReportsService } from "../services/reports.service";
 import { ComplaintStatus, Severity } from "../generated/tenant-client";
-import { syncMessageToGhl } from "../integrations/ghl/sync";
+import { syncMessageToGhl, queueGhlEvent } from "../integrations/ghl/sync";
 
 export const complaintsRouter = Router();
 complaintsRouter.use(requireAuth);
 complaintsRouter.use(requireTenantAccess);
 complaintsRouter.use(requireBusinessAccess());
 
-const actorIdOf = (req: Request): string => req.user!.supabaseUserId;
 
 const svc = (req: Request) => {
   if (!req.tenantPrisma) throw new AppError(500, "Tenant client not initialised");
@@ -58,7 +57,7 @@ complaintsRouter.get(
       filters.technicianId = req.query.technicianId;
     }
 
-    const result = await svc(req).listComplaints(actorIdOf(req), filters);
+    const result = await svc(req).listComplaints(filters);
     res.json(result);
   })
 );
@@ -69,7 +68,7 @@ complaintsRouter.get(
 complaintsRouter.get(
   "/:id",
   h(async (req, res) => {
-    const result = await svc(req).getComplaint(actorIdOf(req), req.params.id);
+    const result = await svc(req).getComplaint(req.params.id);
     res.json(result);
   })
 );
@@ -80,7 +79,7 @@ complaintsRouter.get(
 complaintsRouter.get(
   "/:id/messages",
   h(async (req, res) => {
-    const result = await svc(req).getMessages(actorIdOf(req), req.params.id);
+    const result = await svc(req).getMessages(req.params.id);
     res.json(result);
   })
 );
@@ -93,7 +92,7 @@ complaintsRouter.post(
   h(async (req, res) => {
     const body = asObject(req.body);
     const text = requireString(body.body, "body");
-    const result = await svc(req).addMessage(actorIdOf(req), req.params.id, text);
+    const result = await svc(req).addMessage(req.params.id, text);
     syncMessageToGhl(req.tenantPrisma!, req.params.id, text, result.channel).catch(console.error);
     res.status(201).json(result);
   })
@@ -117,7 +116,7 @@ complaintsRouter.post(
       technicianId: optId(body.technicianId, "technicianId"),
     };
 
-    const result = await svc(req).logComplaint(actorIdOf(req), input);
+    const result = await svc(req).logComplaint(input);
 
     void createReportsService(req.tenantPrisma!).logActivity(
       "COMPLAINT_LOGGED",
@@ -125,6 +124,7 @@ complaintsRouter.post(
       req.profile?.id,
       req.profile?.role ?? undefined,
     );
+    queueGhlEvent(req.tenantPrisma!, "complaint.logged", input.customerId).catch(console.error);
 
     res.status(201).json(result);
   })
@@ -136,7 +136,7 @@ complaintsRouter.post(
 complaintsRouter.post(
   "/:id/mark-in-review",
   h(async (req, res) => {
-    const result = await svc(req).markInReview(actorIdOf(req), req.params.id);
+    const result = await svc(req).markInReview(req.params.id);
     res.json(result);
   })
 );
@@ -149,7 +149,7 @@ complaintsRouter.post(
   h(async (req, res) => {
     const body = asObject(req.body);
     const revisitDate = requireString(body.revisitDate, "revisitDate");
-    const result = await svc(req).scheduleRevisit(actorIdOf(req), req.params.id, revisitDate);
+    const result = await svc(req).scheduleRevisit(req.params.id, revisitDate);
     res.json(result);
   })
 );
@@ -160,7 +160,7 @@ complaintsRouter.post(
 complaintsRouter.post(
   "/:id/resolve",
   h(async (req, res) => {
-    const result = await svc(req).resolve(actorIdOf(req), req.params.id);
+    const result = await svc(req).resolve(req.params.id);
     res.json(result);
   })
 );
@@ -171,7 +171,7 @@ complaintsRouter.post(
 complaintsRouter.post(
   "/:id/reopen",
   h(async (req, res) => {
-    const result = await svc(req).reopen(actorIdOf(req), req.params.id);
+    const result = await svc(req).reopen(req.params.id);
     res.json(result);
   })
 );
@@ -184,7 +184,7 @@ complaintsRouter.post(
   h(async (req, res) => {
     const body = asObject(req.body);
     const technicianId = requireString(body.technicianId, "technicianId");
-    const result = await svc(req).assignTechnician(actorIdOf(req), req.params.id, technicianId);
+    const result = await svc(req).assignTechnician(req.params.id, technicianId);
     res.json(result);
   })
 );

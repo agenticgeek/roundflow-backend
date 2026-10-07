@@ -1,17 +1,16 @@
-import { Router } from "express";
-import { UserRole } from "@prisma/client";
+import { Request, Router } from "express";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
-import { requireRole } from "../middleware/requireRole";
+import { requireBusinessAccess } from "../middleware/requireRole";
 import { h } from "../lib/http";
 import { createDashboardService } from "../services/dashboard.service";
 
 export const dashboardRouter = Router();
 dashboardRouter.use(requireAuth);
 dashboardRouter.use(requireTenantAccess);
-dashboardRouter.use(requireRole(UserRole.ADMIN, UserRole.MANAGER));
+dashboardRouter.use(requireBusinessAccess());
 
-const svc = (req: any) => createDashboardService(req.tenantPrisma!);
+const svc = (req: Request) => createDashboardService(req.tenantPrisma!);
 
 // GET /dashboard/kpis — 4 top metric cards
 dashboardRouter.get("/kpis", h(async (req, res) => {

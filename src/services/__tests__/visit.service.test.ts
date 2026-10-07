@@ -29,7 +29,7 @@ it("createVisit sets isOneOff: true and status: SCHEDULED", async () => {
     round: null, service: null, technician: null,
   });
 
-  await createVisitService(prisma).createVisit("user-1", {
+  await createVisitService(prisma).createVisit({
     propertyId: "p1", date: "2026-09-03", price: 45,
   });
 
@@ -52,7 +52,7 @@ it("createVisit sets servicePlanId: null on the created row", async () => {
     round: null, service: null, technician: null,
   });
 
-  await createVisitService(prisma).createVisit("user-1", {
+  await createVisitService(prisma).createVisit({
     propertyId: "p1", date: "2026-09-03", price: 45,
   });
 
@@ -65,7 +65,7 @@ it("createVisit throws 404 when propertyId does not exist", async () => {
   (prisma.property.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
 
   await expect(
-    createVisitService(prisma).createVisit("user-1", {
+    createVisitService(prisma).createVisit({
       propertyId: "bad", date: "2026-09-03", price: 45,
     })
   ).rejects.toMatchObject({ statusCode: 404 });
@@ -80,7 +80,7 @@ it("createVisit throws 404 when technicianId does not exist", async () => {
   (prisma.technician.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
 
   await expect(
-    createVisitService(prisma).createVisit("user-1", {
+    createVisitService(prisma).createVisit({
       propertyId: "p1", date: "2026-09-03", price: 45, technicianId: "bad",
     })
   ).rejects.toMatchObject({ statusCode: 404 });
@@ -95,7 +95,7 @@ it("createVisit throws 404 when serviceId does not exist", async () => {
   (prisma.service.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
 
   await expect(
-    createVisitService(prisma).createVisit("user-1", {
+    createVisitService(prisma).createVisit({
       propertyId: "p1", date: "2026-09-03", price: 45, serviceId: "bad",
     })
   ).rejects.toMatchObject({ statusCode: 404 });
@@ -110,7 +110,7 @@ it("createVisit throws 404 when roundId does not exist", async () => {
   (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
 
   await expect(
-    createVisitService(prisma).createVisit("user-1", {
+    createVisitService(prisma).createVisit({
       propertyId: "p1", date: "2026-09-03", price: 45, roundId: "bad",
     })
   ).rejects.toMatchObject({ statusCode: 404 });
@@ -118,7 +118,7 @@ it("createVisit throws 404 when roundId does not exist", async () => {
 
 it("createVisit throws 400 for price: 0", async () => {
   await expect(
-    createVisitService(makePrisma()).createVisit("user-1", {
+    createVisitService(makePrisma()).createVisit({
       propertyId: "p1", date: "2026-09-03", price: 0,
     })
   ).rejects.toMatchObject({ statusCode: 400 });
@@ -126,7 +126,7 @@ it("createVisit throws 400 for price: 0", async () => {
 
 it("createVisit throws 400 for price: -5", async () => {
   await expect(
-    createVisitService(makePrisma()).createVisit("user-1", {
+    createVisitService(makePrisma()).createVisit({
       propertyId: "p1", date: "2026-09-03", price: -5,
     })
   ).rejects.toMatchObject({ statusCode: 400 });
@@ -134,7 +134,7 @@ it("createVisit throws 400 for price: -5", async () => {
 
 it("createVisit throws 400 for date: '03-09-2026'", async () => {
   await expect(
-    createVisitService(makePrisma()).createVisit("user-1", {
+    createVisitService(makePrisma()).createVisit({
       propertyId: "p1", date: "03-09-2026", price: 45,
     })
   ).rejects.toMatchObject({ statusCode: 400 });
@@ -154,7 +154,7 @@ it("createVisit returns price as a number", async () => {
     round: null, service: null, technician: null,
   });
 
-  const result = await createVisitService(prisma).createVisit("user-1", {
+  const result = await createVisitService(prisma).createVisit({
     propertyId: "p1", date: "2026-09-03", price: 45,
   });
 
@@ -174,7 +174,7 @@ it("createVisit throws 400 when technicianId has not accepted their invite", asy
   });
 
   await expect(
-    createVisitService(prisma).createVisit("user-1", {
+    createVisitService(prisma).createVisit({
       propertyId: "p1", date: "2026-09-03", price: 45, technicianId: "t1",
     })
   ).rejects.toMatchObject({ statusCode: 400 });
@@ -194,7 +194,7 @@ it("createVisit creates row with roundId: null when roundId is omitted", async (
     round: null, service: null, technician: null,
   });
 
-  await createVisitService(prisma).createVisit("user-1", {
+  await createVisitService(prisma).createVisit({
     propertyId: "p1", date: "2026-09-03", price: 45,
   });
 

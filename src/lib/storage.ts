@@ -1,5 +1,3 @@
-import { StorageClient } from "@supabase/storage-js";
-
 export const ALLOWED_PHOTO_MIME_TYPES = [
   "image/jpeg",
   "image/png",
@@ -28,29 +26,23 @@ export function buildVisitPhotoPath(
   return `${tenantId}/visits/${visitId}/${label}-${ts}.${ext}`;
 }
 
-function getStorageClient(): StorageClient {
-  const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !key) throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set");
-  return new StorageClient(`${url}/storage/v1`, {
-    apikey: key,
-    Authorization: `Bearer ${key}`,
-  });
-}
-
 const BUCKET = process.env.VISIT_PHOTOS_BUCKET ?? "visit-photos";
 
 export async function createSignedUploadUrl(
   path: string
 ): Promise<{ signedUrl: string; token: string; path: string }> {
-  const storage = getStorageClient();
-  const { data, error } = await storage.from(BUCKET).createSignedUploadUrl(path);
-  if (error || !data) throw new Error(`Storage error: ${error?.message ?? "unknown"}`);
-  return { signedUrl: data.signedUrl, token: data.token, path: data.path };
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set");
+
+  const res = await fetch(`${url}/storage/v1/object/upload/sign/${BUCKET}/${path}`, {
+    method: "POST",
+    headers: { apikey: key, Authorization: `Bearer ${key}` },
+  });
+  if (!res.ok) throw new Error(`Storage error: ${await res.text()}`);
+  const data = await res.json() as { url: string };
+  const signedUrl = new URL(`${url}/storage/v1${data.url}`);
+  const token = signedUrl.searchParams.get("token") ?? "";
+  return { signedUrl: signedUrl.toString(), token, path };
 }
 
-export function getPublicUrl(path: string): string {
-  const url = process.env.SUPABASE_URL;
-  const bucket = BUCKET;
-  return `${url}/storage/v1/object/public/${bucket}/${path}`;
-}

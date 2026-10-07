@@ -25,7 +25,7 @@ it("updateRoundSettings is a function", () => {
 it("updateRoundSettings does not write preCleanReminderTimings when omitted", async () => {
   const prisma = makePrisma();
   (prisma.businessSettings.upsert as ReturnType<typeof vi.fn>).mockResolvedValue({});
-  await createSettingsService(prisma).updateRoundSettings("user-1", { defaultCycleLength: 28 });
+  await createSettingsService(prisma).updateRoundSettings({ defaultCycleLength: 28 });
   const written = (prisma.businessSettings.upsert as ReturnType<typeof vi.fn>).mock.calls[0][0];
   expect(written.update.preCleanReminderTimings).toBeUndefined();
 });
@@ -34,7 +34,7 @@ it("updateRoundSettings writes preCleanReminderTimings to the database", async (
   const prisma = makePrisma();
   const timings = ["EVENING_BEFORE", "TWO_HOURS_BEFORE"];
   (prisma.businessSettings.upsert as ReturnType<typeof vi.fn>).mockResolvedValue({});
-  await createSettingsService(prisma).updateRoundSettings("user-1", {
+  await createSettingsService(prisma).updateRoundSettings({
     preCleanReminderTimings: timings,
   });
   const written = (prisma.businessSettings.upsert as ReturnType<typeof vi.fn>).mock.calls[0][0];

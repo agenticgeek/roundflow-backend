@@ -205,6 +205,7 @@ model BusinessSettings {
   ghlAccessTokenEncrypted      String?
   ghlRefreshTokenEncrypted     String?
   ghlTokenExpiresAt            DateTime?
+  ghlWebhookSecretEncrypted    String?
   setupCompleted               Boolean        @default(false)
   lastClosedDate           String?        // YYYY-MM-DD; set by POST /today/close to block re-close
   preCleanReminderTimings  String[]
@@ -632,6 +633,18 @@ model ChatMessage {
 
   @@index([roundId, createdAt])
   @@index([senderProfileId])
+}
+
+// Outbound GHL event queue — written in same call as operational write, drained by outboxWorker.
+model IntegrationOutbox {
+  id          String   @id @default(cuid())
+  eventType   String   // "customer.synced" | "visit.completed" | "payment.collected" | "debt.overdue" | "complaint.logged"
+  payload     Json     // always includes { customerId }
+  status      String   @default("pending") // pending | sent | failed | dead
+  attempts    Int      @default(0)
+  lastError   String?
+  createdAt   DateTime @default(now())
+  processedAt DateTime?
 }
 
 // Inbound webhook dedup — insert before processing; unique constraint rejects replays.

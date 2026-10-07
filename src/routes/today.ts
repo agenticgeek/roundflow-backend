@@ -12,7 +12,6 @@ todayRouter.use(requireAuth);
 todayRouter.use(requireTenantAccess);
 todayRouter.use(requireBusinessAccess());
 
-const actorIdOf = (req: Request): string => req.user!.supabaseUserId;
 const svc = (req: Request) => {
   if (!req.tenantPrisma) throw new AppError(500, "Tenant client not initialised");
   return createTodayService(req.tenantPrisma);
@@ -25,7 +24,7 @@ const svc = (req: Request) => {
 todayRouter.get(
   "/",
   h(async (req, res) => {
-    res.json(await svc(req).getTodaysWork(actorIdOf(req)));
+    res.json(await svc(req).getTodaysWork());
   })
 );
 
@@ -44,7 +43,7 @@ todayRouter.post(
         '"unfinishedAction" must be "push_to_tomorrow" or "mark_as_skipped"'
       );
     }
-    const result = await svc(req).closeDay(actorIdOf(req), raw);
+    const result = await svc(req).closeDay(raw);
     void createReportsService(req.tenantPrisma!).logActivity(
       "DAY_CLOSED",
       `Operational day closed (unfinished: ${raw})`,

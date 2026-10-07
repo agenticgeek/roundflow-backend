@@ -348,15 +348,6 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     },
   },
 
-  MessageTemplateDeferred: {
-    type: "object",
-    required: ["status", "source"],
-    properties: {
-      status: { type: "string", enum: ["deferred"] },
-      source: { type: "string", example: "ghl" },
-    },
-  },
-
   MessageTemplateView: {
     type: "object",
     required: ["id", "name", "channel", "body", "createdAt", "updatedAt"],
@@ -419,15 +410,6 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
         { step: 7, complete: false, deferred: false },
         { step: 8, complete: false, deferred: false },
       ],
-    },
-  },
-
-  DeferredStub: {
-    type: "object",
-    required: ["status", "reason"],
-    properties: {
-      status: { type: "string", enum: ["deferred"] },
-      reason: { type: "string" },
     },
   },
 
@@ -1364,12 +1346,6 @@ const reusableResponses: Record<string, OpenAPIV3.ResponseObject> = {
 // ---------------------------------------------------------------------------
 // 6. Paths.
 // ---------------------------------------------------------------------------
-
-/** A deferred-step (2 & 5) response used by both GET and POST. */
-const deferredResponses = (): OpenAPIV3.ResponsesObject => ({
-  "200": jsonResponse("Deferred stub — no DB write.", ref("DeferredStub")),
-  "401": ERR[401],
-});
 
 const paths: OpenAPIV3.PathsObject = {
   // ---- Health ----

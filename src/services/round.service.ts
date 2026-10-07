@@ -2,13 +2,6 @@ import { CleaningFrequency, DayOfWeek, RoundStatus, VisitStatus, IssueType, Pris
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 
-// ---------------------------------------------------------------------------
-// M3 — Rounds (BE-M3-03).
-//
-// Same OCP seam as the other services: routes depend on IRoundService;
-// methods are profileId-first for Phase 2 extensibility.
-// ---------------------------------------------------------------------------
-
 // ---- input types ----------------------------------------------------------
 
 export interface RoundCreateInput {
@@ -160,32 +153,16 @@ const roundDetailInclude = {
 
 type RoundWithRelations = Prisma.RoundGetPayload<{ include: typeof roundDetailInclude }>;
 
-// ---- contract -------------------------------------------------------------
-
-export interface IRoundService {
-  listRounds(profileId: string, status?: RoundStatus): Promise<RoundSummary[]>;
-  createRound(profileId: string, input: RoundCreateInput): Promise<RoundDetail>;
-  getRound(profileId: string, roundId: string): Promise<RoundDetail>;
-  updateRound(profileId: string, roundId: string, input: RoundUpdateInput): Promise<RoundDetail>;
-  setTechnicians(profileId: string, roundId: string, technicianIds: string[]): Promise<RoundDetail>;
-  listOccurrences(profileId: string, roundId: string, from?: Date, to?: Date): Promise<OccurrenceSummary[]>;
-  getOccurrence(profileId: string, roundId: string, date: string): Promise<OccurrenceDetail>;
-  // M4 additions
-  getTodayPanel(profileId: string, roundId: string): Promise<TodayPanel>;
-  reassignTechnician(profileId: string, roundId: string, input: ReassignInput): Promise<ReassignResult>;
-  pushMissedJobs(profileId: string, roundId: string, input: PushMissedInput): Promise<PushMissedResult>;
-}
-
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
 
-class RoundService implements IRoundService {
+class RoundService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
   // ---- list ----
 
-  async listRounds(_profileId: string, status?: RoundStatus): Promise<RoundSummary[]> {
+  async listRounds(status?: RoundStatus): Promise<RoundSummary[]> {
     const rounds = await this.prisma.round.findMany({
       where: status ? { status } : undefined,
       orderBy: { createdAt: "asc" },
@@ -210,7 +187,7 @@ class RoundService implements IRoundService {
 
   // ---- create ----
 
-  async createRound(_profileId: string, input: RoundCreateInput): Promise<RoundDetail> {
+  async createRound(input: RoundCreateInput): Promise<RoundDetail> {
     await this.assertServiceAreaExists(input.serviceAreaId);
 
     const round = await this.prisma.round.create({
@@ -230,7 +207,7 @@ class RoundService implements IRoundService {
 
   // ---- read ----
 
-  async getRound(_profileId: string, roundId: string): Promise<RoundDetail> {
+  async getRound(roundId: string): Promise<RoundDetail> {
     const round = await this.prisma.round.findUnique({
       where: { id: roundId },
       include: roundDetailInclude,
@@ -247,7 +224,6 @@ class RoundService implements IRoundService {
   // ---- update ----
 
   async updateRound(
-    _profileId: string,
     roundId: string,
     input: RoundUpdateInput
   ): Promise<RoundDetail> {
@@ -273,7 +249,6 @@ class RoundService implements IRoundService {
   // ---- set technicians (replace semantics) ----
 
   async setTechnicians(
-    _profileId: string,
     roundId: string,
     technicianIds: string[]
   ): Promise<RoundDetail> {
@@ -325,7 +300,6 @@ class RoundService implements IRoundService {
   // ---- planner — occurrence list (calendar view) ----
 
   async listOccurrences(
-    _profileId: string,
     roundId: string,
     from?: Date,
     to?: Date
@@ -385,7 +359,6 @@ class RoundService implements IRoundService {
   // ---- planner — single occurrence (list/map view) ----
 
   async getOccurrence(
-    _profileId: string,
     roundId: string,
     date: string
   ): Promise<OccurrenceDetail> {
@@ -487,7 +460,7 @@ class RoundService implements IRoundService {
 
   // ---- M4: today panel (Screen 13) ----------------------------------------
 
-  async getTodayPanel(_profileId: string, roundId: string): Promise<TodayPanel> {
+  async getTodayPanel(roundId: string): Promise<TodayPanel> {
     const round = await this.prisma.round.findUnique({
       where: { id: roundId },
       select: { id: true, name: true },
@@ -555,7 +528,6 @@ class RoundService implements IRoundService {
   // ---- M4: reassign technician (M15) ---------------------------------------
 
   async reassignTechnician(
-    _profileId: string,
     roundId: string,
     input: ReassignInput
   ): Promise<ReassignResult> {
@@ -599,7 +571,6 @@ class RoundService implements IRoundService {
   // ---- M4: push missed jobs (M22) ------------------------------------------
 
   async pushMissedJobs(
-    _profileId: string,
     roundId: string,
     input: PushMissedInput
   ): Promise<PushMissedResult> {
@@ -632,6 +603,6 @@ class RoundService implements IRoundService {
   }
 }
 
-export function createRoundService(prisma: TenantPrismaClient): IRoundService {
+export function createRoundService(prisma: TenantPrismaClient) {
   return new RoundService(prisma);
 }

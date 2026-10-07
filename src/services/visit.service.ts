@@ -34,16 +34,12 @@ export interface VisitDetail {
   technicianName: string | null;
 }
 
-export interface IVisitService {
-  createVisit(profileId: string, input: VisitCreateInput): Promise<VisitDetail>;
-}
-
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-class VisitService implements IVisitService {
+class VisitService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
-  async createVisit(_profileId: string, input: VisitCreateInput): Promise<VisitDetail> {
+  async createVisit(input: VisitCreateInput): Promise<VisitDetail> {
     if (!DATE_RE.test(input.date)) {
       throw new AppError(400, `"date" must be in YYYY-MM-DD format`);
     }
@@ -122,6 +118,6 @@ class VisitService implements IVisitService {
   }
 }
 
-export function createVisitService(prisma: TenantPrismaClient): IVisitService {
+export function createVisitService(prisma: TenantPrismaClient) {
   return new VisitService(prisma);
 }

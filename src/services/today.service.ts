@@ -1,18 +1,11 @@
 import { VisitStatus, Prisma } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
+import { todayRange } from "../lib/dates";
 
 // ---------------------------------------------------------------------------
 // M4 — Today's Work (BE-M4-01, BE-M4-05).
 // ---------------------------------------------------------------------------
-
-// ---- helpers ----------------------------------------------------------------
-
-function todayRange(): { start: Date; end: Date } {
-  const start = new Date();
-  start.setUTCHours(0, 0, 0, 0);
-  return { start, end: new Date(start.getTime() + 86_400_000) };
-}
 
 // Returns the next Mon–Fri date after `date` (UTC). Skips Sat → Mon, Sun → Mon.
 function nextWorkingDay(date: Date): Date {
@@ -99,26 +92,16 @@ const visitTodayInclude = {
 
 type VisitToday = Prisma.VisitGetPayload<{ include: typeof visitTodayInclude }>;
 
-// ---- contract ---------------------------------------------------------------
-
-export interface ITodayService {
-  getTodaysWork(profileId: string): Promise<TodaysWorkAggregate>;
-  closeDay(
-    profileId: string,
-    unfinishedAction: "push_to_tomorrow" | "mark_as_skipped"
-  ): Promise<CloseDaySummary>;
-}
-
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
 
-class TodayService implements ITodayService {
+class TodayService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
   // ---- GET /today (Screen 12 aggregate) ----
 
-  async getTodaysWork(_profileId: string): Promise<TodaysWorkAggregate> {
+  async getTodaysWork(): Promise<TodaysWorkAggregate> {
     const { start, end } = todayRange();
     const today = start.toISOString().slice(0, 10);
 
@@ -143,7 +126,6 @@ class TodayService implements ITodayService {
   // ---- POST /today/close (M21) ----
 
   async closeDay(
-    _profileId: string,
     unfinishedAction: "push_to_tomorrow" | "mark_as_skipped"
   ): Promise<CloseDaySummary> {
     const { start, end } = todayRange();
@@ -310,6 +292,6 @@ class TodayService implements ITodayService {
   }
 }
 
-export function createTodayService(prisma: TenantPrismaClient): ITodayService {
+export function createTodayService(prisma: TenantPrismaClient) {
   return new TodayService(prisma);
 }

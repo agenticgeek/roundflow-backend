@@ -18,14 +18,14 @@ export function createReportsService(prisma: TenantPrismaClient) {
       await prisma.activityLog.create({ data: { type, message, actorId: actorId ?? null, actorRole: actorRole ?? null } });
     },
     getActivity: async (type?: string) => {
-      const where: any = {};
+      const where: Record<string, unknown> = {};
       if (type) where.type = type;
       const logs = await prisma.activityLog.findMany({
         where,
         orderBy: { createdAt: "desc" },
         take: 100,
       });
-      return (logs as any[]).map((l) => ({
+      return logs.map((l) => ({
         id: l.id,
         type: l.type,
         message: l.message,
@@ -35,7 +35,7 @@ export function createReportsService(prisma: TenantPrismaClient) {
     },
     getVisits: async (period: string, status?: string) => {
       const range = periodRange(period as Period);
-      const where: any = { date: range };
+      const where: Record<string, unknown> = { date: range };
       if (status) where.status = status;
       const visits = await prisma.visit.findMany({
         where,
@@ -47,7 +47,7 @@ export function createReportsService(prisma: TenantPrismaClient) {
         },
         orderBy: { date: "desc" },
       });
-      return (visits as any[]).map((v) => ({
+      return visits.map((v) => ({
         visitId: v.id,
         date: v.date,
         property: v.property?.addressLine ?? "",
@@ -65,7 +65,7 @@ export function createReportsService(prisma: TenantPrismaClient) {
         select: { technicianId: true, status: true, price: true, technician: { select: { id: true, name: true, email: true } } },
       });
       const map = new Map<string, { name: string | null; email: string | null; completed: number; skipped: number; revenue: number }>();
-      for (const v of visits as any[]) {
+      for (const v of visits) {
         if (!v.technicianId) continue;
         const existing = map.get(v.technicianId) ?? { name: v.technician?.name ?? null, email: v.technician?.email ?? null, completed: 0, skipped: 0, revenue: 0 };
         if (v.status === "COMPLETED") { existing.completed++; existing.revenue += v.price.toNumber(); }
@@ -82,7 +82,7 @@ export function createReportsService(prisma: TenantPrismaClient) {
         revenueImpact: s.revenue,
       }));
     },
-    getRevenue: async (period: string, _granularity: string) => {
+    getRevenue: async (period: string) => {
       const range = periodRange(period as Period);
       const visits = await prisma.visit.findMany({
         where: { date: range, status: "COMPLETED" },
@@ -91,7 +91,7 @@ export function createReportsService(prisma: TenantPrismaClient) {
       });
       // Group by date string (daily granularity for now)
       const map = new Map<string, number>();
-      for (const v of visits as any[]) {
+      for (const v of visits) {
         const key = (v.date as Date).toISOString().slice(0, 10);
         map.set(key, (map.get(key) ?? 0) + v.price.toNumber());
       }
@@ -109,11 +109,11 @@ export function createReportsService(prisma: TenantPrismaClient) {
           select: { amount: true },
         }),
       ]);
-      const completed = visits.filter((v: any) => v.status === "COMPLETED");
-      const totalRevenue = completed.reduce((s: number, v: any) => s + v.price.toNumber(), 0);
+      const completed = visits.filter((v) => v.status === "COMPLETED");
+      const totalRevenue = completed.reduce((s, v) => s + v.price.toNumber(), 0);
       const completedVisits = completed.length;
-      const completedRounds = new Set(completed.map((v: any) => v.roundId).filter(Boolean)).size;
-      const undonePayments = sentInvoices.reduce((s: number, i: any) => s + i.amount.toNumber(), 0);
+      const completedRounds = new Set(completed.map((v) => v.roundId).filter(Boolean)).size;
+      const undonePayments = sentInvoices.reduce((s, i) => s + i.amount.toNumber(), 0);
       return { totalRevenue, completedVisits, completedRounds, undonePayments };
     },
   };

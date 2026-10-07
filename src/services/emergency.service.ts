@@ -1,4 +1,5 @@
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
+import { AppError } from "../lib/app-error";
 
 export interface AvailableTechnicianRow {
   technicianId: string;
@@ -42,8 +43,8 @@ export function createEmergencyService(prisma: TenantPrismaClient) {
         prisma.round.findUnique({ where: { id: input.roundId }, select: { id: true, name: true } }),
       ]);
 
-      if (!technician) throw Object.assign(new Error("Technician not found"), { statusCode: 404 });
-      if (!round) throw Object.assign(new Error("Round not found"), { statusCode: 404 });
+      if (!technician) throw new AppError(404, "Technician not found");
+      if (!round) throw new AppError(404, "Round not found");
 
       const emergency = await prisma.technicianEmergency.create({
         data: {
@@ -79,16 +80,16 @@ export function createEmergencyService(prisma: TenantPrismaClient) {
         where: { id: emergencyId },
         select: { id: true, status: true, technicianId: true, roundId: true },
       });
-      if (!emergency) throw Object.assign(new Error("Emergency not found"), { statusCode: 404 });
+      if (!emergency) throw new AppError(404, "Emergency not found");
       if (emergency.status === "RESOLVED") {
-        throw Object.assign(new Error("Emergency is already resolved"), { statusCode: 409 });
+        throw new AppError(409, "Emergency is already resolved");
       }
 
       const newTechnician = await prisma.technician.findUnique({
         where: { id: newTechnicianId },
         select: { id: true, name: true },
       });
-      if (!newTechnician) throw Object.assign(new Error("Technician not found"), { statusCode: 404 });
+      if (!newTechnician) throw new AppError(404, "Technician not found");
 
       const dayStart = new Date();
       dayStart.setUTCHours(0, 0, 0, 0);
@@ -143,7 +144,7 @@ export function createEmergencyService(prisma: TenantPrismaClient) {
         where: { id: emergencyId },
         select: { technicianId: true },
       });
-      if (!emergency) throw Object.assign(new Error("Emergency not found"), { statusCode: 404 });
+      if (!emergency) throw new AppError(404, "Emergency not found");
 
       const dayStart = new Date();
       dayStart.setUTCHours(0, 0, 0, 0);
@@ -192,7 +193,7 @@ export function createEmergencyService(prisma: TenantPrismaClient) {
         },
       });
 
-      if (!e) throw Object.assign(new Error("Emergency not found"), { statusCode: 404 });
+      if (!e) throw new AppError(404, "Emergency not found");
 
       return {
         id: e.id,

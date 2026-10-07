@@ -28,8 +28,8 @@ export function asObject(body: unknown): Record<string, unknown> {
 // Accept either a raw array body or `{ [key]: [...] }`.
 export function asArray<T>(body: unknown, key: string): T[] {
   if (Array.isArray(body)) return body as T[];
-  if (body && typeof body === "object" && Array.isArray((body as any)[key])) {
-    return (body as any)[key] as T[];
+  if (body && typeof body === "object" && Array.isArray((body as Record<string, unknown>)[key])) {
+    return (body as Record<string, unknown>)[key] as T[];
   }
   throw new AppError(400, `Expected an array (raw, or under "${key}").`);
 }
@@ -101,3 +101,4 @@ export function optStringArray(v: unknown, field: string): string[] | undefined 
   if (Array.isArray(v) && v.every((x) => typeof x === "string")) return v as string[];
   throw new AppError(400, `"${field}" must be an array of strings.`);
 }
+

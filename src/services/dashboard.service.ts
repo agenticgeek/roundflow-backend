@@ -1,13 +1,8 @@
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { createTodayService, type TodayRoundRow } from "./today.service";
+import { todayRange } from "../lib/dates";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
-
-function todayRange(): { start: Date; end: Date } {
-  const start = new Date();
-  start.setUTCHours(0, 0, 0, 0);
-  return { start, end: new Date(start.getTime() + 86_400_000) };
-}
 
 function monthRange(): { start: Date; end: Date } {
   const now = new Date();
@@ -168,7 +163,7 @@ export function createDashboardService(prisma: TenantPrismaClient) {
     },
 
     getTodaysRounds: async (): Promise<TodayRoundRow[]> => {
-      const { rounds } = await createTodayService(prisma).getTodaysWork("");
+      const { rounds } = await createTodayService(prisma).getTodaysWork();
       return rounds;
     },
 

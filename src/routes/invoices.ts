@@ -1,15 +1,14 @@
 import { Request, Router } from "express";
-import { UserRole } from "@prisma/client";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
-import { requireRole } from "../middleware/requireRole";
+import { requireBusinessAccess } from "../middleware/requireRole";
 import { h, optString } from "../lib/http";
 import { createInvoiceService } from "../services/invoice.service";
 
 export const invoicesRouter = Router();
 invoicesRouter.use(requireAuth);
 invoicesRouter.use(requireTenantAccess);
-invoicesRouter.use(requireRole(UserRole.ADMIN, UserRole.MANAGER));
+invoicesRouter.use(requireBusinessAccess());
 
 const svc = (req: Request) => createInvoiceService(req.tenantPrisma!);
 

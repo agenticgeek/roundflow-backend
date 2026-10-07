@@ -2,18 +2,11 @@ import { VisitStatus, Prisma } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 import type { AppStatus } from "./settings.service";
+import { todayRange } from "../lib/dates";
 
 // ---------------------------------------------------------------------------
 // M9 — Technicians CRUD (BE-M9-02).
 // ---------------------------------------------------------------------------
-
-// ---- helpers ----------------------------------------------------------------
-
-function todayRange(): { start: Date; end: Date } {
-  const start = new Date();
-  start.setUTCHours(0, 0, 0, 0);
-  return { start, end: new Date(start.getTime() + 86_400_000) };
-}
 
 export type { AppStatus };
 
@@ -120,20 +113,11 @@ function toRecord(tech: TechWithAreas): TechnicianRecord {
   };
 }
 
-// ---- contract ---------------------------------------------------------------
-
-export interface ITechnicianService {
-  listTechnicians(): Promise<TechnicianListItem[]>;
-  getTechnicianDetail(id: string): Promise<TechnicianDetail>;
-  createTechnician(input: CreateTechnicianInput): Promise<TechnicianRecord>;
-  updateTechnician(id: string, input: UpdateTechnicianInput): Promise<TechnicianRecord>;
-}
-
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
 
-class TechnicianService implements ITechnicianService {
+class TechnicianService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
   async listTechnicians(): Promise<TechnicianListItem[]> {
@@ -273,6 +257,6 @@ class TechnicianService implements ITechnicianService {
   }
 }
 
-export function createTechnicianService(prisma: TenantPrismaClient): ITechnicianService {
+export function createTechnicianService(prisma: TenantPrismaClient) {
   return new TechnicianService(prisma);
 }

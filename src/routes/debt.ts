@@ -1,21 +1,21 @@
-import { Router } from "express";
-import { UserRole } from "@prisma/client";
+import { Request, Router } from "express";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
-import { requireRole } from "../middleware/requireRole";
+import { requireBusinessAccess } from "../middleware/requireRole";
 import { h } from "../lib/http";
 import { createDebtService } from "../services/debt.service";
 import { decrypt } from "../lib/crypto";
 import { getStripeClient } from "../integrations/stripe/client";
 import { createOneTimeSession } from "../integrations/stripe/checkout";
 import { StripeSessionType } from "../generated/tenant-client";
+import { queueGhlEvent } from "../integrations/ghl/sync";
 
 export const debtRouter = Router();
 debtRouter.use(requireAuth);
 debtRouter.use(requireTenantAccess);
-debtRouter.use(requireRole(UserRole.ADMIN, UserRole.MANAGER));
+debtRouter.use(requireBusinessAccess());
 
-const svc = (req: any) => createDebtService(req.tenantPrisma!);
+const svc = (req: Request) => createDebtService(req.tenantPrisma!);
 
 // GET /debt/kpis
 debtRouter.get("/kpis", h(async (req, res) => {
@@ -27,7 +27,7 @@ debtRouter.get("/kpis", h(async (req, res) => {
 debtRouter.get("/board", h(async (req, res) => {
   const { bucket, roundId, paymentMethod } = req.query as Record<string, string | undefined>;
   if (!bucket) return res.status(400).json({ error: "bucket query param is required" });
-  const items = await svc(req).getBoard(bucket as any, roundId, paymentMethod);
+  const items = await svc(req).getBoard(bucket, roundId, paymentMethod);
   return res.json(items);
 }));
 
@@ -36,6 +36,10 @@ debtRouter.post("/:id/remind", h(async (req, res) => {
   const { channel, message } = req.body ?? {};
   if (!channel || !message) return res.status(400).json({ error: "channel and message are required" });
   const result = await svc(req).sendReminder(req.params.id, channel, message);
+  const invoice = await req.tenantPrisma!.invoice.findUnique({ where: { id: req.params.id }, select: { customerId: true } });
+  if (invoice?.customerId) {
+    queueGhlEvent(req.tenantPrisma!, "debt.overdue", invoice.customerId).catch(console.error);
+  }
   return res.json(result);
 }));
 

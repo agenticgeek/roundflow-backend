@@ -30,15 +30,6 @@ const FREQUENCY_LABELS: Record<CleaningFrequency, string> = {
   TWELVE_WEEKLY: "Twelve Weekly",
 };
 
-// ---------------------------------------------------------------------------
-// M2 — Customers & Properties (Screens 14 & 15, modals M4/M9/M19/M20).
-//
-// Same OCP seam as SetupService / SettingsService: routes depend on the
-// ICustomerService abstraction, every method is profileId-first. In Phase 1 a
-// Customer has exactly ONE active Property; the aggregate reads return that
-// property (multi-property navigation is a Phase 2 concern).
-// ---------------------------------------------------------------------------
-
 // ---- input types ----------------------------------------------------------
 
 export interface CustomerListFilters {
@@ -260,48 +251,6 @@ export interface CustomerDetail {
   };
 }
 
-// ---- contract -------------------------------------------------------------
-
-export interface ICustomerService {
-  getCustomers(
-    profileId: string,
-    filters: CustomerListFilters,
-    viewerRole: UserRole
-  ): Promise<CustomerListResult>;
-  getCustomerDetail(
-    profileId: string,
-    customerId: string,
-    viewerRole: UserRole
-  ): Promise<CustomerDetail>;
-  createCustomer(profileId: string, input: CustomerCreateInput): Promise<Customer>;
-  updateCustomer(
-    profileId: string,
-    customerId: string,
-    input: CustomerUpdateInput
-  ): Promise<{ customerId: string; propertyId: string | null; servicePlanId: string | null }>;
-  deleteCustomer(profileId: string, customerId: string): Promise<void>;
-
-  createProperty(
-    profileId: string,
-    input: PropertyCreateInput
-  ): Promise<{ customerId: string; propertyId: string; servicePlanId: string; assigned: boolean }>;
-  addPropertyToCustomer(
-    profileId: string,
-    customerId: string,
-    input: PropertyAddInput
-  ): Promise<{ propertyId: string; servicePlanId: string; assigned: boolean }>;
-  updateProperty(
-    profileId: string,
-    propertyId: string,
-    input: PropertyUpdateInput
-  ): Promise<Property>;
-  deleteProperty(profileId: string, propertyId: string): Promise<void>;
-  pauseService(profileId: string, propertyId: string, input: PauseInput): Promise<ServicePlan>;
-  resumeService(profileId: string, propertyId: string): Promise<ServicePlan>;
-  getNotes(profileId: string, propertyId: string): Promise<PropertyNote[]>;
-  addNote(profileId: string, propertyId: string, input: NoteCreateInput): Promise<PropertyNote>;
-}
-
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
@@ -313,7 +262,7 @@ const DUE_PAYMENT: PaymentStatus[] = [
   PaymentStatus.FAILED,
 ];
 
-class CustomerService implements ICustomerService {
+class CustomerService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
   /** Decimal | number | null → number | null. */
@@ -344,7 +293,6 @@ class CustomerService implements ICustomerService {
   // ---- list ----
 
   async getCustomers(
-    _profileId: string,
     filters: CustomerListFilters,
     viewerRole: UserRole
   ): Promise<CustomerListResult> {
@@ -499,7 +447,6 @@ class CustomerService implements ICustomerService {
   // ---- detail aggregate ----
 
   async getCustomerDetail(
-    _profileId: string,
     customerId: string,
     viewerRole: UserRole
   ): Promise<CustomerDetail> {
@@ -671,7 +618,7 @@ class CustomerService implements ICustomerService {
 
   // ---- create standalone customer ----
 
-  async createCustomer(_profileId: string, input: CustomerCreateInput): Promise<Customer> {
+  async createCustomer(input: CustomerCreateInput): Promise<Customer> {
     return this.prisma.customer.create({
       data: {
         name: input.name,
@@ -686,7 +633,6 @@ class CustomerService implements ICustomerService {
   // ---- M19: edit customer (Customer + Property + ServicePlan, atomic) ----
 
   async updateCustomer(
-    _profileId: string,
     customerId: string,
     input: CustomerUpdateInput
   ): Promise<{ customerId: string; propertyId: string | null; servicePlanId: string | null }> {
@@ -773,7 +719,7 @@ class CustomerService implements ICustomerService {
 
   // ---- soft-delete customer (CANCELLED + cascades to properties + plans) ----
 
-  async deleteCustomer(_profileId: string, customerId: string): Promise<void> {
+  async deleteCustomer(customerId: string): Promise<void> {
     await this.prisma.$transaction(async (tx) => {
       const c = await tx.customer.findUnique({ where: { id: customerId }, select: { id: true } });
       if (!c) throw new AppError(404, "Customer not found");
@@ -848,7 +794,6 @@ class CustomerService implements ICustomerService {
   }
 
   async createProperty(
-    _profileId: string,
     input: PropertyCreateInput
   ): Promise<{ customerId: string; propertyId: string; servicePlanId: string; assigned: boolean }> {
     const roundFrequency = await this.resolveRoundFrequency(input.roundId);
@@ -875,7 +820,6 @@ class CustomerService implements ICustomerService {
   // ---- add property to existing customer (Property + ServicePlan, atomic) ----
 
   async addPropertyToCustomer(
-    _profileId: string,
     customerId: string,
     input: PropertyAddInput
   ): Promise<{ propertyId: string; servicePlanId: string; assigned: boolean }> {
@@ -897,7 +841,7 @@ class CustomerService implements ICustomerService {
 
   // ---- soft-delete property (CANCELLED + cancels active service plans) ----
 
-  async deleteProperty(_profileId: string, propertyId: string): Promise<void> {
+  async deleteProperty(propertyId: string): Promise<void> {
     await this.assertPropertyExists(propertyId);
     await this.prisma.$transaction(async (tx) => {
       await tx.visit.updateMany({
@@ -916,7 +860,6 @@ class CustomerService implements ICustomerService {
   }
 
   async updateProperty(
-    _profileId: string,
     propertyId: string,
     input: PropertyUpdateInput
   ): Promise<Property> {
@@ -1038,7 +981,6 @@ class CustomerService implements ICustomerService {
   // ---- M9: pause / resume ----
 
   async pauseService(
-    _profileId: string,
     propertyId: string,
     input: PauseInput
   ): Promise<ServicePlan> {
@@ -1056,7 +998,7 @@ class CustomerService implements ICustomerService {
     });
   }
 
-  async resumeService(_profileId: string, propertyId: string): Promise<ServicePlan> {
+  async resumeService(propertyId: string): Promise<ServicePlan> {
     const plan = await this.primaryPlan(propertyId);
     if (plan.status !== LifecycleStatus.PAUSED) {
       throw new AppError(409, "Service plan is not paused");
@@ -1073,7 +1015,7 @@ class CustomerService implements ICustomerService {
 
   // ---- M20: notes ----
 
-  async getNotes(_profileId: string, propertyId: string): Promise<PropertyNote[]> {
+  async getNotes(propertyId: string): Promise<PropertyNote[]> {
     await this.assertPropertyExists(propertyId);
     return this.prisma.propertyNote.findMany({
       where: { propertyId },
@@ -1082,7 +1024,6 @@ class CustomerService implements ICustomerService {
   }
 
   async addNote(
-    _profileId: string,
     propertyId: string,
     input: NoteCreateInput
   ): Promise<PropertyNote> {
@@ -1125,6 +1066,6 @@ private async assertServiceAreaExists(id: string): Promise<void> {
   }
 }
 
-export function createCustomerService(prisma: TenantPrismaClient): ICustomerService {
+export function createCustomerService(prisma: TenantPrismaClient) {
   return new CustomerService(prisma);
 }

@@ -2,7 +2,7 @@ import { Request, Router } from "express";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
-import { syncCustomerToGhl } from "../integrations/ghl/sync";
+import { queueGhlEvent } from "../integrations/ghl/sync";
 import { AppError } from "../lib/app-error";
 import {
   asObject,
@@ -36,7 +36,6 @@ const svc = (req: Request) => {
 
 // Thin routes: validate → call service → respond. No DB access here.
 // Returns the Supabase user ID of the acting caller (the profileId seam).
-const actorIdOf = (req: Request): string => req.user!.supabaseUserId;
 
 // ==========================================================================
 // POST /customers — create a standalone customer (no property yet)
@@ -51,8 +50,8 @@ customersRouter.post(
       email: optString(body.email, "email"),
       paymentMethod: optPaymentMethod(body.paymentMethod),
     };
-    const customer = await svc(req).createCustomer(actorIdOf(req), input);
-    syncCustomerToGhl(req.tenantPrisma!, customer.id).catch(console.error);
+    const customer = await svc(req).createCustomer(input);
+    queueGhlEvent(req.tenantPrisma!, "customer.synced", customer.id).catch(console.error);
     res.status(201).json(customer);
   })
 );
@@ -77,8 +76,8 @@ customersRouter.get(
     const pageSizeRaw = Number(req.query.pageSize);
     res.json(
       await svc(req).getCustomers(
-        actorIdOf(req),
         {
+        
           search: (() => {
             const s = typeof req.query.search === "string" ? req.query.search : undefined;
             if (s !== undefined && s.includes("\0")) throw new AppError(400, "search must not contain null bytes");
@@ -101,7 +100,7 @@ customersRouter.get(
 customersRouter.get(
   "/:id",
   h(async (req, res) => {
-    res.json(await svc(req).getCustomerDetail(actorIdOf(req), req.params.id, req.profile!.role));
+    res.json(await svc(req).getCustomerDetail(req.params.id, req.profile!.role));
   })
 );
 
@@ -133,8 +132,8 @@ customersRouter.patch(
       cleanMethod: optString(body.cleanMethod, "cleanMethod"),
       paymentMethod: optPaymentMethod(body.paymentMethod),
     };
-    const result = await svc(req).updateCustomer(actorIdOf(req), req.params.id, input);
-    syncCustomerToGhl(req.tenantPrisma!, req.params.id).catch(console.error);
+    const result = await svc(req).updateCustomer(req.params.id, input);
+    queueGhlEvent(req.tenantPrisma!, "customer.synced", req.params.id).catch(console.error);
     res.json(result);
   })
 );
@@ -145,7 +144,7 @@ customersRouter.patch(
 customersRouter.delete(
   "/:id",
   h(async (req, res) => {
-    await svc(req).deleteCustomer(actorIdOf(req), req.params.id);
+    await svc(req).deleteCustomer(req.params.id);
     res.status(204).send();
   })
 );
@@ -174,7 +173,7 @@ customersRouter.post(
       riskNotes: optString(body.riskNotes, "riskNotes"),
       roundId: optId(body.roundId, "roundId"),
     };
-    res.status(201).json(await svc(req).addPropertyToCustomer(actorIdOf(req), req.params.id, input));
+    res.status(201).json(await svc(req).addPropertyToCustomer(req.params.id, input));
   })
 );
 

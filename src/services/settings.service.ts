@@ -1,4 +1,4 @@
-import { ServiceCategory, PaymentTiming, MessageChannel, RoundStatus, LifecycleStatus } from "../generated/tenant-client";
+import { ServiceCategory, PaymentTiming, MessageChannel, RoundStatus } from "../generated/tenant-client";
 import type {
   BusinessSettings,
   Service,
@@ -6,19 +6,14 @@ import type {
   Technician,
   MessageTemplate,
 } from "../generated/tenant-client";
-import type { Profile } from "@prisma/client";
+
 import { Prisma as TenantPrisma } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-//
-// This is the **post-completion editing surface** for the same data the Setup
-// Wizard seeds (see docs/SETTINGS_API_DESIGN.md). It is a SEPARATE service from
-// SetupService — same discipline (profileId-first, singleton seam, thin routes)
-// but no `assertSetupIncomplete` guard: Settings is always open.
+// This is the post-completion editing surface for the same data the Setup
+// Wizard seeds (see docs/SETTINGS_API_DESIGN.md). Separate from SetupService:
+// no assertSetupIncomplete guard here.
 
 export interface BankDetails {
   accountName: string;
@@ -111,11 +106,6 @@ export interface TechnicianWithDisplayName extends Technician {
   appStatus: AppStatus;
 }
 
-export interface DeferredStub {
-  status: string;
-  source: string;
-}
-
 export interface MessageTemplateInput {
   name: string;
   channel: MessageChannel;
@@ -140,77 +130,6 @@ export interface MessageTemplateView {
   updatedAt: string;
 }
 
-// The service contract. Routes depend on this abstraction, never on the
-// concrete class — so Phase 2 (multi-tenancy) can bind a different
-// implementation (one that resolves a tenant from profileId and scopes every
-// query) without any route changes. Every method takes profileId first.
-export interface ISettingsService {
-  // Guard — mutating Settings operations require setup to be complete.
-  assertSetupComplete(profileId: string): Promise<void>;
-
-  // Business Profile
-  getBusinessProfile(profileId: string): Promise<BusinessSettings | null>;
-  updateBusinessProfile(
-    profileId: string,
-    input: BusinessProfileUpdateInput
-  ): Promise<BusinessSettings>;
-
-  // Round Settings
-  getRoundSettings(profileId: string): Promise<BusinessSettings | null>;
-  updateRoundSettings(
-    profileId: string,
-    input: RoundSettingsUpdateInput
-  ): Promise<BusinessSettings>;
-
-  // Service Catalogue (per-item)
-  getServices(profileId: string): Promise<Service[]>;
-  createService(profileId: string, input: ServiceCreateInput): Promise<Service>;
-  updateService(
-    profileId: string,
-    id: string,
-    input: ServiceUpdateInput
-  ): Promise<Service>;
-  deleteService(profileId: string, id: string): Promise<void>;
-
-  // Service Areas (per-item)
-  getServiceAreas(profileId: string): Promise<ServiceAreaWithRounds[]>;
-  createServiceArea(
-    profileId: string,
-    input: ServiceAreaCreateInput
-  ): Promise<ServiceArea>;
-  updateServiceArea(
-    profileId: string,
-    id: string,
-    input: ServiceAreaUpdateInput
-  ): Promise<ServiceArea>;
-  deleteServiceArea(profileId: string, id: string): Promise<void>;
-
-  // Technician Management (per-item)
-  getTechnicians(profileId: string): Promise<TechnicianWithDisplayName[]>;
-  createTechnician(
-    profileId: string,
-    input: TechnicianCreateInput
-  ): Promise<Technician>;
-  updateTechnician(
-    profileId: string,
-    id: string,
-    input: TechnicianUpdateInput
-  ): Promise<Technician>;
-  deleteTechnician(profileId: string, id: string): Promise<void>;
-
-  // Payment Setup
-  getPaymentSetup(profileId: string): Promise<BusinessSettings | null>;
-  updatePaymentRules(
-    profileId: string,
-    input: PaymentRulesUpdateInput
-  ): Promise<BusinessSettings>;
-  // Message Templates (SMS / WhatsApp / Email via GHL)
-  getMessageTemplates(profileId: string): Promise<MessageTemplateView[]>;
-  createMessageTemplate(profileId: string, input: MessageTemplateInput): Promise<MessageTemplateView>;
-  updateMessageTemplate(profileId: string, id: string, input: MessageTemplateUpdateInput): Promise<MessageTemplateView>;
-  deleteMessageTemplate(profileId: string, id: string): Promise<void>;
-  replaceTemplates(profileId: string, templates: MessageTemplateInput[]): Promise<MessageTemplateView[]>;
-}
 
 // PHASE 2 TENANT SEAM — honest assessment:
 //
@@ -262,13 +181,13 @@ type SettingsWritable = {
 // Implementation
 // ---------------------------------------------------------------------------
 
-class SettingsService implements ISettingsService {
+class SettingsService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
   // ---- singleton seam (the ONLY two methods that know the singleton key) ----
 
   /** Read the BusinessSettings singleton. */
-  private async getSettings(): Promise<BusinessSettings | null> {
+  async getSettings(): Promise<BusinessSettings | null> {
     return this.prisma.businessSettings.findFirst();
   }
 
@@ -286,7 +205,7 @@ class SettingsService implements ISettingsService {
 
   /** Mutating Settings endpoints require setup to be complete. Reads the
    *  singleton via the existing getSettings() seam (no extra findUnique). */
-  async assertSetupComplete(_profileId: string): Promise<void> {
+  async assertSetupComplete(): Promise<void> {
     const settings = await this.getSettings();
     if (!settings || settings.setupCompleted === false) {
       throw new AppError(
@@ -298,12 +217,7 @@ class SettingsService implements ISettingsService {
 
   // ---- Business Profile ----
 
-  async getBusinessProfile(_profileId: string): Promise<BusinessSettings | null> {
-    return this.getSettings();
-  }
-
   async updateBusinessProfile(
-    _profileId: string,
     input: BusinessProfileUpdateInput
   ): Promise<BusinessSettings> {
     // Step-1 fields only — never touches the round-settings fields.
@@ -328,12 +242,7 @@ class SettingsService implements ISettingsService {
 
   // ---- Round Settings ----
 
-  async getRoundSettings(_profileId: string): Promise<BusinessSettings | null> {
-    return this.getSettings();
-  }
-
   async updateRoundSettings(
-    _profileId: string,
     input: RoundSettingsUpdateInput
   ): Promise<BusinessSettings> {
     return this.writeSettings({
@@ -345,12 +254,11 @@ class SettingsService implements ISettingsService {
 
   // ---- Service Catalogue ----
 
-  async getServices(_profileId: string): Promise<Service[]> {
+  async getServices(): Promise<Service[]> {
     return this.prisma.service.findMany({ orderBy: { createdAt: "asc" } });
   }
 
   async createService(
-    _profileId: string,
     input: ServiceCreateInput
   ): Promise<Service> {
     return this.prisma.service.create({
@@ -365,7 +273,6 @@ class SettingsService implements ISettingsService {
   }
 
   async updateService(
-    _profileId: string,
     id: string,
     input: ServiceUpdateInput
   ): Promise<Service> {
@@ -383,7 +290,7 @@ class SettingsService implements ISettingsService {
     });
   }
 
-  async deleteService(_profileId: string, id: string): Promise<void> {
+  async deleteService(id: string): Promise<void> {
     const existing = await this.prisma.service.findUnique({ where: { id } });
     if (!existing) throw new AppError(404, "Service not found");
     const [planRefs, visitRefs] = await Promise.all([
@@ -398,7 +305,7 @@ class SettingsService implements ISettingsService {
 
   // ---- Service Areas ----
 
-  async getServiceAreas(_profileId: string): Promise<ServiceAreaWithRounds[]> {
+  async getServiceAreas(): Promise<ServiceAreaWithRounds[]> {
     const areas = await this.prisma.serviceArea.findMany({
       orderBy: { createdAt: "asc" },
       include: { rounds: { where: { status: RoundStatus.ACTIVE }, select: { id: true, name: true } } },
@@ -411,7 +318,6 @@ class SettingsService implements ISettingsService {
   }
 
   async createServiceArea(
-    _profileId: string,
     input: ServiceAreaCreateInput
   ): Promise<ServiceArea> {
     const data = {
@@ -435,7 +341,6 @@ class SettingsService implements ISettingsService {
   }
 
   async updateServiceArea(
-    _profileId: string,
     id: string,
     input: ServiceAreaUpdateInput
   ): Promise<ServiceArea> {
@@ -461,7 +366,7 @@ class SettingsService implements ISettingsService {
     return this.prisma.serviceArea.update({ where: { id }, data });
   }
 
-  async deleteServiceArea(_profileId: string, id: string): Promise<void> {
+  async deleteServiceArea(id: string): Promise<void> {
     const existing = await this.prisma.serviceArea.findUnique({ where: { id } });
     if (!existing) throw new AppError(404, "Service area not found");
     const [roundRefs, propertyRefs, techRefs] = await Promise.all([
@@ -477,9 +382,7 @@ class SettingsService implements ISettingsService {
 
   // ---- Technician Management ----
 
-  async getTechnicians(
-    _profileId: string
-  ): Promise<TechnicianWithDisplayName[]> {
+  async getTechnicians(): Promise<TechnicianWithDisplayName[]> {
     const techs = await this.prisma.technician.findMany({
       orderBy: { createdAt: "asc" },
     });
@@ -498,7 +401,6 @@ class SettingsService implements ISettingsService {
   }
 
   async createTechnician(
-    _profileId: string,
     input: TechnicianCreateInput
   ): Promise<Technician> {
     // Single invite-pending create (profileId = null) — not the wizard's bulk replace.
@@ -514,7 +416,6 @@ class SettingsService implements ISettingsService {
   }
 
   async updateTechnician(
-    _profileId: string,
     id: string,
     input: TechnicianUpdateInput
   ): Promise<Technician> {
@@ -531,7 +432,7 @@ class SettingsService implements ISettingsService {
     });
   }
 
-  async deleteTechnician(_profileId: string, id: string): Promise<void> {
+  async deleteTechnician(id: string): Promise<void> {
     const existing = await this.prisma.technician.findUnique({ where: { id } });
     if (!existing) throw new AppError(404, "Technician not found");
     if (existing.profileId !== null) {
@@ -545,12 +446,7 @@ class SettingsService implements ISettingsService {
 
   // ---- Payment Setup ----
 
-  async getPaymentSetup(_profileId: string): Promise<BusinessSettings | null> {
-    return this.getSettings();
-  }
-
   async updatePaymentRules(
-    _profileId: string,
     input: PaymentRulesUpdateInput
   ): Promise<BusinessSettings> {
     // Rules only — never touches the gocardless/stripe connect booleans.
@@ -565,13 +461,12 @@ class SettingsService implements ISettingsService {
 
   // ---- Message Templates ----
 
-  async getMessageTemplates(_profileId: string): Promise<MessageTemplateView[]> {
+  async getMessageTemplates(): Promise<MessageTemplateView[]> {
     const rows = await this.prisma.messageTemplate.findMany({ orderBy: { createdAt: "asc" } });
     return rows.map(toTemplateView);
   }
 
   async createMessageTemplate(
-    _profileId: string,
     input: MessageTemplateInput
   ): Promise<MessageTemplateView> {
     const row = await this.prisma.messageTemplate.create({
@@ -586,7 +481,6 @@ class SettingsService implements ISettingsService {
   }
 
   async updateMessageTemplate(
-    _profileId: string,
     id: string,
     input: MessageTemplateUpdateInput
   ): Promise<MessageTemplateView> {
@@ -605,7 +499,7 @@ class SettingsService implements ISettingsService {
     return toTemplateView(row);
   }
 
-  async deleteMessageTemplate(_profileId: string, id: string): Promise<void> {
+  async deleteMessageTemplate(id: string): Promise<void> {
     if (!(await this.prisma.messageTemplate.findUnique({ where: { id } }))) {
       throw new AppError(404, "Message template not found");
     }
@@ -613,7 +507,6 @@ class SettingsService implements ISettingsService {
   }
 
   async replaceTemplates(
-    _profileId: string,
     templates: MessageTemplateInput[]
   ): Promise<MessageTemplateView[]> {
     const rows = await this.prisma.$transaction(async (tx) => {
@@ -645,6 +538,6 @@ function toTemplateView(t: MessageTemplate): MessageTemplateView {
   };
 }
 
-export function createSettingsService(prisma: TenantPrismaClient): ISettingsService {
+export function createSettingsService(prisma: TenantPrismaClient) {
   return new SettingsService(prisma);
 }

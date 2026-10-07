@@ -4,7 +4,7 @@ import { prisma } from "../lib/prisma";
 import { getTenantPrismaForSchema } from "../lib/tenant-prisma-manager";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
-import { requireRole } from "../middleware/requireRole";
+import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
 import { h, asObject, requireString, optString } from "../lib/http";
 import { sendInviteEmail, INVITE_TTL_DAYS } from "../lib/email";
@@ -25,7 +25,7 @@ invitesRouter.post(
   "/",
   requireAuth,
   requireTenantAccess,
-  requireRole(UserRole.ADMIN, UserRole.MANAGER),
+  requireBusinessAccess(),
   h(async (req, res) => {
     const profile = req.profile!;
     const body = asObject(req.body);
@@ -59,15 +59,13 @@ invitesRouter.post(
       data: { tenantId: profile.tenantId, email, role, technicianId, expiresAt },
     });
 
-    const settings = await req.tenantPrisma!.businessSettings.findFirst();
     const base = process.env.INVITE_BASE_URL!;
     try {
       await sendInviteEmail({
         to: email,
         inviteUrl: `${base}/accept-invite?token=${invite.token}`,
-        businessName: settings?.businessName,
       });
-    } catch (emailErr) {
+    } catch {
       // Roll back the invite row so the admin can retry without hitting 409.
       await prisma.tenantInvite.delete({ where: { id: invite.id } }).catch((rollbackErr) => {
         console.error("[invites] Failed to roll back invite after email failure:", rollbackErr);

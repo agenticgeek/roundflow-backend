@@ -1,13 +1,7 @@
 import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
 import type { ChatMessageRow } from "../types";
 
-export interface IChatService {
-  getChatMessages(roundId: string, since?: Date): Promise<ChatMessageRow[]>;
-  sendChatMessage(roundId: string, senderProfileId: string, body: string): Promise<ChatMessageRow>;
-  sendWorkPhotosMessage(roundId: string, senderProfileId: string, visitId: string): Promise<ChatMessageRow>;
-}
-
-class ChatService implements IChatService {
+class ChatService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
   async getChatMessages(roundId: string, since?: Date): Promise<ChatMessageRow[]> {
@@ -26,6 +20,6 @@ class ChatService implements IChatService {
   }
 }
 
-export function createChatService(prisma: TenantPrismaClient): IChatService {
+export function createChatService(prisma: TenantPrismaClient) {
   return new ChatService(prisma);
 }

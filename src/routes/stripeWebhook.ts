@@ -5,6 +5,7 @@ import { getTenantPrismaForSchema } from "../lib/tenant-prisma-manager";
 import { decrypt } from "../lib/crypto";
 import { getStripeClient } from "../integrations/stripe/client";
 import { PaymentMethod, PaymentStatus, StripeSessionStatus } from "../generated/tenant-client";
+import { queueGhlEvent } from "../integrations/ghl/sync";
 
 export const stripeWebhookRouter = Router();
 
@@ -145,6 +146,7 @@ async function handleSessionCompleted(
       data: { status: "PAID" },
     }),
   ]);
+  queueGhlEvent(tp, "payment.collected", invoice.customerId).catch(console.error);
 }
 
 async function handlePaymentFailed(
@@ -176,21 +178,5 @@ async function handlePaymentFailed(
     });
   }
 
-  // GHL outbox: payment.failed (non-fatal — outbox table added with ghl branch)
-  const customer = await tp.customer.findUnique({ where: { id: invoice.customerId } });
-  if (customer?.ghlContactId) {
-    try {
-      await (tp as any).integrationOutbox?.create?.({
-        data: {
-          eventType: "payment.failed",
-          payload: {
-            ghlContactId: customer.ghlContactId,
-            amount: Number(invoice.amount),
-            balanceOwed: Number(invoice.amount),
-          },
-        },
-      });
-    } catch { /* outbox not yet available on this branch */ }
-  }
 }
 

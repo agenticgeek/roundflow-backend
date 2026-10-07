@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { it, expect, vi } from "vitest";
 
 vi.mock("../../lib/email", () => ({}));
 import { createInvoiceService } from "../invoice.service";

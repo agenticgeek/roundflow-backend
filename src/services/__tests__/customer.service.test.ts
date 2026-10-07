@@ -26,7 +26,7 @@ it("createProperty writes landline to the customer", async () => {
   const prisma = makePrisma();
   (prisma.serviceArea.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sa1" });
   (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb: any) => cb(makePrisma()));
-  const innerPrisma = (prisma.$transaction as ReturnType<typeof vi.fn>).mock.calls;
+  const _innerPrisma = (prisma.$transaction as ReturnType<typeof vi.fn>).mock.calls;
   // Capture what was written to customer.create inside the transaction
   let capturedCreate: any;
   const txPrisma = {
@@ -44,7 +44,7 @@ it("createProperty writes landline to the customer", async () => {
     round: { findUnique: vi.fn().mockResolvedValue(null) },
   };
   (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb: any) => cb(txPrisma));
-  await createCustomerService(prisma).createProperty("user-1", {
+  await createCustomerService(prisma).createProperty({
     customerName: "John Smith",
     phone: "+44 7700 900111",
     landline: "+44 1665 000111",
@@ -77,7 +77,7 @@ it("updateCustomer writes landline when provided", async () => {
     round: { findUnique: vi.fn().mockResolvedValue(null) },
   };
   (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb: any) => cb(txPrisma));
-  await createCustomerService(prisma).updateCustomer("user-1", "c1", {
+  await createCustomerService(prisma).updateCustomer("c1", {
     landline: "+44 1665 000111",
   });
   expect(capturedUpdate.data.landline).toBe("+44 1665 000111");

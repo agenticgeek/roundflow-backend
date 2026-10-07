@@ -1,7 +1,18 @@
-import { getGhlToken, createGhlContact, updateGhlContact, sendGhlMessage } from "./api";
+import { getGhlToken, createGhlContact, updateGhlContact, sendGhlMessage, addGhlTags, removeGhlTags } from "./api";
 
 type TP = import("../../lib/tenant-prisma-manager").TenantPrismaClient;
 
+// Write an outbox row — worker drains these every 30s and calls GHL.
+export async function queueGhlEvent(
+  tp: TP,
+  eventType: string,
+  customerId: string,
+): Promise<void> {
+  await tp.integrationOutbox.create({ data: { eventType, payload: { customerId } } });
+}
+
+// Called by the outbox worker — still used directly for complaint messages since
+// those need the message body at send time.
 export async function syncMessageToGhl(tp: TP, complaintId: string, body: string, channel: string): Promise<void> {
   const ctx = await getGhlToken(tp);
   if (!ctx) return;
@@ -16,9 +27,10 @@ export async function syncMessageToGhl(tp: TP, complaintId: string, body: string
   await sendGhlMessage(ctx, contactId, body, channel);
 }
 
+// Called by the outbox worker for customer.synced rows.
 export async function syncCustomerToGhl(tp: TP, customerId: string): Promise<void> {
   const ctx = await getGhlToken(tp);
-  if (!ctx) return; // GHL not connected for this tenant
+  if (!ctx) return;
 
   const customer = await tp.customer.findUnique({
     where: { id: customerId },
@@ -30,9 +42,26 @@ export async function syncCustomerToGhl(tp: TP, customerId: string): Promise<voi
     await updateGhlContact(ctx, customer.ghlContactId, customer);
   } else {
     const contactId = await createGhlContact(ctx, customer);
-    await tp.customer.update({
-      where: { id: customerId },
-      data:  { ghlContactId: contactId },
-    });
+    await tp.customer.update({ where: { id: customerId }, data: { ghlContactId: contactId } });
   }
+}
+
+// Called by the outbox worker for tag-based events.
+export async function applyGhlTags(
+  tp: TP,
+  customerId: string,
+  tagsToAdd: string[],
+  tagsToRemove: string[] = [],
+): Promise<void> {
+  const ctx = await getGhlToken(tp);
+  if (!ctx) return;
+
+  const customer = await tp.customer.findUnique({
+    where: { id: customerId },
+    select: { ghlContactId: true },
+  });
+  if (!customer?.ghlContactId) return;
+
+  if (tagsToAdd.length)    await addGhlTags(ctx, customer.ghlContactId, tagsToAdd);
+  if (tagsToRemove.length) await removeGhlTags(ctx, customer.ghlContactId, tagsToRemove);
 }
