@@ -547,6 +547,54 @@ settingsRouter.get(
   })
 );
 
+// POST /settings/ghl/connect-private — connect a specific GHL sub-account using a
+// Location API key (private integration, no OAuth flow). The key is found under
+// sub-account Settings → Integrations → API Keys. Unlike OAuth tokens these never
+// expire, so no refresh token or expiry is stored. The key is validated against the
+// GHL locations API before being saved.
+settingsRouter.post(
+  "/ghl/connect-private",
+  h(async (req, res) => {
+    await svc(req).assertSetupComplete(actorIdOf(req));
+    const body       = asObject(req.body);
+    const apiKey     = requireString(body.apiKey,     "apiKey");
+    const locationId = requireString(body.locationId, "locationId");
+
+    // Validate key + locationId by fetching the location from GHL
+    const verifyRes = await fetch(
+      `https://services.leadconnectorhq.com/locations/${locationId}`,
+      {
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Version":       "2021-07-28",
+        },
+      }
+    );
+    if (!verifyRes.ok) {
+      throw new AppError(400, "GHL API key or location ID is invalid");
+    }
+
+    await req.tenantPrisma!.businessSettings.updateMany({
+      data: {
+        ghlConnected:            true,
+        ghlLocationId:           locationId,
+        ghlAccessTokenEncrypted: encrypt(apiKey),
+        // Private keys never expire — clear any stale OAuth refresh state
+        ghlRefreshTokenEncrypted: null,
+        ghlTokenExpiresAt:        null,
+      },
+    });
+
+    // Stamp on global Tenant for fast webhook lookup by locationId
+    await prisma.tenant.update({
+      where: { id: req.profile!.tenantId },
+      data:  { ghlLocationId: locationId },
+    });
+
+    res.json({ status: "connected", method: "private" });
+  })
+);
+
 // POST /settings/ghl/disconnect
 settingsRouter.post(
   "/ghl/disconnect",

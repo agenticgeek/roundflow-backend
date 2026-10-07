@@ -2,6 +2,7 @@ import { Request, Router } from "express";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
+import { syncCustomerToGhl } from "../integrations/ghl/sync";
 import { AppError } from "../lib/app-error";
 import {
   asObject,
@@ -50,7 +51,9 @@ customersRouter.post(
       email: optString(body.email, "email"),
       paymentMethod: optPaymentMethod(body.paymentMethod),
     };
-    res.status(201).json(await svc(req).createCustomer(actorIdOf(req), input));
+    const customer = await svc(req).createCustomer(actorIdOf(req), input);
+    syncCustomerToGhl(req.tenantPrisma!, customer.id).catch(console.error);
+    res.status(201).json(customer);
   })
 );
 
@@ -130,7 +133,9 @@ customersRouter.patch(
       cleanMethod: optString(body.cleanMethod, "cleanMethod"),
       paymentMethod: optPaymentMethod(body.paymentMethod),
     };
-    res.json(await svc(req).updateCustomer(actorIdOf(req), req.params.id, input));
+    const result = await svc(req).updateCustomer(actorIdOf(req), req.params.id, input);
+    syncCustomerToGhl(req.tenantPrisma!, req.params.id).catch(console.error);
+    res.json(result);
   })
 );
 

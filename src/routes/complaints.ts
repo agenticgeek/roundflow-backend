@@ -7,6 +7,7 @@ import { asObject, h, requireString, optString, optId } from "../lib/http";
 import { createComplaintService, ComplaintCreateInput, ComplaintListFilters } from "../services/complaint.service";
 import { createReportsService } from "../services/reports.service";
 import { ComplaintStatus, Severity } from "../generated/tenant-client";
+import { syncMessageToGhl } from "../integrations/ghl/sync";
 
 export const complaintsRouter = Router();
 complaintsRouter.use(requireAuth);
@@ -93,6 +94,7 @@ complaintsRouter.post(
     const body = asObject(req.body);
     const text = requireString(body.body, "body");
     const result = await svc(req).addMessage(actorIdOf(req), req.params.id, text);
+    syncMessageToGhl(req.tenantPrisma!, req.params.id, text, result.channel).catch(console.error);
     res.status(201).json(result);
   })
 );
