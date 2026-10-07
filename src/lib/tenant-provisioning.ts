@@ -179,6 +179,7 @@ export async function migrateAllTenantSchemas(): Promise<void> {
   // Pull the list of tenant schemas from the public schema.
   const listClient = dbClient();
   await listClient.connect();
+  // eslint-disable-next-line no-useless-assignment
   let schemas: string[] = [];
   try {
     const result = await listClient.query<{ schemaName: string }>(

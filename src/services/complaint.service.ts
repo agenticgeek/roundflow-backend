@@ -1,4 +1,4 @@
-import { ComplaintStatus, MessageChannel, MessageDirection, Severity } from "../generated/tenant-client";
+import { ComplaintStatus, MessageChannel, MessageDirection, Prisma, Severity } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 
@@ -43,6 +43,8 @@ export interface MessageDetail {
 }
 
 const INCLUDE = { customer: true, property: true, technician: true } as const;
+type ComplaintRow = Prisma.ComplaintGetPayload<{ include: typeof INCLUDE }>;
+type MessageRow = Prisma.MessageGetPayload<object>;
 
 class ComplaintService {
   constructor(private readonly prisma: TenantPrismaClient) {}
@@ -64,7 +66,7 @@ class ComplaintService {
       orderBy: { createdAt: "desc" },
     });
 
-    return complaints.map((c: any) => this.toDetail(c));
+    return complaints.map((c) => this.toDetail(c));
   }
 
   async getComplaint(complaintId: string): Promise<ComplaintDetail> {
@@ -199,7 +201,7 @@ class ComplaintService {
       orderBy: { createdAt: "asc" },
     });
 
-    return messages.map((m: any) => this.toMessageDetail(m));
+    return messages.map((m) => this.toMessageDetail(m));
   }
 
   async addMessage(complaintId: string, body: string): Promise<MessageDetail> {
@@ -218,7 +220,7 @@ class ComplaintService {
     return this.toMessageDetail(message);
   }
 
-  private toMessageDetail(message: any): MessageDetail {
+  private toMessageDetail(message: MessageRow): MessageDetail {
     return {
       id: message.id,
       direction: message.direction,
@@ -229,7 +231,7 @@ class ComplaintService {
     };
   }
 
-  private toDetail(complaint: any): ComplaintDetail {
+  private toDetail(complaint: ComplaintRow): ComplaintDetail {
     return {
       id: complaint.id,
       status: complaint.status,

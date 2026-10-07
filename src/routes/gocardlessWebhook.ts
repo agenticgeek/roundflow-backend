@@ -1,5 +1,5 @@
 import { Router, Request, Response } from "express";
-// @ts-ignore — gocardless-nodejs ships ESM as main but has a CJS build under require condition
+// @ts-expect-error — gocardless-nodejs ships ESM as main but has a CJS build under require condition
 import { parse, InvalidSignatureError } from "gocardless-nodejs";
 import { prisma } from "../lib/prisma";
 import { getTenantPrismaForSchema } from "../lib/tenant-prisma-manager";

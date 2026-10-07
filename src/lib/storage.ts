@@ -46,6 +46,3 @@ export async function createSignedUploadUrl(
   return { signedUrl: signedUrl.toString(), token, path };
 }
 
-export function getPublicUrl(path: string): string {
-  return `${process.env.SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${path}`;
-}

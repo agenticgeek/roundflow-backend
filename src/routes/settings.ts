@@ -4,13 +4,12 @@ import { ServiceCategory, PaymentTiming } from "../generated/tenant-client";
 import { encrypt } from "../lib/crypto";
 import { prisma } from "../lib/prisma";
 import { buildGhlAuthUrl, exchangeGhlCode } from "../integrations/ghl/oauth";
-import { getStripeClient } from "../integrations/stripe/client";
 import { buildStripeAuthUrl, exchangeStripeCode } from "../integrations/stripe/oauth";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
-import { validateWorkingDays, assertPositiveInt, assertPositive, assertNonNegative, requireMessageChannel, optMessageChannel } from "../lib/validation";
+import { validateWorkingDays, assertPositiveInt, assertNonNegative, requireMessageChannel, optMessageChannel } from "../lib/validation";
 import {
   asObject,
   h,

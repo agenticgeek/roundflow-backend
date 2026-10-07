@@ -11,7 +11,7 @@ reportsRouter.use(requireAuth, requireTenantAccess, requireBusinessAccess());
 reportsRouter.get("/activity", async (req, res, next) => {
   try {
     const { type } = req.query as { type?: string };
-    const svc = createReportsService((req as any).tenantPrisma);
+    const svc = createReportsService(req.tenantPrisma!);
     const data = await svc.getActivity(type);
     res.json(data);
   } catch (err) { next(err); }
@@ -20,7 +20,7 @@ reportsRouter.get("/activity", async (req, res, next) => {
 reportsRouter.get("/visits", async (req, res, next) => {
   try {
     const { period = "last30", status } = req.query as { period?: string; status?: string };
-    const svc = createReportsService((req as any).tenantPrisma);
+    const svc = createReportsService(req.tenantPrisma!);
     const data = await svc.getVisits(period, status);
     res.json(data);
   } catch (err) { next(err); }
@@ -29,7 +29,7 @@ reportsRouter.get("/visits", async (req, res, next) => {
 reportsRouter.get("/technicians", async (req, res, next) => {
   try {
     const { period = "last30" } = req.query as { period?: string };
-    const svc = createReportsService((req as any).tenantPrisma);
+    const svc = createReportsService(req.tenantPrisma!);
     const data = await svc.getTechnicians(period);
     res.json(data);
   } catch (err) { next(err); }
@@ -38,7 +38,7 @@ reportsRouter.get("/technicians", async (req, res, next) => {
 reportsRouter.get("/revenue", async (req, res, next) => {
   try {
     const { period = "last30" } = req.query as { period?: string };
-    const svc = createReportsService((req as any).tenantPrisma);
+    const svc = createReportsService(req.tenantPrisma!);
     const data = await svc.getRevenue(period);
     res.json(data);
   } catch (err) { next(err); }
@@ -47,7 +47,7 @@ reportsRouter.get("/revenue", async (req, res, next) => {
 reportsRouter.get("/summary", async (req, res, next) => {
   try {
     const { period = "last30" } = req.query as { period?: string };
-    const svc = createReportsService((req as any).tenantPrisma);
+    const svc = createReportsService(req.tenantPrisma!);
     const data = await svc.getSummary(period);
     res.json(data);
   } catch (err) { next(err); }

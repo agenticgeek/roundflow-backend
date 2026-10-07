@@ -26,7 +26,7 @@ it("createProperty writes landline to the customer", async () => {
   const prisma = makePrisma();
   (prisma.serviceArea.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sa1" });
   (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb: any) => cb(makePrisma()));
-  const innerPrisma = (prisma.$transaction as ReturnType<typeof vi.fn>).mock.calls;
+  const _innerPrisma = (prisma.$transaction as ReturnType<typeof vi.fn>).mock.calls;
   // Capture what was written to customer.create inside the transaction
   let capturedCreate: any;
   const txPrisma = {

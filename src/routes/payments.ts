@@ -8,20 +8,12 @@ import { decrypt } from "../lib/crypto";
 import { getStripeClient } from "../integrations/stripe/client";
 import { createOneTimeSession, createSetupSession } from "../integrations/stripe/checkout";
 import { StripeSessionType } from "../generated/tenant-client";
-import { prisma } from "../lib/prisma";
-
 export const paymentsRouter = Router();
 paymentsRouter.use(requireAuth);
 paymentsRouter.use(requireTenantAccess);
 paymentsRouter.use(requireBusinessAccess());
 
 const FRONTEND_URL = process.env.FRONTEND_URL?.split(",")[0].trim() ?? "";
-
-function getStripe(req: Request) {
-  const settings = req as unknown as { _stripeSecretKey?: string };
-  // Loaded once per request via getSettings() below.
-  return settings._stripeSecretKey ? getStripeClient(settings._stripeSecretKey) : null;
-}
 
 async function loadStripeClient(req: Request) {
   const bs = await req.tenantPrisma!.businessSettings.findFirst({

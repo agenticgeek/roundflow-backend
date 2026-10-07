@@ -1,5 +1,6 @@
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
+import { MessageChannel } from "../generated/tenant-client";
 
 export function createDebtService(prisma: TenantPrismaClient) {
   return {
@@ -17,7 +18,7 @@ export function createDebtService(prisma: TenantPrismaClient) {
         orderBy: { createdAt: "asc" },
       });
 
-      const customerIds = [...new Set(invoices.map((i: any) => i.customerId as string))];
+      const customerIds = [...new Set(invoices.map((i) => i.customerId))];
       const lastMessages = await Promise.all(
         customerIds.map((cid: string) =>
           prisma.message.findFirst({ where: { customerId: cid, direction: "OUTBOUND" }, orderBy: { createdAt: "desc" }, select: { customerId: true, createdAt: true } })
@@ -32,26 +33,11 @@ export function createDebtService(prisma: TenantPrismaClient) {
         prisma.payment.findMany({ where: { status: "FAILED", method: "GOCARDLESS" }, select: { visitId: true } }),
         prisma.visit.findMany({ where: { date: { gte: now, lte: sevenDaysFromNow } }, select: { property: { select: { customerId: true } } } }),
       ]);
-      const failedVisitIds = new Set(failedPayments.map((p: any) => p.visitId).filter(Boolean));
-      const upcomingCustomerIds = new Set(upcomingVisits.map((v: any) => v.property.customerId));
-
-      const toItem = (inv: any) => ({
-        invoiceId: inv.id,
-        invoiceNumber: inv.invoiceNumber,
-        amount: inv.amount.toNumber(),
-        dueDate: inv.dueDate,
-        customerId: inv.customerId,
-        customerName: inv.customer.name,
-        addressLine: inv.visit?.property.addressLine ?? "",
-        postcode: inv.visit?.property.postcode ?? null,
-        paymentMethod: (inv.customer.paymentMethod as string | null) ?? null,
-        lastContactedAt: lastContactMap.get(inv.customerId) ?? null,
-        badDebt: inv.customer.badDebt,
-        holdNextClean: inv.customer.holdNextClean,
-      });
+      const failedVisitIds = new Set(failedPayments.map((p) => p.visitId).filter(Boolean));
+      const upcomingCustomerIds = new Set(upcomingVisits.map((v) => v.property.customerId));
 
       return invoices
-        .filter((inv: any) => {
+        .filter((inv) => {
           if (roundId && inv.visit?.property.roundId !== roundId) return false;
           if (paymentMethod && inv.customer.paymentMethod !== paymentMethod) return false;
           switch (bucket) {
@@ -64,34 +50,47 @@ export function createDebtService(prisma: TenantPrismaClient) {
             default: return !inv.customer.badDebt && !inv.customer.holdNextClean && !failedVisitIds.has(inv.visitId) && !upcomingCustomerIds.has(inv.customerId) && (inv.dueDate === null || inv.dueDate >= sevenDaysAgo);
           }
         })
-        .map(toItem);
+        .map((inv) => ({
+          invoiceId: inv.id,
+          invoiceNumber: inv.invoiceNumber,
+          amount: inv.amount.toNumber(),
+          dueDate: inv.dueDate,
+          customerId: inv.customerId,
+          customerName: inv.customer.name,
+          addressLine: inv.visit?.property.addressLine ?? "",
+          postcode: inv.visit?.property.postcode ?? null,
+          paymentMethod: (inv.customer.paymentMethod as string | null) ?? null,
+          lastContactedAt: lastContactMap.get(inv.customerId) ?? null,
+          badDebt: inv.customer.badDebt,
+          holdNextClean: inv.customer.holdNextClean,
+        }));
     },
     sendPaymentLink: async (invoiceId: string, _message: string, overrideUrl?: string) => {
       const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId }, include: { customer: { select: { id: true, name: true, email: true } } } });
       if (!invoice) throw new AppError(404, "Invoice not found");
-      if (!(invoice as any).customer.email) throw new AppError(400, "Customer has no email address");
-      const link = overrideUrl ?? `https://pay.roundflow.app/i/${(invoice as any).invoiceNumber}`;
+      if (!invoice.customer.email) throw new AppError(400, "Customer has no email address");
+      const link = overrideUrl ?? `https://pay.roundflow.app/i/${invoice.invoiceNumber}`;
       const body = `${_message}\n\n${link}`;
-      const msg = await prisma.message.create({ data: { channel: "EMAIL", direction: "OUTBOUND", body, customerId: (invoice as any).customerId, sentAt: new Date() } });
+      const msg = await prisma.message.create({ data: { channel: "EMAIL", direction: "OUTBOUND", body, customerId: invoice.customerId, sentAt: new Date() } });
       return { id: msg.id, paymentUrl: link };
     },
     flagHold: async (invoiceId: string, _flag: boolean) => {
       const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
       if (!invoice) throw new AppError(404, "Invoice not found");
-      const updated = await prisma.customer.update({ where: { id: (invoice as any).customerId }, data: { holdNextClean: _flag } });
-      return { customerId: updated.id, holdNextClean: (updated as any).holdNextClean };
+      const updated = await prisma.customer.update({ where: { id: invoice.customerId }, data: { holdNextClean: _flag } });
+      return { customerId: updated.id, holdNextClean: updated.holdNextClean };
     },
     flagBadDebt: async (invoiceId: string, _flag: boolean) => {
       const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
       if (!invoice) throw new AppError(404, "Invoice not found");
-      const updated = await prisma.customer.update({ where: { id: (invoice as any).customerId }, data: { badDebt: _flag } });
+      const updated = await prisma.customer.update({ where: { id: invoice.customerId }, data: { badDebt: _flag } });
       return { customerId: updated.id, badDebt: updated.badDebt };
     },
     sendReminder: async (invoiceId: string, channel: string, _message: string) => {
       const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId }, include: { customer: { select: { id: true, name: true, email: true } } } });
       if (!invoice) throw new AppError(404, "Invoice not found");
-      if (channel === "EMAIL" && !(invoice as any).customer.email) throw new AppError(400, "Customer has no email address");
-      const msg = await prisma.message.create({ data: { channel: channel as any, direction: "OUTBOUND", body: _message, customerId: (invoice as any).customerId, sentAt: new Date() } });
+      if (channel === "EMAIL" && !invoice.customer.email) throw new AppError(400, "Customer has no email address");
+      const msg = await prisma.message.create({ data: { channel: channel as MessageChannel, direction: "OUTBOUND", body: _message, customerId: invoice.customerId, sentAt: new Date() } });
       return { id: msg.id };
     },
     getKpis: async () => {
@@ -111,17 +110,17 @@ export function createDebtService(prisma: TenantPrismaClient) {
           select: { property: { select: { customerId: true } } },
         }),
       ]);
-      const failedVisitIds = new Set(failedPayments.map((p: any) => p.visitId).filter(Boolean));
-      const upcomingCustomerIds = new Set(upcomingVisits.map((v: any) => v.property.customerId));
+      const failedVisitIds = new Set(failedPayments.map((p) => p.visitId).filter(Boolean));
+      const upcomingCustomerIds = new Set(upcomingVisits.map((v) => v.property.customerId));
       const totalOutstandings = invoices
-        .filter((i: any) => !i.customer.badDebt)
-        .reduce((sum: number, i: any) => sum + i.amount.toNumber(), 0);
+        .filter((i) => !i.customer.badDebt)
+        .reduce((sum, i) => sum + i.amount.toNumber(), 0);
       const badDebt = invoices
-        .filter((i: any) => i.customer.badDebt)
-        .reduce((sum: number, i: any) => sum + i.amount.toNumber(), 0);
-      const failedGoCardless = invoices.filter((i: any) => !i.customer.badDebt && failedVisitIds.has(i.visitId)).length;
-      const dueBeforeClean = invoices.filter((i: any) => !i.customer.badDebt && upcomingCustomerIds.has(i.customerId)).length;
-      const holdCustomers = new Set(invoices.filter((i: any) => !i.customer.badDebt && i.customer.holdNextClean).map((i: any) => i.customerId));
+        .filter((i) => i.customer.badDebt)
+        .reduce((sum, i) => sum + i.amount.toNumber(), 0);
+      const failedGoCardless = invoices.filter((i) => !i.customer.badDebt && failedVisitIds.has(i.visitId)).length;
+      const dueBeforeClean = invoices.filter((i) => !i.customer.badDebt && upcomingCustomerIds.has(i.customerId)).length;
+      const holdCustomers = new Set(invoices.filter((i) => !i.customer.badDebt && i.customer.holdNextClean).map((i) => i.customerId));
       return { totalOutstandings, badDebt, failedGoCardless, dueBeforeClean, holdNextClean: holdCustomers.size };
     },
   };

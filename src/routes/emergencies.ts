@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Request, Router } from "express";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
@@ -10,7 +10,7 @@ export const emergenciesRouter = Router();
 emergenciesRouter.use(requireAuth);
 emergenciesRouter.use(requireTenantAccess);
 
-const svc = (req: any) => createEmergencyService(req.tenantPrisma!);
+const svc = (req: Request) => createEmergencyService(req.tenantPrisma!);
 
 // GET /emergencies?status=ACTIVE|RESOLVED — ADMIN/MANAGER only
 emergenciesRouter.get("/", requireBusinessAccess(), h(async (req, res) => {

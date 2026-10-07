@@ -1,4 +1,4 @@
-import { ServiceCategory, PaymentTiming, MessageChannel, RoundStatus, LifecycleStatus } from "../generated/tenant-client";
+import { ServiceCategory, PaymentTiming, MessageChannel, RoundStatus } from "../generated/tenant-client";
 import type {
   BusinessSettings,
   Service,

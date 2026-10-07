@@ -59,14 +59,13 @@ invitesRouter.post(
       data: { tenantId: profile.tenantId, email, role, technicianId, expiresAt },
     });
 
-    const settings = await req.tenantPrisma!.businessSettings.findFirst();
     const base = process.env.INVITE_BASE_URL!;
     try {
       await sendInviteEmail({
         to: email,
         inviteUrl: `${base}/accept-invite?token=${invite.token}`,
       });
-    } catch (emailErr) {
+    } catch {
       // Roll back the invite row so the admin can retry without hitting 409.
       await prisma.tenantInvite.delete({ where: { id: invite.id } }).catch((rollbackErr) => {
         console.error("[invites] Failed to roll back invite after email failure:", rollbackErr);

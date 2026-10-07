@@ -18,7 +18,6 @@ import type {
   Customer,
   Property,
   ServicePlan,
-  RoundTechnician,
 } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { Prisma as TenantPrisma } from "../generated/tenant-client";

@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Request, Router } from "express";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
@@ -10,7 +10,7 @@ dashboardRouter.use(requireAuth);
 dashboardRouter.use(requireTenantAccess);
 dashboardRouter.use(requireBusinessAccess());
 
-const svc = (req: any) => createDashboardService(req.tenantPrisma!);
+const svc = (req: Request) => createDashboardService(req.tenantPrisma!);
 
 // GET /dashboard/kpis — 4 top metric cards
 dashboardRouter.get("/kpis", h(async (req, res) => {

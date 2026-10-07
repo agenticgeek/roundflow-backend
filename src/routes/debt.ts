@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Request, Router } from "express";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
@@ -15,7 +15,7 @@ debtRouter.use(requireAuth);
 debtRouter.use(requireTenantAccess);
 debtRouter.use(requireBusinessAccess());
 
-const svc = (req: any) => createDebtService(req.tenantPrisma!);
+const svc = (req: Request) => createDebtService(req.tenantPrisma!);
 
 // GET /debt/kpis
 debtRouter.get("/kpis", h(async (req, res) => {
@@ -27,7 +27,7 @@ debtRouter.get("/kpis", h(async (req, res) => {
 debtRouter.get("/board", h(async (req, res) => {
   const { bucket, roundId, paymentMethod } = req.query as Record<string, string | undefined>;
   if (!bucket) return res.status(400).json({ error: "bucket query param is required" });
-  const items = await svc(req).getBoard(bucket as any, roundId, paymentMethod);
+  const items = await svc(req).getBoard(bucket, roundId, paymentMethod);
   return res.json(items);
 }));
 
