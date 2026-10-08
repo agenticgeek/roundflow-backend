@@ -226,7 +226,7 @@ class ComplaintService {
       direction: message.direction,
       channel: message.channel,
       body: message.body,
-      complaintId: message.complaintId,
+      complaintId: message.complaintId!,
       createdAt: message.createdAt.toISOString(),
     };
   }
