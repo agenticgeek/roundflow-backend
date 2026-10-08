@@ -73,6 +73,7 @@ vi.mock("../../middleware/requireTenantAccess", () => ({
 }));
 vi.mock("../../middleware/requireRole", () => ({
   requireRole: () => (_req: any, _res: any, next: any) => next(),
+  requireBusinessAccess: () => (_req: any, _res: any, next: any) => next(),
 }));
 
 import { emergenciesRouter } from "../../routes/emergencies";
