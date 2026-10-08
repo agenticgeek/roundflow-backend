@@ -420,7 +420,7 @@ settingsRouter.get(
 
     const tenantId = req.profile!.tenantId;
     const webhookUrl = `${process.env.PUBLIC_API_URL}/webhooks/stripe?tenantId=${tenantId}&secret=${webhookSecret}`;
-    const frontendUrl = process.env.FRONTEND_URL!;
+    const frontendUrl = process.env.FRONTEND_URL!.split(",")[0].trim();
     res.redirect(`${frontendUrl}/settings/integrations?stripe=connected&webhookUrl=${encodeURIComponent(webhookUrl)}`);
   })
 );
@@ -539,7 +539,7 @@ settingsRouter.get(
 
     const tenantId = req.profile!.tenantId;
     const webhookUrl = `${process.env.PUBLIC_API_URL}/webhooks/ghl?tenantId=${tenantId}&secret=${webhookSecret}`;
-    const frontendUrl = process.env.FRONTEND_URL!;
+    const frontendUrl = process.env.FRONTEND_URL!.split(",")[0].trim();
     res.redirect(`${frontendUrl}/settings/integrations?ghl=connected&webhookUrl=${encodeURIComponent(webhookUrl)}`);
   })
 );

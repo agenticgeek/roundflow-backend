@@ -70,10 +70,18 @@ jobs:
             aws ecr get-login-password --region eu-north-1 | \
               docker login --username AWS --password-stdin 574667603029.dkr.ecr.eu-north-1.amazonaws.com
             docker pull 574667603029.dkr.ecr.eu-north-1.amazonaws.com/roundflow:qa-latest
+            # Shared network + Gotenberg HTML->PDF render service (idempotent).
+            docker network create roundflow 2>/dev/null || true
+            if [ -z "$(docker ps -q -f name=^gotenberg$)" ]; then
+              docker rm -f gotenberg 2>/dev/null || true
+              docker run -d --name gotenberg --network roundflow --restart unless-stopped gotenberg/gotenberg:8
+            fi
             docker stop roundflow-qa || true
             docker rm roundflow-qa || true
             docker run -d \
               --name roundflow-qa \
+              --network roundflow \
+              -e GOTENBERG_URL=http://gotenberg:3000 \
               --env-file /home/ec2-user/.env.qa \
               -p 127.0.0.1:3001:3000 \
               --restart unless-stopped \

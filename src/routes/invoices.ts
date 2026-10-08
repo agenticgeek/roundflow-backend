@@ -4,6 +4,7 @@ import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { h, optString } from "../lib/http";
 import { createInvoiceService } from "../services/invoice.service";
+import { renderHtmlToPdf, invoiceHtml } from "../integrations/pdf/render";
 
 export const invoicesRouter = Router();
 invoicesRouter.use(requireAuth);
@@ -29,6 +30,18 @@ invoicesRouter.get(
   h(async (req, res) => {
     const invoice = await svc(req).getInvoice(req.params.id);
     return res.json(invoice);
+  })
+);
+
+// GET /invoices/:id/pdf — rendered invoice (used for both download and print)
+invoicesRouter.get(
+  "/:id/pdf",
+  h(async (req, res) => {
+    const data = await svc(req).getRenderData(req.params.id);
+    const pdf = await renderHtmlToPdf(invoiceHtml(data));
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="${data.invoiceNumber}.pdf"`);
+    return res.send(pdf);
   })
 );
 
