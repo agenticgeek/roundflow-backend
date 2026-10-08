@@ -38,6 +38,10 @@ export interface InvoicePreview {
   };
 }
 
+// Full data needed to render a saved invoice (PDF). Same shape as the preview
+// plus the persisted status and the business currency symbol.
+export type InvoiceRenderData = InvoicePreview & { status: string; currency: string };
+
 // ---- Prisma include ---------------------------------------------------------
 
 const visitInvoiceInclude = {
@@ -164,6 +168,56 @@ class InvoiceService {
       status: updated.status,
       sentToCustomer: updated.sentToCustomer,
       sentAt: updated.sentAt,
+    };
+  }
+
+  // Assemble the full renderable invoice from a *saved* invoice row (preview
+  // refuses once an invoice exists, so this is its sibling for the PDF path).
+  async getRenderData(invoiceId: string): Promise<InvoiceRenderData> {
+    const invoice = await this.prisma.invoice.findUnique({
+      where: { id: invoiceId },
+      include: { visit: { include: visitInvoiceInclude } },
+    });
+    if (!invoice) throw new AppError(404, "Invoice not found");
+    const visit = invoice.visit;
+    if (!visit) throw new AppError(409, "Invoice has no linked visit to render");
+
+    const settings = await this.prisma.businessSettings.findFirst({
+      select: { businessName: true, email: true, vatInInvoices: true, currency: true },
+    });
+
+    const total = invoice.amount.toNumber();
+    const vatAmount = settings?.vatInInvoices ? +(total - total / 1.2).toFixed(2) : 0;
+    const subtotal = +(total - vatAmount).toFixed(2);
+
+    const customer = visit.property.customer;
+    const serviceName = visit.service?.name ?? "Window Cleaning Service";
+    const roundPart = visit.round ? ` — ${visit.round.name}` : "";
+    const datePart = ` — ${toDateStr(visit.date)}`;
+
+    return {
+      invoiceNumber: invoice.invoiceNumber,
+      invoiceDate: toDateStr(invoice.createdAt),
+      visitDate: toDateStr(visit.date),
+      dueDate: invoice.dueDate ? toDateStr(invoice.dueDate) : null,
+      paymentMethod: visit.paymentMethod ?? customer.paymentMethod ?? null,
+      status: invoice.status,
+      currency: settings?.currency ?? "£",
+      customer: {
+        name: customer.name,
+        addressLine: visit.property.addressLine,
+        postcode: visit.property.postcode ?? null,
+        email: customer.email ?? null,
+        phone: customer.phone ?? null,
+      },
+      lineItems: [
+        { description: `${serviceName}${roundPart}${datePart}`, technicianName: visit.technician?.name ?? null, amount: subtotal },
+      ],
+      subtotal,
+      vatAmount,
+      total,
+      amount: total,
+      business: { name: settings?.businessName ?? null, email: settings?.email ?? null },
     };
   }
 
