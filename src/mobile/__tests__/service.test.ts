@@ -4,6 +4,7 @@ import { createJobDetailService } from "../services/job-detail.service";
 import { createJobTrackerService } from "../services/job-tracker.service";
 import { createMediaService } from "../services/media.service";
 import { evaluateDebtGate } from "../services/debt-gate";
+import { createNotificationService } from "../services/notification.service";
 
 function makePrisma() {
   return {
@@ -14,6 +15,8 @@ function makePrisma() {
     technician: { findUnique: vi.fn() },
     invoice: { findMany: vi.fn() },
     businessSettings: { findFirst: vi.fn().mockResolvedValue({ debtHoldEnabled: false, debtHoldMaxInvoices: null, debtHoldMaxAmount: null }) },
+    notification: { findMany: vi.fn(), count: vi.fn(), updateMany: vi.fn(), create: vi.fn() },
+    device: { findMany: vi.fn(), upsert: vi.fn(), deleteMany: vi.fn() },
   } as unknown as Parameters<typeof createHomeService>[0];
 }
 
@@ -430,4 +433,37 @@ it("adjustPrice restoring to the original price clears the adjustment", async ()
   await createJobTrackerService(prisma).adjustPrice("v1", 52);
   const data = (prisma.visit.update as ReturnType<typeof vi.fn>).mock.calls[0][0].data;
   expect(data).toEqual({ price: 52, originalPrice: null, priceAdjustmentReason: null });
+});
+
+// ---------------------------------------------------------------------------
+// NotificationService (list pagination + unreadCount; device register)
+// ---------------------------------------------------------------------------
+
+it("notifications list returns a page + unreadCount + nextCursor when more exist", async () => {
+  const prisma = makePrisma();
+  const rows = Array.from({ length: 31 }, (_, i) => ({ id: `n${i}`, createdAt: new Date() }));
+  (prisma.notification.findMany as ReturnType<typeof vi.fn>).mockResolvedValue(rows);
+  (prisma.notification.count as ReturnType<typeof vi.fn>).mockResolvedValue(5);
+  const res = await createNotificationService(prisma).list("p1");
+  expect(res.notifications).toHaveLength(30);
+  expect(res.unreadCount).toBe(5);
+  expect(res.nextCursor).toBe("n29");
+});
+
+it("notifications list returns nextCursor null on the last page", async () => {
+  const prisma = makePrisma();
+  (prisma.notification.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ id: "n1", createdAt: new Date() }]);
+  (prisma.notification.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
+  const res = await createNotificationService(prisma).list("p1");
+  expect(res.notifications).toHaveLength(1);
+  expect(res.nextCursor).toBeNull();
+});
+
+it("registerDevice upserts by pushToken", async () => {
+  const prisma = makePrisma();
+  (prisma.device.upsert as ReturnType<typeof vi.fn>).mockResolvedValue({});
+  await createNotificationService(prisma).registerDevice("p1", "ExponentPushToken[abc]", "ios");
+  const args = (prisma.device.upsert as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(args.where).toEqual({ pushToken: "ExponentPushToken[abc]" });
+  expect(args.create).toMatchObject({ profileId: "p1", platform: "ios" });
 });

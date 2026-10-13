@@ -3,7 +3,7 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { prisma } from "../lib/prisma";
 import { AppError } from "../lib/app-error";
-import { asObject, h, requireString, optString, optReqString, optBool } from "../lib/http";
+import { asObject, h, requireString, optString, optReqString, optStringArray, optBool } from "../lib/http";
 import { IssueType, PaymentMethod, PaymentStatus, VisitStatus } from "../generated/tenant-client";
 import { ALLOWED_PHOTO_MIME_TYPES, MAX_PHOTO_BYTES } from "../lib/storage.js";
 import { createHomeService } from "./services/home.service";
@@ -11,6 +11,7 @@ import { createJobDetailService } from "./services/job-detail.service";
 import { createJobTrackerService } from "./services/job-tracker.service";
 import { createMediaService } from "./services/media.service";
 import { createChatService } from "./services/chat.service";
+import { createNotificationService } from "./services/notification.service";
 
 export const mobileRouter = Router();
 mobileRouter.use(requireAuth);
@@ -25,34 +26,107 @@ const detail  = (req: Request) => createJobDetailService(tp(req));
 const tracker = (req: Request) => createJobTrackerService(tp(req));
 const media   = (req: Request) => createMediaService(tp(req));
 const chat    = (req: Request) => createChatService(tp(req));
+const notif   = (req: Request) => createNotificationService(tp(req));
 
-// GET /mobile/me — the signed-in technician's profile basics.
-mobileRouter.get("/me", h(async (req, res) => {
+// Build the GET/PATCH /mobile/me response (public Profile name/DOB + tenant Technician avatar/area).
+async function meResponse(req: Request) {
   const profile = await prisma.profile.findUnique({
     where: { supabaseUserId: req.user!.supabaseUserId },
     select: { name: true, dateOfBirth: true },
   });
-  if (!profile) throw new AppError(404, "Profile not found");
-  res.json({ name: profile.name, email: req.user!.email, dateOfBirth: profile.dateOfBirth ?? null });
+  const tech = await tp(req).technician.findUnique({
+    where: { profileId: req.profile!.id },
+    select: { avatarUrl: true, serviceAreas: { select: { serviceArea: { select: { name: true } } }, take: 1 } },
+  });
+  return {
+    name: profile?.name ?? req.profile!.name,
+    email: req.user!.email,
+    dateOfBirth: profile?.dateOfBirth ?? null,
+    avatarUrl: tech?.avatarUrl ?? null,
+    areaName: tech?.serviceAreas[0]?.serviceArea.name ?? null,
+  };
+}
+
+function assertMime(mimeType: string) {
+  if (!(ALLOWED_PHOTO_MIME_TYPES as readonly string[]).includes(mimeType)) {
+    throw new AppError(400, `mimeType must be one of: ${ALLOWED_PHOTO_MIME_TYPES.join(", ")}`);
+  }
+}
+
+// GET /mobile/me — the signed-in technician's profile (name, DOB, avatar, area).
+mobileRouter.get("/me", h(async (req, res) => {
+  res.json(await meResponse(req));
 }));
 
-// PATCH /mobile/me — update name / date of birth.
+// PATCH /mobile/me — update name / date of birth / avatar.
 mobileRouter.patch("/me", h(async (req, res) => {
   const body = asObject(req.body);
   const name = optReqString(body.name, "name");
   const dateOfBirth = optString(body.dateOfBirth, "dateOfBirth");
+  const avatarUrl = optString(body.avatarUrl, "avatarUrl");
   if (dateOfBirth && !/^\d{4}-\d{2}-\d{2}$/.test(dateOfBirth)) {
     throw new AppError(400, "dateOfBirth must be in YYYY-MM-DD format");
   }
-  const updated = await prisma.profile.update({
-    where: { supabaseUserId: req.user!.supabaseUserId },
-    data: {
-      ...(name !== undefined ? { name } : {}),
-      ...(dateOfBirth !== undefined ? { dateOfBirth } : {}),
-    },
-    select: { name: true, dateOfBirth: true },
-  });
-  res.json({ name: updated.name, email: req.user!.email, dateOfBirth: updated.dateOfBirth ?? null });
+  if (name !== undefined || dateOfBirth !== undefined) {
+    await prisma.profile.update({
+      where: { supabaseUserId: req.user!.supabaseUserId },
+      data: { ...(name !== undefined ? { name } : {}), ...(dateOfBirth !== undefined ? { dateOfBirth } : {}) },
+    });
+  }
+  if (avatarUrl !== undefined) {
+    await tp(req).technician.updateMany({ where: { profileId: req.profile!.id }, data: { avatarUrl } });
+  }
+  res.json(await meResponse(req));
+}));
+
+// POST /mobile/me/avatar/upload-url — signed URL to upload a profile photo.
+mobileRouter.post("/me/avatar/upload-url", h(async (req, res) => {
+  const mimeType = optString(asObject(req.body).mimeType, "mimeType") ?? "image/jpeg";
+  assertMime(mimeType);
+  res.json(await media(req).getAvatarUploadUrl(req.profile!.id, mimeType, req.profile!.tenantId));
+}));
+
+// POST /mobile/messages/attachments/upload-url — signed URL for a chat image.
+mobileRouter.post("/messages/attachments/upload-url", h(async (req, res) => {
+  const body = asObject(req.body);
+  const roundId = requireString(body.roundId, "roundId");
+  const mimeType = optString(body.mimeType, "mimeType") ?? "image/jpeg";
+  assertMime(mimeType);
+  res.json(await media(req).getChatAttachmentUploadUrl(roundId, mimeType, req.profile!.tenantId));
+}));
+
+// GET /mobile/notifications?cursor=
+mobileRouter.get("/notifications", h(async (req, res) => {
+  const cursor = (req.query.cursor as string | undefined) || undefined;
+  res.json(await notif(req).list(req.profile!.id, cursor));
+}));
+
+// PATCH /mobile/notifications/:id/read
+mobileRouter.patch("/notifications/:id/read", h(async (req, res) => {
+  await notif(req).markRead(req.profile!.id, req.params.id);
+  res.json({ read: true });
+}));
+
+// POST /mobile/notifications/read-all
+mobileRouter.post("/notifications/read-all", h(async (req, res) => {
+  await notif(req).markAllRead(req.profile!.id);
+  res.json({ read: true });
+}));
+
+// POST /mobile/devices — register a push token.
+mobileRouter.post("/devices", h(async (req, res) => {
+  const body = asObject(req.body);
+  const pushToken = requireString(body.pushToken, "pushToken");
+  const platform = requireString(body.platform, "platform");
+  if (platform !== "ios" && platform !== "android") throw new AppError(400, 'platform must be "ios" or "android"');
+  await notif(req).registerDevice(req.profile!.id, pushToken, platform);
+  res.status(201).json({ registered: true });
+}));
+
+// DELETE /mobile/devices/:token — deregister on sign-out.
+mobileRouter.delete("/devices/:token", h(async (req, res) => {
+  await notif(req).unregisterDevice(req.profile!.id, req.params.token);
+  res.json({ unregistered: true });
 }));
 
 // GET /mobile/company — Help & Support contact details + policy links.
@@ -83,17 +157,17 @@ mobileRouter.post("/support/reports", h(async (req, res) => {
 
 // GET /mobile/rounds/today
 mobileRouter.get("/rounds/today", h(async (req, res) => {
-  res.json(await home(req).getRoundsSummary(req.user!.supabaseUserId));
+  res.json(await home(req).getRoundsSummary(req.profile!.id));
 }));
 
 // GET /mobile/visits/today
 mobileRouter.get("/visits/today", h(async (req, res) => {
-  res.json(await home(req).getTodayVisits(req.user!.supabaseUserId));
+  res.json(await home(req).getTodayVisits(req.profile!.id));
 }));
 
 // GET /mobile/completions
 mobileRouter.get("/completions", h(async (req, res) => {
-  res.json(await home(req).getCompletions(req.user!.supabaseUserId));
+  res.json(await home(req).getCompletions(req.profile!.id));
 }));
 
 // GET /mobile/visits/:id
@@ -200,7 +274,13 @@ mobileRouter.post("/chat/messages", h(async (req, res) => {
     const msg = await chat(req).sendWorkPhotosMessage(roundId, req.user!.supabaseUserId, requireString(body.visitId, "visitId"));
     return res.status(201).json(msg);
   }
-  if (type !== "TEXT") throw new AppError(400, 'type must be "TEXT" or "WORK_PHOTOS"');
+  if (type === "PHOTOS") {
+    const photoUrls = optStringArray(body.photoUrls, "photoUrls") ?? [];
+    if (photoUrls.length === 0) throw new AppError(400, "photoUrls must be a non-empty array for type PHOTOS");
+    const text = optString(body.text, "text");
+    return res.status(201).json(await chat(req).sendPhotosMessage(roundId, req.user!.supabaseUserId, photoUrls, text ?? undefined));
+  }
+  if (type !== "TEXT") throw new AppError(400, 'type must be "TEXT", "WORK_PHOTOS", or "PHOTOS"');
   res.status(201).json(await chat(req).sendChatMessage(roundId, req.user!.supabaseUserId, requireString(body.text, "text")));
 }));
 

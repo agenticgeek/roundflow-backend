@@ -18,6 +18,10 @@ class ChatService {
   async sendWorkPhotosMessage(roundId: string, senderProfileId: string, visitId: string): Promise<ChatMessageRow> {
     return this.prisma.chatMessage.create({ data: { roundId, senderProfileId, type: "WORK_PHOTOS", visitId } });
   }
+
+  async sendPhotosMessage(roundId: string, senderProfileId: string, photoUrls: string[], body?: string): Promise<ChatMessageRow> {
+    return this.prisma.chatMessage.create({ data: { roundId, senderProfileId, type: "PHOTOS", photoUrls, body: body ?? null } });
+  }
 }
 
 export function createChatService(prisma: TenantPrismaClient) {

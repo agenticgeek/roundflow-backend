@@ -1,6 +1,6 @@
 import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
 import { AppError } from "../../lib/app-error";
-import { buildVisitPhotoPath, createSignedUploadUrl } from "../../lib/storage.js";
+import { buildVisitPhotoPath, buildAvatarPath, buildChatAttachmentPath, createSignedUploadUrl } from "../../lib/storage.js";
 
 class MediaService {
   constructor(private readonly prisma: TenantPrismaClient) {}
@@ -26,6 +26,18 @@ class MediaService {
     const visit = await this.prisma.visit.findUnique({ where: { id: visitId }, select: { id: true } });
     if (!visit) throw new AppError(404, "Visit not found");
     const path = buildVisitPhotoPath(tenantId, visitId, photoType, mimeType);
+    const { signedUrl } = await createSignedUploadUrl(path);
+    return { signedUrl, path };
+  }
+
+  async getAvatarUploadUrl(profileId: string, mimeType: string, tenantId: string): Promise<{ signedUrl: string; path: string }> {
+    const path = buildAvatarPath(tenantId, profileId, mimeType);
+    const { signedUrl } = await createSignedUploadUrl(path);
+    return { signedUrl, path };
+  }
+
+  async getChatAttachmentUploadUrl(roundId: string, mimeType: string, tenantId: string): Promise<{ signedUrl: string; path: string }> {
+    const path = buildChatAttachmentPath(tenantId, roundId, mimeType);
     const { signedUrl } = await createSignedUploadUrl(path);
     return { signedUrl, path };
   }

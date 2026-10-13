@@ -647,12 +647,39 @@ model ChatMessage {
   round           Round    @relation(fields: [roundId], references: [id], onDelete: Cascade)
   senderProfileId String
   body            String?
-  type            String   @default("TEXT") // TEXT | WORK_PHOTOS
+  type            String   @default("TEXT") // TEXT | WORK_PHOTOS | PHOTOS
   visitId         String?
+  photoUrls       String[] @default([]) // image URLs for type = PHOTOS
   createdAt       DateTime @default(now())
 
   @@index([roundId, createdAt])
   @@index([senderProfileId])
+}
+
+// Push device registrations (mobile). pushToken is the provider token
+// (Expo/FCM/APNs); profileId = owning technician's public.Profile.id.
+model Device {
+  id        String   @id @default(cuid())
+  profileId String
+  pushToken String   @unique
+  platform  String   // "ios" | "android"
+  createdAt DateTime @default(now())
+
+  @@index([profileId])
+}
+
+// In-app notifications for a technician (profileId = public.Profile.id).
+model Notification {
+  id        String   @id @default(cuid())
+  profileId String
+  type      String   // e.g. "ROUND_UPDATE" | "SCHEDULE" | "PAYMENT"
+  title     String
+  body      String?
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([profileId, read])
+  @@index([profileId, createdAt])
 }
 
 // Outbound GHL event queue — written in same call as operational write, drained by outboxWorker.

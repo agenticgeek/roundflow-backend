@@ -26,6 +26,16 @@ export function buildVisitPhotoPath(
   return `${tenantId}/visits/${visitId}/${label}-${ts}.${ext}`;
 }
 
+export function buildAvatarPath(tenantId: string, profileId: string, mimeType: string): string {
+  const ext = MIME_TO_EXT[mimeType] ?? "jpg";
+  return `${tenantId}/avatars/${profileId}-${Date.now()}.${ext}`;
+}
+
+export function buildChatAttachmentPath(tenantId: string, roundId: string, mimeType: string): string {
+  const ext = MIME_TO_EXT[mimeType] ?? "jpg";
+  return `${tenantId}/chat/${roundId}/${Date.now()}.${ext}`;
+}
+
 const BUCKET = process.env.VISIT_PHOTOS_BUCKET ?? "visit-photos";
 
 export async function createSignedUploadUrl(

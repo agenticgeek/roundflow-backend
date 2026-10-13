@@ -57,5 +57,6 @@ export interface ChatMessageRow {
   body: string | null;
   type: string;
   visitId: string | null;
+  photoUrls: string[];
   createdAt: Date;
 }
