@@ -1,6 +1,6 @@
 # RoundFlow Backend — Progress Log
 
-> Living document. Last updated: 2026-07-21 · Branch: `dev`
+> Living document. Last updated: 2026-10-13 · Branch: `dev`
 > Written by reading the codebase directly. If a claim isn't backed by code or a
 > run, it's flagged as unverified. Update this file as the backend grows.
 > **2026-07-07:** `docs/designFindings.md` re-audited (admin design update + new
@@ -52,6 +52,20 @@
 > trigger v2). No `/auth/callback` yet — it's a **frontend** route.
 > **2026-07-08:** Settings API built (7 sub-sections, 21 endpoints, `SettingsService`
 > OCP seam). Setup-completion guard added — mutations blocked until `setupCompleted = true`.
+> **2026-10-13:** Closed the frontend-gaps doc (2026-10-07 "What the Frontend Needs From the
+> Backend") — see **"Frontend Gaps: Messaging, Invoice PDF, Reports Export, Preferences
+> (2026-10-13)"** below and `docs/Handoffs/FRONTEND_GAPS_RESPONSE_2026-10-13.md`. Shipped to
+> **dev**: `POST /messages/{send,bulk}` (GHL, send-now), `GET /invoices/:id/pdf` +
+> `GET /invoices/preview/pdf` (Gotenberg render service), `GET /reports/export` (CSV), and a
+> per-user preferences store (`Profile.preferences` JSON + `GET/PATCH /auth/me/preferences`,
+> migration `20261009000000`). CORS: `FRONTEND_URL` treated as a comma-list consistently
+> (fixed two raw Stripe/GHL redirect usages); dev host now allows `https://dev.roundflow.ai`.
+> Deploy workflows (dev/qa) run a Gotenberg container on a shared docker network + pass
+> `GOTENBERG_URL`. `tsc` + **200 tests** green; dev deploy verified. **QA/prod not done;
+> Stripe connect already existed (blocked on provider accounts); bulk scheduling = GHL handoff.**
+> ⚠️ **This log skipped ~2026-07 → 2026-10 of backend build-out** (customers, rounds, visits,
+> invoicing, debt, complaints, dashboard, mobile, GHL integration, CI/CD) — treat sections
+> below as stale before this entry; the code is the source of truth.
 
 ## Project Overview
 
@@ -543,6 +557,54 @@ fixes. All 14 are resolved:
 | **M-7** Payments tab uncapped (vs visitHistory cap of 50) | `visits.slice(0, 50).map(...)` in `getCustomerDetail` payments tab |
 | **NEW-1** Email + tenant ownership checks bypassed on idempotent path | Two guards added at top of `if (existing)` block: `existing.tenantId !== invite.tenantId` → 403; email mismatch → 403 |
 | **NEW-2** `DROP SCHEMA CASCADE` could destroy live tenant data | Table-count check before DROP: if tables > 0 but no `BusinessSettings` → throw (manual intervention required); DROP only on empty schema |
+
+### Frontend Gaps: Messaging, Invoice PDF, Reports Export, Preferences (2026-10-13)
+
+Resolves the 2026-10-07 frontend doc. Full response + endpoint contracts in
+`docs/Handoffs/FRONTEND_GAPS_RESPONSE_2026-10-13.md`. All shipped to **dev**
+(`api-dev.roundflow.ai`); **not QA/prod**. `tsc --noEmit` clean; **200 tests** pass.
+
+- **Customer messaging** (`src/routes/messages.ts`, `src/services/message.service.ts`).
+  `POST /messages/send` (single customer by `propertyId`|`customerId`) and
+  `POST /messages/bulk` (whole round, **send-now**, deduped by customer; `excludePaymentHold`
+  drops customers whose round properties all have a payment-hold visit). Both reuse the
+  existing GHL path (`getGhlToken` → ensure contact via `createGhlContact` persisting
+  `ghlContactId` → `sendGhlMessage`). Guards: 400 bad channel, 404 not found, 409 GHL not
+  connected. **No `sendAt`** — scheduling is a GHL workflow handoff. SMS Templates were
+  already a real CRUD (no change).
+- **Invoice PDF** (`src/integrations/pdf/render.ts`, `invoice.service.getRenderData`,
+  routes in `src/routes/invoices.ts`). `GET /invoices/:id/pdf` (saved invoice) and
+  `GET /invoices/preview/pdf?visitId=` (quote before the invoice exists; registered **before**
+  `/:id/pdf` so "preview" isn't captured as an id). HTML→PDF via a **Gotenberg** service
+  (chosen over bundling Chromium / a paid SaaS); `GOTENBERG_URL` gates it (501 if unset).
+  Customer-controlled fields HTML-escaped. `getRenderData` rebuilds the full invoice from the
+  saved row (back-computes VAT from the stored total, since `previewInvoice` refuses once an
+  invoice exists); `currency` exposed on the preview shape.
+- **Reports export** (`src/routes/reports.ts`, `src/lib/csv.ts`).
+  `GET /reports/export?type=visits|technicians|revenue&period=&status=` → `text/csv`, reusing
+  the existing report service + a tiny stdlib CSV serialiser (quotes commas/quotes/newlines;
+  Dates → ISO).
+- **Per-user preferences** (`Profile.preferences` JSON, migration
+  `20261009000000_add_profile_preferences`; `GET/PATCH /auth/me/preferences`;
+  `mergePreferences` in `src/lib/preferences.ts`). Free-form JSON bag per user, shallow-merged
+  on PATCH, 100KB cap — lets the Part-B frontend controls (remember-me, filter choices, etc.)
+  persist per user across sessions. `mergePreferences` lives in `lib/` (not the route) so its
+  test doesn't load `requireAuth`'s module-level `SUPABASE_ISSUER` check, which the CI test
+  step runs without.
+- **CORS** (`src/routes/settings.ts`). `src/index.ts` already split `FRONTEND_URL` on commas
+  for allowed origins; fixed the two Stripe/GHL OAuth redirect handlers that used `FRONTEND_URL`
+  **raw** — they now take the first (canonical) entry like every other caller, so `FRONTEND_URL`
+  can safely be a comma-list. Dev host `FRONTEND_URL` updated to include `https://dev.roundflow.ai`.
+- **Deploy wiring** (`.github/workflows/deploy-dev.yml`, `deploy-qa.yml`). Each dev/qa deploy
+  creates a shared `roundflow` docker network, runs an idempotent **Gotenberg** container, and
+  starts the app with `--network roundflow -e GOTENBERG_URL=http://gotenberg:3000`. **Prod (ECS)
+  still needs a Gotenberg sidecar in the task definition** — not done.
+
+**Verified on dev:** `/reports/export`, `/invoices/:id/pdf`, `/invoices/preview/pdf`,
+`/messages/send`, `/auth/me/preferences` all return `401` unauthenticated (deployed & routed);
+Gotenberg container up and reachable from the app by name (`/health` 200); CORS reflects
+`https://dev.roundflow.ai`. **Not yet exercised with live authenticated data** (empty dev
+tenant), and **frontend buttons are not yet wired** (Export fires no request to `/reports/export`).
 
 ## Verified Working
 
