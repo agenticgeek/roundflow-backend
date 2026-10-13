@@ -76,6 +76,17 @@
 > public `20261013000000_profile_dob` applied + verified. Deferred (reasons in RESPONSE):
 > notifications/push (needs event producer + FCM/APNs), avatar/areaName, customer import (blocked
 > on template), chat enhancements, AI assistant, and product decisions (#4/#12/#20/#21). 205 tests.
+> **2026-10-13 (mobile round 2):** Built the remaining buildable mobile gaps — `/mobile/me`
+> avatar + areaName (+ `POST /mobile/me/avatar/upload-url`), chat photo attachments
+> (`ChatMessage.photoUrls`, `POST /mobile/messages/attachments/upload-url`, `type:"PHOTOS"`),
+> and notifications (`Notification` + `Device` models; `GET /mobile/notifications`,
+> `PATCH /:id/read`, `POST /read-all`, `POST`/`DELETE /mobile/devices`; Expo push token-gated;
+> `createNotification` hook — no producers wired yet). Tenant migration
+> `20261013000002_mobile_notifications`; 208 tests. Fixed a **tech-resolution bug** (home
+> endpoints keyed by `supabaseUserId` vs `Technician.profileId` = `Profile.id`) and a **deploy
+> stale-image bug** (full EC2 disk → silent `docker pull` failure → old image kept running
+> despite green deploys): added `docker image prune -f` before the pull + a `concurrency` guard
+> to the deploy workflows. All verified live on dev (migration applied, tables exist, new code in dist).
 
 ## Project Overview
 

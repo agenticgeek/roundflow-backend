@@ -25,14 +25,26 @@
 
 Migrations: tenant `20261013000000_mobile_issue_types` + `20261013000001_mobile_gaps` (applied at startup, verified), public `20261013000000_profile_dob`. `tsc` clean; 205 tests pass.
 
+### Shipped — round 2 (also live + verified on dev)
+
+| # | What shipped |
+|---|---|
+| **17/31** | `GET`/`PATCH /mobile/me` now return/update **`avatarUrl`** + **`areaName`**; **`POST /mobile/me/avatar/upload-url`** returns a signed upload URL. |
+| **28** | Chat image attachments: **`POST /mobile/messages/attachments/upload-url`**; `POST /mobile/chat/messages` accepts **`type:"PHOTOS"` + `photoUrls[]`** (`ChatMessage.photoUrls`). |
+| **22-24** | **`GET /mobile/notifications?cursor=`** (+`unreadCount`/`nextCursor`), **`PATCH /:id/read`**, **`POST /read-all`**, **`POST /devices`** `{pushToken,platform}`, **`DELETE /devices/:token`**. Push via Expo (token-gated). ⚠️ `createNotification` is the **producer hook** — no events generate notifications yet; wiring them (round assignment, payment, etc.) is the next step. Expo is assumed; swap for FCM/APNs if the app isn't Expo. |
+
+Round-2 migration: tenant `20261013000002_mobile_notifications`. 208 tests.
+
+**Bugs found + fixed while wiring this:**
+- **Technician resolution** — mobile home endpoints resolved the technician by `supabaseUserId`, but `Technician.profileId` stores `Profile.id` — they'd return **empty for every real invited tech**. Now pass `req.profile.id`.
+- **Deploy stale-image** — the dev/qa EC2 disk filled; `docker pull` failed and (no `set -e`) the deploy silently re-ran the old image, so new code/migrations never landed despite green deploys. Fixed: `docker image prune -f` before the pull + a `concurrency` guard so deploys can't race.
+
 ## Deferred — with reasons (not built)
 
 | # | Item | Why / what it needs |
 |---|---|---|
-| 17, 31 | Avatar upload + `areaName` on `/mobile/me` | Needs the Profile→Technician join + an avatar storage path. Next focused piece — `/mobile/me` and `dateOfBirth` are already in. |
-| 22-24 | Notifications list / read / push | Needs (a) a **notification-event producer** design (what generates them) and (b) **FCM/APNs credentials**. A dedicated build, not a field-add. |
-| 27 | Realtime | Poll the existing chat `since` param; no websocket layer today. |
-| 28 | Chat photo attachments | Small follow-up (a chat-scoped upload-url, like visit photos). |
+| 27 | Realtime | Poll the existing chat `since` param; no websocket layer today (client-side). |
+| 22-24 producers | What *generates* notifications | The notification API is shipped, but no backend events create notifications yet — wiring producers (round assignment, payment, schedule) is a product-driven follow-up. |
 | 7 | Customer import | Blocked on Mark's spreadsheet template; admin feature. |
 | 4 | Access-issue auto-close | Product decision: app sends `skip` after the last reason, or backend auto-closes (needs a defined "all reasons" set). |
 | 12 | Mobile sign-up | Don't expose — `POST /auth/signup` is admin tenant provisioning. Techs join via the invite flow. |
