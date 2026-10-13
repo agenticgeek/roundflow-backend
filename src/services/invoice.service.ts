@@ -32,6 +32,7 @@ export interface InvoicePreview {
   vatAmount: number;
   total: number;
   amount: number;            // alias of total for convenience
+  currency: string;          // business currency symbol, e.g. "£" / "€"
   business: {
     name: string | null;
     email: string | null;
@@ -310,6 +311,7 @@ class InvoiceService {
       vatAmount,
       total,
       amount: total,
+      currency: settings?.currency ?? "£",
       business: {
         name: settings?.businessName ?? null,
         email: settings?.email ?? null,

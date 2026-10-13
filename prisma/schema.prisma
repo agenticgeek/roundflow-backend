@@ -31,6 +31,7 @@ model Profile {
   tenant         Tenant    @relation(fields: [tenantId], references: [id])
   role           UserRole
   name           String
+  preferences    Json?
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 

@@ -24,6 +24,21 @@ invoicesRouter.get(
   })
 );
 
+// GET /invoices/preview/pdf?visitId= — PDF of an invoice preview (before it's saved).
+// Registered before /:id/pdf so "preview" isn't captured as an invoice id.
+invoicesRouter.get(
+  "/preview/pdf",
+  h(async (req, res) => {
+    const visitId = req.query.visitId as string | undefined;
+    if (!visitId) return res.status(400).json({ error: "visitId query param is required" });
+    const preview = await svc(req).previewInvoice(visitId);
+    const pdf = await renderHtmlToPdf(invoiceHtml({ ...preview, status: "PREVIEW" }));
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="${preview.invoiceNumber}-preview.pdf"`);
+    return res.send(pdf);
+  })
+);
+
 // GET /invoices/:id
 invoicesRouter.get(
   "/:id",

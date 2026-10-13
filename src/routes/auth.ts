@@ -1,10 +1,11 @@
 import { randomBytes } from "crypto";
 import { Router } from "express";
+import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { requireAuth } from "../middleware/requireAuth";
 import { provisionTenantSchema } from "../lib/tenant-provisioning";
 import { AppError } from "../lib/app-error";
-import { h, requireString, optString } from "../lib/http";
+import { h, requireString, optString, asObject } from "../lib/http";
 
 export const authRouter = Router();
 
@@ -23,6 +24,59 @@ authRouter.get(
       return res.status(404).json({ error: "Profile not found" });
     }
     return res.json(profile);
+  })
+);
+
+// Per-user UI preferences — a free-form JSON blob the frontend owns, so toggles,
+// filter choices, "remember me", etc. persist per user across sessions. Shallow-
+// merged on PATCH so the frontend can set one key without resending the whole blob.
+export function mergePreferences(
+  existing: unknown,
+  incoming: Record<string, unknown>
+): Record<string, unknown> {
+  const base =
+    existing && typeof existing === "object" && !Array.isArray(existing)
+      ? (existing as Record<string, unknown>)
+      : {};
+  const merged = { ...base, ...incoming };
+  // ponytail: flat 100KB cap so a client can't bloat its row; raise if a real need appears.
+  if (JSON.stringify(merged).length > 100_000) {
+    throw new AppError(400, "preferences payload too large (max 100KB)");
+  }
+  return merged;
+}
+
+// GET /auth/me/preferences
+authRouter.get(
+  "/me/preferences",
+  requireAuth,
+  h(async (req, res) => {
+    const profile = await prisma.profile.findUnique({
+      where: { supabaseUserId: req.user!.supabaseUserId },
+      select: { preferences: true },
+    });
+    if (!profile) return res.status(404).json({ error: "Profile not found" });
+    return res.json({ preferences: profile.preferences ?? {} });
+  })
+);
+
+// PATCH /auth/me/preferences — shallow-merge the given keys into stored prefs
+authRouter.patch(
+  "/me/preferences",
+  requireAuth,
+  h(async (req, res) => {
+    const incoming = asObject(req.body);
+    const profile = await prisma.profile.findUnique({
+      where: { supabaseUserId: req.user!.supabaseUserId },
+      select: { preferences: true },
+    });
+    if (!profile) return res.status(404).json({ error: "Profile not found" });
+    const updated = await prisma.profile.update({
+      where: { supabaseUserId: req.user!.supabaseUserId },
+      data: { preferences: mergePreferences(profile.preferences, incoming) as Prisma.InputJsonValue },
+      select: { preferences: true },
+    });
+    return res.json({ preferences: updated.preferences });
   })
 );
 
