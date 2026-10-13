@@ -73,6 +73,9 @@ jobs:
           script: |
             aws ecr get-login-password --region eu-north-1 | \
               docker login --username AWS --password-stdin 574667603029.dkr.ecr.eu-north-1.amazonaws.com
+            # Reclaim space before pulling: on a full disk docker pull fails and
+            # (no set -e) docker run silently falls back to the stale local image.
+            docker image prune -f
             docker pull 574667603029.dkr.ecr.eu-north-1.amazonaws.com/roundflow:qa-latest
             # Shared network + Gotenberg HTML->PDF render service (idempotent).
             docker network create roundflow 2>/dev/null || true
