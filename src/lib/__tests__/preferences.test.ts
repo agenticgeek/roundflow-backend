@@ -1,5 +1,5 @@
 import { it, expect } from "vitest";
-import { mergePreferences } from "../auth";
+import { mergePreferences } from "../preferences";
 
 it("merges, overwrites keys, and treats null/non-object existing as empty", () => {
   expect(mergePreferences(null, { a: 1 })).toEqual({ a: 1 });
