@@ -66,6 +66,16 @@
 > ⚠️ **This log skipped ~2026-07 → 2026-10 of backend build-out** (customers, rounds, visits,
 > invoicing, debt, complaints, dashboard, mobile, GHL integration, CI/CD) — treat sections
 > below as stale before this entry; the code is the source of truth.
+> **2026-10-13 (mobile):** Audited the Technician-App gaps doc and shipped the bounded gaps to
+> **dev** (`docs/Handoffs/MOBILE_GAPS_AUDIT_2026-10-13.md` + `MOBILE_GAPS_RESPONSE_2026-10-13.md`):
+> `GET /mobile/visits/:id` canStart/blockReason (shared `evaluateDebtGate`); partial-service
+> `originalPrice` + `priceAdjustmentReason` (restorable); `IssueType` +DOG_LOOSE/NO_REAR_ACCESS/
+> UNSAFE_CONDITIONS/WRONG_ADDRESS; `GET/PATCH /mobile/me` (name, dateOfBirth); `GET /mobile/company`
+> (+termsUrl/privacyUrl); `POST /mobile/support/reports` (+SupportReport); `revenueByMethod` on
+> /completions; expected/earnedRevenue on /rounds/today. Tenant migrations `20261013000000/1` +
+> public `20261013000000_profile_dob` applied + verified. Deferred (reasons in RESPONSE):
+> notifications/push (needs event producer + FCM/APNs), avatar/areaName, customer import (blocked
+> on template), chat enhancements, AI assistant, and product decisions (#4/#12/#20/#21). 205 tests.
 
 ## Project Overview
 
