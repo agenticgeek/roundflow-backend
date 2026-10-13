@@ -4,6 +4,12 @@ on:
   push:
     branches: [dev]
 
+# Serialize deploys so a later push can't be overtaken by an earlier one
+# racing to tag dev-latest / deploy to EC2 (don't cancel a deploy mid-flight).
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
 env:
   AWS_REGION: eu-north-1
   ECR_REGISTRY: 574667603029.dkr.ecr.eu-north-1.amazonaws.com

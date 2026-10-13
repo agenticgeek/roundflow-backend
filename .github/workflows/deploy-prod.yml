@@ -4,6 +4,10 @@ on:
   push:
     branches: [prod]
 
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
 env:
   AWS_REGION: eu-north-1
   ECR_REGISTRY: 574667603029.dkr.ecr.eu-north-1.amazonaws.com
