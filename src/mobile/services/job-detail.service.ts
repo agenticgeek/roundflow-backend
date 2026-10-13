@@ -3,6 +3,7 @@ import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
 import { AppError } from "../../lib/app-error";
 import type { ActivityLogEntry, OutstandingInvoice } from "../types";
 import { todayRange } from "../../lib/dates";
+import { evaluateDebtGate } from "./debt-gate";
 
 const visitDetailInclude = {
   property: {
@@ -34,6 +35,8 @@ export interface VisitDetail extends VisitDetailBase {
   activityLog: ActivityLogEntry[];
   outstandingInvoices: OutstandingInvoice[];
   debtAmount: number;
+  canStart: boolean;
+  blockReason: string | null;
 }
 
 class JobDetailService {
@@ -78,8 +81,9 @@ class JobDetailService {
       dueDate: inv.dueDate ?? null,
     }));
     const debtAmount = outstandingInvoices.reduce((s, i) => s + i.amount, 0);
+    const gate = await evaluateDebtGate(this.prisma, visit.property.customer.id);
 
-    return { ...visit, lastClean: lastVisit?.completedAt ?? null, roundPosition, activityLog, outstandingInvoices, debtAmount };
+    return { ...visit, lastClean: lastVisit?.completedAt ?? null, roundPosition, activityLog, outstandingInvoices, debtAmount, canStart: gate.canStart, blockReason: gate.blockReason };
   }
 
   async collectDebtPayment(visitId: string): Promise<{ cleared: boolean; amountPaid: number }> {

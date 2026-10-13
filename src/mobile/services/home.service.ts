@@ -1,4 +1,4 @@
-import { Prisma, VisitStatus } from "../../generated/tenant-client";
+import { PaymentMethod, Prisma, VisitStatus } from "../../generated/tenant-client";
 import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
 import type { CompletionsSummary, MobileVisitRow, RoundSummary } from "../types";
 import { todayRange } from "../../lib/dates";
@@ -72,7 +72,7 @@ class HomeService {
       where: { profileId: technicianProfileId },
       select: { id: true },
     });
-    if (!tech) return { revenueToday: 0, revenueChangePercent: null, completedCount: 0, skippedCount: 0, totalCount: 0, roundName: null, visits: [] };
+    if (!tech) return { revenueToday: 0, revenueByMethod: { cash: 0, directDebit: 0, other: 0 }, revenueChangePercent: null, completedCount: 0, skippedCount: 0, totalCount: 0, roundName: null, visits: [] };
 
     const { start, end } = todayRange();
     const visits = await this.prisma.visit.findMany({
@@ -84,6 +84,15 @@ class HomeService {
     const completed = visits.filter(v => v.status === VisitStatus.COMPLETED);
     const skipped = visits.filter(v => v.status === VisitStatus.SKIPPED);
     const revenueToday = completed.reduce((sum, v) => sum + v.price.toNumber(), 0);
+
+    // Split today's completed revenue by the visit's payment method (Cash vs Direct Debit vs other).
+    const revenueByMethod = { cash: 0, directDebit: 0, other: 0 };
+    for (const v of completed) {
+      const amt = v.price.toNumber();
+      if (v.paymentMethod === PaymentMethod.CASH) revenueByMethod.cash += amt;
+      else if (v.paymentMethod === PaymentMethod.GOCARDLESS) revenueByMethod.directDebit += amt;
+      else revenueByMethod.other += amt;
+    }
 
     const lastWeekStart = new Date(start.getTime() - 7 * 86_400_000);
     const lastWeekEnd = new Date(end.getTime() - 7 * 86_400_000);
@@ -98,6 +107,7 @@ class HomeService {
 
     return {
       revenueToday,
+      revenueByMethod,
       revenueChangePercent,
       completedCount: completed.length,
       skippedCount: skipped.length,
@@ -117,7 +127,7 @@ class HomeService {
     const { start, end } = todayRange();
     const visits = await this.prisma.visit.findMany({
       where: { technicianId: tech.id, date: { gte: start, lt: end } },
-      select: { roundId: true, date: true, status: true, round: { select: { name: true } } },
+      select: { roundId: true, date: true, status: true, price: true, round: { select: { name: true } } },
       orderBy: [{ date: "asc" }, { createdAt: "asc" }],
     });
 
@@ -125,17 +135,22 @@ class HomeService {
     for (const v of visits) {
       if (!v.roundId || !v.round) continue;
       const existing = roundMap.get(v.roundId);
+      const amt = v.price.toNumber();
+      const done = v.status === VisitStatus.COMPLETED;
       if (!existing) {
         roundMap.set(v.roundId, {
           roundId: v.roundId,
           roundName: v.round.name,
           totalCount: 1,
-          completedCount: v.status === VisitStatus.COMPLETED ? 1 : 0,
+          completedCount: done ? 1 : 0,
+          expectedRevenue: amt,
+          earnedRevenue: done ? amt : 0,
           date: v.date,
         });
       } else {
         existing.totalCount++;
-        if (v.status === VisitStatus.COMPLETED) existing.completedCount++;
+        existing.expectedRevenue += amt;
+        if (done) { existing.completedCount++; existing.earnedRevenue += amt; }
       }
     }
     return Array.from(roundMap.values());

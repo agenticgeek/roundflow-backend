@@ -140,6 +140,10 @@ enum IssueType {
   ACCESS_PROBLEM
   GATE_LOCKED
   PAYMENT_ISSUE
+  DOG_LOOSE
+  NO_REAR_ACCESS
+  UNSAFE_CONDITIONS
+  WRONG_ADDRESS
   OTHER
 }
 
@@ -209,7 +213,21 @@ model BusinessSettings {
   setupCompleted               Boolean        @default(false)
   lastClosedDate           String?        // YYYY-MM-DD; set by POST /today/close to block re-close
   preCleanReminderTimings  String[]
+  termsUrl                 String?        // mobile: Terms & Policies link
+  privacyUrl               String?        // mobile: Privacy link
   updatedAt                DateTime       @updatedAt
+}
+
+// Mobile "Report a problem" submissions. profileId = the reporting user's Profile.id.
+model SupportReport {
+  id          String   @id @default(cuid())
+  profileId   String
+  description String
+  appVersion  String?
+  device      String?
+  createdAt   DateTime @default(now())
+
+  @@index([createdAt])
 }
 
 model Customer {
@@ -376,6 +394,8 @@ model Visit {
   status        VisitStatus    @default(SCHEDULED)
   paymentHold   Boolean        @default(false)
   price         Decimal        @db.Decimal(10, 2)
+  originalPrice Decimal?       @db.Decimal(10, 2) // set when price is adjusted (partial service); null = at full price
+  priceAdjustmentReason String?                   // e.g. "Front only"
   isOneOff      Boolean        @default(false)
   serviceId     String?
   service       Service?       @relation(fields: [serviceId], references: [id])

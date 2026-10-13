@@ -31,6 +31,7 @@ export interface MobileVisitRow {
 
 export interface CompletionsSummary {
   revenueToday: number;
+  revenueByMethod: { cash: number; directDebit: number; other: number };
   revenueChangePercent: number | null;
   completedCount: number;
   skippedCount: number;
@@ -44,6 +45,8 @@ export interface RoundSummary {
   roundName: string;
   totalCount: number;
   completedCount: number;
+  expectedRevenue: number;
+  earnedRevenue: number;
   date: Date;
 }
 

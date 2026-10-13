@@ -1,8 +1,9 @@
 import { Router, Request } from "express";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
+import { prisma } from "../lib/prisma";
 import { AppError } from "../lib/app-error";
-import { asObject, h, requireString, optString, optBool } from "../lib/http";
+import { asObject, h, requireString, optString, optReqString, optBool } from "../lib/http";
 import { IssueType, PaymentMethod, PaymentStatus, VisitStatus } from "../generated/tenant-client";
 import { ALLOWED_PHOTO_MIME_TYPES, MAX_PHOTO_BYTES } from "../lib/storage.js";
 import { createHomeService } from "./services/home.service";
@@ -24,6 +25,61 @@ const detail  = (req: Request) => createJobDetailService(tp(req));
 const tracker = (req: Request) => createJobTrackerService(tp(req));
 const media   = (req: Request) => createMediaService(tp(req));
 const chat    = (req: Request) => createChatService(tp(req));
+
+// GET /mobile/me — the signed-in technician's profile basics.
+mobileRouter.get("/me", h(async (req, res) => {
+  const profile = await prisma.profile.findUnique({
+    where: { supabaseUserId: req.user!.supabaseUserId },
+    select: { name: true, dateOfBirth: true },
+  });
+  if (!profile) throw new AppError(404, "Profile not found");
+  res.json({ name: profile.name, email: req.user!.email, dateOfBirth: profile.dateOfBirth ?? null });
+}));
+
+// PATCH /mobile/me — update name / date of birth.
+mobileRouter.patch("/me", h(async (req, res) => {
+  const body = asObject(req.body);
+  const name = optReqString(body.name, "name");
+  const dateOfBirth = optString(body.dateOfBirth, "dateOfBirth");
+  if (dateOfBirth && !/^\d{4}-\d{2}-\d{2}$/.test(dateOfBirth)) {
+    throw new AppError(400, "dateOfBirth must be in YYYY-MM-DD format");
+  }
+  const updated = await prisma.profile.update({
+    where: { supabaseUserId: req.user!.supabaseUserId },
+    data: {
+      ...(name !== undefined ? { name } : {}),
+      ...(dateOfBirth !== undefined ? { dateOfBirth } : {}),
+    },
+    select: { name: true, dateOfBirth: true },
+  });
+  res.json({ name: updated.name, email: req.user!.email, dateOfBirth: updated.dateOfBirth ?? null });
+}));
+
+// GET /mobile/company — Help & Support contact details + policy links.
+mobileRouter.get("/company", h(async (req, res) => {
+  const bs = await tp(req).businessSettings.findFirst({
+    select: { businessName: true, phone: true, email: true, termsUrl: true, privacyUrl: true },
+  });
+  res.json({
+    name: bs?.businessName ?? null,
+    phone: bs?.phone ?? null,
+    email: bs?.email ?? null,
+    termsUrl: bs?.termsUrl ?? null,
+    privacyUrl: bs?.privacyUrl ?? null,
+  });
+}));
+
+// POST /mobile/support/reports — "Report a problem".
+mobileRouter.post("/support/reports", h(async (req, res) => {
+  const body = asObject(req.body);
+  const description = requireString(body.description, "description");
+  const appVersion = optString(body.appVersion, "appVersion");
+  const device = optString(body.device, "device");
+  const report = await tp(req).supportReport.create({
+    data: { profileId: req.profile!.id, description, appVersion: appVersion ?? null, device: device ?? null },
+  });
+  res.status(201).json({ id: report.id, createdAt: report.createdAt });
+}));
 
 // GET /mobile/rounds/today
 mobileRouter.get("/rounds/today", h(async (req, res) => {
@@ -71,7 +127,8 @@ mobileRouter.patch("/visits/:id/price", h(async (req, res) => {
   const body = asObject(req.body);
   const price = Number(requireString(String(body.price ?? ""), "price"));
   if (isNaN(price)) throw new AppError(400, "price must be a number");
-  await tracker(req).adjustPrice(req.params.id, price);
+  const reason = optString(body.reason, "reason");
+  await tracker(req).adjustPrice(req.params.id, price, reason ?? undefined);
   res.json({ adjusted: true });
 }));
 

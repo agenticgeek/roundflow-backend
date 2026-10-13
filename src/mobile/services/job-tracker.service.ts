@@ -1,6 +1,7 @@
-import { InvoiceStatus, IssueType, VisitStatus } from "../../generated/tenant-client";
+import { IssueType, VisitStatus } from "../../generated/tenant-client";
 import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
 import { AppError } from "../../lib/app-error";
+import { evaluateDebtGate } from "./debt-gate";
 
 class JobTrackerService {
   constructor(private readonly prisma: TenantPrismaClient) {}
@@ -15,32 +16,9 @@ class JobTrackerService {
       throw new AppError(409, `Cannot start a visit with status ${visit.status}`);
     }
 
-    const settings = await this.prisma.businessSettings.findFirst({
-      select: { debtHoldEnabled: true, debtHoldMaxInvoices: true, debtHoldMaxAmount: true },
-    });
-
-    if (settings?.debtHoldEnabled) {
-      const invoices = await this.prisma.invoice.findMany({
-        where: {
-          customerId: visit.property.customerId,
-          status: { in: [InvoiceStatus.DRAFT, InvoiceStatus.SENT] },
-        },
-        select: { amount: true },
-      });
-
-      if (invoices.length > 0) {
-        const count = invoices.length;
-        const total = invoices.reduce((s, i) => s + i.amount.toNumber(), 0);
-        const maxCount = settings.debtHoldMaxInvoices;
-        const maxAmount = settings.debtHoldMaxAmount?.toNumber() ?? null;
-
-        const blockedByCount  = maxCount  === null ? true : count  > maxCount;
-        const blockedByAmount = maxAmount === null ? true : total > maxAmount;
-
-        if (blockedByCount || blockedByAmount) {
-          throw new AppError(403, "Cannot start visit: customer has outstanding debt");
-        }
-      }
+    const gate = await evaluateDebtGate(this.prisma, visit.property.customerId);
+    if (!gate.canStart) {
+      throw new AppError(403, gate.blockReason ?? "Cannot start visit: customer has outstanding debt");
     }
 
     await this.prisma.visit.update({
@@ -76,14 +54,31 @@ class JobTrackerService {
     await this.prisma.issue.create({ data: { visitId, type: issueType, note: description } });
   }
 
-  async adjustPrice(visitId: string, price: number): Promise<void> {
+  async adjustPrice(visitId: string, price: number, reason?: string | null): Promise<void> {
     if (price < 0) throw new AppError(400, "Price cannot be negative");
-    const visit = await this.prisma.visit.findUnique({ where: { id: visitId }, select: { id: true, status: true } });
+    const visit = await this.prisma.visit.findUnique({
+      where: { id: visitId },
+      select: { status: true, price: true, originalPrice: true },
+    });
     if (!visit) throw new AppError(404, "Visit not found");
     if (visit.status !== VisitStatus.SCHEDULED && visit.status !== VisitStatus.IN_PROGRESS) {
       throw new AppError(409, `Cannot adjust price of a ${visit.status} visit`);
     }
-    await this.prisma.visit.update({ where: { id: visitId }, data: { price } });
+    const current = visit.price.toNumber();
+    // First adjustment remembers the full price; later ones keep that original.
+    const original = visit.originalPrice ? visit.originalPrice.toNumber() : current;
+    if (price === original) {
+      // Restored to the full price — clear the adjustment.
+      await this.prisma.visit.update({
+        where: { id: visitId },
+        data: { price, originalPrice: null, priceAdjustmentReason: null },
+      });
+    } else {
+      await this.prisma.visit.update({
+        where: { id: visitId },
+        data: { price, originalPrice: original, priceAdjustmentReason: reason ?? null },
+      });
+    }
   }
 }
 

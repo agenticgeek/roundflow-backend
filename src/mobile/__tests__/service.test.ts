@@ -3,6 +3,7 @@ import { createHomeService } from "../services/home.service";
 import { createJobDetailService } from "../services/job-detail.service";
 import { createJobTrackerService } from "../services/job-tracker.service";
 import { createMediaService } from "../services/media.service";
+import { evaluateDebtGate } from "../services/debt-gate";
 
 function makePrisma() {
   return {
@@ -382,4 +383,51 @@ it("getVisitDetail includes roundPosition when visit is part of a round", async 
   ]);
 
   expect((await createJobDetailService(prisma).getVisitDetail("v2")).roundPosition).toEqual({ position: 2, total: 5 });
+});
+
+// ---------------------------------------------------------------------------
+// evaluateDebtGate (shared debt-hold evaluation — canStart/blockReason + 403)
+// ---------------------------------------------------------------------------
+
+it("evaluateDebtGate allows when debt hold is disabled", async () => {
+  const prisma = makePrisma();
+  expect(await evaluateDebtGate(prisma, "c1")).toEqual({ canStart: true, blockReason: null });
+});
+
+it("evaluateDebtGate blocks when outstanding debt exceeds the limit", async () => {
+  const prisma = makePrisma();
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ debtHoldEnabled: true, debtHoldMaxInvoices: 2, debtHoldMaxAmount: { toNumber: () => 50 } });
+  (prisma.invoice.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ amount: { toNumber: () => 80 } }]);
+  const gate = await evaluateDebtGate(prisma, "c1");
+  expect(gate.canStart).toBe(false);
+  expect(gate.blockReason).toMatch(/over the allowed limit/);
+});
+
+it("evaluateDebtGate allows when debt is under the limits", async () => {
+  const prisma = makePrisma();
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ debtHoldEnabled: true, debtHoldMaxInvoices: 3, debtHoldMaxAmount: { toNumber: () => 100 } });
+  (prisma.invoice.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ amount: { toNumber: () => 20 } }]);
+  expect((await evaluateDebtGate(prisma, "c1")).canStart).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// adjustPrice (partial-service price keeps original + reason; restorable)
+// ---------------------------------------------------------------------------
+
+it("adjustPrice records the original price + reason on the first adjustment", async () => {
+  const prisma = makePrisma();
+  (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ status: "IN_PROGRESS", price: { toNumber: () => 52 }, originalPrice: null });
+  (prisma.visit.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
+  await createJobTrackerService(prisma).adjustPrice("v1", 26, "Front only");
+  const data = (prisma.visit.update as ReturnType<typeof vi.fn>).mock.calls[0][0].data;
+  expect(data).toEqual({ price: 26, originalPrice: 52, priceAdjustmentReason: "Front only" });
+});
+
+it("adjustPrice restoring to the original price clears the adjustment", async () => {
+  const prisma = makePrisma();
+  (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ status: "IN_PROGRESS", price: { toNumber: () => 26 }, originalPrice: { toNumber: () => 52 } });
+  (prisma.visit.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
+  await createJobTrackerService(prisma).adjustPrice("v1", 52);
+  const data = (prisma.visit.update as ReturnType<typeof vi.fn>).mock.calls[0][0].data;
+  expect(data).toEqual({ price: 52, originalPrice: null, priceAdjustmentReason: null });
 });
