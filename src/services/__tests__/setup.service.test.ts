@@ -23,7 +23,7 @@ function makeServiceArea(id: string) {
   return { id };
 }
 
-function makeRound(id: string, status = RoundStatus.ACTIVE) {
+function makeRound(id: string, status: RoundStatus = RoundStatus.ACTIVE) {
   return { id, status, name: "Round A", frequency: "FOUR_WEEKLY", defaultDay: null };
 }
 
