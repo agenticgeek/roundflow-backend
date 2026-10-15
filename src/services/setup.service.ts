@@ -132,6 +132,11 @@ export interface SetupPropertyResult {
   servicePlan: ServicePlan;
 }
 
+export interface BulkSetupPropertyResult {
+  created: number;
+  results: SetupPropertyResult[];
+}
+
 export interface RoundAssignmentResult {
   roundId: string;
   roundName: string;
@@ -605,6 +610,111 @@ class SetupService {
       });
       return { customer, property, servicePlan };
     });
+  }
+
+  async bulkAddSetupProperties(
+    inputs: SetupPropertyInput[]
+  ): Promise<BulkSetupPropertyResult> {
+    if (inputs.length === 0) return { created: 0, results: [] };
+
+    // Validate enums upfront across all rows
+    for (let i = 0; i < inputs.length; i++) {
+      const inp = inputs[i];
+      if (inp.propertyType && !(Object.values(PropertyType) as string[]).includes(inp.propertyType)) {
+        throw new AppError(400, `Row ${i}: Invalid propertyType: ${inp.propertyType}`);
+      }
+      if (inp.cleaningFrequency && !(Object.values(CleaningFrequency) as string[]).includes(inp.cleaningFrequency)) {
+        throw new AppError(400, `Row ${i}: Invalid cleaningFrequency: ${inp.cleaningFrequency}`);
+      }
+      if (inp.paymentMethod && !(Object.values(PaymentMethod) as string[]).includes(inp.paymentMethod)) {
+        throw new AppError(400, `Row ${i}: Invalid paymentMethod: ${inp.paymentMethod}`);
+      }
+      if (inp.price < 0) throw new AppError(400, `Row ${i}: price must be >= 0`);
+    }
+
+    // Pre-validate FK existence in bulk before touching transactions
+    const distinctAreaIds = [...new Set(inputs.map((i) => i.serviceAreaId))];
+    const foundAreas = await this.prisma.serviceArea.findMany({
+      where: { id: { in: distinctAreaIds } },
+      select: { id: true },
+    });
+    const foundAreaSet = new Set(foundAreas.map((a) => a.id));
+    const missingAreas = distinctAreaIds.filter((id) => !foundAreaSet.has(id));
+    if (missingAreas.length > 0) {
+      throw new AppError(400, `serviceAreaId not found: ${missingAreas.join(", ")}`);
+    }
+
+    const distinctRoundIds = [...new Set(inputs.map((i) => i.roundId))];
+    const foundRounds = await this.prisma.round.findMany({
+      where: { id: { in: distinctRoundIds } },
+      select: { id: true, status: true },
+    });
+    const foundRoundMap = new Map(foundRounds.map((r) => [r.id, r]));
+    const missingRounds = distinctRoundIds.filter((id) => !foundRoundMap.has(id));
+    if (missingRounds.length > 0) {
+      throw new AppError(400, `roundId not found: ${missingRounds.join(", ")}`);
+    }
+    const inactiveRounds = distinctRoundIds.filter(
+      (id) => foundRoundMap.get(id)!.status !== RoundStatus.ACTIVE
+    );
+    if (inactiveRounds.length > 0) {
+      throw new AppError(400, `roundId must reference an ACTIVE round: ${inactiveRounds.join(", ")}`);
+    }
+
+    const BATCH_SIZE = 100;
+    const allResults: SetupPropertyResult[] = [];
+
+    for (let batchStart = 0; batchStart < inputs.length; batchStart += BATCH_SIZE) {
+      const batch = inputs.slice(batchStart, batchStart + BATCH_SIZE);
+      const batchIndex = Math.floor(batchStart / BATCH_SIZE);
+
+      const batchResults = await this.prisma.$transaction(async (tx) => {
+        const results: SetupPropertyResult[] = [];
+        for (const inp of batch) {
+          const customer = await tx.customer.create({
+            data: {
+              name: inp.customerName,
+              phone: inp.phone ?? null,
+              email: inp.email ?? null,
+              paymentMethod: (inp.paymentMethod as PaymentMethod) ?? null,
+            },
+          });
+          const property = await tx.property.create({
+            data: {
+              customerId: customer.id,
+              propertyName: inp.propertyName ?? null,
+              addressLine: inp.fullAddress,
+              postcode: inp.postcode,
+              serviceAreaId: inp.serviceAreaId,
+              propertyType: (inp.propertyType as PropertyType) ?? null,
+              accessNotes: inp.accessNotes ?? null,
+              riskNotes: inp.riskNotes ?? null,
+              roundId: inp.roundId,
+            },
+          });
+          const servicePlan = await tx.servicePlan.create({
+            data: {
+              propertyId: property.id,
+              serviceId: inp.serviceId ?? null,
+              price: inp.price,
+              paymentMethod: (inp.paymentMethod as PaymentMethod) ?? null,
+              cleaningFrequency: (inp.cleaningFrequency as CleaningFrequency) ?? null,
+            },
+          });
+          results.push({ customer, property, servicePlan });
+        }
+        return results;
+      }).catch((err) => {
+        throw new AppError(
+          500,
+          `Batch ${batchIndex} (rows ${batchStart}–${batchStart + batch.length - 1}) failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      });
+
+      allResults.push(...batchResults);
+    }
+
+    return { created: allResults.length, results: allResults };
   }
 
   // ── Step 10: Assign Technicians to Rounds ───────────────────────────────

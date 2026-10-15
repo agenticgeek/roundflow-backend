@@ -223,7 +223,7 @@ export interface CustomerDetail {
     roundName: string | null;
     serviceAreaId: string | null;
   } | null;
-  servicePlan: ServicePlanView | null;
+  servicePlans: ServicePlanView[];
   standingInfo: {
     frequency: CleaningFrequency | null;
     assignedRound: string | null;
@@ -243,7 +243,7 @@ export interface CustomerDetail {
       riskNotes: string | null;
       contact: { name: string; phone: string | null; email: string | null };
     } | null;
-    servicePlan: ServicePlanView | null;
+    servicePlans: ServicePlanView[];
     visitHistory: VisitHistoryRow[];
     payments?: { rows: PaymentRow[] }; // full payment history + transaction ids — omitted for TECHNICIAN viewers
     notes: Array<PropertyNote & { authorName: string | null }>;
@@ -496,23 +496,25 @@ class CustomerService {
 
     const paymentRule = settings?.paymentRule ?? null;
 
-    const servicePlanView: ServicePlanView | null = plan
-      ? {
-          id: plan.id,
-          serviceId: plan.serviceId,
-          serviceName: plan.service?.name ?? null,
-          price: this.num(plan.price),
-          cleanMethod: plan.cleanMethod,
-          paymentMethod: plan.paymentMethod,
-          cleaningFrequency: plan.cleaningFrequency,
-          status: plan.status,
-          nextDueDate: plan.nextDueDate,
-          lastCompleted: plan.lastCompleted,
-          pauseStartDate: plan.pauseStartDate,
-          pauseEndDate: plan.pauseEndDate,
-          paymentRule,
-        }
-      : null;
+    const toServicePlanView = (p: NonNullable<typeof plan>): ServicePlanView => ({
+      id: p.id,
+      serviceId: p.serviceId,
+      serviceName: p.service?.name ?? null,
+      price: this.num(p.price),
+      cleanMethod: p.cleanMethod,
+      paymentMethod: p.paymentMethod,
+      cleaningFrequency: p.cleaningFrequency,
+      status: p.status,
+      nextDueDate: p.nextDueDate,
+      lastCompleted: p.lastCompleted,
+      pauseStartDate: p.pauseStartDate,
+      pauseEndDate: p.pauseEndDate,
+      paymentRule,
+    });
+
+    const servicePlanViews: ServicePlanView[] = property
+      ? property.servicePlans.map(toServicePlanView)
+      : [];
 
     const visits = property?.visits ?? [];
     const scheduled = visits
@@ -558,7 +560,7 @@ class CustomerService {
             serviceAreaId: property.serviceAreaId,
           }
         : null,
-      servicePlan: servicePlanView,
+      servicePlans: servicePlanViews,
       standingInfo: {
         frequency: plan?.cleaningFrequency ?? property?.round?.frequency ?? null,
         assignedRound: property?.round?.name ?? null,
@@ -580,7 +582,7 @@ class CustomerService {
               contact: { name: customer.name, phone: customer.phone, email: customer.email },
             }
           : null,
-        servicePlan: servicePlanView,
+        servicePlans: servicePlanViews,
         visitHistory: visits.slice(0, 50).map((v) => ({
           visitId: v.id,
           date: v.date,
