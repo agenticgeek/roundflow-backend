@@ -24,6 +24,7 @@ import {
   ServiceAreaInput,
   FirstRoundInput,
   SetupPropertyInput,
+  BulkSetupPropertyResult,
   RoundTechnicianAssignment,
   ActivationInput,
 } from "../services/setup.service";
@@ -334,6 +335,54 @@ setupRouter.post(
     };
 
     res.status(201).json(await svc(req).addSetupProperty(input));
+  })
+);
+
+// ---- Step 9: Bulk Import Properties --------------------------------------
+// Accepts up to 1000 properties in one call. Processes in batches of 100,
+// each batch in its own transaction. Partial commits are possible — check
+// `created` in the response if the call fails mid-import.
+
+setupRouter.post(
+  "/step/9/bulk",
+  h(async (req, res) => {
+    await svc(req).assertSetupIncomplete();
+
+    const rows = asArray<Record<string, unknown>>(req.body, "properties");
+
+    const errors: { row: number; field: string; message: string }[] = [];
+    const inputs: SetupPropertyInput[] = rows.map((body, i) => {
+      try {
+        return {
+          customerName: requireString(body.customerName, "customerName"),
+          propertyName: optString(body.propertyName, "propertyName") ?? null,
+          phone: optString(body.phone, "phone") ?? null,
+          email: optString(body.email, "email") ?? null,
+          fullAddress: requireString(body.fullAddress, "fullAddress"),
+          postcode: requireString(body.postcode, "postcode"),
+          serviceAreaId: requireString(body.serviceAreaId, "serviceAreaId"),
+          propertyType: optString(body.propertyType, "propertyType") ?? null,
+          price: assertPositive(requireNumber(body.price, "price"), "price"),
+          cleaningFrequency: optString(body.cleaningFrequency, "cleaningFrequency") ?? null,
+          paymentMethod: optString(body.paymentMethod, "paymentMethod") ?? null,
+          serviceId: optId(body.serviceId, "serviceId") ?? null,
+          accessNotes: optString(body.accessNotes, "accessNotes") ?? null,
+          riskNotes: optString(body.riskNotes, "riskNotes") ?? null,
+          roundId: requireString(body.roundId, "roundId"),
+        } satisfies SetupPropertyInput;
+      } catch (err) {
+        const e = err as AppError | Error;
+        errors.push({ row: i, field: "unknown", message: e.message });
+        return null as unknown as SetupPropertyInput;
+      }
+    });
+
+    if (errors.length > 0) {
+      throw new AppError(400, `Validation failed: ${JSON.stringify(errors)}`);
+    }
+
+    const result: BulkSetupPropertyResult = await svc(req).bulkAddSetupProperties(inputs);
+    res.status(201).json(result);
   })
 );
 
