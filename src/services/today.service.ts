@@ -2,6 +2,7 @@ import { VisitStatus, Prisma } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 import { todayRange } from "../lib/dates";
+import { getCachedBusinessSettings, invalidateCachedBusinessSettings } from "./settings.service";
 
 // ---------------------------------------------------------------------------
 // M4 — Today's Work (BE-M4-01, BE-M4-05).
@@ -106,7 +107,7 @@ class TodayService {
     const today = start.toISOString().slice(0, 10);
 
     const [settings, visits] = await Promise.all([
-      this.prisma.businessSettings.findFirst({ select: { lastClosedDate: true } }),
+      getCachedBusinessSettings(this.prisma),
       this.prisma.visit.findMany({
         where: { date: { gte: start, lt: end } },
         include: visitTodayInclude,
@@ -130,7 +131,7 @@ class TodayService {
   ): Promise<CloseDaySummary> {
     const { start, end } = todayRange();
 
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
       const today = start.toISOString().slice(0, 10);
 
       const settings = await tx.businessSettings.findFirst({
@@ -196,6 +197,13 @@ class TodayService {
         revenue: preCompleted.reduce((acc, v) => acc.add(v.price), new Prisma.Decimal(0)).toNumber(),
       };
     });
+    // Invalidate after the transaction commits (not inside the tx callback —
+    // the cache is keyed by this outer long-lived client, not the short-lived
+    // `tx` object). Without this, getTodaysWork()'s cached read of
+    // lastClosedDate can report dayClosed:false for up to the cache TTL right
+    // after a successful close.
+    invalidateCachedBusinessSettings(this.prisma);
+    return result;
   }
 
   // ---- private helpers ----

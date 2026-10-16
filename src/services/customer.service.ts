@@ -20,6 +20,7 @@ import type {
 import { UserRole } from "@prisma/client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
+import { getCachedBusinessSettings } from "./settings.service";
 
 // Human-readable labels for CleaningFrequency values — used when naming
 // auto-created rounds in the frequency-change reassignment flow (FR-FREQ-4).
@@ -316,6 +317,17 @@ class CustomerService {
     }
     if (roundId) where.properties = { some: { roundId } };
     if (status && status !== "HOLD") where.status = status as LifecycleStatus;
+    if (status === "HOLD") {
+      // HOLD is a derived filter (paymentHold lives on Visit, not Customer) —
+      // push it into `where` as a semi-join, same pattern as the paymentHolds
+      // summary count above, so it flows through the standard count+findMany path.
+      where.properties = {
+        some: {
+          ...(roundId ? { roundId } : {}),
+          visits: { some: { paymentHold: true, status: { in: OPEN_VISIT } } },
+        },
+      };
+    }
 
     // Summary KPIs are always business-wide — never filtered or paginated.
     const [totalCustomers, active, paymentHolds, dueAgg] = await Promise.all([
@@ -342,6 +354,11 @@ class CustomerService {
     ]);
 
     // Shared include for both list paths.
+    // `payments` is NOT take-limited: toRow() below reads payments[0] for the
+    // latest status but also sums every due-status payment for amountDue, so
+    // capping this would silently undercount a customer's outstanding balance.
+    // Per-customer payment counts are small — this isn't the over-fetch risk
+    // the visits/history caps elsewhere in this file were solving.
     const listInclude = {
       payments: { orderBy: { createdAt: "desc" as const } },
       properties: {
@@ -370,7 +387,12 @@ class CustomerService {
         property.servicePlans[0] ??
         null;
       const nextVisit = property.visits[0] ?? null;
-      const onHold = property.visits.some((v) => v.paymentHold);
+      // onHold reflects the customer as a whole, not just the primary/displayed
+      // property — must match the scope of the status=HOLD filter above
+      // (properties.some.visits.some), or a customer could match that filter
+      // via a secondary property while this field (and the paymentStatus badge
+      // derived from it) stays false.
+      const onHold = c.properties.some((p) => p.visits.some((v) => v.paymentHold));
       const amountDue = Number(
         c.payments
           .filter((p) => DUE_PAYMENT.includes(p.status))
@@ -397,35 +419,19 @@ class CustomerService {
       };
     };
 
-    let rows: CustomerListRow[];
-    let total: number;
-
-    if (status === "HOLD") {
-      // HOLD is a derived filter (paymentHold lives on Visit, not Customer).
-      // Must fetch all matching customers, filter in memory, then slice.
-      const all = await this.prisma.customer.findMany({
+    // DB-level pagination for every status filter, including HOLD (pushed into `where` above).
+    const [count, customers] = await Promise.all([
+      this.prisma.customer.count({ where }),
+      this.prisma.customer.findMany({
         where,
         orderBy: { createdAt: "asc" },
+        take: pageSize,
+        skip,
         include: listInclude,
-      });
-      const held = all.map(toRow).filter((r): r is CustomerListRow => r !== null && r.onHold);
-      total = held.length;
-      rows = held.slice(skip, skip + pageSize);
-    } else {
-      // DB-level pagination for all other filters.
-      const [count, customers] = await Promise.all([
-        this.prisma.customer.count({ where }),
-        this.prisma.customer.findMany({
-          where,
-          orderBy: { createdAt: "asc" },
-          take: pageSize,
-          skip,
-          include: listInclude,
-        }),
-      ]);
-      total = count;
-      rows = customers.map(toRow).filter((r): r is CustomerListRow => r !== null);
-    }
+      }),
+    ]);
+    const total = count;
+    const rows = customers.map(toRow).filter((r): r is CustomerListRow => r !== null);
 
     return {
       summary: {
@@ -467,6 +473,7 @@ class CustomerService {
               photos: { where: { type: PhotoType.PROPERTY }, orderBy: { createdAt: "desc" } },
               visits: {
                 orderBy: { date: "desc" },
+                take: 50,
                 include: {
                   round: true,
                   technician: true,
@@ -479,7 +486,7 @@ class CustomerService {
           },
         },
       }),
-      this.prisma.businessSettings.findFirst(),
+      getCachedBusinessSettings(this.prisma),
     ]);
     if (!customer) throw new AppError(404, "Customer not found");
 
@@ -516,6 +523,13 @@ class CustomerService {
       ? property.servicePlans.map(toServicePlanView)
       : [];
 
+    // Full-history issue count — NOT derived from `property.visits` below,
+    // which is capped to the 50 most recent visits for display. An issue
+    // logged against an older visit outside that cap must still count here.
+    const issuesCount = property
+      ? await this.prisma.issue.count({ where: { visit: { propertyId: property.id } } })
+      : 0;
+
     const visits = property?.visits ?? [];
     const scheduled = visits
       .filter((v) => OPEN_VISIT.includes(v.status))
@@ -533,7 +547,6 @@ class CustomerService {
         .filter((p) => p.paidAt != null)
         .map((p) => p.paidAt as Date)
         .sort((a, b) => b.getTime() - a.getTime())[0] ?? null;
-    const issuesCount = visits.reduce((n, v) => n + v.issues.length, 0);
     const technicianName =
       nextScheduled?.technician?.name ?? null;
 
@@ -583,7 +596,7 @@ class CustomerService {
             }
           : null,
         servicePlans: servicePlanViews,
-        visitHistory: visits.slice(0, 50).map((v) => ({
+        visitHistory: visits.map((v) => ({
           visitId: v.id,
           date: v.date,
           roundName: v.round?.name ?? null,
@@ -594,7 +607,7 @@ class CustomerService {
         payments: hideFinancials
           ? undefined
           : {
-              rows: visits.slice(0, 50).map((v) => ({
+              rows: visits.map((v) => ({
                 visitId: v.id,
                 visitDate: v.date,
                 technicianName: v.technician?.name ?? null,

@@ -67,6 +67,42 @@ export function parseIsoDate(v: unknown, field: string): Date {
   return d;
 }
 
+// YYYY-MM-DD, checked for calendar validity below (not just regex shape) —
+// new Date("2026-02-30") silently rolls over to March 2 instead of throwing,
+// and new Date("2026-01-00") produces an Invalid Date that NaN-compares as
+// false against any other date, silently skipping range-order guards.
+const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+/** Parse a "YYYY-MM-DD" date-only query param → UTC midnight Date, verifying
+ *  it's a real calendar date (rejects 2026-02-30, 2026-01-00, etc.), not just
+ *  the right shape. Returns undefined if `v` is undefined (field omitted). */
+export function parseOptionalDateOnly(v: unknown, field: string): Date | undefined {
+  if (v === undefined) return undefined;
+  if (typeof v !== "string") {
+    throw new AppError(400, `"${field}" must be a YYYY-MM-DD date`);
+  }
+  const match = DATE_ONLY_RE.exec(v);
+  if (!match) {
+    throw new AppError(400, `"${field}" must be a YYYY-MM-DD date`);
+  }
+  const [, yearStr, monthStr, dayStr] = match;
+  const year = Number(yearStr);
+  const month = Number(monthStr);
+  const day = Number(dayStr);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  // Date.UTC silently normalizes out-of-range components (e.g. month 13 or
+  // day 30 of a 28-day month) instead of throwing — round-trip the parts to
+  // catch it.
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day
+  ) {
+    throw new AppError(400, `"${field}" must be a valid calendar date`);
+  }
+  return date;
+}
+
 /** Optional ISO date: undefined = omitted, null = clear, else parse. */
 export function optIsoDate(v: unknown, field: string): Date | null | undefined {
   if (v === undefined) return undefined;

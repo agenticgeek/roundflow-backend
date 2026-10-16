@@ -47,7 +47,7 @@ const svc = (req: Request) => createSetupService(req.tenantPrisma!);
 // are shared via ../lib/http. Only route-local helpers live here.
 
 
-const settingsSvc = (req: Request) => createSettingsService(req.tenantPrisma!);
+const settingsSvc = (req: Request) => createSettingsService(req.tenantPrisma!, req.tenantSchemaName!);
 
 // ---- status --------------------------------------------------------------
 

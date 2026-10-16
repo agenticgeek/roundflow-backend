@@ -1,5 +1,6 @@
 import { encrypt, decrypt } from "../../lib/crypto";
 import { refreshGhlToken } from "./oauth";
+import { invalidateCachedBusinessSettings } from "../../services/settings.service";
 
 const GHL_API = "https://services.leadconnectorhq.com";
 const REFRESH_BUFFER_MS = 5 * 60 * 1000;
@@ -45,6 +46,7 @@ export async function getGhlToken(tp: TP): Promise<GhlTokenContext | null> {
           ghlTokenExpiresAt:        newExpiry,
         },
       });
+      invalidateCachedBusinessSettings(tp);
       return { accessToken: tokens.access_token, locationId: bs.ghlLocationId };
     } catch (err) {
       console.error("[ghl/api] token refresh failed — marking connection dead:", err);
@@ -56,6 +58,7 @@ export async function getGhlToken(tp: TP): Promise<GhlTokenContext | null> {
           ghlTokenExpiresAt:        null,
         },
       });
+      invalidateCachedBusinessSettings(tp);
       return null;
     }
   }

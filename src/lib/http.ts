@@ -102,3 +102,43 @@ export function optStringArray(v: unknown, field: string): string[] | undefined 
   throw new AppError(400, `"${field}" must be an array of strings.`);
 }
 
+// ---- pagination -------------------------------------------------------------
+// Shared page/pageSize parsing for list endpoints. Previously each route
+// (customers, debt board) re-derived page/pageSize with its own inline
+// Number(...) + isFinite check and its own Math.max/min clamp in the service
+// layer — none of which rejected a fractional value like "1.5", which then
+// reached Prisma's skip/take as a non-integer and surfaced as an unhandled
+// 500 instead of a clean 400.
+
+function parsePositiveIntParam(raw: unknown, field: string, fallback: number): number {
+  if (raw === undefined) return fallback;
+  if (typeof raw !== "string" || raw.trim() === "") {
+    throw new AppError(400, `"${field}" must be a positive integer.`);
+  }
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n <= 0) {
+    throw new AppError(400, `"${field}" must be a positive integer.`);
+  }
+  return n;
+}
+
+/** Parse `page`/`pageSize` from a route's `req.query`, validating both are
+ *  positive integers (not just finite numbers) and clamping pageSize to
+ *  `maxPageSize`. Returns a ready-to-use `skip` alongside the validated
+ *  page/pageSize so callers don't re-derive or re-clamp it themselves. */
+export function parsePageParams(
+  query: Record<string, unknown>,
+  opts?: { defaultPageSize?: number; maxPageSize?: number }
+): { page: number; pageSize: number; skip: number } {
+  const maxPageSize = opts?.maxPageSize ?? 100;
+  const defaultPageSize = Math.min(opts?.defaultPageSize ?? 50, maxPageSize);
+
+  const page = parsePositiveIntParam(query.page, "page", 1);
+  const pageSize = Math.min(
+    parsePositiveIntParam(query.pageSize, "pageSize", defaultPageSize),
+    maxPageSize
+  );
+
+  return { page, pageSize, skip: (page - 1) * pageSize };
+}
+

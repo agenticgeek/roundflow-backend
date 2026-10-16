@@ -70,66 +70,74 @@ export function createDashboardService(prisma: TenantPrismaClient) {
 
       const [
         jobsScheduledToday,
-        complaints,
+        severityGroups,
+        unpaidAgg,
         unpaidVisits,
-        monthlyVisits,
+        monthlyAgg,
       ] = await Promise.all([
         // Jobs scheduled for today (any non-cancelled status)
         prisma.visit.count({
           where: { date: { gte: dayStart, lt: dayEnd } },
         }),
 
-        // All open complaints (not resolved)
-        prisma.complaint.findMany({
+        // All open complaints (not resolved), bucketed by severity in SQL
+        prisma.complaint.groupBy({
+          by: ["severity"],
           where: { status: { not: "RESOLVED" } },
-          select: { severity: true },
+          _count: true,
         }),
 
-        // Visits this month that have no payment or payment is unpaid
+        // Visits this month that have no payment or payment is unpaid — summed in SQL
+        prisma.visit.aggregate({
+          _sum: { price: true },
+          where: {
+            date: { gte: monthStart, lt: monthEnd },
+            status: "COMPLETED",
+            payment: { is: null },
+          },
+        }),
+
+        // Same unpaid-visit set, but only the customerId needed for distinct-customer dedup
         prisma.visit.findMany({
           where: {
             date: { gte: monthStart, lt: monthEnd },
             status: "COMPLETED",
             payment: { is: null },
           },
-          select: { price: true, property: { select: { customerId: true } } },
+          select: { property: { select: { customerId: true } } },
         }),
 
-        // Completed visits this month for revenue
-        prisma.visit.findMany({
+        // Completed visits this month for revenue — summed in SQL
+        prisma.visit.aggregate({
+          _sum: { price: true },
           where: {
             date: { gte: monthStart, lt: monthEnd },
             status: "COMPLETED",
           },
-          select: { price: true },
         }),
       ]);
 
       const openComplaintsByPriority = { high: 0, medium: 0, low: 0 };
-      for (const c of complaints as Array<{ severity: string }>) {
-        if (c.severity === "HIGH") openComplaintsByPriority.high++;
-        else if (c.severity === "MEDIUM") openComplaintsByPriority.medium++;
-        else openComplaintsByPriority.low++;
+      let openComplaints = 0;
+      for (const row of severityGroups as Array<{ severity: string; _count: number }>) {
+        openComplaints += row._count;
+        if (row.severity === "HIGH") openComplaintsByPriority.high += row._count;
+        else if (row.severity === "MEDIUM") openComplaintsByPriority.medium += row._count;
+        else openComplaintsByPriority.low += row._count;
       }
 
-      const cleanUnpaidAmount = (unpaidVisits as Array<{ price: { toNumber(): number } }>).reduce(
-        (sum, v) => sum + v.price.toNumber(),
-        0
-      );
+      const cleanUnpaidAmount = unpaidAgg._sum.price?.toNumber() ?? 0;
       const cleanUnpaidCount = new Set(
         (unpaidVisits as Array<{ property: { customerId: string } }>).map(
           (v) => v.property.customerId
         )
       ).size;
 
-      const monthlyRevenue = (monthlyVisits as Array<{ price: { toNumber(): number } }>).reduce(
-        (sum, v) => sum + v.price.toNumber(),
-        0
-      );
+      const monthlyRevenue = monthlyAgg._sum.price?.toNumber() ?? 0;
 
       return {
         jobsScheduledToday,
-        openComplaints: complaints.length,
+        openComplaints,
         openComplaintsByPriority,
         cleanUnpaidAmount,
         cleanUnpaidCount,
@@ -174,10 +182,23 @@ export function createDashboardService(prisma: TenantPrismaClient) {
       const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - monthCount + 1, 1));
       const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
 
-      const visits = await prisma.visit.findMany({
-        where: { date: { gte: start, lt: end }, status: "COMPLETED" },
-        select: { date: true, price: true, issues: { select: { id: true } } },
-      });
+      // Two independent queries instead of one LEFT JOIN Visit→Issue: summing
+      // v.price through a one-to-many join duplicates a visit's price once
+      // per linked issue (a £100 visit with 2 issues summed as £200). Neither
+      // query here can fan out — groupBy(["date"]) never duplicates a Visit
+      // row, and querying Issue directly (not joining *into* it from Visit)
+      // naturally gives one row per issue.
+      const [visitGroups, issueRows] = await Promise.all([
+        prisma.visit.groupBy({
+          by: ["date"],
+          where: { date: { gte: start, lt: end }, status: "COMPLETED" },
+          _sum: { price: true },
+        }),
+        prisma.issue.findMany({
+          where: { visit: { date: { gte: start, lt: end }, status: "COMPLETED" } },
+          select: { visit: { select: { date: true } } },
+        }),
+      ]);
 
       // Build ordered month keys: ["2025-10", "2025-11", ...]
       const monthKeys: string[] = [];
@@ -185,14 +206,17 @@ export function createDashboardService(prisma: TenantPrismaClient) {
         const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - monthCount + 1 + i, 1));
         monthKeys.push(`${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`);
       }
+      const monthKeyOf = (d: Date) => `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
 
-      type VisitRow = { date: Date; price: { toNumber(): number }; issues: { id: string }[] };
       const valueMap = new Map<string, number>();
+      for (const g of visitGroups) {
+        const key = monthKeyOf(g.date);
+        valueMap.set(key, (valueMap.get(key) ?? 0) + (g._sum.price?.toNumber() ?? 0));
+      }
       const issueMap = new Map<string, number>();
-      for (const v of visits as VisitRow[]) {
-        const key = `${v.date.getUTCFullYear()}-${String(v.date.getUTCMonth() + 1).padStart(2, "0")}`;
-        valueMap.set(key, (valueMap.get(key) ?? 0) + v.price.toNumber());
-        issueMap.set(key, (issueMap.get(key) ?? 0) + v.issues.length);
+      for (const issue of issueRows) {
+        const key = monthKeyOf(issue.visit.date);
+        issueMap.set(key, (issueMap.get(key) ?? 0) + 1);
       }
 
       const MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -215,11 +239,25 @@ export function createDashboardService(prisma: TenantPrismaClient) {
           ? new Date(Date.UTC(now.getUTCFullYear() + 1, 0, 1))
           : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
 
-      const [technicians, visits, complaints] = await Promise.all([
+      const [technicians, visitGroups, issueRows, complaintGroups] = await Promise.all([
         prisma.technician.findMany({
           where: { active: true },
           select: { id: true, name: true },
         }),
+        // jobsCompleted / valueCompleted per technician, summed in SQL
+        prisma.visit.groupBy({
+          by: ["technicianId"],
+          where: {
+            date: { gte: start, lt: end },
+            status: "COMPLETED",
+            technicianId: { not: null },
+          },
+          _count: true,
+          _sum: { price: true },
+        }),
+        // issueCount per technician — kept as a scoped findMany (already bounded to
+        // one period's completed visits per technician, a small row count), but
+        // trimmed to drop `price` now that it's covered by the groupBy above.
         prisma.visit.findMany({
           where: {
             date: { gte: start, lt: end },
@@ -228,31 +266,40 @@ export function createDashboardService(prisma: TenantPrismaClient) {
           },
           select: {
             technicianId: true,
-            price: true,
             issues: { select: { id: true } },
           },
         }),
-        prisma.complaint.findMany({
+        prisma.complaint.groupBy({
+          by: ["technicianId"],
           where: { status: { not: "RESOLVED" }, technicianId: { not: null } },
-          select: { technicianId: true },
+          _count: true,
         }),
       ]);
 
-      type VisitRow = { technicianId: string | null; price: { toNumber(): number }; issues: { id: string }[] };
-      const statsMap = new Map<string, { jobsCompleted: number; valueCompleted: number; issueCount: number }>();
-      for (const v of visits as VisitRow[]) {
+      const statsMap = new Map<string, { jobsCompleted: number; valueCompleted: number }>();
+      for (const g of visitGroups as Array<{
+        technicianId: string | null;
+        _count: number;
+        _sum: { price: { toNumber(): number } | null };
+      }>) {
+        const tid = g.technicianId!;
+        statsMap.set(tid, {
+          jobsCompleted: g._count,
+          valueCompleted: g._sum.price?.toNumber() ?? 0,
+        });
+      }
+
+      type IssueRow = { technicianId: string | null; issues: { id: string }[] };
+      const issueMap = new Map<string, number>();
+      for (const v of issueRows as IssueRow[]) {
         const tid = v.technicianId!;
-        const entry = statsMap.get(tid) ?? { jobsCompleted: 0, valueCompleted: 0, issueCount: 0 };
-        entry.jobsCompleted++;
-        entry.valueCompleted += v.price.toNumber();
-        entry.issueCount += v.issues.length;
-        statsMap.set(tid, entry);
+        issueMap.set(tid, (issueMap.get(tid) ?? 0) + v.issues.length);
       }
 
       const complaintMap = new Map<string, number>();
-      for (const c of complaints as { technicianId: string | null }[]) {
+      for (const c of complaintGroups as Array<{ technicianId: string | null; _count: number }>) {
         const tid = c.technicianId!;
-        complaintMap.set(tid, (complaintMap.get(tid) ?? 0) + 1);
+        complaintMap.set(tid, (complaintMap.get(tid) ?? 0) + c._count);
       }
 
       return technicians.map((t) => ({
@@ -260,7 +307,7 @@ export function createDashboardService(prisma: TenantPrismaClient) {
         technicianName: t.name,
         jobsCompleted: statsMap.get(t.id)?.jobsCompleted ?? 0,
         valueCompleted: statsMap.get(t.id)?.valueCompleted ?? 0,
-        issueCount: statsMap.get(t.id)?.issueCount ?? 0,
+        issueCount: issueMap.get(t.id) ?? 0,
         openComplaints: complaintMap.get(t.id) ?? 0,
         timeOnJobMinutes: null,
         strikes: null,

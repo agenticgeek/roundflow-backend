@@ -208,11 +208,11 @@ model BusinessSettings {
   ghlLocationId                String?
   ghlAccessTokenEncrypted      String?
   ghlRefreshTokenEncrypted     String?
-  ghlTokenExpiresAt            DateTime?
+  ghlTokenExpiresAt            DateTime?      @db.Timestamptz
   ghlWebhookSecretEncrypted    String?
   setupCompleted               Boolean        @default(false)
   lastClosedDate           String?        // YYYY-MM-DD; set by POST /today/close to block re-close
-  preCleanReminderTimings  String[]
+  preCleanReminderTimings  String[]       @default([])
   termsUrl                 String?        // mobile: Terms & Policies link
   privacyUrl               String?        // mobile: Privacy link
   updatedAt                DateTime       @updatedAt
@@ -225,7 +225,7 @@ model SupportReport {
   description String
   appVersion  String?
   device      String?
-  createdAt   DateTime @default(now())
+  createdAt   DateTime @default(now()) @db.Timestamptz
 
   @@index([createdAt])
 }
@@ -253,6 +253,8 @@ model Customer {
   complaints    Complaint[]
   createdAt     DateTime        @default(now())
   updatedAt     DateTime        @updatedAt
+
+  @@index([status, createdAt])
 }
 
 model Property {
@@ -379,9 +381,9 @@ model TechnicianServiceArea {
 
 model RoundTechnician {
   roundId      String
-  round        Round      @relation(fields: [roundId], references: [id])
+  round        Round      @relation(fields: [roundId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   technicianId String
-  technician   Technician @relation(fields: [technicianId], references: [id])
+  technician   Technician @relation(fields: [technicianId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   assignedAt   DateTime   @default(now())
 
   @@id([roundId, technicianId])
@@ -401,8 +403,8 @@ model Visit {
   service       Service?       @relation(fields: [serviceId], references: [id])
   notes         String?
   skipReason    String?
-  startedAt     DateTime?
-  arrivedAt     DateTime?
+  startedAt     DateTime?      @db.Timestamptz
+  arrivedAt     DateTime?      @db.Timestamptz
   completedAt   DateTime?
   propertyId    String
   property      Property       @relation(fields: [propertyId], references: [id])
@@ -425,6 +427,9 @@ model Visit {
   @@index([roundId])
   @@index([servicePlanId])
   @@index([technicianId])
+  @@index([date, status])
+  @@index([roundId, date])
+  @@index([technicianId, date])
 }
 
 model Complaint {
@@ -449,6 +454,7 @@ model Complaint {
   @@index([customerId])
   @@index([propertyId])
   @@index([technicianId])
+  @@index([status])
 }
 
 model Issue {
@@ -484,6 +490,7 @@ model Invoice {
   updatedAt      DateTime      @updatedAt
 
   @@index([customerId])
+  @@index([status, dueDate])
 }
 
 model Payment {
@@ -504,6 +511,7 @@ model Payment {
   updatedAt    DateTime      @updatedAt
 
   @@index([customerId])
+  @@index([status])
 }
 
 model Message {
@@ -629,9 +637,9 @@ model StripeSession {
   amountTotal     Decimal?            @db.Decimal(10, 2)
   currency        String              @default("gbp")
   url             String
-  expiresAt       DateTime?
-  completedAt     DateTime?
-  createdAt       DateTime            @default(now())
+  expiresAt       DateTime?           @db.Timestamptz
+  completedAt     DateTime?           @db.Timestamptz
+  createdAt       DateTime            @default(now()) @db.Timestamptz
 
   @@index([customerId])
   @@index([invoiceId])
@@ -650,7 +658,7 @@ model ChatMessage {
   type            String   @default("TEXT") // TEXT | WORK_PHOTOS | PHOTOS
   visitId         String?
   photoUrls       String[] @default([]) // image URLs for type = PHOTOS
-  createdAt       DateTime @default(now())
+  createdAt       DateTime @default(now()) @db.Timestamptz
 
   @@index([roundId, createdAt])
   @@index([senderProfileId])
@@ -663,7 +671,7 @@ model Device {
   profileId String
   pushToken String   @unique
   platform  String   // "ios" | "android"
-  createdAt DateTime @default(now())
+  createdAt DateTime @default(now()) @db.Timestamptz
 
   @@index([profileId])
 }
@@ -676,7 +684,7 @@ model Notification {
   title     String
   body      String?
   read      Boolean  @default(false)
-  createdAt DateTime @default(now())
+  createdAt DateTime @default(now()) @db.Timestamptz
 
   @@index([profileId, read])
   @@index([profileId, createdAt])
@@ -692,6 +700,8 @@ model IntegrationOutbox {
   lastError   String?
   createdAt   DateTime @default(now())
   processedAt DateTime?
+
+  @@index([status, createdAt])
 }
 
 // Inbound webhook dedup — insert before processing; unique constraint rejects replays.
@@ -699,7 +709,7 @@ model WebhookEvent {
   id         String   @id @default(cuid())
   source     String   // "stripe" | "ghl"
   externalId String   // Stripe event ID or GHL event ID
-  receivedAt DateTime @default(now())
+  receivedAt DateTime @default(now()) @db.Timestamptz
 
   @@unique([source, externalId])
 }
