@@ -18,6 +18,11 @@ const mockSetupSvc = {
   getBusinessProfile: vi.fn().mockResolvedValue({}),
   saveBusinessProfile: vi.fn().mockResolvedValue({}),
   getSetupStatus: vi.fn().mockResolvedValue({}),
+  getStatus: vi.fn().mockResolvedValue({
+    setupCompleted: false,
+    allRequiredComplete: false,
+    steps: [{ step: 1, complete: false, deferred: false }],
+  }),
   getServices: vi.fn().mockResolvedValue([]),
   saveServices: vi.fn().mockResolvedValue([]),
   getMessageTemplates: vi.fn().mockResolvedValue([]),
@@ -81,6 +86,20 @@ const validRow = {
   roundId: "round1",
   price: 35,
 };
+
+// Smoke test for the getStatus() perf refactor (query batching + settings
+// memoization lives inside the service, which is mocked here) — this just
+// guards against a route-level regression breaking the response shape.
+it("GET /setup/status returns 200 with the expected shape", async () => {
+  const app = makeApp();
+  const res = await request(app).get("/setup/status");
+  expect(res.status).toBe(200);
+  expect(res.body).toMatchObject({
+    setupCompleted: expect.any(Boolean),
+    allRequiredComplete: expect.any(Boolean),
+    steps: expect.any(Array),
+  });
+});
 
 it("POST /setup/step/9/bulk with valid body returns 201 and created count", async () => {
   mockSetupSvc.bulkAddSetupProperties.mockResolvedValue(mockBulkResult);
