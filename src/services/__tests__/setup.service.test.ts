@@ -5,16 +5,22 @@ import { RoundStatus } from "../../generated/tenant-client";
 function makePrisma() {
   return {
     businessSettings: { findFirst: vi.fn(), findMany: vi.fn(), upsert: vi.fn() },
-    service: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn() },
-    messageTemplate: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn() },
-    technician: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn() },
-    serviceArea: { findMany: vi.fn(), findUnique: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn() },
-    round: { findMany: vi.fn(), findUnique: vi.fn(), create: vi.fn(), update: vi.fn() },
+    service: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
+    messageTemplate: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
+    technician: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
+    serviceArea: { findMany: vi.fn(), findUnique: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
+    round: {
+      findMany: vi.fn().mockResolvedValue([]),
+      findUnique: vi.fn(),
+      create: vi.fn(),
+      update: vi.fn(),
+      count: vi.fn().mockResolvedValue(0),
+    },
     roundTechnician: { deleteMany: vi.fn(), createMany: vi.fn() },
     customer: { findMany: vi.fn(), create: vi.fn() },
-    property: { findMany: vi.fn(), create: vi.fn() },
+    property: { findMany: vi.fn(), create: vi.fn(), count: vi.fn().mockResolvedValue(0) },
     servicePlan: { findMany: vi.fn(), create: vi.fn() },
-    visit: { findMany: vi.fn(), createMany: vi.fn() },
+    visit: { findMany: vi.fn(), createMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
     $transaction: vi.fn((cb: any) => cb(makePrisma())),
   } as unknown as Parameters<typeof createSetupService>[0];
 }
@@ -137,4 +143,101 @@ it("bulkAddSetupProperties: invalid propertyType throws 400 before FK checks", a
   ).rejects.toMatchObject({ statusCode: 400, message: expect.stringContaining("propertyType") });
 
   expect(prisma.serviceArea.findMany).not.toHaveBeenCalled();
+});
+
+// ── getStatus: step 10 "all active rounds assigned" ────────────────────────
+// These also guard the perf refactor that folded round.findMany into the
+// getStatus() Promise.all — round.findMany must still be called exactly
+// once and allRoundsAssigned must still be computed correctly.
+
+it("getStatus: no active rounds → step 10 incomplete, round.findMany called once", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+  const status = await createSetupService(prisma).getStatus();
+
+  expect(status.steps.find((s) => s.step === 10)?.complete).toBe(false);
+  expect(prisma.round.findMany).toHaveBeenCalledTimes(1);
+});
+
+it("getStatus: active round with no technicians → step 10 incomplete", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    { id: "round1", roundTechnicians: [] },
+  ]);
+
+  const status = await createSetupService(prisma).getStatus();
+
+  expect(status.steps.find((s) => s.step === 10)?.complete).toBe(false);
+  expect(prisma.round.findMany).toHaveBeenCalledTimes(1);
+});
+
+it("getStatus: every active round has ≥1 technician → step 10 complete", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    { id: "round1", roundTechnicians: [{ technicianId: "t1" }] },
+    { id: "round2", roundTechnicians: [{ technicianId: "t2" }] },
+  ]);
+
+  const status = await createSetupService(prisma).getStatus();
+
+  expect(status.steps.find((s) => s.step === 10)?.complete).toBe(true);
+  expect(prisma.round.findMany).toHaveBeenCalledTimes(1);
+});
+
+// ── getSettings() memoization & upsertSettings() cache refresh ─────────────
+// A SetupService instance is created fresh per request (createSetupService),
+// so these assert request-scoped behavior, not cross-request caching.
+
+it("getSettings is memoized within one service instance: assertSetupIncomplete then a read hits the DB only once", async () => {
+  const prisma = makePrisma();
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+    uniqueId: "singleton",
+    setupCompleted: false,
+    businessName: "Acme Cleaning",
+  });
+
+  const svc = createSetupService(prisma);
+  await svc.assertSetupIncomplete();
+  const settings = await svc.getBusinessSettings();
+
+  expect(settings?.businessName).toBe("Acme Cleaning");
+  expect(prisma.businessSettings.findFirst).toHaveBeenCalledTimes(1);
+});
+
+it("a new service instance does not share the memoized settings of a prior instance", async () => {
+  const prisma = makePrisma();
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+    uniqueId: "singleton",
+    setupCompleted: false,
+  });
+
+  await createSetupService(prisma).getBusinessSettings();
+  await createSetupService(prisma).getBusinessSettings();
+
+  expect(prisma.businessSettings.findFirst).toHaveBeenCalledTimes(2);
+});
+
+it("saveBusinessProfile refreshes the memo: a subsequent read in the same request reflects the write without re-querying", async () => {
+  const prisma = makePrisma();
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+    uniqueId: "singleton",
+    setupCompleted: false,
+    businessName: null,
+  });
+  (prisma.businessSettings.upsert as ReturnType<typeof vi.fn>).mockResolvedValue({
+    uniqueId: "singleton",
+    setupCompleted: false,
+    businessName: "Acme Cleaning",
+  });
+
+  const svc = createSetupService(prisma);
+  await svc.getBusinessSettings(); // primes the memo with businessName: null
+  await svc.saveBusinessProfile({ businessName: "Acme Cleaning" });
+  const settings = await svc.getBusinessSettings();
+
+  expect(settings?.businessName).toBe("Acme Cleaning");
+  // One priming read + one post-write read that must be served from the
+  // refreshed memo, not a second findFirst.
+  expect(prisma.businessSettings.findFirst).toHaveBeenCalledTimes(1);
 });

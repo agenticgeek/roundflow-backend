@@ -194,8 +194,31 @@ export interface ActivationResult {
 class SetupService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
+  // Memoized for the lifetime of this request-scoped instance (one
+  // SetupService is created per request via createSetupService — see
+  // routes/setup.ts). Avoids re-fetching the singleton when a step handler
+  // calls assertSetupIncomplete() and then reads/writes settings again.
+  // Writes go through upsertSettings(), which refreshes this cache from the
+  // upsert's own return value rather than invalidating it, so no extra read
+  // is needed within the same request.
+  private settingsCache: BusinessSettings | null | undefined = undefined;
+
   private async getSettings(): Promise<BusinessSettings | null> {
-    return this.prisma.businessSettings.findFirst();
+    if (this.settingsCache !== undefined) return this.settingsCache;
+    this.settingsCache = await this.prisma.businessSettings.findFirst();
+    return this.settingsCache;
+  }
+
+  private async upsertSettings(
+    data: TenantPrisma.BusinessSettingsUpsertArgs["create"]
+  ): Promise<BusinessSettings> {
+    const result = await this.prisma.businessSettings.upsert({
+      where: { uniqueId: "singleton" },
+      update: data,
+      create: { ...data },
+    });
+    this.settingsCache = result;
+    return result;
   }
 
   async getStatus(): Promise<SetupStatus> {
@@ -208,6 +231,7 @@ class SetupService {
       setupPropertyCount,
       visitCount,
       messageTemplateCount,
+      activeRounds,
     ] = await Promise.all([
       this.getSettings(),
       this.prisma.service.count(),
@@ -217,13 +241,13 @@ class SetupService {
       this.prisma.property.count({ where: { roundId: { not: null } } }),
       this.prisma.visit.count({ where: { status: VisitStatus.SCHEDULED } }),
       this.prisma.messageTemplate.count(),
+      // Step 10: all ACTIVE rounds must have ≥1 technician assigned.
+      this.prisma.round.findMany({
+        where: { status: RoundStatus.ACTIVE },
+        include: { roundTechnicians: { select: { technicianId: true } } },
+      }),
     ]);
 
-    // Step 10: all ACTIVE rounds must have ≥1 technician assigned.
-    const activeRounds = await this.prisma.round.findMany({
-      where: { status: RoundStatus.ACTIVE },
-      include: { roundTechnicians: { select: { technicianId: true } } },
-    });
     const allRoundsAssigned =
       activeRounds.length > 0 &&
       activeRounds.every((r) => r.roundTechnicians.length > 0);
@@ -287,11 +311,7 @@ class SetupService {
         `Setup cannot be completed — required steps incomplete: ${missing.join(", ")}`
       );
     }
-    await this.prisma.businessSettings.upsert({
-      where: { uniqueId: "singleton" },
-      update: { setupCompleted: true },
-      create: { setupCompleted: true },
-    });
+    await this.upsertSettings({ setupCompleted: true });
   }
 
   async saveBusinessProfile(
@@ -315,11 +335,7 @@ class SetupService {
       currency: input.currency,
       bankDetails,
     };
-    return this.prisma.businessSettings.upsert({
-      where: { uniqueId: "singleton" },
-      update: data,
-      create: { ...data },
-    });
+    return this.upsertSettings(data);
   }
 
   async getBusinessSettings(): Promise<BusinessSettings | null> {
@@ -367,11 +383,7 @@ class SetupService {
       defaultCycleLength: input.defaultCycleLength,
       defaultWorkingDays: input.defaultWorkingDays,
     };
-    return this.prisma.businessSettings.upsert({
-      where: { uniqueId: "singleton" },
-      update: data,
-      create: { ...data },
-    });
+    return this.upsertSettings(data);
   }
 
   async getPaymentSetup(): Promise<BusinessSettings | null> {
@@ -390,11 +402,7 @@ class SetupService {
       gocardlessConnected: input.gocardlessConnected,
       stripeConnected: input.stripeConnected,
     };
-    return this.prisma.businessSettings.upsert({
-      where: { uniqueId: "singleton" },
-      update: data,
-      create: { ...data },
-    });
+    return this.upsertSettings(data);
   }
 
   async getTechnicians(): Promise<Technician[]> {
