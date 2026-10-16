@@ -115,3 +115,26 @@ it("profile cache TTL is configured to 30s, bounding role-change staleness", asy
   expect(lruCtorCalls).toHaveLength(1);
   expect(lruCtorCalls[0]).toMatchObject({ ttl: 30_000 });
 });
+
+it("sets req.tenantSchemaName alongside req.tenantPrisma from profile.tenant.schemaName", async () => {
+  findUnique.mockResolvedValue(PROFILE);
+  const requireTenantAccess = await freshMiddleware();
+
+  const req = makeReq("user1");
+  await requireTenantAccess(req, makeRes(), vi.fn() as unknown as NextFunction);
+
+  expect(req.tenantSchemaName).toBe("t_abc");
+  expect(req.tenantPrisma).toBeDefined();
+});
+
+it("sets req.tenantSchemaName correctly from a cached profile too (2nd request, cache hit)", async () => {
+  findUnique.mockResolvedValue(PROFILE);
+  const requireTenantAccess = await freshMiddleware();
+
+  await requireTenantAccess(makeReq("user1"), makeRes(), vi.fn() as unknown as NextFunction);
+  const req2 = makeReq("user1");
+  await requireTenantAccess(req2, makeRes(), vi.fn() as unknown as NextFunction);
+
+  expect(req2.tenantSchemaName).toBe("t_abc");
+  expect(findUnique).toHaveBeenCalledTimes(1);
+});

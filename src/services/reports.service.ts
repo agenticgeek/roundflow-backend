@@ -60,17 +60,52 @@ export function createReportsService(prisma: TenantPrismaClient) {
     },
     getTechnicians: async (period: string) => {
       const range = periodRange(period as Period);
-      const visits = await prisma.visit.findMany({
+      // One grouped row per (technicianId, status) combination within the period,
+      // with counts/sum computed in SQL instead of a full-row findMany + JS reduce.
+      const groups = await prisma.visit.groupBy({
+        by: ["technicianId", "status"],
         where: { date: range, technicianId: { not: null } },
-        select: { technicianId: true, status: true, price: true, technician: { select: { id: true, name: true, email: true } } },
+        _count: true,
+        _sum: { price: true },
       });
+
+      const technicianIds = Array.from(
+        new Set(
+          (groups as Array<{ technicianId: string | null }>)
+            .map((g) => g.technicianId)
+            .filter((id): id is string => !!id)
+        )
+      );
+      const technicians = technicianIds.length > 0
+        ? await prisma.technician.findMany({
+            where: { id: { in: technicianIds } },
+            select: { id: true, name: true, email: true },
+          })
+        : [];
+      const techInfo = new Map(technicians.map((t) => [t.id, t]));
+
       const map = new Map<string, { name: string | null; email: string | null; completed: number; skipped: number; revenue: number }>();
-      for (const v of visits) {
-        if (!v.technicianId) continue;
-        const existing = map.get(v.technicianId) ?? { name: v.technician?.name ?? null, email: v.technician?.email ?? null, completed: 0, skipped: 0, revenue: 0 };
-        if (v.status === "COMPLETED") { existing.completed++; existing.revenue += v.price.toNumber(); }
-        if (v.status === "SKIPPED") existing.skipped++;
-        map.set(v.technicianId, existing);
+      for (const g of groups as Array<{
+        technicianId: string | null;
+        status: string;
+        _count: number;
+        _sum: { price: { toNumber(): number } | null };
+      }>) {
+        if (!g.technicianId) continue;
+        const info = techInfo.get(g.technicianId);
+        const existing = map.get(g.technicianId) ?? {
+          name: info?.name ?? null,
+          email: info?.email ?? null,
+          completed: 0,
+          skipped: 0,
+          revenue: 0,
+        };
+        if (g.status === "COMPLETED") {
+          existing.completed += g._count;
+          existing.revenue += g._sum.price?.toNumber() ?? 0;
+        }
+        if (g.status === "SKIPPED") existing.skipped += g._count;
+        map.set(g.technicianId, existing);
       }
       return Array.from(map.entries()).map(([id, s]) => ({
         technicianId: id,
@@ -84,37 +119,46 @@ export function createReportsService(prisma: TenantPrismaClient) {
     },
     getRevenue: async (period: string) => {
       const range = periodRange(period as Period);
-      const visits = await prisma.visit.findMany({
-        where: { date: range, status: "COMPLETED" },
-        select: { date: true, price: true },
-        orderBy: { date: "asc" },
-      });
-      // Group by date string (daily granularity for now)
-      const map = new Map<string, number>();
-      for (const v of visits) {
-        const key = (v.date as Date).toISOString().slice(0, 10);
-        map.set(key, (map.get(key) ?? 0) + v.price.toNumber());
-      }
-      return Array.from(map.entries()).map(([date, amount]) => ({ date, amount }));
+      // Daily-granularity grouping requires date truncation, which Prisma's groupBy
+      // can't do — use raw SQL (Visit.date is "timestamp(3) without time zone", so
+      // date_trunc('day', ...) truncates the same UTC wall-clock value the old JS
+      // code bucketed via date.toISOString().slice(0, 10)).
+      const rows = await prisma.$queryRaw<{ day: Date; amount: unknown }[]>`
+        SELECT date_trunc('day', "date") AS day,
+               COALESCE(SUM("price"), 0) AS amount
+        FROM "Visit"
+        WHERE "date" >= ${range.gte} AND "date" <= ${range.lte} AND "status" = 'COMPLETED'
+        GROUP BY 1 ORDER BY 1
+      `;
+      return rows.map((r) => ({
+        date: new Date(r.day).toISOString().slice(0, 10),
+        amount: Number(r.amount),
+      }));
     },
     getSummary: async (period: string) => {
       const range = periodRange(period as Period);
-      const [visits, sentInvoices] = await Promise.all([
-        prisma.visit.findMany({
-          where: { date: range },
-          select: { price: true, status: true, roundId: true },
+      const [visitAgg, roundGroups, invoiceAgg] = await Promise.all([
+        prisma.visit.aggregate({
+          _count: true,
+          _sum: { price: true },
+          where: { date: range, status: "COMPLETED" },
         }),
-        prisma.invoice.findMany({
+        // completedRounds is a distinct-round count, not a sum — groupBy + length
+        prisma.visit.groupBy({
+          by: ["roundId"],
+          where: { date: range, status: "COMPLETED", roundId: { not: null } },
+        }),
+        prisma.invoice.aggregate({
+          _sum: { amount: true },
           where: { status: "SENT" },
-          select: { amount: true },
         }),
       ]);
-      const completed = visits.filter((v) => v.status === "COMPLETED");
-      const totalRevenue = completed.reduce((s, v) => s + v.price.toNumber(), 0);
-      const completedVisits = completed.length;
-      const completedRounds = new Set(completed.map((v) => v.roundId).filter(Boolean)).size;
-      const undonePayments = sentInvoices.reduce((s, i) => s + i.amount.toNumber(), 0);
-      return { totalRevenue, completedVisits, completedRounds, undonePayments };
+      return {
+        totalRevenue: visitAgg._sum.price?.toNumber() ?? 0,
+        completedVisits: visitAgg._count as unknown as number,
+        completedRounds: roundGroups.length,
+        undonePayments: invoiceAgg._sum.amount?.toNumber() ?? 0,
+      };
     },
   };
 }

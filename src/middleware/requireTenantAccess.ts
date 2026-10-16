@@ -9,6 +9,7 @@ declare global {
   namespace Express {
     interface Request {
       tenantPrisma?: TenantPrismaClient;
+      tenantSchemaName?: string;
     }
   }
 }
@@ -67,6 +68,7 @@ export async function requireTenantAccess(
       profileCache.set(supabaseUserId, profile);
     }
     req.profile = profile;
+    req.tenantSchemaName = profile.tenant.schemaName;
     req.tenantPrisma = getTenantPrismaForSchema(profile.tenant.schemaName);
     next();
   } catch (err) {

@@ -1,6 +1,7 @@
 import { Prisma } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
+import { getCachedBusinessSettings } from "./settings.service";
 
 // ---------------------------------------------------------------------------
 // M6 — Invoicing (BE-M6-04).
@@ -183,9 +184,7 @@ class InvoiceService {
     const visit = invoice.visit;
     if (!visit) throw new AppError(409, "Invoice has no linked visit to render");
 
-    const settings = await this.prisma.businessSettings.findFirst({
-      select: { businessName: true, email: true, vatInInvoices: true, currency: true },
-    });
+    const settings = await getCachedBusinessSettings(this.prisma);
 
     const total = invoice.amount.toNumber();
     const vatAmount = settings?.vatInInvoices ? +(total - total / 1.2).toFixed(2) : 0;
@@ -231,9 +230,7 @@ class InvoiceService {
     if (visit.invoice) throw new AppError(409, "Visit already has an invoice");
 
     const [settings, invoiceNumber] = await Promise.all([
-      this.prisma.businessSettings.findFirst({
-        select: { businessName: true, email: true, vatInInvoices: true, vatRegistered: true, currency: true },
-      }),
+      getCachedBusinessSettings(this.prisma),
       nextInvoiceNumber(this.prisma),
     ]);
 
@@ -272,9 +269,7 @@ class InvoiceService {
     if (visit.invoice) throw new AppError(409, "Visit already has an invoice");
 
     const [settings, invoiceNumber] = await Promise.all([
-      this.prisma.businessSettings.findFirst({
-        select: { businessName: true, email: true, vatInInvoices: true, vatRegistered: true, currency: true },
-      }),
+      getCachedBusinessSettings(this.prisma),
       nextInvoiceNumber(this.prisma),
     ]);
 

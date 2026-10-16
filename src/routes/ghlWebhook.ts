@@ -4,6 +4,7 @@ import { prisma } from "../lib/prisma";
 import { getTenantPrismaForSchema } from "../lib/tenant-prisma-manager";
 import { decrypt } from "../lib/crypto";
 import { MessageChannel, MessageDirection } from "../generated/tenant-client";
+import { invalidateCachedBusinessSettings } from "../services/settings.service";
 
 export const ghlWebhookRouter = Router();
 
@@ -119,6 +120,7 @@ async function processEvent(schemaName: string, event: GhlEvent, eventId?: strin
         ghlWebhookSecretEncrypted:   null,
       },
     });
+    invalidateCachedBusinessSettings(tp);
     await prisma.tenant.updateMany({
       where: { schemaName },
       data: { ghlLocationId: null },

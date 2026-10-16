@@ -356,6 +356,82 @@ class RoundService {
     );
   }
 
+  // ---- planner — batched occurrence list across multiple rounds ----
+  // Batch call: unlike listOccurrences(), does NOT 404 on a missing/unknown
+  // roundId — a round with no matching visits simply gets an empty array,
+  // so callers can pass IDs from a stale list without the whole call failing.
+
+  async listOccurrencesForRounds(
+    roundIds: string[],
+    from?: Date,
+    to?: Date
+  ): Promise<{ roundId: string; occurrences: OccurrenceSummary[] }[]> {
+    if (from && to && from > to) {
+      throw new AppError(400, '"from" must be before "to"');
+    }
+    // Cap to 90 days to prevent unbounded full-table scans.
+    const MAX_RANGE_MS = 90 * 24 * 60 * 60 * 1000;
+    if (from && to && to.getTime() - from.getTime() > MAX_RANGE_MS) {
+      throw new AppError(400, "Date range must not exceed 90 days");
+    }
+    // Require at least one bound so callers can't scan all visits.
+    if (!from && !to) {
+      throw new AppError(400, "At least one of \"from\" or \"to\" is required");
+    }
+
+    const visits = await this.prisma.visit.findMany({
+      where: {
+        roundId: { in: roundIds },
+        date: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) },
+      },
+      select: {
+        roundId: true,
+        date: true,
+        status: true,
+        paymentHold: true,
+        price: true,
+        _count: { select: { issues: true } },
+      },
+      orderBy: { date: "asc" },
+    });
+
+    // Group visits by roundId, then by UTC date string within each round.
+    const byRound = new Map<string, Map<string, typeof visits>>();
+    for (const v of visits) {
+      // where.roundId: { in: roundIds } guarantees this is one of the
+      // (non-null) requested IDs; the field is nullable in the schema so TS
+      // still sees string | null here.
+      if (v.roundId === null) continue;
+      let byDate = byRound.get(v.roundId);
+      if (!byDate) {
+        byDate = new Map();
+        byRound.set(v.roundId, byDate);
+      }
+      const key = v.date.toISOString().slice(0, 10);
+      let bucket = byDate.get(key);
+      if (!bucket) {
+        bucket = [];
+        byDate.set(key, bucket);
+      }
+      bucket.push(v);
+    }
+
+    return roundIds.map((roundId) => {
+      const byDate = byRound.get(roundId);
+      const occurrences = byDate
+        ? Array.from(byDate.entries()).map(([date, vs]) =>
+            this.aggregateStats(date, vs.length, {
+              completedCount: vs.filter((v) => v.status === VisitStatus.COMPLETED).length,
+              totalValue: vs.reduce((acc, v) => acc + v.price.toNumber(), 0),
+              holdCount: vs.filter((v) => v.paymentHold).length,
+              issueCount: vs.reduce((acc, v) => acc + v._count.issues, 0),
+            })
+          )
+        : [];
+      return { roundId, occurrences };
+    });
+  }
+
   // ---- planner — single occurrence (list/map view) ----
 
   async getOccurrence(

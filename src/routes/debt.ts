@@ -9,6 +9,7 @@ import { getStripeClient } from "../integrations/stripe/client";
 import { createOneTimeSession } from "../integrations/stripe/checkout";
 import { StripeSessionType } from "../generated/tenant-client";
 import { queueGhlEvent } from "../integrations/ghl/sync";
+import { parsePageParams } from "../lib/http";
 
 export const debtRouter = Router();
 debtRouter.use(requireAuth);
@@ -23,12 +24,16 @@ debtRouter.get("/kpis", h(async (req, res) => {
   return res.json(kpis);
 }));
 
-// GET /debt/board?bucket=&roundId=&paymentMethod=
+// GET /debt/board?bucket=&roundId=&paymentMethod=&page=&pageSize=
 debtRouter.get("/board", h(async (req, res) => {
   const { bucket, roundId, paymentMethod } = req.query as Record<string, string | undefined>;
   if (!bucket) return res.status(400).json({ error: "bucket query param is required" });
-  const items = await svc(req).getBoard(bucket, roundId, paymentMethod);
-  return res.json(items);
+  const { page, pageSize } = parsePageParams(req.query as Record<string, unknown>, {
+    defaultPageSize: 50,
+    maxPageSize: 100,
+  });
+  const result = await svc(req).getBoard(bucket, roundId, paymentMethod, page, pageSize);
+  return res.json(result);
 }));
 
 // POST /debt/:id/remind

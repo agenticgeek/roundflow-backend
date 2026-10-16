@@ -13,6 +13,7 @@ import {
   optReqString,
   optReqNumber,
   optId,
+  parsePageParams,
 } from "../lib/http";
 import { assertPositive, optPaymentMethod, optPropertyType, optIsoDate } from "../lib/validation";
 import { createInvoiceService } from "../services/invoice.service";
@@ -72,12 +73,13 @@ customersRouter.get(
         throw new AppError(400, `status must be one of: ${VALID_STATUSES.join(", ")}`);
       }
     }
-    const pageRaw = Number(req.query.page);
-    const pageSizeRaw = Number(req.query.pageSize);
+    const { page, pageSize } = parsePageParams(req.query as Record<string, unknown>, {
+      defaultPageSize: 50,
+      maxPageSize: 100,
+    });
     res.json(
       await svc(req).getCustomers(
         {
-        
           search: (() => {
             const s = typeof req.query.search === "string" ? req.query.search : undefined;
             if (s !== undefined && s.includes("\0")) throw new AppError(400, "search must not contain null bytes");
@@ -85,8 +87,8 @@ customersRouter.get(
           })(),
           roundId: typeof req.query.roundId === "string" ? req.query.roundId : undefined,
           status: rawStatus as string | undefined,
-          page: Number.isFinite(pageRaw) && pageRaw > 0 ? pageRaw : undefined,
-          pageSize: Number.isFinite(pageSizeRaw) && pageSizeRaw > 0 ? pageSizeRaw : undefined,
+          page,
+          pageSize,
         },
         req.profile!.role
       )

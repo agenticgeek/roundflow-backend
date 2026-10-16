@@ -18,7 +18,7 @@ import {
   PushMissedInput,
 } from "../services/round.service";
 import { createReportsService } from "../services/reports.service";
-import { parseIsoDate } from "../lib/validation";
+import { parseIsoDate, parseOptionalDateOnly } from "../lib/validation";
 
 export const roundsRouter = Router();
 roundsRouter.use(requireAuth);
@@ -58,6 +58,37 @@ roundsRouter.post(
       description: optString(body.description, "description"),
     };
     res.status(201).json(await svc(req).createRound(input));
+  })
+);
+
+// ==========================================================================
+// GET /rounds/planner/occurrences — batched calendar view across multiple
+//   rounds in one call: ?roundIds=a,b,c&from=YYYY-MM-DD&to=YYYY-MM-DD
+//   Registered before "/:id" routes so this two-segment path can never be
+//   shadowed by a single-segment ":id" param route (not actually ambiguous
+//   here since "/:id" only matches one path segment, but kept explicit).
+// ==========================================================================
+roundsRouter.get(
+  "/planner/occurrences",
+  h(async (req, res) => {
+    const rawRoundIds = req.query.roundIds;
+    if (typeof rawRoundIds !== "string" || rawRoundIds.trim() === "") {
+      throw new AppError(400, '"roundIds" is required and must be a comma-separated list of round IDs');
+    }
+    const roundIds = rawRoundIds
+      .split(",")
+      .map((id) => id.trim())
+      .filter((id) => id.length > 0);
+    if (roundIds.length === 0) {
+      throw new AppError(400, '"roundIds" is required and must be a comma-separated list of round IDs');
+    }
+    if (roundIds.length > 50) {
+      throw new AppError(400, '"roundIds" must not contain more than 50 round IDs');
+    }
+
+    const from = parseOptionalDateOnly(req.query.from, "from");
+    const to = parseOptionalDateOnly(req.query.to, "to");
+    res.json(await svc(req).listOccurrencesForRounds(roundIds, from, to));
   })
 );
 
@@ -104,21 +135,8 @@ roundsRouter.patch(
 roundsRouter.get(
   "/:id/planner/occurrences",
   h(async (req, res) => {
-    const dateOnly = /^\d{4}-\d{2}-\d{2}$/;
-    const rawFrom = req.query.from;
-    const rawTo = req.query.to;
-    if (rawFrom !== undefined && (typeof rawFrom !== "string" || !dateOnly.test(rawFrom))) {
-      throw new AppError(400, '"from" must be a YYYY-MM-DD date');
-    }
-    if (rawTo !== undefined && (typeof rawTo !== "string" || !dateOnly.test(rawTo))) {
-      throw new AppError(400, '"to" must be a YYYY-MM-DD date');
-    }
-    // After the guards above rawFrom/rawTo are guaranteed strings (or undefined).
-    const fromStr = rawFrom as string | undefined;
-    const toStr = rawTo as string | undefined;
-    // Visits are stored as midnight UTC timestamps; lte: midnight of 'to' is inclusive for that day.
-    const from = fromStr ? new Date(`${fromStr}T00:00:00.000Z`) : undefined;
-    const to = toStr ? new Date(`${toStr}T00:00:00.000Z`) : undefined;
+    const from = parseOptionalDateOnly(req.query.from, "from");
+    const to = parseOptionalDateOnly(req.query.to, "to");
     res.json(await svc(req).listOccurrences(req.params.id, from, to));
   })
 );

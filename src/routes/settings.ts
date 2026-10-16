@@ -9,6 +9,7 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
+import { invalidateCachedBusinessSettings } from "../services/settings.service";
 import { validateWorkingDays, assertPositiveInt, assertNonNegative, requireMessageChannel, optMessageChannel } from "../lib/validation";
 import {
   asObject,
@@ -42,7 +43,7 @@ settingsRouter.use(requireTenantAccess);
 // Authorization: reads allowed for any known role; mutations require ADMIN/MANAGER.
 settingsRouter.use(requireBusinessAccess());
 
-const svc = (req: Request) => createSettingsService(req.tenantPrisma!);
+const svc = (req: Request) => createSettingsService(req.tenantPrisma!, req.tenantSchemaName!);
 
 // ---- helpers -------------------------------------------------------------
 // Settings routes are thin: validate → call service → respond. No DB access
@@ -364,6 +365,7 @@ settingsRouter.post(
         gocardlessEnvironment: environment,
       },
     });
+    invalidateCachedBusinessSettings(req.tenantPrisma!);
 
     const tenantId = req.profile!.tenantId;
     const webhookUrl = `${process.env.PUBLIC_API_URL}/webhooks/gocardless?tenantId=${tenantId}&secret=${webhookSecret}`;
@@ -383,6 +385,7 @@ settingsRouter.post(
         gocardlessEnvironment: null,
       },
     });
+    invalidateCachedBusinessSettings(req.tenantPrisma!);
     res.json({ status: "disconnected" });
   })
 );
@@ -417,6 +420,7 @@ settingsRouter.get(
         stripeWebhookSecretEncrypted: encrypt(webhookSecret),
       },
     });
+    invalidateCachedBusinessSettings(req.tenantPrisma!);
 
     const tenantId = req.profile!.tenantId;
     const webhookUrl = `${process.env.PUBLIC_API_URL}/webhooks/stripe?tenantId=${tenantId}&secret=${webhookSecret}`;
@@ -438,6 +442,7 @@ settingsRouter.post(
         stripeWebhookSecretEncrypted: null,
       },
     });
+    invalidateCachedBusinessSettings(req.tenantPrisma!);
     res.json({ status: "disconnected" });
   })
 );
@@ -530,6 +535,7 @@ settingsRouter.get(
         ghlWebhookSecretEncrypted:   encrypt(webhookSecret),
       },
     });
+    invalidateCachedBusinessSettings(req.tenantPrisma!);
 
     // Stamp on global Tenant for fast webhook lookup by locationId
     await prisma.tenant.update({
@@ -582,6 +588,7 @@ settingsRouter.post(
         ghlWebhookSecretEncrypted: encrypt(webhookSecret),
       },
     });
+    invalidateCachedBusinessSettings(req.tenantPrisma!);
 
     // Stamp on global Tenant for fast webhook lookup by locationId
     await prisma.tenant.update({
@@ -610,6 +617,7 @@ settingsRouter.post(
         ghlWebhookSecretEncrypted: null,
       },
     });
+    invalidateCachedBusinessSettings(req.tenantPrisma!);
     res.json({ status: "disconnected" });
   })
 );

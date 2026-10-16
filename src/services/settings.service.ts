@@ -181,24 +181,93 @@ type SettingsWritable = {
 // Implementation
 // ---------------------------------------------------------------------------
 
+// Short-TTL, positive-only cache of the BusinessSettings singleton, keyed by
+// TenantPrismaClient instance rather than tenant schema name. This is the ONE
+// cache for this row — every reader (SettingsService.getSettings() below,
+// and the direct-call-site readers in customer.service.ts, invoice.service.ts,
+// today.service.ts) goes through getCachedBusinessSettings(), and every
+// writer (writeSettings() below, plus every direct businessSettings.update*/
+// upsert call across the codebase — see invalidateCachedBusinessSettings())
+// invalidates the same entry. (A previous version of this cache was split in
+// two — one keyed by schema name for SettingsService, one keyed by client
+// instance for the direct readers — which meant a request touching both
+// paths could double-miss, and a write through one path could leave the
+// other's entry stale. Collapsed into one.)
+//
+// Keying by client instance works because getTenantPrismaForSchema()
+// (tenant-prisma-manager.ts) returns the SAME client instance per tenant
+// schema for as long as it stays in that LRU (max 100) — instance identity is
+// a reliable per-tenant key; a cache miss after eviction just costs one extra
+// DB read, never a cross-tenant leak.
+//
+// Positive-only by construction: only a *found* settings row is ever cached,
+// so a tenant that just completed the Setup Wizard is never stuck behind a
+// stale "not set up" null for this TTL window.
+//
+// TTL matches profileCache's 30s (requireTenantAccess.ts) — same staleness
+// trade-off rationale, and business settings change even less often than a
+// user's role/profile does, so there's no reason to go shorter.
+const SETTINGS_CACHE_TTL_MS = 30_000;
+const settingsCache = new WeakMap<
+  TenantPrismaClient,
+  { value: BusinessSettings; expiresAt: number }
+>();
+
+/** Cached read of the BusinessSettings singleton. Never caches a null result.
+ *  Not for use inside a `$transaction` callback — the `tx` client there is a
+ *  distinct, short-lived object each call, and transactional reads that gate
+ *  a mutation (e.g. an idempotency check) need a fresh row anyway. */
+export async function getCachedBusinessSettings(
+  prisma: TenantPrismaClient
+): Promise<BusinessSettings | null> {
+  const entry = settingsCache.get(prisma);
+  if (entry && entry.expiresAt > Date.now()) return entry.value;
+  const settings = await prisma.businessSettings.findFirst();
+  if (settings) {
+    settingsCache.set(prisma, { value: settings, expiresAt: Date.now() + SETTINGS_CACHE_TTL_MS });
+  } else {
+    settingsCache.delete(prisma);
+  }
+  return settings;
+}
+
+/** Invalidate the cached BusinessSettings row for this tenant's prisma
+ *  client. Call this after ANY successful direct `businessSettings.update*`/
+ *  `upsert` write that doesn't go through SettingsService.writeSettings()
+ *  (which already calls this itself) — otherwise a cached read elsewhere
+ *  (customer/invoice/today services, SettingsService.getSettings()) can
+ *  serve a stale row for up to SETTINGS_CACHE_TTL_MS after the write. */
+export function invalidateCachedBusinessSettings(prisma: TenantPrismaClient): void {
+  settingsCache.delete(prisma);
+}
+
 class SettingsService {
-  constructor(private readonly prisma: TenantPrismaClient) {}
+  constructor(
+    private readonly prisma: TenantPrismaClient,
+    // Unused by caching now (collapsed onto the client-instance-keyed cache
+    // above), but kept to avoid touching every call site's/test's signature
+    // again for no behavioral benefit.
+    private readonly schemaName: string
+  ) {}
 
   // ---- singleton seam (the ONLY two methods that know the singleton key) ----
 
-  /** Read the BusinessSettings singleton. */
+  /** Read the BusinessSettings singleton (cached — see getCachedBusinessSettings). */
   async getSettings(): Promise<BusinessSettings | null> {
-    return this.prisma.businessSettings.findFirst();
+    return getCachedBusinessSettings(this.prisma);
   }
 
   /** Partial upsert of the BusinessSettings singleton. Undefined fields are
-   *  left unchanged; null clears the field. */
+   *  left unchanged; null clears the field. Invalidates the cache after a
+   *  successful write, forcing the next getSettings() call to refetch. */
   private async writeSettings(data: SettingsWritable): Promise<BusinessSettings> {
-    return this.prisma.businessSettings.upsert({
+    const result = await this.prisma.businessSettings.upsert({
       where: { uniqueId: "singleton" },
       update: data,
       create: { ...data },
     });
+    invalidateCachedBusinessSettings(this.prisma);
+    return result;
   }
 
   // ---- guard ----
@@ -538,6 +607,6 @@ function toTemplateView(t: MessageTemplate): MessageTemplateView {
   };
 }
 
-export function createSettingsService(prisma: TenantPrismaClient) {
-  return new SettingsService(prisma);
+export function createSettingsService(prisma: TenantPrismaClient, schemaName: string) {
+  return new SettingsService(prisma, schemaName);
 }
