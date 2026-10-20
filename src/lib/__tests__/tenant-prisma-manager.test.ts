@@ -27,32 +27,32 @@ describe("getTenantPrismaForSchema", () => {
   });
 
   it("returns the same cached instance for the same schema", async () => {
-    const { getTenantPrismaForSchema } = await import("../tenant-prisma-manager");
+    const { getTenantPrismaForSchema } = await import("../tenant-prisma-manager.js");
     const a = getTenantPrismaForSchema("tenant_a");
     const b = getTenantPrismaForSchema("tenant_a");
     expect(a).toBe(b);
   });
 
   it("returns distinct instances for different schemas", async () => {
-    const { getTenantPrismaForSchema } = await import("../tenant-prisma-manager");
+    const { getTenantPrismaForSchema } = await import("../tenant-prisma-manager.js");
     const a = getTenantPrismaForSchema("tenant_a");
     const b = getTenantPrismaForSchema("tenant_b");
     expect(a).not.toBe(b);
   });
 
   it("reuses the clientCache across module re-evaluation via globalThis", async () => {
-    const mod1 = await import("../tenant-prisma-manager");
+    const mod1 = await import("../tenant-prisma-manager.js");
     const first = mod1.getTenantPrismaForSchema("tenant_reload");
 
     vi.resetModules();
-    const mod2 = await import("../tenant-prisma-manager");
+    const mod2 = await import("../tenant-prisma-manager.js");
     const second = mod2.getTenantPrismaForSchema("tenant_reload");
 
     expect(second).toBe(first);
   });
 
   it("$disconnects evicted clients once the LRU cap is exceeded", async () => {
-    const { getTenantPrismaForSchema } = await import("../tenant-prisma-manager");
+    const { getTenantPrismaForSchema } = await import("../tenant-prisma-manager.js");
     for (let i = 0; i < 101; i++) {
       getTenantPrismaForSchema(`tenant_${i}`);
     }
