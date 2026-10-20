@@ -53,6 +53,24 @@ function assertMime(mimeType: string) {
   }
 }
 
+const PROFILE_NAME_MAX_LENGTH = 100;
+
+function assertValidDateOfBirth(dateOfBirth: string) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateOfBirth)) {
+    throw new AppError(400, "dateOfBirth must be in YYYY-MM-DD format");
+  }
+  const [year, month, day] = dateOfBirth.split("-").map(Number);
+  const parsed = new Date(Date.UTC(year, month - 1, day));
+  const roundTrips =
+    parsed.getUTCFullYear() === year && parsed.getUTCMonth() === month - 1 && parsed.getUTCDate() === day;
+  if (!roundTrips) {
+    throw new AppError(400, "dateOfBirth must be a valid calendar date");
+  }
+  if (year < 1900 || parsed.getTime() > Date.now()) {
+    throw new AppError(400, "dateOfBirth must be between 1900-01-01 and today");
+  }
+}
+
 // GET /mobile/me — the signed-in technician's profile (name, DOB, avatar, area).
 mobileRouter.get("/me", h(async (req, res) => {
   res.json(await meResponse(req));
@@ -64,8 +82,11 @@ mobileRouter.patch("/me", h(async (req, res) => {
   const name = optReqString(body.name, "name");
   const dateOfBirth = optString(body.dateOfBirth, "dateOfBirth");
   const avatarUrl = optString(body.avatarUrl, "avatarUrl");
-  if (dateOfBirth && !/^\d{4}-\d{2}-\d{2}$/.test(dateOfBirth)) {
-    throw new AppError(400, "dateOfBirth must be in YYYY-MM-DD format");
+  if (name !== undefined && name.length > PROFILE_NAME_MAX_LENGTH) {
+    throw new AppError(400, `"name" must be at most ${PROFILE_NAME_MAX_LENGTH} characters.`);
+  }
+  if (dateOfBirth) {
+    assertValidDateOfBirth(dateOfBirth);
   }
   if (name !== undefined || dateOfBirth !== undefined) {
     await prisma.profile.update({
