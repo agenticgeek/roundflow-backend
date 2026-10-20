@@ -8,14 +8,27 @@ export type TenantPrismaClient = PrismaClient;
 // On eviction, $disconnect() releases the pool immediately.
 const CLIENT_CACHE_MAX = 100;
 
-const clientCache = new LRUCache<string, PrismaClient>({
-  max: CLIENT_CACHE_MAX,
-  dispose(client) {
-    client.$disconnect().catch(() => {
-      // Swallow — process may be shutting down or the connection already closed.
-    });
-  },
-});
+// Stash on globalThis so dev hot-reload (tsx watch) reuses the same cache
+// instead of re-creating it on every reload, which would orphan the
+// PrismaClients already in it (dispose() never fires, pools never close).
+const globalForTenantPrisma = globalThis as unknown as {
+  tenantClientCache?: LRUCache<string, PrismaClient>;
+};
+
+const clientCache =
+  globalForTenantPrisma.tenantClientCache ??
+  new LRUCache<string, PrismaClient>({
+    max: CLIENT_CACHE_MAX,
+    dispose(client) {
+      client.$disconnect().catch(() => {
+        // Swallow — process may be shutting down or the connection already closed.
+      });
+    },
+  });
+
+if (process.env.NODE_ENV !== "production") {
+  globalForTenantPrisma.tenantClientCache = clientCache;
+}
 
 export function getTenantPrismaForSchema(schemaName: string): PrismaClient {
   const cached = clientCache.get(schemaName);
