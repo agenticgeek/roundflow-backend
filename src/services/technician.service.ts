@@ -51,6 +51,21 @@ export interface TechnicianDetail extends TechnicianListItem {
   todayWorkload: WorkloadRoundRow[];
 }
 
+export interface TodayStats {
+  total: number;
+  completed: number;
+  skipped: number;
+  remaining: number;
+}
+
+// listTechnicians() — adds round names and today's job stats directly on the
+// list response, so the frontend doesn't have to fan out N x
+// getTechnicianDetail() calls just to show that on the technician list.
+export interface TechnicianListRow extends TechnicianListItem {
+  roundNames: string[];
+  todayStats: TodayStats;
+}
+
 // Alias: create/update operations return the same shape as list items.
 export type TechnicianRecord = TechnicianListItem;
 
@@ -120,13 +135,40 @@ function toRecord(tech: TechWithAreas): TechnicianRecord {
 class TechnicianService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
-  async listTechnicians(): Promise<TechnicianListItem[]> {
-    const technicians = await this.prisma.technician.findMany({
-      include: techInclude,
-      orderBy: { createdAt: "asc" },
-    });
+  async listTechnicians(): Promise<TechnicianListRow[]> {
+    const { start, end } = todayRange();
 
-    return technicians.map(toRecord);
+    const [technicians, todayGroups] = await Promise.all([
+      this.prisma.technician.findMany({
+        include: {
+          ...techInclude,
+          roundTechnicians: { select: { round: { select: { name: true } } } },
+        },
+        orderBy: { createdAt: "asc" },
+      }),
+      this.prisma.visit.groupBy({
+        by: ["technicianId", "status"],
+        where: { technicianId: { not: null }, date: { gte: start, lt: end } },
+        _count: true,
+      }),
+    ]);
+
+    const statsMap = new Map<string, TodayStats>();
+    for (const g of todayGroups as Array<{ technicianId: string | null; status: VisitStatus; _count: number }>) {
+      if (!g.technicianId) continue;
+      const stats = statsMap.get(g.technicianId) ?? { total: 0, completed: 0, skipped: 0, remaining: 0 };
+      stats.total += g._count;
+      if (g.status === VisitStatus.COMPLETED) stats.completed += g._count;
+      else if (g.status === VisitStatus.SKIPPED) stats.skipped += g._count;
+      else if (g.status === VisitStatus.SCHEDULED || g.status === VisitStatus.IN_PROGRESS) stats.remaining += g._count;
+      statsMap.set(g.technicianId, stats);
+    }
+
+    return technicians.map((tech) => ({
+      ...toRecord(tech),
+      roundNames: tech.roundTechnicians.map((rt) => rt.round.name),
+      todayStats: statsMap.get(tech.id) ?? { total: 0, completed: 0, skipped: 0, remaining: 0 },
+    }));
   }
 
   async getTechnicianDetail(id: string): Promise<TechnicianDetail> {

@@ -2,14 +2,14 @@ import { Request, Router } from "express";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
-import { h } from "../lib/http";
+import { h, parsePageParams } from "../lib/http";
+import { optIsoDate } from "../lib/validation";
 import { createDebtService } from "../services/debt.service";
 import { decrypt } from "../lib/crypto";
 import { getStripeClient } from "../integrations/stripe/client";
 import { createOneTimeSession } from "../integrations/stripe/checkout";
 import { StripeSessionType } from "../generated/tenant-client";
 import { queueGhlEvent } from "../integrations/ghl/sync";
-import { parsePageParams } from "../lib/http";
 
 export const debtRouter = Router();
 debtRouter.use(requireAuth);
@@ -45,6 +45,13 @@ debtRouter.get("/board/counts", h(async (req, res) => {
   return res.json(result);
 }));
 
+// GET /debt/:id — invoice detail (phone/email/round/next visit/mandate/
+// recent visits) the board row doesn't carry.
+debtRouter.get("/:id", h(async (req, res) => {
+  const result = await svc(req).getInvoiceDetail(req.params.id);
+  return res.json(result);
+}));
+
 // POST /debt/:id/remind
 debtRouter.post("/:id/remind", h(async (req, res) => {
   const { channel, message } = req.body ?? {};
@@ -74,7 +81,12 @@ debtRouter.post("/:id/payment-link", h(async (req, res) => {
       const existing = await req.tenantPrisma!.stripeSession.findFirst({
         where: { invoiceId: invoice.id, status: "PENDING" },
       });
-      const checkoutUrl = existing?.url ?? await (async () => {
+      let checkoutUrl: string;
+      let checkoutExpiresAt: Date | null;
+      if (existing) {
+        checkoutUrl = existing.url;
+        checkoutExpiresAt = existing.expiresAt;
+      } else {
         const stripe = getStripeClient(decrypt(bs.stripeSecretKeyEncrypted!));
         const FRONTEND = process.env.FRONTEND_URL?.split(",")[0].trim() ?? "";
         const result = await createOneTimeSession(stripe, req.tenantPrisma!, {
@@ -98,14 +110,19 @@ debtRouter.post("/:id/payment-link", h(async (req, res) => {
             expiresAt: result.expiresAt,
           },
         });
-        return result.url;
-      })();
-      const result = await svc(req).sendPaymentLink(req.params.id, message, checkoutUrl);
+        checkoutUrl = result.url;
+        checkoutExpiresAt = result.expiresAt;
+      }
+      const result = await svc(req).sendPaymentLink(req.params.id, message, {
+        overrideUrl: checkoutUrl,
+        provider: "stripe",
+        expiresAt: checkoutExpiresAt,
+      });
       return res.json(result);
     }
   }
 
-  const result = await svc(req).sendPaymentLink(req.params.id, message);
+  const result = await svc(req).sendPaymentLink(req.params.id, message, { provider: "static" });
   return res.json(result);
 }));
 
@@ -117,10 +134,22 @@ debtRouter.patch("/:id/bad-debt", h(async (req, res) => {
   return res.json(result);
 }));
 
-// PATCH /debt/:id/hold
+// PATCH /debt/:id/hold {flag, reason?, date?, notify?, message?}
 debtRouter.patch("/:id/hold", h(async (req, res) => {
-  const { flag } = req.body ?? {};
+  const { flag, reason, date, notify, message } = req.body ?? {};
   if (typeof flag !== "boolean") return res.status(400).json({ error: "flag (boolean) is required" });
-  const result = await svc(req).flagHold(req.params.id, flag);
+  if (reason !== undefined && typeof reason !== "string") {
+    return res.status(400).json({ error: "reason must be a string" });
+  }
+  if (notify !== undefined && typeof notify !== "boolean") {
+    return res.status(400).json({ error: "notify must be a boolean" });
+  }
+  const parsedDate = optIsoDate(date, "date");
+  const result = await svc(req).flagHold(req.params.id, flag, {
+    reason,
+    date: parsedDate ?? undefined,
+    notify,
+    message,
+  });
   return res.json(result);
 }));

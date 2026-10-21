@@ -22,8 +22,14 @@ export interface ComplaintDetail {
   customerId: string;
   customerName: string;
   propertyId: string | null;
+  propertyAddress: string | null;
   technicianId: string | null;
+  technicianName: string | null;
   revisitDate: string | null;
+  messageCount: number;
+  resolvedAt: string | null;
+  resolvedBy: string | null;
+  notes: string | null;
   createdAt: string;
 }
 
@@ -56,7 +62,12 @@ export interface MessageDetail {
   createdAt: string;
 }
 
-const INCLUDE = { customer: true, property: true, technician: true } as const;
+const INCLUDE = {
+  customer: true,
+  property: true,
+  technician: true,
+  _count: { select: { messages: true } },
+} as const;
 type ComplaintRow = Prisma.ComplaintGetPayload<{ include: typeof INCLUDE }>;
 type MessageRow = Prisma.MessageGetPayload<object>;
 
@@ -178,20 +189,28 @@ class ComplaintService {
 
     const complaint = await this.prisma.complaint.update({
       where: { id: complaintId },
-      data: { status: ComplaintStatus.OPEN, revisitDate: null },
+      data: { status: ComplaintStatus.OPEN, revisitDate: null, resolvedAt: null, resolvedBy: null },
       include: INCLUDE,
     });
 
     return this.toDetail(complaint);
   }
 
-  async resolve(complaintId: string): Promise<ComplaintDetail> {
+  async resolve(
+    complaintId: string,
+    options?: { notes?: string | null; resolvedBy?: string | null }
+  ): Promise<ComplaintDetail> {
     const existing = await this.prisma.complaint.findUnique({ where: { id: complaintId } });
     if (!existing) throw new AppError(404, "Complaint not found");
 
     const complaint = await this.prisma.complaint.update({
       where: { id: complaintId },
-      data: { status: ComplaintStatus.RESOLVED },
+      data: {
+        status: ComplaintStatus.RESOLVED,
+        resolvedAt: new Date(),
+        resolvedBy: options?.resolvedBy ?? null,
+        notes: options?.notes ?? null,
+      },
       include: INCLUDE,
     });
 
@@ -268,8 +287,14 @@ class ComplaintService {
       customerId: complaint.customerId,
       customerName: complaint.customer.name,
       propertyId: complaint.propertyId,
+      propertyAddress: complaint.property?.addressLine ?? null,
       technicianId: complaint.technicianId,
+      technicianName: complaint.technician?.name ?? null,
       revisitDate: complaint.revisitDate?.toISOString().slice(0, 10) ?? null,
+      messageCount: complaint._count.messages,
+      resolvedAt: complaint.resolvedAt?.toISOString() ?? null,
+      resolvedBy: complaint.resolvedBy ?? null,
+      notes: complaint.notes ?? null,
       createdAt: complaint.createdAt.toISOString(),
     };
   }

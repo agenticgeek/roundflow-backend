@@ -13,6 +13,7 @@ import {
   requireNumber,
   optString,
   optId,
+  optStringArray,
 } from "../lib/http";
 import {
   createSetupService,
@@ -318,6 +319,7 @@ setupRouter.post(
       customerName: requireString(body.customerName, "customerName"),
       propertyName: optString(body.propertyName, "propertyName") ?? null,
       phone: optString(body.phone, "phone") ?? null,
+      landline: optString(body.landline, "landline") ?? null,
       email: optString(body.email, "email") ?? null,
       fullAddress: requireString(body.fullAddress, "fullAddress"),
       postcode: requireString(body.postcode, "postcode"),
@@ -327,6 +329,7 @@ setupRouter.post(
       cleaningFrequency: optString(body.cleaningFrequency, "cleaningFrequency") ?? null,
       paymentMethod: optString(body.paymentMethod, "paymentMethod") ?? null,
       serviceId: optId(body.serviceId, "serviceId") ?? null,
+      serviceIds: optStringArray(body.serviceIds, "serviceIds") ?? null,
       accessNotes: optString(body.accessNotes, "accessNotes") ?? null,
       riskNotes: optString(body.riskNotes, "riskNotes") ?? null,
       // L-1: roundId is required so the property counts toward step 9 completion.
@@ -340,49 +343,99 @@ setupRouter.post(
 
 // ---- Step 9: Bulk Import Properties --------------------------------------
 // Accepts up to 1000 properties in one call. Processes in batches of 100,
-// each batch in its own transaction. Partial commits are possible — check
-// `created` in the response if the call fails mid-import.
+// each batch in its own transaction. A row that fails parsing/validation (or
+// a batch that fails to commit) is reported in `errors[]` by its original
+// row index — it does not abort the other, valid rows in the same request.
+// Pass `idempotencyKey` to make a retried call (e.g. after a client timeout)
+// safe: a repeat call with the same key returns the original result instead
+// of re-creating the same rows.
+
+// Attaches which field failed to a parse error, so the response's errors[]
+// can report a real field name instead of "unknown".
+class RowFieldError extends Error {
+  constructor(public readonly field: string, message: string) {
+    super(message);
+  }
+}
+
+function need<T>(field: string, parse: () => T): T {
+  try {
+    return parse();
+  } catch (err) {
+    throw new RowFieldError(field, err instanceof Error ? err.message : String(err));
+  }
+}
+
+function parseBulkRow(body: Record<string, unknown>): SetupPropertyInput {
+  return {
+    customerName: need("customerName", () => requireString(body.customerName, "customerName")),
+    propertyName: need("propertyName", () => optString(body.propertyName, "propertyName") ?? null),
+    phone: need("phone", () => optString(body.phone, "phone") ?? null),
+    landline: need("landline", () => optString(body.landline, "landline") ?? null),
+    email: need("email", () => optString(body.email, "email") ?? null),
+    fullAddress: need("fullAddress", () => requireString(body.fullAddress, "fullAddress")),
+    postcode: need("postcode", () => requireString(body.postcode, "postcode")),
+    serviceAreaId: need("serviceAreaId", () => requireString(body.serviceAreaId, "serviceAreaId")),
+    propertyType: need("propertyType", () => optString(body.propertyType, "propertyType") ?? null),
+    price: need("price", () => assertPositive(requireNumber(body.price, "price"), "price")),
+    cleaningFrequency: need("cleaningFrequency", () => optString(body.cleaningFrequency, "cleaningFrequency") ?? null),
+    paymentMethod: need("paymentMethod", () => optString(body.paymentMethod, "paymentMethod") ?? null),
+    serviceId: need("serviceId", () => optId(body.serviceId, "serviceId") ?? null),
+    serviceIds: need("serviceIds", () => optStringArray(body.serviceIds, "serviceIds") ?? null),
+    accessNotes: need("accessNotes", () => optString(body.accessNotes, "accessNotes") ?? null),
+    riskNotes: need("riskNotes", () => optString(body.riskNotes, "riskNotes") ?? null),
+    roundId: need("roundId", () => requireString(body.roundId, "roundId")),
+  };
+}
 
 setupRouter.post(
   "/step/9/bulk",
   h(async (req, res) => {
     await svc(req).assertSetupIncomplete();
 
-    const rows = asArray<Record<string, unknown>>(req.body, "properties");
+    const body = asObject(req.body);
+    const rows = asArray<Record<string, unknown>>(body.properties, "properties");
+    const idempotencyKey = optString(body.idempotencyKey, "idempotencyKey") ?? undefined;
 
+    // originalIndexes[i] = the row's position in `rows`, for inputs[i].
     const errors: { row: number; field: string; message: string }[] = [];
-    const inputs: SetupPropertyInput[] = rows.map((body, i) => {
+    const inputs: SetupPropertyInput[] = [];
+    const originalIndexes: number[] = [];
+    rows.forEach((row, i) => {
       try {
-        return {
-          customerName: requireString(body.customerName, "customerName"),
-          propertyName: optString(body.propertyName, "propertyName") ?? null,
-          phone: optString(body.phone, "phone") ?? null,
-          email: optString(body.email, "email") ?? null,
-          fullAddress: requireString(body.fullAddress, "fullAddress"),
-          postcode: requireString(body.postcode, "postcode"),
-          serviceAreaId: requireString(body.serviceAreaId, "serviceAreaId"),
-          propertyType: optString(body.propertyType, "propertyType") ?? null,
-          price: assertPositive(requireNumber(body.price, "price"), "price"),
-          cleaningFrequency: optString(body.cleaningFrequency, "cleaningFrequency") ?? null,
-          paymentMethod: optString(body.paymentMethod, "paymentMethod") ?? null,
-          serviceId: optId(body.serviceId, "serviceId") ?? null,
-          accessNotes: optString(body.accessNotes, "accessNotes") ?? null,
-          riskNotes: optString(body.riskNotes, "riskNotes") ?? null,
-          roundId: requireString(body.roundId, "roundId"),
-        } satisfies SetupPropertyInput;
+        inputs.push(parseBulkRow(row));
+        originalIndexes.push(i);
       } catch (err) {
-        const e = err as AppError | Error;
-        errors.push({ row: i, field: "unknown", message: e.message });
-        return null as unknown as SetupPropertyInput;
+        // parseBulkRow() wraps every field parser through need(), which only
+        // ever throws RowFieldError — this always has a real field name.
+        const e = err as RowFieldError;
+        errors.push({ row: i, field: e.field, message: e.message });
       }
     });
 
-    if (errors.length > 0) {
-      throw new AppError(400, `Validation failed: ${JSON.stringify(errors)}`);
-    }
+    const serviceResult: BulkSetupPropertyResult =
+      inputs.length > 0
+        ? await svc(req).bulkAddSetupProperties(inputs, idempotencyKey)
+        : { created: 0, failed: 0, results: [], errors: [] };
 
-    const result: BulkSetupPropertyResult = await svc(req).bulkAddSetupProperties(inputs);
-    res.status(201).json(result);
+    // Remap service-level errors (indexed into `inputs`) back to the
+    // original `rows` index so every error in the response is addressable
+    // against what the caller actually submitted.
+    const remappedServiceErrors = serviceResult.errors.map((e) => ({
+      ...e,
+      row: originalIndexes[e.row],
+    }));
+
+    const result: BulkSetupPropertyResult = {
+      created: serviceResult.created,
+      failed: rows.length - serviceResult.created,
+      results: serviceResult.results,
+      errors: [...errors, ...remappedServiceErrors].sort((a, b) => a.row - b.row),
+      ...(serviceResult.idempotent ? { idempotent: true } : {}),
+    };
+
+    const allRowsFailed = rows.length > 0 && result.created === 0 && !result.idempotent;
+    res.status(allRowsFailed ? 400 : 201).json(result);
   })
 );
 

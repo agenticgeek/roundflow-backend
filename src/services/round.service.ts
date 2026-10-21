@@ -4,6 +4,7 @@ import { AppError } from "../lib/app-error";
 import { getCachedBusinessSettings } from "./settings.service";
 import { todayRange } from "../lib/dates";
 import { createMessageService } from "./message.service";
+import { generateForRound } from "../jobs/visitGeneration";
 
 // ---- input types ----------------------------------------------------------
 
@@ -98,6 +99,15 @@ export interface OccurrenceDetail {
   date: string;
   stops: PlannerStop[];
   summary: Omit<OccurrenceSummary, "date">;
+}
+
+export interface DayStopsForRound {
+  roundId: string;
+  stops: PlannerStop[];
+}
+
+export interface GenerateVisitsResult {
+  visitsGenerated: number;
 }
 
 // ---- M4 output types (BE-M4-02, BE-M4-03, BE-M4-04) ----------------------
@@ -490,6 +500,63 @@ class RoundService {
       stops,
       summary: this.toSummary(stops),
     };
+  }
+
+  // ---- planner — batched day stops across multiple rounds (list/map view) ----
+  // Batch call: like listOccurrencesForRounds(), does NOT 404 on an unknown
+  // roundId — it just gets an empty stops array, so a stale round list
+  // doesn't fail the whole request.
+
+  async listDayStopsForRounds(
+    roundIds: string[],
+    date: string
+  ): Promise<DayStopsForRound[]> {
+    const dayStart = new Date(`${date}T00:00:00.000Z`);
+    if (isNaN(dayStart.getTime())) {
+      throw new AppError(400, '"date" is not a valid calendar date');
+    }
+    const dayEnd = new Date(dayStart.getTime() + 86_400_000); // exclusive: next midnight
+
+    const visits = await this.prisma.visit.findMany({
+      where: { roundId: { in: roundIds }, date: { gte: dayStart, lt: dayEnd } },
+      include: visitDetailInclude,
+      orderBy: { property: { addressLine: "asc" } },
+    });
+
+    const byRound = new Map<string, VisitWithDetails[]>();
+    for (const v of visits) {
+      if (v.roundId === null) continue;
+      const bucket = byRound.get(v.roundId) ?? [];
+      bucket.push(v);
+      byRound.set(v.roundId, bucket);
+    }
+
+    return roundIds.map((roundId) => ({
+      roundId,
+      stops: (byRound.get(roundId) ?? []).map((v) => this.toStop(v)),
+    }));
+  }
+
+  // ---- on-demand visit generation ----
+  // Rounds created after setup otherwise wait for the next nightly
+  // runVisitGeneration() cron run before they have any visits — this runs
+  // the same per-round generation logic immediately, for just this round.
+
+  async generateVisitsNow(roundId: string): Promise<GenerateVisitsResult> {
+    const round = await this.prisma.round.findUnique({
+      where: { id: roundId },
+      select: { id: true, frequency: true, status: true },
+    });
+    if (!round) throw new AppError(404, "Round not found");
+    if (round.status !== RoundStatus.ACTIVE) {
+      throw new AppError(400, "Round must be ACTIVE to generate visits");
+    }
+
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+
+    const visitsGenerated = await generateForRound(this.prisma, round, today);
+    return { visitsGenerated };
   }
 
   // ---- shared helpers ----

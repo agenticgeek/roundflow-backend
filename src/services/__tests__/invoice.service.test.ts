@@ -362,9 +362,8 @@ it("listCustomerInvoices defaults visitId to null when the invoice has none", as
   expect(result[0].visitId).toBeNull();
 });
 
-it("getInvoice returns the invoice id and amount", async () => {
-  const prisma = makePrisma();
-  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+function makeInvoiceWithVisit(overrides: Record<string, unknown> = {}) {
+  return {
     id: "inv-1",
     invoiceNumber: "INV-2026-001",
     status: "SENT",
@@ -376,7 +375,24 @@ it("getInvoice returns the invoice id and amount", async () => {
     createdAt: new Date(),
     customerId: "cust-1",
     visitId: "visit-1",
-  });
+    customer: { id: "cust-1", name: "John Smith", email: "j@example.com", phone: "07123456789", paymentMethod: "GOCARDLESS" },
+    visit: {
+      date: new Date("2026-08-12T00:00:00Z"),
+      paymentMethod: null,
+      property: { addressLine: "12 Market Street", postcode: "NE66 1SS", customer: { id: "cust-1", name: "John Smith", email: "j@example.com", phone: "07123456789", paymentMethod: "GOCARDLESS" } },
+      round: { name: "Alnwick Monday" },
+      technician: { name: "James Smith" },
+      service: { name: "Window Cleaning" },
+      invoice: { id: "inv-1" },
+    },
+    ...overrides,
+  };
+}
+
+it("getInvoice returns the invoice id and amount", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeInvoiceWithVisit());
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
   const svc = createInvoiceService(prisma);
   const result = await svc.getInvoice("inv-1");
   expect(result.id).toBe("inv-1");
@@ -385,22 +401,85 @@ it("getInvoice returns the invoice id and amount", async () => {
 
 it("getInvoice defaults visitId to null when the invoice has none", async () => {
   const prisma = makePrisma();
-  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-    id: "inv-1",
-    invoiceNumber: "INV-2026-001",
-    status: "DRAFT",
-    amount: { toNumber: () => 35 },
-    dueDate: null,
-    notes: null,
-    sentToCustomer: false,
-    sentAt: null,
-    createdAt: new Date(),
-    customerId: "cust-1",
-    visitId: null,
-  });
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeInvoiceWithVisit({
+    status: "DRAFT", sentToCustomer: false, sentAt: null, visitId: null, visit: null,
+  }));
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
   const svc = createInvoiceService(prisma);
   const result = await svc.getInvoice("inv-1");
   expect(result.visitId).toBeNull();
+});
+
+it("getInvoice includes line items, technician, visit date and a VAT/subtotal breakdown when a visit is linked", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeInvoiceWithVisit());
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ vatInInvoices: true });
+  const svc = createInvoiceService(prisma);
+  const result = await svc.getInvoice("inv-1");
+  expect(result.visitDate).toEqual(new Date("2026-08-12T00:00:00Z"));
+  expect(result.technicianName).toBe("James Smith");
+  expect(result.roundName).toBe("Alnwick Monday");
+  expect(result.lineItems).toHaveLength(1);
+  expect(result.lineItems[0].description).toContain("Window Cleaning");
+  expect(result.lineItems[0].technicianName).toBe("James Smith");
+  expect(result.subtotal + result.vatAmount).toBeCloseTo(35);
+  expect(result.vatAmount).toBeGreaterThan(0);
+  expect(result.customer).toMatchObject({ name: "John Smith", addressLine: "12 Market Street", postcode: "NE66 1SS" });
+});
+
+it("getInvoice degrades gracefully (empty lineItems, null visit-derived fields) for a standalone invoice with no linked visit", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeInvoiceWithVisit({ visitId: null, visit: null }));
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+  const svc = createInvoiceService(prisma);
+  const result = await svc.getInvoice("inv-1");
+  expect(result.lineItems).toEqual([]);
+  expect(result.visitDate).toBeNull();
+  expect(result.technicianName).toBeNull();
+  expect(result.roundName).toBeNull();
+  expect(result.vatAmount).toBe(0);
+  expect(result.customer).toMatchObject({ name: "John Smith", addressLine: null, postcode: null });
+  // Falls back to the invoice-level customer's own paymentMethod when there's no visit.
+  expect(result.paymentMethod).toBe("GOCARDLESS");
+});
+
+it("getInvoice falls back paymentMethod all the way to null when neither the visit nor the customer has one", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+    makeInvoiceWithVisit({
+      visitId: null,
+      visit: null,
+      customer: { id: "cust-1", name: "John Smith", email: null, phone: null, paymentMethod: null },
+    })
+  );
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+  const svc = createInvoiceService(prisma);
+  const result = await svc.getInvoice("inv-1");
+  expect(result.paymentMethod).toBeNull();
+});
+
+it("getInvoice prefers the visit's own paymentMethod over the customer's when a visit is linked", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
+    makeInvoiceWithVisit({
+      visit: {
+        date: new Date("2026-08-12T00:00:00Z"),
+        paymentMethod: "CASH",
+        property: { addressLine: "12 Market Street", postcode: "NE66 1SS", customer: { id: "cust-1", name: "John Smith", email: null, phone: null, paymentMethod: "GOCARDLESS" } },
+        round: null,
+        technician: null,
+        service: null,
+        invoice: { id: "inv-1" },
+      },
+    })
+  );
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+  const svc = createInvoiceService(prisma);
+  const result = await svc.getInvoice("inv-1");
+  expect(result.paymentMethod).toBe("CASH");
+  expect(result.roundName).toBeNull();
+  expect(result.lineItems[0].description).toContain("Window Cleaning Service");
+  expect(result.lineItems[0].technicianName).toBeNull();
 });
 
 it("sendInvoice returns status SENT after sending", async () => {

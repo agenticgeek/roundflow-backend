@@ -1,6 +1,7 @@
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 import { MessageChannel, PaymentMethod, Prisma } from "../generated/tenant-client";
+import { createMessageService } from "./message.service";
 
 // The 7 tabs the debt board UI shows: the 6 named buckets below, plus
 // whatever bucket string doesn't match one of them (the "default"/catch-all
@@ -177,20 +178,49 @@ export function createDebtService(prisma: TenantPrismaClient) {
         },
       };
     },
-    sendPaymentLink: async (invoiceId: string, _message: string, overrideUrl?: string) => {
+    sendPaymentLink: async (
+      invoiceId: string,
+      _message: string,
+      options?: { overrideUrl?: string; provider?: string; expiresAt?: Date | null }
+    ) => {
       const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId }, include: { customer: { select: { id: true, name: true, email: true } } } });
       if (!invoice) throw new AppError(404, "Invoice not found");
       if (!invoice.customer.email) throw new AppError(400, "Customer has no email address");
-      const link = overrideUrl ?? `https://pay.roundflow.app/i/${invoice.invoiceNumber}`;
+      const link = options?.overrideUrl ?? `https://pay.roundflow.app/i/${invoice.invoiceNumber}`;
       const body = `${_message}\n\n${link}`;
       const msg = await prisma.message.create({ data: { channel: "EMAIL", direction: "OUTBOUND", body, customerId: invoice.customerId, sentAt: new Date() } });
-      return { id: msg.id, paymentUrl: link };
+      return {
+        id: msg.id,
+        paymentUrl: link,
+        provider: options?.provider ?? "static",
+        expiresAt: options?.expiresAt ?? null,
+      };
     },
-    flagHold: async (invoiceId: string, _flag: boolean) => {
+    flagHold: async (
+      invoiceId: string,
+      _flag: boolean,
+      options?: { reason?: string | null; date?: Date; notify?: boolean; message?: string }
+    ) => {
       const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
       if (!invoice) throw new AppError(404, "Invoice not found");
-      const updated = await prisma.customer.update({ where: { id: invoice.customerId }, data: { holdNextClean: _flag } });
-      return { customerId: updated.id, holdNextClean: updated.holdNextClean };
+      const updated = await prisma.customer.update({
+        where: { id: invoice.customerId },
+        data: _flag
+          ? { holdNextClean: true, holdReason: options?.reason ?? null, holdSince: options?.date ?? new Date() }
+          : { holdNextClean: false, holdReason: null, holdSince: null },
+      });
+      if (_flag && options?.notify) {
+        const body = options.message?.trim() || "Your next clean is on hold until this is resolved.";
+        await createMessageService(prisma).send({ customerId: updated.id, channel: "sms", body }).catch((err) => {
+          console.error(`[debt] hold notify failed for customer ${updated.id}:`, err);
+        });
+      }
+      return {
+        customerId: updated.id,
+        holdNextClean: updated.holdNextClean,
+        holdReason: updated.holdReason,
+        holdSince: updated.holdSince,
+      };
     },
     flagBadDebt: async (invoiceId: string, _flag: boolean) => {
       const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId } });
@@ -239,6 +269,65 @@ export function createDebtService(prisma: TenantPrismaClient) {
       const badDebt = Number(badDebtAgg._sum.amount ?? 0);
 
       return { totalOutstandings, badDebt, failedGoCardless, dueBeforeClean, holdNextClean: holdCustomers.length };
+    },
+    // Detail for one invoice — the fields the debt board's row doesn't carry
+    // (phone/email/round/next visit/mandate/recent visits), so the debt
+    // detail panel stops showing "—" for all of them.
+    getInvoiceDetail: async (invoiceId: string) => {
+      const invoice = await prisma.invoice.findUnique({
+        where: { id: invoiceId },
+        include: {
+          customer: {
+            select: {
+              id: true, name: true, phone: true, email: true,
+              gocardlessMandateId: true, gocardlessMandateStatus: true,
+            },
+          },
+          visit: { select: { property: { select: { roundId: true, round: { select: { name: true } } } } } },
+        },
+      });
+      if (!invoice) throw new AppError(404, "Invoice not found");
+
+      const [nextVisit, recentVisits] = await Promise.all([
+        prisma.visit.findFirst({
+          where: {
+            property: { customerId: invoice.customerId },
+            date: { gte: new Date() },
+            status: { in: ["SCHEDULED", "IN_PROGRESS"] },
+          },
+          orderBy: { date: "asc" },
+          select: { date: true },
+        }),
+        prisma.visit.findMany({
+          where: { property: { customerId: invoice.customerId } },
+          orderBy: { date: "desc" },
+          take: 5,
+          select: { id: true, date: true, status: true, price: true },
+        }),
+      ]);
+
+      return {
+        invoiceId: invoice.id,
+        invoiceNumber: invoice.invoiceNumber,
+        amount: invoice.amount.toNumber(),
+        dueDate: invoice.dueDate,
+        status: invoice.status,
+        customerId: invoice.customerId,
+        customerName: invoice.customer.name,
+        phone: invoice.customer.phone,
+        email: invoice.customer.email,
+        roundId: invoice.visit?.property.roundId ?? null,
+        roundName: invoice.visit?.property.round?.name ?? null,
+        nextVisitDate: nextVisit?.date ?? null,
+        mandateId: invoice.customer.gocardlessMandateId,
+        mandateStatus: invoice.customer.gocardlessMandateStatus,
+        recentVisits: recentVisits.map((v) => ({
+          visitId: v.id,
+          date: v.date,
+          status: v.status,
+          amount: v.price.toNumber(),
+        })),
+      };
     },
   };
 }

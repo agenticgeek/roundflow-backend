@@ -16,7 +16,9 @@ function makePrisma() {
     round: { findMany: vi.fn(), findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), create: vi.fn(), update: vi.fn(), delete: vi.fn() },
     serviceArea: { findUnique: vi.fn() },
     technician: { findUnique: vi.fn(), findMany: vi.fn() },
-    visit: { findMany: vi.fn(), updateMany: vi.fn() },
+    property: { findMany: vi.fn() },
+    servicePlan: { update: vi.fn() },
+    visit: { findMany: vi.fn(), updateMany: vi.fn(), findFirst: vi.fn(), create: vi.fn() },
     roundTechnician: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn() },
     // Defaults to "no settings row" (day not closed) so pre-existing tests
     // that don't care about Close Day behave the same as before it existed.
@@ -342,6 +344,140 @@ it("getOccurrence returns stops and a summary with deduped technicians", async (
   expect(result.summary.technicians).toEqual([{ id: "t1", name: "James" }]);
   expect(result.summary.holdCount).toBe(1);
   expect(result.summary.issueCount).toBe(1);
+});
+
+// ---- listDayStopsForRounds ---------------------------------------------------
+
+function makeFullStopVisit(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "v1", propertyId: "p1", price: { toNumber: () => 40 }, status: "COMPLETED", paymentHold: false,
+    technicianId: "t1", completedAt: null, roundId: "r1",
+    technician: { id: "t1", name: "James" },
+    property: { propertyName: null, addressLine: "12 Main St", postcode: "NE1 1AA", customer: { name: "John Smith" } },
+    issues: [],
+    ...overrides,
+  };
+}
+
+it("listDayStopsForRounds throws 400 for an invalid date (no per-round 404 lookup)", async () => {
+  const prisma = makePrisma();
+  await expect(
+    createRoundService(prisma).listDayStopsForRounds(["r1", "r2"], "not-a-date")
+  ).rejects.toMatchObject({ statusCode: 400 });
+  expect(prisma.visit.findMany).not.toHaveBeenCalled();
+});
+
+it("listDayStopsForRounds groups stops by round, one query for every requested round", async () => {
+  const prisma = makePrisma();
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    makeFullStopVisit({ id: "v1", roundId: "r1" }),
+    makeFullStopVisit({ id: "v2", roundId: "r1" }),
+    makeFullStopVisit({ id: "v3", roundId: "r2" }),
+  ]);
+
+  const result = await createRoundService(prisma).listDayStopsForRounds(["r1", "r2", "r3"], "2026-01-01");
+
+  expect(prisma.visit.findMany).toHaveBeenCalledTimes(1);
+  expect(result).toHaveLength(3);
+  expect(result.find((r) => r.roundId === "r1")!.stops).toHaveLength(2);
+  expect(result.find((r) => r.roundId === "r2")!.stops).toHaveLength(1);
+  // A round with zero matching visits still appears, with an empty array —
+  // no per-round 404, matching listOccurrencesForRounds()'s batch semantics.
+  expect(result.find((r) => r.roundId === "r3")!.stops).toEqual([]);
+});
+
+it("listDayStopsForRounds skips a visit whose roundId is null (defensive, shouldn't happen given the where filter)", async () => {
+  const prisma = makePrisma();
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    makeFullStopVisit({ id: "v1", roundId: null }),
+    makeFullStopVisit({ id: "v2", roundId: "r1" }),
+  ]);
+
+  const result = await createRoundService(prisma).listDayStopsForRounds(["r1"], "2026-01-01");
+
+  expect(result[0].stops).toHaveLength(1);
+});
+
+it("listDayStopsForRounds queries the given date's UTC range for all roundIds at once", async () => {
+  const prisma = makePrisma();
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+  await createRoundService(prisma).listDayStopsForRounds(["r1", "r2"], "2026-01-01");
+
+  const call = (prisma.visit.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(call.where.roundId).toEqual({ in: ["r1", "r2"] });
+  expect(call.where.date.gte).toEqual(new Date("2026-01-01T00:00:00.000Z"));
+  expect(call.where.date.lt).toEqual(new Date("2026-01-02T00:00:00.000Z"));
+});
+
+// ---- generateVisitsNow --------------------------------------------------------
+
+it("generateVisitsNow throws 404 when the round does not exist", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+  await expect(createRoundService(prisma).generateVisitsNow("missing")).rejects.toMatchObject({ statusCode: 404 });
+});
+
+it("generateVisitsNow throws 400 when the round is not ACTIVE", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1", frequency: "FOUR_WEEKLY", status: RoundStatus.DRAFT });
+  await expect(createRoundService(prisma).generateVisitsNow("r1")).rejects.toMatchObject({ statusCode: 400 });
+  expect(prisma.property.findMany).not.toHaveBeenCalled();
+});
+
+it("generateVisitsNow creates due visits for the round's ACTIVE properties right now", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1", frequency: "FOUR_WEEKLY", status: RoundStatus.ACTIVE });
+  (prisma.property.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    {
+      id: "p1",
+      servicePlans: [
+        { id: "sp1", price: 35, nextDueDate: new Date("2026-01-01T00:00:00.000Z"), cleaningFrequency: "FOUR_WEEKLY", serviceId: null },
+      ],
+    },
+  ]);
+  (prisma.visit.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+  (prisma.visit.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1" });
+  (prisma.servicePlan.update as ReturnType<typeof vi.fn>).mockResolvedValue({});
+
+  const result = await createRoundService(prisma).generateVisitsNow("r1");
+
+  expect(result).toEqual({ visitsGenerated: 1 });
+  expect(prisma.visit.create).toHaveBeenCalledTimes(1);
+  const createArgs = (prisma.visit.create as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(createArgs.data).toMatchObject({ propertyId: "p1", roundId: "r1", servicePlanId: "sp1", price: 35 });
+});
+
+it("generateVisitsNow skips a plan that already has a future scheduled/in-progress visit (idempotent)", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1", frequency: "FOUR_WEEKLY", status: RoundStatus.ACTIVE });
+  (prisma.property.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    {
+      id: "p1",
+      servicePlans: [
+        { id: "sp1", price: 35, nextDueDate: new Date("2026-01-01T00:00:00.000Z"), cleaningFrequency: "FOUR_WEEKLY", serviceId: null },
+      ],
+    },
+  ]);
+  (prisma.visit.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "existing-visit" });
+
+  const result = await createRoundService(prisma).generateVisitsNow("r1");
+
+  expect(result).toEqual({ visitsGenerated: 0 });
+  expect(prisma.visit.create).not.toHaveBeenCalled();
+});
+
+it("generateVisitsNow skips a plan with no frequency (neither its own nor the round's) and no nextDueDate", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1", frequency: null, status: RoundStatus.ACTIVE });
+  (prisma.property.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    { id: "p1", servicePlans: [{ id: "sp1", price: 35, nextDueDate: null, cleaningFrequency: null, serviceId: null }] },
+  ]);
+
+  const result = await createRoundService(prisma).generateVisitsNow("r1");
+
+  expect(result).toEqual({ visitsGenerated: 0 });
+  expect(prisma.visit.create).not.toHaveBeenCalled();
 });
 
 it("reassignTechnician throws 400 when fromTechnicianId and toTechnicianId are the same", async () => {

@@ -37,6 +37,7 @@ const AUDIT_REMEDIATION_FILES = [
   "src/services/reports.service.ts",
   "src/services/complaint.service.ts",
   "src/lib/csv.ts",
+  "src/routes/service-plans.ts",
 ];
 
 export default defineConfig({

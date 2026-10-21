@@ -120,6 +120,17 @@ export interface PauseInput {
   pauseEndDate?: Date | null;
 }
 
+// Per-plan write — unlike CustomerUpdateInput/PropertyUpdateInput (which
+// always resolve to the property's "primary" plan via primaryPlan()), this
+// targets one specific ServicePlan by its own id, so a property with 2+
+// plans can have each one edited independently.
+export interface ServicePlanUpdateInput {
+  price?: number;
+  cleanMethod?: string | null;
+  paymentMethod?: PaymentMethod | null;
+  cleaningFrequency?: CleaningFrequency | null;
+}
+
 export interface NoteCreateInput {
   type: NoteType;
   body: string;
@@ -1026,6 +1037,57 @@ class CustomerService {
     }
     return this.prisma.servicePlan.update({
       where: { id: plan.id },
+      data: {
+        status: LifecycleStatus.ACTIVE,
+        pauseStartDate: null,
+        pauseEndDate: null,
+      },
+    });
+  }
+
+  // ---- per-plan writes (targets one ServicePlan directly, not the
+  // property's guessed "primary" plan) ----
+
+  async updateServicePlan(
+    servicePlanId: string,
+    input: ServicePlanUpdateInput
+  ): Promise<ServicePlan> {
+    const existing = await this.prisma.servicePlan.findUnique({ where: { id: servicePlanId } });
+    if (!existing) throw new AppError(404, "Service plan not found");
+
+    const data: Partial<Prisma.ServicePlanUpdateInput> = {};
+    if (input.price !== undefined) data.price = input.price;
+    if (input.cleanMethod !== undefined) data.cleanMethod = input.cleanMethod;
+    if (input.paymentMethod !== undefined) data.paymentMethod = input.paymentMethod;
+    if (input.cleaningFrequency !== undefined) data.cleaningFrequency = input.cleaningFrequency;
+
+    return this.prisma.servicePlan.update({ where: { id: servicePlanId }, data });
+  }
+
+  async pauseServicePlan(servicePlanId: string, input: PauseInput): Promise<ServicePlan> {
+    const plan = await this.prisma.servicePlan.findUnique({ where: { id: servicePlanId } });
+    if (!plan) throw new AppError(404, "Service plan not found");
+    if (plan.status === LifecycleStatus.PAUSED) {
+      throw new AppError(409, "Service plan is already paused");
+    }
+    return this.prisma.servicePlan.update({
+      where: { id: servicePlanId },
+      data: {
+        status: LifecycleStatus.PAUSED,
+        pauseStartDate: input.pauseStartDate,
+        pauseEndDate: input.pauseEndDate ?? null,
+      },
+    });
+  }
+
+  async resumeServicePlan(servicePlanId: string): Promise<ServicePlan> {
+    const plan = await this.prisma.servicePlan.findUnique({ where: { id: servicePlanId } });
+    if (!plan) throw new AppError(404, "Service plan not found");
+    if (plan.status !== LifecycleStatus.PAUSED) {
+      throw new AppError(409, "Service plan is not paused");
+    }
+    return this.prisma.servicePlan.update({
+      where: { id: servicePlanId },
       data: {
         status: LifecycleStatus.ACTIVE,
         pauseStartDate: null,

@@ -1,9 +1,10 @@
-import { it, expect, vi, beforeEach } from "vitest";
+import { it, expect, vi, beforeEach, describe } from "vitest";
 import request from "supertest";
 import express from "express";
 
 const emptyPage = { rows: [], pagination: { page: 1, pageSize: 50, total: 0, totalPages: 0 } };
 const listComplaints = vi.fn();
+const resolve = vi.fn();
 
 vi.mock("../../services/complaint.service", () => ({
   createComplaintService: vi.fn(() => ({
@@ -13,7 +14,7 @@ vi.mock("../../services/complaint.service", () => ({
     markInReview: vi.fn(),
     scheduleRevisit: vi.fn(),
     reopen: vi.fn(),
-    resolve: vi.fn(),
+    resolve,
     assignTechnician: vi.fn(),
     getMessages: vi.fn(),
     addMessage: vi.fn(),
@@ -112,4 +113,20 @@ it("GET /complaints?assignedTo=me omits technicianId when the caller has no tech
 it("GET /complaints passes an explicit technicianId query param through", async () => {
   await request(makeApp()).get("/complaints?technicianId=tech-2");
   expect(listComplaints).toHaveBeenCalledWith(expect.objectContaining({ technicianId: "tech-2" }));
+});
+
+describe("POST /complaints/:id/resolve", () => {
+  it("passes notes and the caller's profile id as resolvedBy", async () => {
+    resolve.mockResolvedValue({ id: "cmp1", status: "RESOLVED" });
+    const res = await request(makeApp()).post("/complaints/cmp1/resolve").send({ notes: "Fixed on revisit" });
+    expect(res.status).toBe(200);
+    expect(resolve).toHaveBeenCalledWith("cmp1", { notes: "Fixed on revisit", resolvedBy: "profile-1" });
+  });
+
+  it("defaults notes to undefined when omitted", async () => {
+    resolve.mockResolvedValue({ id: "cmp1", status: "RESOLVED" });
+    const res = await request(makeApp()).post("/complaints/cmp1/resolve").send({});
+    expect(res.status).toBe(200);
+    expect(resolve).toHaveBeenCalledWith("cmp1", { notes: undefined, resolvedBy: "profile-1" });
+  });
 });

@@ -163,7 +163,11 @@ complaintsRouter.post(
 complaintsRouter.post(
   "/:id/resolve",
   h(async (req, res) => {
-    const result = await svc(req).resolve(req.params.id);
+    const body = asObject(req.body);
+    const result = await svc(req).resolve(req.params.id, {
+      notes: optString(body.notes, "notes"),
+      resolvedBy: req.profile?.id ?? null,
+    });
     res.json(result);
   })
 );

@@ -1,5 +1,5 @@
 import { prisma } from "../lib/prisma";
-import { getTenantPrismaForSchema } from "../lib/tenant-prisma-manager";
+import { getTenantPrismaForSchema, type TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { CleaningFrequency, LifecycleStatus, RoundStatus, VisitStatus } from "../generated/tenant-client";
 
 const FREQ_WEEKS: Record<CleaningFrequency, number> = {
@@ -47,54 +47,71 @@ async function generateForTenant(tp: TP, today: Date): Promise<void> {
   });
 
   for (const round of rounds) {
-    const properties = await tp.property.findMany({
-      where: { roundId: round.id, status: LifecycleStatus.ACTIVE },
-      select: {
-        id: true,
-        servicePlans: {
-          where: { status: LifecycleStatus.ACTIVE, nextDueDate: { lte: today } },
-          select: { id: true, price: true, nextDueDate: true, cleaningFrequency: true, serviceId: true },
-        },
+    await generateForRound(tp, round, today);
+  }
+}
+
+// Shared by the nightly cron (one round at a time, for every ACTIVE round)
+// and the on-demand POST /rounds/:id/generate-visits endpoint (one round,
+// right now — so a round created after setup doesn't wait for the next
+// nightly run before it has any visits).
+export async function generateForRound(
+  tp: TenantPrismaClient,
+  round: { id: string; frequency: CleaningFrequency | null },
+  today: Date
+): Promise<number> {
+  let created = 0;
+
+  const properties = await tp.property.findMany({
+    where: { roundId: round.id, status: LifecycleStatus.ACTIVE },
+    select: {
+      id: true,
+      servicePlans: {
+        where: { status: LifecycleStatus.ACTIVE, nextDueDate: { lte: today } },
+        select: { id: true, price: true, nextDueDate: true, cleaningFrequency: true, serviceId: true },
       },
-    });
+    },
+  });
 
-    for (const property of properties) {
-      for (const plan of property.servicePlans) {
-        const freq = plan.cleaningFrequency ?? round.frequency;
-        if (!freq || !plan.nextDueDate) continue;
+  for (const property of properties) {
+    for (const plan of property.servicePlans) {
+      const freq = plan.cleaningFrequency ?? round.frequency;
+      if (!freq || !plan.nextDueDate) continue;
 
-        // Idempotent: skip if a future scheduled/in-progress visit already exists
-        const existing = await tp.visit.findFirst({
-          where: {
-            servicePlanId: plan.id,
-            status: { in: [VisitStatus.SCHEDULED, VisitStatus.IN_PROGRESS] },
-            date: { gte: today },
-          },
-          select: { id: true },
-        });
-        if (existing) continue;
+      // Idempotent: skip if a future scheduled/in-progress visit already exists
+      const existing = await tp.visit.findFirst({
+        where: {
+          servicePlanId: plan.id,
+          status: { in: [VisitStatus.SCHEDULED, VisitStatus.IN_PROGRESS] },
+          date: { gte: today },
+        },
+        select: { id: true },
+      });
+      if (existing) continue;
 
-        const visitDate = snapToWeekday(new Date(plan.nextDueDate));
-        await tp.visit.create({
-          data: {
-            propertyId:   property.id,
-            roundId:      round.id,
-            servicePlanId: plan.id,
-            serviceId:    plan.serviceId ?? null,
-            date:         visitDate,
-            price:        plan.price,
-            isOneOff:     false,
-            status:       VisitStatus.SCHEDULED,
-            paymentHold:  false,
-          },
-        });
+      const visitDate = snapToWeekday(new Date(plan.nextDueDate));
+      await tp.visit.create({
+        data: {
+          propertyId:   property.id,
+          roundId:      round.id,
+          servicePlanId: plan.id,
+          serviceId:    plan.serviceId ?? null,
+          date:         visitDate,
+          price:        plan.price,
+          isOneOff:     false,
+          status:       VisitStatus.SCHEDULED,
+          paymentHold:  false,
+        },
+      });
+      created++;
 
-        // Advance nextDueDate by one cycle
-        await tp.servicePlan.update({
-          where: { id: plan.id },
-          data: { nextDueDate: snapToWeekday(addWeeks(new Date(plan.nextDueDate), FREQ_WEEKS[freq])) },
-        });
-      }
+      // Advance nextDueDate by one cycle
+      await tp.servicePlan.update({
+        where: { id: plan.id },
+        data: { nextDueDate: snapToWeekday(addWeeks(new Date(plan.nextDueDate), FREQ_WEEKS[freq])) },
+      });
     }
   }
+
+  return created;
 }
