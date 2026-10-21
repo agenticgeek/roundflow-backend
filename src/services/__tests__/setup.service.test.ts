@@ -17,11 +17,30 @@ function makePrisma() {
       count: vi.fn().mockResolvedValue(0),
     },
     roundTechnician: { deleteMany: vi.fn(), createMany: vi.fn() },
-    customer: { findMany: vi.fn(), create: vi.fn() },
-    property: { findMany: vi.fn(), create: vi.fn(), count: vi.fn().mockResolvedValue(0) },
-    servicePlan: { findMany: vi.fn(), create: vi.fn() },
+    // findMany defaults to echoing back a bare { id } record per id in a
+    // `where: { id: { in: [...] } }` query — bulkAddSetupProperties refetches
+    // createMany'd rows this way to build its response shape.
+    customer: {
+      findMany: vi.fn((args: any) => Promise.resolve((args?.where?.id?.in ?? []).map((id: string) => ({ id })))),
+      create: vi.fn(),
+      createMany: vi.fn().mockResolvedValue({ count: 0 }),
+    },
+    property: {
+      findMany: vi.fn((args: any) => Promise.resolve((args?.where?.id?.in ?? []).map((id: string) => ({ id })))),
+      create: vi.fn(),
+      createMany: vi.fn().mockResolvedValue({ count: 0 }),
+      count: vi.fn().mockResolvedValue(0),
+    },
+    servicePlan: {
+      findMany: vi.fn((args: any) => Promise.resolve((args?.where?.id?.in ?? []).map((id: string) => ({ id })))),
+      create: vi.fn(),
+      createMany: vi.fn().mockResolvedValue({ count: 0 }),
+    },
     visit: { findMany: vi.fn(), createMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
-    $transaction: vi.fn((cb: any) => cb(makePrisma())),
+    // Supports both the interactive callback form ($transaction(cb)) used by
+    // other steps and the array/batched form ($transaction([...])) used by
+    // bulkAddSetupProperties.
+    $transaction: vi.fn((arg: any) => (Array.isArray(arg) ? Promise.all(arg) : arg(makePrisma()))),
   } as unknown as Parameters<typeof createSetupService>[0];
 }
 
@@ -61,19 +80,14 @@ it("bulkAddSetupProperties: 3 valid rows returns created: 3", async () => {
   (prisma.serviceArea.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeServiceArea("area1")]);
   (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeRound("round1")]);
 
-  const txPrisma = {
-    ...makePrisma(),
-    customer: { create: vi.fn().mockResolvedValue({ id: "c1" }) },
-    property: { create: vi.fn().mockResolvedValue({ id: "p1" }) },
-    servicePlan: { create: vi.fn().mockResolvedValue({ id: "sp1" }) },
-  };
-  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb: any) => cb(txPrisma));
-
   const inputs = [makeInput(), makeInput(), makeInput()];
   const result = await createSetupService(prisma).bulkAddSetupProperties(inputs);
 
   expect(result.created).toBe(3);
   expect(result.results).toHaveLength(3);
+  expect(prisma.customer.createMany).toHaveBeenCalledTimes(1);
+  expect(prisma.property.createMany).toHaveBeenCalledTimes(1);
+  expect(prisma.servicePlan.createMany).toHaveBeenCalledTimes(1);
 });
 
 it("bulkAddSetupProperties: unknown serviceAreaId throws 400 before any insert", async () => {
@@ -116,16 +130,6 @@ it("bulkAddSetupProperties: 150 rows fires two transactions", async () => {
   const prisma = makePrisma();
   (prisma.serviceArea.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeServiceArea("area1")]);
   (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeRound("round1")]);
-
-  let rowCounter = 0;
-  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation(async (cb: any) => {
-    const tx = {
-      customer: { create: vi.fn().mockImplementation(() => Promise.resolve({ id: `c${++rowCounter}` })) },
-      property: { create: vi.fn().mockResolvedValue({ id: "p1" }) },
-      servicePlan: { create: vi.fn().mockResolvedValue({ id: "sp1" }) },
-    };
-    return cb(tx);
-  });
 
   const inputs = Array.from({ length: 150 }, () => makeInput());
   const result = await createSetupService(prisma).bulkAddSetupProperties(inputs);

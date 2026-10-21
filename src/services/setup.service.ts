@@ -22,6 +22,7 @@ import type {
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { Prisma as TenantPrisma } from "../generated/tenant-client";
 import { AppError } from "../lib/app-error";
+import { randomUUID } from "crypto";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -676,50 +677,83 @@ class SetupService {
       const batch = inputs.slice(batchStart, batchStart + BATCH_SIZE);
       const batchIndex = Math.floor(batchStart / BATCH_SIZE);
 
-      const batchResults = await this.prisma.$transaction(async (tx) => {
-        const results: SetupPropertyResult[] = [];
-        for (const inp of batch) {
-          const customer = await tx.customer.create({
-            data: {
-              name: inp.customerName,
-              phone: inp.phone ?? null,
-              email: inp.email ?? null,
-              paymentMethod: (inp.paymentMethod as PaymentMethod) ?? null,
-            },
-          });
-          const property = await tx.property.create({
-            data: {
-              customerId: customer.id,
-              propertyName: inp.propertyName ?? null,
-              addressLine: inp.fullAddress,
-              postcode: inp.postcode,
-              serviceAreaId: inp.serviceAreaId,
-              propertyType: (inp.propertyType as PropertyType) ?? null,
-              accessNotes: inp.accessNotes ?? null,
-              riskNotes: inp.riskNotes ?? null,
-              roundId: inp.roundId,
-            },
-          });
-          const servicePlan = await tx.servicePlan.create({
-            data: {
-              propertyId: property.id,
-              serviceId: inp.serviceId ?? null,
-              price: inp.price,
-              paymentMethod: (inp.paymentMethod as PaymentMethod) ?? null,
-              cleaningFrequency: (inp.cleaningFrequency as CleaningFrequency) ?? null,
-            },
-          });
-          results.push({ customer, property, servicePlan });
-        }
-        return results;
-      }).catch((err) => {
+      // IDs generated up front so customer/property/servicePlan rows can be
+      // inserted with createMany (3 queries per batch) instead of looping
+      // create() per row inside an interactive transaction (3 * batch.length
+      // round trips). The old loop routinely ran past Prisma's default 5s
+      // interactive-transaction timeout on a 100-row batch, so the engine
+      // closed the transaction mid-batch and the next query in it failed with
+      // "Transaction API error: Transaction not found ... old closed
+      // transaction". The array form of $transaction below sends all three
+      // createMany statements as one batched (non-interactive) request, so
+      // there's no long-lived transaction to time out.
+      const rows = batch.map((inp) => ({
+        inp,
+        customerId: randomUUID(),
+        propertyId: randomUUID(),
+        servicePlanId: randomUUID(),
+      }));
+
+      await this.prisma.$transaction([
+        this.prisma.customer.createMany({
+          data: rows.map(({ inp, customerId }) => ({
+            id: customerId,
+            name: inp.customerName,
+            phone: inp.phone ?? null,
+            email: inp.email ?? null,
+            paymentMethod: (inp.paymentMethod as PaymentMethod) ?? null,
+          })),
+        }),
+        this.prisma.property.createMany({
+          data: rows.map(({ inp, customerId, propertyId }) => ({
+            id: propertyId,
+            customerId,
+            propertyName: inp.propertyName ?? null,
+            addressLine: inp.fullAddress,
+            postcode: inp.postcode,
+            serviceAreaId: inp.serviceAreaId,
+            propertyType: (inp.propertyType as PropertyType) ?? null,
+            accessNotes: inp.accessNotes ?? null,
+            riskNotes: inp.riskNotes ?? null,
+            roundId: inp.roundId,
+          })),
+        }),
+        this.prisma.servicePlan.createMany({
+          data: rows.map(({ inp, propertyId, servicePlanId }) => ({
+            id: servicePlanId,
+            propertyId,
+            serviceId: inp.serviceId ?? null,
+            price: inp.price,
+            paymentMethod: (inp.paymentMethod as PaymentMethod) ?? null,
+            cleaningFrequency: (inp.cleaningFrequency as CleaningFrequency) ?? null,
+          })),
+        }),
+      ]).catch((err) => {
         throw new AppError(
           500,
           `Batch ${batchIndex} (rows ${batchStart}–${batchStart + batch.length - 1}) failed: ${err instanceof Error ? err.message : String(err)}`
         );
       });
 
-      allResults.push(...batchResults);
+      // createMany doesn't return the created rows — refetch by the IDs we
+      // just assigned so the response shape (full customer/property/plan
+      // records) is unchanged for callers.
+      const [customers, properties, servicePlans] = await Promise.all([
+        this.prisma.customer.findMany({ where: { id: { in: rows.map((r) => r.customerId) } } }),
+        this.prisma.property.findMany({ where: { id: { in: rows.map((r) => r.propertyId) } } }),
+        this.prisma.servicePlan.findMany({ where: { id: { in: rows.map((r) => r.servicePlanId) } } }),
+      ]);
+      const customerById = new Map(customers.map((c) => [c.id, c]));
+      const propertyById = new Map(properties.map((p) => [p.id, p]));
+      const servicePlanById = new Map(servicePlans.map((sp) => [sp.id, sp]));
+
+      for (const row of rows) {
+        allResults.push({
+          customer: customerById.get(row.customerId)!,
+          property: propertyById.get(row.propertyId)!,
+          servicePlan: servicePlanById.get(row.servicePlanId)!,
+        });
+      }
     }
 
     return { created: allResults.length, results: allResults };
