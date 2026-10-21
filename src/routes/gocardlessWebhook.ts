@@ -3,8 +3,8 @@ import { Router, Request, Response } from "express";
 import { parse, InvalidSignatureError } from "gocardless-nodejs";
 import { prisma } from "../lib/prisma";
 import { getTenantPrismaForSchema } from "../lib/tenant-prisma-manager";
-import { decrypt } from "../lib/crypto";
-import { PaymentStatus } from "../generated/tenant-client";
+import { decrypt, safeEqual } from "../lib/crypto";
+import { Prisma, PaymentStatus } from "../generated/tenant-client";
 import { queueGhlEvent } from "../integrations/ghl/sync";
 
 export const gocardlessWebhookRouter = Router();
@@ -22,12 +22,29 @@ gocardlessWebhookRouter.post("/", async (req: Request, res: Response) => {
   if (!tenant) { res.sendStatus(200); return; }
 
   const tp = getTenantPrismaForSchema(tenant.schemaName);
+  // gocardlessWebhookSecretEncrypted only gates this URL's ?secret= query
+  // param (see connect route) — GoCardless signs with its own secret, which
+  // the admin must paste in separately after creating the endpoint by hand
+  // in their GoCardless dashboard (no API for that, unlike Stripe).
   const bs = await tp.businessSettings.findFirst({
-    select: { gocardlessWebhookSecretEncrypted: true },
+    select: { gocardlessWebhookSecretEncrypted: true, gocardlessWebhookSigningSecretEncrypted: true },
   });
   if (!bs?.gocardlessWebhookSecretEncrypted) { res.sendStatus(200); return; }
+  if (!safeEqual(decrypt(bs.gocardlessWebhookSecretEncrypted), secret)) {
+    // Wrong (or forged) route token — fail quietly, same as every other
+    // "not for this request" branch above, so this endpoint doesn't tell a
+    // prober whether a given tenantId exists.
+    res.sendStatus(200);
+    return;
+  }
+  if (!bs.gocardlessWebhookSigningSecretEncrypted) {
+    // Admin hasn't pasted the real GoCardless-issued secret in yet — nothing
+    // we can verify signatures against.
+    res.sendStatus(200);
+    return;
+  }
 
-  const webhookSecret = decrypt(bs.gocardlessWebhookSecretEncrypted);
+  const webhookSecret = decrypt(bs.gocardlessWebhookSigningSecretEncrypted);
   const sig = req.headers["webhook-signature"] as string | undefined;
 
   let events: Event[];
@@ -57,13 +74,20 @@ async function processEvents(
   for (const event of events as Array<{ id?: string; resource_type?: string; action?: string; links?: { payment?: string; mandate?: string } }>) {
     if (!event.id) continue;
 
-    // Idempotency — skip replays
+    // Idempotency — skip replays. Only a genuine unique-constraint violation
+    // means "already processed, safe to skip". Any other error must not be
+    // silently swallowed, or a transient failure would permanently drop the
+    // event with no record it ever arrived.
     try {
       await tp.webhookEvent.create({
         data: { source: "gocardless", externalId: event.id },
       });
-    } catch {
-      continue; // unique constraint → already processed
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+        continue;
+      }
+      console.error(`[gcWebhook] failed to record webhook event ${event.id}:`, err);
+      continue;
     }
 
     try {

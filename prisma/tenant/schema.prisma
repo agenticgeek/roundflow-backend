@@ -197,13 +197,21 @@ model BusinessSettings {
   vatInInvoices       Boolean        @default(false)
   gocardlessConnected              Boolean @default(false)
   gocardlessAccessTokenEncrypted   String?
+  // Route-auth token only (gates the ?secret= query param on
+  // /webhooks/gocardless) — NOT used for signature verification. GoCardless
+  // has no API to create webhook endpoints, so the admin creates one by hand
+  // in their GoCardless dashboard and GoCardless assigns its own signing
+  // secret, which must be pasted in separately (see gocardlessWebhookSigningSecretEncrypted).
   gocardlessWebhookSecretEncrypted String?
+  // The real signing secret GoCardless generated for the manually-created
+  // webhook endpoint, pasted in via PATCH /settings/payment/gocardless/webhook-secret.
+  // This is what verifies incoming webhook signatures.
+  gocardlessWebhookSigningSecretEncrypted String?
   gocardlessEnvironment            String?
   stripeConnected              Boolean        @default(false)
   stripeConnectAccountId       String?
   stripePublishableKey         String?
   stripeSecretKeyEncrypted     String?
-  stripeWebhookSecretEncrypted String?
   ghlConnected                 Boolean        @default(false)
   ghlLocationId                String?
   ghlAccessTokenEncrypted      String?

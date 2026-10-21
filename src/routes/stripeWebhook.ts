@@ -2,62 +2,77 @@ import { Router, Request, Response } from "express";
 import Stripe from "stripe";
 import { prisma } from "../lib/prisma";
 import { getTenantPrismaForSchema } from "../lib/tenant-prisma-manager";
-import { decrypt } from "../lib/crypto";
 import { getStripeClient } from "../integrations/stripe/client";
-import { PaymentMethod, PaymentStatus, StripeSessionStatus } from "../generated/tenant-client";
+import { Prisma, PaymentMethod, PaymentStatus, StripeSessionStatus } from "../generated/tenant-client";
 import { queueGhlEvent } from "../integrations/ghl/sync";
 
 export const stripeWebhookRouter = Router();
 
+// Platform-level Connect webhook — one endpoint, created once in RoundFlow's
+// own Stripe account (dashboard: Developers -> Webhooks -> Add endpoint,
+// "Listen to events on Connected accounts"), receives events for every
+// tenant's connected account automatically, tagged by `event.account`.
+//
+// This replaces a per-tenant design where RoundFlow generated its own random
+// "webhook secret" per tenant and asked the admin to manually register a
+// per-tenant URL in their own Stripe dashboard. That never actually worked:
+// Stripe generates and owns the real signing secret for whatever endpoint is
+// registered, so a self-invented value could never match it — signature
+// verification would fail on every event, forever. See
+// docs/handoff/backend for the full writeup.
 stripeWebhookRouter.post("/", async (req: Request, res: Response) => {
-  const tenantId = req.query.tenantId as string | undefined;
-  const secret   = req.query.secret   as string | undefined;
-
-  if (!tenantId || !secret) {
-    res.status(400).json({ error: "Missing tenantId or secret" });
+  const connectSecret = process.env.STRIPE_CONNECT_WEBHOOK_SECRET;
+  if (!connectSecret) {
+    console.error("[stripeWebhook] STRIPE_CONNECT_WEBHOOK_SECRET is not configured");
+    res.sendStatus(500);
     return;
   }
 
-  // Look up tenant and load BusinessSettings for this schema
-  const tenant = await prisma.tenant.findUnique({ where: { id: tenantId } });
-  if (!tenant) { res.sendStatus(200); return; }
-
-  const tp = getTenantPrismaForSchema(tenant.schemaName);
-  const bs = await tp.businessSettings.findFirst({
-    select: { stripeWebhookSecretEncrypted: true, stripeSecretKeyEncrypted: true },
-  });
-  if (!bs?.stripeWebhookSecretEncrypted || !bs.stripeSecretKeyEncrypted) {
-    res.sendStatus(200);
-    return;
-  }
-
-  // Verify Stripe signature — requires raw body
-  const webhookSecret = decrypt(bs.stripeWebhookSecretEncrypted);
   const sig = req.headers["stripe-signature"] as string;
   let event: Stripe.Event;
   try {
-    const stripe = getStripeClient(decrypt(bs.stripeSecretKeyEncrypted));
-    event = stripe.webhooks.constructEvent(req.body as Buffer, sig, webhookSecret);
+    const stripe = getStripeClient(process.env.STRIPE_SECRET_KEY!);
+    event = stripe.webhooks.constructEvent(req.body as Buffer, sig, connectSecret);
   } catch {
     res.status(400).json({ error: "Webhook signature verification failed" });
     return;
   }
 
-  // Idempotency — reject replays
-  try {
-    await tp.webhookEvent.create({
-      data: { source: "stripe", externalId: event.id },
-    });
-  } catch {
-    // Unique constraint violation = already processed
+  const stripeAccountId = event.account;
+  if (!stripeAccountId) {
+    // Not a connected-account event — nothing for RoundFlow to do with it.
     res.sendStatus(200);
     return;
   }
 
-  // Process asynchronously; always ack 200 immediately
+  const tenant = await prisma.tenant.findUnique({ where: { stripeConnectAccountId: stripeAccountId } });
+  if (!tenant) { res.sendStatus(200); return; }
+
+  const tp = getTenantPrismaForSchema(tenant.schemaName);
+
+  // Idempotency — reject replays. Only a genuine unique-constraint violation
+  // means "already processed, safe to skip". Any other error (e.g. a
+  // transient DB failure) must NOT be silently acked — doing so would tell
+  // Stripe "got it" for an event we never actually recorded or processed,
+  // and Stripe would then never retry it.
+  try {
+    await tp.webhookEvent.create({
+      data: { source: "stripe", externalId: event.id },
+    });
+  } catch (err) {
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+      res.sendStatus(200);
+      return;
+    }
+    console.error(`[stripeWebhook] ${tenant.id} failed to record webhook event ${event.id}:`, err);
+    res.sendStatus(500);
+    return;
+  }
+
+  // Process asynchronously; always ack 200 immediately once recorded.
   res.sendStatus(200);
-  handleEvent(tp, tenantId, event).catch((err) =>
-    console.error(`[stripeWebhook] ${tenantId} event ${event.id} failed:`, err)
+  handleEvent(tp, tenant.id, event).catch((err) =>
+    console.error(`[stripeWebhook] ${tenant.id} event ${event.id} failed:`, err)
   );
 });
 
@@ -179,4 +194,3 @@ async function handlePaymentFailed(
   }
 
 }
-

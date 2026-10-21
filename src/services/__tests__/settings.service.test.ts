@@ -281,3 +281,66 @@ it("invalidateCachedBusinessSettings() forces the next read (through either entr
   expect(result).toEqual(fresh);
   expect(prisma.businessSettings.findFirst).toHaveBeenCalledTimes(2);
 });
+
+// ---- updatePaymentRules -------------------------------------------------------
+
+it("updatePaymentRules is a function", () => {
+  expect(typeof createSettingsService(makePrisma(), "schema_payment_rules_a").updatePaymentRules).toBe("function");
+});
+
+it("updatePaymentRules writes paymentRule/vatInInvoices/debtHold fields and never touches the connect booleans", async () => {
+  const prisma = makePrisma();
+  (prisma.businessSettings.upsert as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "s1" });
+
+  await createSettingsService(prisma, "schema_payment_rules_b").updatePaymentRules({
+    paymentRule: "COLLECT_BEFORE_VISIT",
+    vatInInvoices: true,
+    debtHoldEnabled: true,
+    debtHoldMaxInvoices: 3,
+    debtHoldMaxAmount: 150,
+  });
+
+  const written = (prisma.businessSettings.upsert as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(written.update).toEqual({
+    paymentRule: "COLLECT_BEFORE_VISIT",
+    vatInInvoices: true,
+    debtHoldEnabled: true,
+    debtHoldMaxInvoices: 3,
+    debtHoldMaxAmount: 150,
+  });
+  expect(written.update.gocardlessConnected).toBeUndefined();
+  expect(written.update.stripeConnected).toBeUndefined();
+});
+
+it("updatePaymentRules clears debtHoldMaxInvoices/debtHoldMaxAmount when explicitly set to null", async () => {
+  const prisma = makePrisma();
+  (prisma.businessSettings.upsert as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "s1" });
+
+  await createSettingsService(prisma, "schema_payment_rules_c").updatePaymentRules({
+    debtHoldMaxInvoices: null,
+    debtHoldMaxAmount: null,
+  });
+
+  const written = (prisma.businessSettings.upsert as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(written.update.debtHoldMaxInvoices).toBeNull();
+  expect(written.update.debtHoldMaxAmount).toBeNull();
+  expect(written.update.paymentRule).toBeUndefined();
+});
+
+it("updatePaymentRules invalidates the settings cache", async () => {
+  const prisma = makePrisma();
+  const stale = { id: "s1", paymentRule: "COLLECT_AFTER_VISIT" };
+  const fresh = { id: "s1", paymentRule: "COLLECT_BEFORE_VISIT" };
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>)
+    .mockResolvedValueOnce(stale)
+    .mockResolvedValueOnce(fresh);
+  (prisma.businessSettings.upsert as ReturnType<typeof vi.fn>).mockResolvedValue(fresh);
+  const svc = createSettingsService(prisma, "schema_payment_rules_d");
+
+  await svc.getSettings();
+  await svc.updatePaymentRules({ paymentRule: "COLLECT_BEFORE_VISIT" });
+  const after = await svc.getSettings();
+
+  expect(after).toEqual(fresh);
+  expect(prisma.businessSettings.findFirst).toHaveBeenCalledTimes(2);
+});
