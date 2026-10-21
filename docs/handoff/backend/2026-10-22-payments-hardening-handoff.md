@@ -233,15 +233,36 @@ into a value that's never re-read; the resetModules dance works for re-exercisin
 internal branches across fresh module instances, just not for a plain top-level `const`
 assignment's own branch.
 
-## 6. Known issue, deliberately not fixed
+## 6. Follow-up fix: the `?secret=` route token was never actually checked
 
-`gocardlessWebhook.ts`'s `?secret=` query-param check only verifies the param is *present*
-(truthy), never that it matches anything stored — this was true before this work and is
-unchanged. It's a separate, pre-existing issue from the two bugs above (which were specifically
-about signature verification using the wrong secret, not about the route-auth token being
-unchecked). Flagging it here since it surfaced during the audit; fixing it wasn't requested and
-would need its own decision about whether/how to compare it (plain string compare is a timing
-side-channel; needs a constant-time comparison).
+Originally flagged here as a known-but-not-fixed issue, then fixed on request:
+`gocardlessWebhook.ts`'s `?secret=` query-param check only verified the param was *present*
+(truthy) — never that it matched the stored per-tenant route token. Any non-empty string in
+`?secret=` passed, for any tenant whose id you could guess (cuids, not trivially guessable, but
+still an unnecessary gap — this token exists specifically to gate the route).
+
+**Fix:** added `safeEqual(a, b)` to `src/lib/crypto.ts` — a constant-time string comparison
+(`crypto.timingSafeEqual`, with an explicit length check first since `timingSafeEqual` throws
+on mismatched buffer lengths rather than just returning `false`). A plain `===` here would leak
+timing information proportional to how many leading bytes match, letting an attacker recover
+the token byte-by-byte; `safeEqual` closes that.
+
+`gocardlessWebhook.ts` now decrypts the stored `gocardlessWebhookSecretEncrypted` and compares
+it against the query `secret` with `safeEqual` right after confirming it's present, before
+doing anything else — a mismatch acks 200 and no-ops, same "fail quietly" shape as every other
+not-for-this-request branch in that handler (unknown tenant, no secret stored, no signing
+secret yet), so this endpoint still doesn't let a prober distinguish "wrong secret" from
+"tenant doesn't exist" by status code.
+
+Tests added: `safeEqual` unit tests in `crypto.test.ts` (equal, different, different-length,
+both-empty), and a new case in `gocardlessWebhook.route.test.ts` asserting a mismatched
+`?secret=` 200s without ever calling `parse()` (i.e. never reaches signature verification).
+Existing tests had to switch their mocked `decrypt` from a wrapping fake
+(`` `decrypted(${v})` ``) to an identity function, since the route token now also flows through
+`decrypt()` for the comparison — every fixture's `gocardlessWebhookSecretEncrypted` was updated
+to equal the query string's `secret` value they already used (`"abc"`) so the existing tests
+keep exercising the same downstream branches they always did, rather than short-circuiting one
+step earlier at the new check.
 
 ## 7. Verification performed
 

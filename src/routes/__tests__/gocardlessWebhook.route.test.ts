@@ -10,9 +10,13 @@ vi.mock("../../lib/prisma", () => ({
   prisma: { tenant: { findUnique: (...args: unknown[]) => tenantFindUnique(...args) } },
 }));
 
-const decrypt = vi.fn((v: string) => `decrypted(${v})`);
+// Identity decrypt — lets fixtures set the "encrypted" field directly to the
+// plaintext value a test wants to assert against (e.g. the route token
+// equal to the query ?secret=, or the signing secret passed to parse()).
+const decrypt = vi.fn((v: string) => v);
 vi.mock("../../lib/crypto", () => ({
   decrypt: (...args: [string]) => decrypt(...args),
+  safeEqual: (a: string, b: string) => a === b,
 }));
 
 const parse = vi.fn();
@@ -87,11 +91,26 @@ describe("POST /webhooks/gocardless — routing", () => {
     expect(res.status).toBe(200);
   });
 
+  it("200s (without verifying signatures) when the ?secret= query param doesn't match the stored route token", async () => {
+    tenantFindUnique.mockResolvedValue({ id: "tenant-1", schemaName: "tenant_1" });
+    const tp = makeTenantPrisma();
+    tp.businessSettings.findFirst.mockResolvedValue({
+      gocardlessWebhookSecretEncrypted: "the-real-route-token",
+      gocardlessWebhookSigningSecretEncrypted: "real-signing-secret",
+    });
+    getTenantPrismaForSchema.mockReturnValue(tp);
+
+    const res = await send("?tenantId=tenant-1&secret=wrong-guess");
+
+    expect(res.status).toBe(200);
+    expect(parse).not.toHaveBeenCalled();
+  });
+
   it("200s when the real signing secret hasn't been pasted in yet", async () => {
     tenantFindUnique.mockResolvedValue({ id: "tenant-1", schemaName: "tenant_1" });
     const tp = makeTenantPrisma();
     tp.businessSettings.findFirst.mockResolvedValue({
-      gocardlessWebhookSecretEncrypted: "route-token",
+      gocardlessWebhookSecretEncrypted: "abc",
       gocardlessWebhookSigningSecretEncrypted: null,
     });
     getTenantPrismaForSchema.mockReturnValue(tp);
@@ -107,7 +126,7 @@ describe("POST /webhooks/gocardless — signature verification", () => {
     tenantFindUnique.mockResolvedValue({ id: "tenant-1", schemaName: "tenant_1" });
     const tp = makeTenantPrisma();
     tp.businessSettings.findFirst.mockResolvedValue({
-      gocardlessWebhookSecretEncrypted: "route-token",
+      gocardlessWebhookSecretEncrypted: "abc",
       gocardlessWebhookSigningSecretEncrypted: "real-signing-secret",
     });
     getTenantPrismaForSchema.mockReturnValue(tp);
@@ -140,7 +159,7 @@ describe("POST /webhooks/gocardless — signature verification", () => {
     parse.mockReturnValue([]);
     await send("?tenantId=tenant-1&secret=abc");
     expect(decrypt).toHaveBeenCalledWith("real-signing-secret");
-    expect(parse).toHaveBeenCalledWith(expect.anything(), "decrypted(real-signing-secret)", "sig_test");
+    expect(parse).toHaveBeenCalledWith(expect.anything(), "real-signing-secret", "sig_test");
   });
 
   it("falls back to an empty-string signature when the webhook-signature header is missing", async () => {
@@ -150,7 +169,7 @@ describe("POST /webhooks/gocardless — signature verification", () => {
       .post("/webhooks/gocardless?tenantId=tenant-1&secret=abc")
       .set("Content-Type", "application/json")
       .send(JSON.stringify([]));
-    expect(parse).toHaveBeenCalledWith(expect.anything(), "decrypted(real-signing-secret)", "");
+    expect(parse).toHaveBeenCalledWith(expect.anything(), "real-signing-secret", "");
   });
 });
 
@@ -159,7 +178,7 @@ describe("POST /webhooks/gocardless — event processing", () => {
     tenantFindUnique.mockResolvedValue({ id: "tenant-1", schemaName: "tenant_1" });
     const tp = makeTenantPrisma();
     tp.businessSettings.findFirst.mockResolvedValue({
-      gocardlessWebhookSecretEncrypted: "route-token",
+      gocardlessWebhookSecretEncrypted: "abc",
       gocardlessWebhookSigningSecretEncrypted: "real-signing-secret",
     });
     getTenantPrismaForSchema.mockReturnValue(tp);
@@ -238,7 +257,7 @@ describe("POST /webhooks/gocardless — event processing", () => {
     tenantFindUnique.mockResolvedValue({ id: "tenant-1", schemaName: "tenant_1" });
     const tp = makeTenantPrisma();
     tp.businessSettings.findFirst.mockResolvedValue({
-      gocardlessWebhookSecretEncrypted: "route-token",
+      gocardlessWebhookSecretEncrypted: "abc",
       gocardlessWebhookSigningSecretEncrypted: "real-signing-secret",
     });
     getTenantPrismaForSchema.mockReturnValue(tp);

@@ -3,7 +3,7 @@ import { Router, Request, Response } from "express";
 import { parse, InvalidSignatureError } from "gocardless-nodejs";
 import { prisma } from "../lib/prisma";
 import { getTenantPrismaForSchema } from "../lib/tenant-prisma-manager";
-import { decrypt } from "../lib/crypto";
+import { decrypt, safeEqual } from "../lib/crypto";
 import { Prisma, PaymentStatus } from "../generated/tenant-client";
 import { queueGhlEvent } from "../integrations/ghl/sync";
 
@@ -30,6 +30,13 @@ gocardlessWebhookRouter.post("/", async (req: Request, res: Response) => {
     select: { gocardlessWebhookSecretEncrypted: true, gocardlessWebhookSigningSecretEncrypted: true },
   });
   if (!bs?.gocardlessWebhookSecretEncrypted) { res.sendStatus(200); return; }
+  if (!safeEqual(decrypt(bs.gocardlessWebhookSecretEncrypted), secret)) {
+    // Wrong (or forged) route token — fail quietly, same as every other
+    // "not for this request" branch above, so this endpoint doesn't tell a
+    // prober whether a given tenantId exists.
+    res.sendStatus(200);
+    return;
+  }
   if (!bs.gocardlessWebhookSigningSecretEncrypted) {
     // Admin hasn't pasted the real GoCardless-issued secret in yet — nothing
     // we can verify signatures against.

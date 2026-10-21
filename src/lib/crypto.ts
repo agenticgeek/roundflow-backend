@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes } from "crypto";
+import { createCipheriv, createDecipheriv, randomBytes, timingSafeEqual } from "crypto";
 
 const ALGORITHM = "aes-256-gcm";
 const KEY_HEX = process.env.ENCRYPTION_KEY ?? "";
@@ -25,4 +25,19 @@ export function decrypt(ciphertext: string): string {
   const decipher = createDecipheriv(ALGORITHM, getKey(), Buffer.from(ivHex, "hex"));
   decipher.setAuthTag(Buffer.from(authTagHex, "hex"));
   return decipher.update(Buffer.from(dataHex, "hex")).toString("utf8") + decipher.final("utf8");
+}
+
+// Constant-time string comparison — use for comparing a caller-supplied
+// secret/token against a stored one (e.g. a webhook route-auth token).
+// A plain `===` leaks timing information proportional to how many leading
+// bytes match, which an attacker can use to brute-force the secret
+// byte-by-byte. timingSafeEqual() requires equal-length buffers, so the
+// length check must happen first — doing so doesn't reintroduce a
+// meaningful side channel here, since the secret's length isn't itself
+// a part of what's being protected.
+export function safeEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, "utf8");
+  const bufB = Buffer.from(b, "utf8");
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
 }

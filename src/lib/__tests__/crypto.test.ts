@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { encrypt, decrypt } from "../crypto";
+import { encrypt, decrypt, safeEqual } from "../crypto";
 
 describe("crypto", () => {
   it("round-trips plaintext through encrypt/decrypt", () => {
@@ -44,6 +44,24 @@ describe("crypto", () => {
     const [iv, authTag, data] = ciphertext.split(":");
     const tamperedData = data.replace(/^./, data[0] === "0" ? "1" : "0");
     expect(() => decrypt(`${iv}:${authTag}:${tamperedData}`)).toThrow();
+  });
+
+  describe("safeEqual", () => {
+    it("returns true for identical strings", () => {
+      expect(safeEqual("same-secret", "same-secret")).toBe(true);
+    });
+
+    it("returns false for different strings of the same length", () => {
+      expect(safeEqual("secret-a", "secret-b")).toBe(false);
+    });
+
+    it("returns false for strings of different lengths without throwing", () => {
+      expect(safeEqual("short", "a-much-longer-string")).toBe(false);
+    });
+
+    it("returns true for two empty strings", () => {
+      expect(safeEqual("", "")).toBe(true);
+    });
   });
 
   // KEY_HEX is read from process.env.ENCRYPTION_KEY once at module load, so
