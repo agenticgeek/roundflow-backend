@@ -238,6 +238,7 @@ roundsRouter.post(
       reason: requireString(body.reason, "reason"),
       technicianId: optId(body.technicianId, "technicianId"),
       notifyCustomers: optBool(body.notifyCustomers, "notifyCustomers") ?? false,
+      message: optString(body.message, "message"),
     };
     const result = await svc(req).pushMissedJobs(req.params.id, input);
     void createReportsService(req.tenantPrisma!).logActivity(

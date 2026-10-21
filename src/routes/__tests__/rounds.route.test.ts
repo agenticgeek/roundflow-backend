@@ -1,4 +1,4 @@
-import { it, expect, vi } from "vitest";
+import { it, expect, vi, describe } from "vitest";
 import request from "supertest";
 import express from "express";
 
@@ -8,6 +8,7 @@ const mockBatchResult = [
 ];
 
 const listOccurrencesForRounds = vi.fn().mockResolvedValue(mockBatchResult);
+const pushMissedJobs = vi.fn();
 
 vi.mock("../../services/round.service", () => ({
   createRoundService: vi.fn(() => ({
@@ -21,7 +22,7 @@ vi.mock("../../services/round.service", () => ({
     getOccurrence: vi.fn(),
     getTodayPanel: vi.fn(),
     reassignTechnician: vi.fn(),
-    pushMissedJobs: vi.fn(),
+    pushMissedJobs,
   })),
 }));
 
@@ -165,4 +166,44 @@ it("GET /rounds/:id/planner/occurrences returns 400 for day-of-month 00", async 
   const app = makeApp();
   const res = await request(app).get("/rounds/round-1/planner/occurrences?to=2026-01-00");
   expect(res.status).toBe(400);
+});
+
+// ---------------------------------------------------------------------------
+// POST /rounds/:id/push-missed
+// ---------------------------------------------------------------------------
+
+describe("POST /rounds/:id/push-missed", () => {
+  it("passes the optional message field through to the service", async () => {
+    pushMissedJobs.mockResolvedValueOnce({ pushedCount: 2 });
+    const app = makeApp();
+    const res = await request(app)
+      .post("/rounds/r1/push-missed")
+      .send({ newDate: "2099-01-01", reason: "Weather", notifyCustomers: true, message: "Sorry!" });
+    expect(res.status).toBe(200);
+    expect(pushMissedJobs).toHaveBeenCalledWith(
+      "r1",
+      expect.objectContaining({ reason: "Weather", notifyCustomers: true, message: "Sorry!" })
+    );
+  });
+
+  it("defaults message to undefined when omitted", async () => {
+    pushMissedJobs.mockResolvedValueOnce({ pushedCount: 0 });
+    const app = makeApp();
+    const res = await request(app)
+      .post("/rounds/r1/push-missed")
+      .send({ newDate: "2099-01-01", reason: "Weather" });
+    expect(res.status).toBe(200);
+    expect(pushMissedJobs).toHaveBeenCalledWith(
+      "r1",
+      expect.objectContaining({ message: undefined })
+    );
+  });
+
+  it("400s when newDate is not a YYYY-MM-DD string", async () => {
+    const app = makeApp();
+    const res = await request(app)
+      .post("/rounds/r1/push-missed")
+      .send({ newDate: "01/01/2099", reason: "Weather" });
+    expect(res.status).toBe(400);
+  });
 });

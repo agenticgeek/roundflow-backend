@@ -439,6 +439,108 @@ it("getBoard combines roundId and paymentMethod with a bucket filter", async () 
   expect(callArgs.where.customer).toMatchObject({ paymentMethod: "CARD", badDebt: false, holdNextClean: true });
 });
 
+// ---- getBoard: search param ------------------------------------------------------
+
+it("getBoard with no search leaves where.AND untouched for a named bucket", async () => {
+  const prisma = makePrisma();
+  setupBoard(prisma, [inv()]);
+  await createDebtService(prisma).getBoard("BAD_DEBT");
+  const callArgs = (prisma.invoice.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(callArgs.where.AND).toBeUndefined();
+});
+
+it("getBoard with search adds an OR clause on customer name / property address for a named bucket", async () => {
+  const prisma = makePrisma();
+  setupBoard(prisma, [inv()]);
+  await createDebtService(prisma).getBoard("BAD_DEBT", undefined, undefined, undefined, undefined, "smith");
+  const callArgs = (prisma.invoice.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(callArgs.where.AND).toEqual([
+    {
+      OR: [
+        { customer: { name: { contains: "smith", mode: "insensitive" } } },
+        { visit: { property: { addressLine: { contains: "smith", mode: "insensitive" } } } },
+      ],
+    },
+  ]);
+});
+
+it("getBoard with search on the default bucket appends to the existing AND array rather than replacing it", async () => {
+  const prisma = makePrisma();
+  setupBoard(prisma, [inv()]);
+  await createDebtService(prisma).getBoard("INVOICE_SENT", undefined, undefined, undefined, undefined, "smith");
+  const callArgs = (prisma.invoice.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(callArgs.where.AND).toHaveLength(3);
+  expect(callArgs.where.AND[2]).toEqual({
+    OR: [
+      { customer: { name: { contains: "smith", mode: "insensitive" } } },
+      { visit: { property: { addressLine: { contains: "smith", mode: "insensitive" } } } },
+    ],
+  });
+});
+
+// ---- getBucketCounts ---------------------------------------------------------------
+
+it("getBucketCounts is a function", () => {
+  expect(typeof createDebtService(makePrisma()).getBucketCounts).toBe("function");
+});
+
+it("getBucketCounts returns a count for all 7 bucket tabs in one call", async () => {
+  const prisma = makePrisma();
+  (prisma.payment.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (prisma.invoice.count as ReturnType<typeof vi.fn>).mockResolvedValue(3);
+  const result = await createDebtService(prisma).getBucketCounts();
+  expect(result).toEqual({
+    BAD_DEBT: 3,
+    ON_HOLD: 3,
+    FAILED_GC: 3,
+    DUE_BEFORE_CLEAN: 3,
+    SEVEN_DAYS_OVER: 3,
+    FOURTEEN_DAYS_OVER: 3,
+    ALL: 3,
+  });
+  expect(prisma.invoice.count).toHaveBeenCalledTimes(7);
+});
+
+it("getBucketCounts only computes the failed/upcoming context once, not once per bucket", async () => {
+  const prisma = makePrisma();
+  (prisma.payment.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (prisma.invoice.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
+  await createDebtService(prisma).getBucketCounts();
+  expect(prisma.payment.findMany).toHaveBeenCalledTimes(1);
+  expect(prisma.visit.findMany).toHaveBeenCalledTimes(1);
+});
+
+it("getBucketCounts threads roundId/paymentMethod/search into every bucket's where clause", async () => {
+  const prisma = makePrisma();
+  (prisma.payment.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (prisma.invoice.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
+  await createDebtService(prisma).getBucketCounts("round-1", "CARD", "smith");
+  const calls = (prisma.invoice.count as ReturnType<typeof vi.fn>).mock.calls;
+  expect(calls).toHaveLength(7);
+  for (const [{ where }] of calls) {
+    expect(where.visit).toMatchObject({ property: { roundId: "round-1" } });
+    expect(where.customer).toMatchObject({ paymentMethod: "CARD" });
+    expect(where.AND).toBeDefined();
+  }
+});
+
+it("getBucketCounts distinguishes BAD_DEBT (true) from every other bucket (false) in the where clause", async () => {
+  const prisma = makePrisma();
+  (prisma.payment.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (prisma.invoice.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
+  await createDebtService(prisma).getBucketCounts();
+  const calls = (prisma.invoice.count as ReturnType<typeof vi.fn>).mock.calls as Array<[{ where: { customer: { badDebt?: boolean } } }]>;
+  // DEBT_BUCKETS order: BAD_DEBT, ON_HOLD, FAILED_GC, DUE_BEFORE_CLEAN, SEVEN_DAYS_OVER, FOURTEEN_DAYS_OVER, ALL
+  expect(calls[0][0].where.customer.badDebt).toBe(true);
+  for (const [{ where }] of calls.slice(1)) {
+    expect(where.customer.badDebt).toBe(false);
+  }
+});
+
 // ---- getBoard: pagination ---------------------------------------------------------
 
 it("getBoard defaults to page=1, pageSize=50 (take/skip passed to findMany)", async () => {

@@ -177,6 +177,11 @@ export interface ServicePlanView {
   pauseStartDate: Date | null;
   pauseEndDate: Date | null;
   paymentRule: PaymentTiming | null;
+  // True for the one plan that property/customer-level writes (Edit Customer,
+  // Change Frequency, Pause/Resume) currently target — see primaryPlan().
+  // Lets the frontend stop guessing which plan a property-level write affects
+  // until per-plan write endpoints exist.
+  isPrimary: boolean;
 }
 
 export interface PaymentRow {
@@ -517,6 +522,7 @@ class CustomerService {
       pauseStartDate: p.pauseStartDate,
       pauseEndDate: p.pauseEndDate,
       paymentRule,
+      isPrimary: p.id === plan?.id,
     });
 
     const servicePlanViews: ServicePlanView[] = property

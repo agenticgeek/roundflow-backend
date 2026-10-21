@@ -33,8 +33,12 @@ dashboardRouter.get("/technician-kpis", h(async (req, res) => {
   res.json(await svc(req).getTechnicianKpis(period));
 }));
 
-// GET /dashboard/charts?range=6m|12m
+// GET /dashboard/charts?range=6m|12m&technicianIds=a,b,c
 dashboardRouter.get("/charts", h(async (req, res) => {
   const range = req.query.range === "12m" ? "12m" : "6m";
-  res.json(await svc(req).getChartData(range));
+  const technicianIds =
+    typeof req.query.technicianIds === "string"
+      ? req.query.technicianIds.split(",").map((id) => id.trim()).filter(Boolean)
+      : undefined;
+  res.json(await svc(req).getChartData(range, technicianIds));
 }));

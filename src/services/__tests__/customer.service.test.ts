@@ -140,6 +140,39 @@ it("getCustomerDetail returns servicePlans array with 2 items when property has 
   expect(result.servicePlans[1].id).toBe("sp2");
   expect(result.servicePlans[1].serviceName).toBe("Gutters");
   expect(result.tabs.servicePlans).toHaveLength(2);
+  // Both plans are ACTIVE; primaryPlan()'s rule picks the first one found.
+  expect(result.servicePlans[0].isPrimary).toBe(true);
+  expect(result.servicePlans[1].isPrimary).toBe(false);
+});
+
+it("getCustomerDetail marks exactly one servicePlan as isPrimary: true when a later plan is ACTIVE and an earlier one is CANCELLED", async () => {
+  const prisma = makePrisma();
+  const plans = [
+    { id: "sp1", serviceId: null, service: null, price: 40, cleanMethod: null, paymentMethod: null, cleaningFrequency: "FOUR_WEEKLY", status: LifecycleStatus.CANCELLED, nextDueDate: null, lastCompleted: null, pauseStartDate: null, pauseEndDate: null },
+    { id: "sp2", serviceId: null, service: null, price: 80, cleanMethod: null, paymentMethod: null, cleaningFrequency: "TWELVE_WEEKLY", status: LifecycleStatus.ACTIVE, nextDueDate: null, lastCompleted: null, pauseStartDate: null, pauseEndDate: null },
+  ];
+  (prisma.customer.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeCustomerWithPlans(plans));
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(makeSettings());
+
+  const result = await createCustomerService(prisma).getCustomerDetail("c1", UserRole.ADMIN);
+
+  expect(result.servicePlans.find((p) => p.id === "sp1")?.isPrimary).toBe(false);
+  expect(result.servicePlans.find((p) => p.id === "sp2")?.isPrimary).toBe(true);
+});
+
+it("getCustomerDetail falls back the primary plan to servicePlans[0] when none are ACTIVE, marking only that one isPrimary", async () => {
+  const prisma = makePrisma();
+  const plans = [
+    { id: "sp1", serviceId: null, service: null, price: 40, cleanMethod: null, paymentMethod: null, cleaningFrequency: "FOUR_WEEKLY", status: LifecycleStatus.CANCELLED, nextDueDate: null, lastCompleted: null, pauseStartDate: null, pauseEndDate: null },
+    { id: "sp2", serviceId: null, service: null, price: 80, cleanMethod: null, paymentMethod: null, cleaningFrequency: "TWELVE_WEEKLY", status: LifecycleStatus.CANCELLED, nextDueDate: null, lastCompleted: null, pauseStartDate: null, pauseEndDate: null },
+  ];
+  (prisma.customer.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeCustomerWithPlans(plans));
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(makeSettings());
+
+  const result = await createCustomerService(prisma).getCustomerDetail("c1", UserRole.ADMIN);
+
+  expect(result.servicePlans.find((p) => p.id === "sp1")?.isPrimary).toBe(true);
+  expect(result.servicePlans.find((p) => p.id === "sp2")?.isPrimary).toBe(false);
 });
 
 it("getCustomerDetail standingInfo uses active plan frequency when multiple plans exist", async () => {

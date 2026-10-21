@@ -2,65 +2,127 @@ import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 import { MessageChannel, PaymentMethod, Prisma } from "../generated/tenant-client";
 
+// The 7 tabs the debt board UI shows: the 6 named buckets below, plus
+// whatever bucket string doesn't match one of them (the "default"/catch-all
+// tab, keyed here as "ALL" for the counts endpoint).
+export const DEBT_BUCKETS = [
+  "BAD_DEBT",
+  "ON_HOLD",
+  "FAILED_GC",
+  "DUE_BEFORE_CLEAN",
+  "SEVEN_DAYS_OVER",
+  "FOURTEEN_DAYS_OVER",
+  "ALL",
+] as const;
+export type DebtBucket = (typeof DEBT_BUCKETS)[number];
+
+interface BucketContext {
+  failedVisitIds: string[];
+  upcomingCustomerIds: string[];
+  now: Date;
+  sevenDaysAgo: Date;
+}
+
+async function computeBucketContext(prisma: TenantPrismaClient): Promise<BucketContext> {
+  const now = new Date();
+  const sevenDaysAgo = new Date(now.getTime() - 7 * 86_400_000);
+  const sevenDaysFromNow = new Date(now.getTime() + 7 * 86_400_000);
+
+  const [failedPayments, upcomingVisits] = await Promise.all([
+    prisma.payment.findMany({ where: { status: "FAILED", method: "GOCARDLESS" }, select: { visitId: true } }),
+    prisma.visit.findMany({ where: { date: { gte: now, lte: sevenDaysFromNow } }, select: { property: { select: { customerId: true } } } }),
+  ]);
+  const failedVisitIds = [...new Set(failedPayments.map((p) => p.visitId).filter(Boolean) as string[])];
+  const upcomingCustomerIds = [...new Set(upcomingVisits.map((v) => v.property.customerId))];
+
+  return { failedVisitIds, upcomingCustomerIds, now, sevenDaysAgo };
+}
+
+function buildBucketWhere(
+  bucket: string,
+  filters: { roundId?: string; paymentMethod?: string; search?: string },
+  ctx: BucketContext
+): Prisma.InvoiceWhereInput {
+  const { roundId, paymentMethod, search } = filters;
+  const { failedVisitIds, upcomingCustomerIds, now, sevenDaysAgo } = ctx;
+
+  const customerWhere: Prisma.CustomerWhereInput = {};
+  if (paymentMethod) customerWhere.paymentMethod = paymentMethod as PaymentMethod;
+
+  const where: Prisma.InvoiceWhereInput = { status: "SENT", customer: customerWhere };
+  if (roundId) where.visit = { property: { roundId } };
+  switch (bucket) {
+    case "BAD_DEBT":
+      customerWhere.badDebt = true;
+      break;
+    case "ON_HOLD":
+      customerWhere.badDebt = false;
+      customerWhere.holdNextClean = true;
+      break;
+    case "FAILED_GC":
+      customerWhere.badDebt = false;
+      where.visitId = { in: failedVisitIds };
+      break;
+    case "DUE_BEFORE_CLEAN":
+      customerWhere.badDebt = false;
+      where.customerId = { in: upcomingCustomerIds };
+      break;
+    case "SEVEN_DAYS_OVER":
+      customerWhere.badDebt = false;
+      where.dueDate = { gte: sevenDaysAgo, lt: now };
+      break;
+    case "FOURTEEN_DAYS_OVER":
+      customerWhere.badDebt = false;
+      where.dueDate = { lt: sevenDaysAgo };
+      break;
+    default:
+      customerWhere.badDebt = false;
+      customerWhere.holdNextClean = false;
+      where.customerId = { notIn: upcomingCustomerIds };
+      // `visitId` is nullable on Invoice — plain `{ notIn: [...] }` would
+      // translate to SQL `NOT IN`, which is NULL (not true) for a NULL
+      // visitId, silently dropping standalone invoices with no linked
+      // visit. Explicitly allow null alongside "not in the failed set".
+      where.AND = [
+        { OR: [{ visitId: null }, { visitId: { notIn: failedVisitIds } }] },
+        { OR: [{ dueDate: null }, { dueDate: { gte: sevenDaysAgo } }] },
+      ];
+  }
+
+  if (search) {
+    const searchClause: Prisma.InvoiceWhereInput = {
+      OR: [
+        { customer: { name: { contains: search, mode: "insensitive" } } },
+        { visit: { property: { addressLine: { contains: search, mode: "insensitive" } } } },
+      ],
+    };
+    // `where.AND` is only ever set above as an array literal (default bucket
+    // case) or left undefined — never a bare object — so no Array.isArray
+    // guard is needed here.
+    where.AND = where.AND
+      ? [...(where.AND as Prisma.InvoiceWhereInput[]), searchClause]
+      : [searchClause];
+  }
+
+  return where;
+}
+
 export function createDebtService(prisma: TenantPrismaClient) {
   return {
-    getBoard: async (bucket: string, roundId?: string, paymentMethod?: string, page?: number, pageSize?: number) => {
-      const now = new Date();
-      const sevenDaysAgo = new Date(now.getTime() - 7 * 86_400_000);
-      const sevenDaysFromNow = new Date(now.getTime() + 7 * 86_400_000);
+    getBoard: async (
+      bucket: string,
+      roundId?: string,
+      paymentMethod?: string,
+      page?: number,
+      pageSize?: number,
+      search?: string
+    ) => {
       const pageNum = Math.max(1, page ?? 1);
       const pageSizeNum = Math.min(100, Math.max(1, pageSize ?? 50));
       const skip = (pageNum - 1) * pageSizeNum;
 
-      const [failedPayments, upcomingVisits] = await Promise.all([
-        prisma.payment.findMany({ where: { status: "FAILED", method: "GOCARDLESS" }, select: { visitId: true } }),
-        prisma.visit.findMany({ where: { date: { gte: now, lte: sevenDaysFromNow } }, select: { property: { select: { customerId: true } } } }),
-      ]);
-      const failedVisitIds = [...new Set(failedPayments.map((p) => p.visitId).filter(Boolean) as string[])];
-      const upcomingCustomerIds = [...new Set(upcomingVisits.map((v) => v.property.customerId))];
-
-      const customerWhere: Prisma.CustomerWhereInput = {};
-      if (paymentMethod) customerWhere.paymentMethod = paymentMethod as PaymentMethod;
-
-      const where: Prisma.InvoiceWhereInput = { status: "SENT", customer: customerWhere };
-      if (roundId) where.visit = { property: { roundId } };
-      switch (bucket) {
-        case "BAD_DEBT":
-          customerWhere.badDebt = true;
-          break;
-        case "ON_HOLD":
-          customerWhere.badDebt = false;
-          customerWhere.holdNextClean = true;
-          break;
-        case "FAILED_GC":
-          customerWhere.badDebt = false;
-          where.visitId = { in: failedVisitIds };
-          break;
-        case "DUE_BEFORE_CLEAN":
-          customerWhere.badDebt = false;
-          where.customerId = { in: upcomingCustomerIds };
-          break;
-        case "SEVEN_DAYS_OVER":
-          customerWhere.badDebt = false;
-          where.dueDate = { gte: sevenDaysAgo, lt: now };
-          break;
-        case "FOURTEEN_DAYS_OVER":
-          customerWhere.badDebt = false;
-          where.dueDate = { lt: sevenDaysAgo };
-          break;
-        default:
-          customerWhere.badDebt = false;
-          customerWhere.holdNextClean = false;
-          where.customerId = { notIn: upcomingCustomerIds };
-          // `visitId` is nullable on Invoice — plain `{ notIn: [...] }` would
-          // translate to SQL `NOT IN`, which is NULL (not true) for a NULL
-          // visitId, silently dropping standalone invoices with no linked
-          // visit. Explicitly allow null alongside "not in the failed set".
-          where.AND = [
-            { OR: [{ visitId: null }, { visitId: { notIn: failedVisitIds } }] },
-            { OR: [{ dueDate: null }, { dueDate: { gte: sevenDaysAgo } }] },
-          ];
-      }
+      const ctx = await computeBucketContext(prisma);
+      const where = buildBucketWhere(bucket, { roundId, paymentMethod, search }, ctx);
 
       const [total, invoices] = await Promise.all([
         prisma.invoice.count({ where }),
@@ -143,15 +205,23 @@ export function createDebtService(prisma: TenantPrismaClient) {
       const msg = await prisma.message.create({ data: { channel: channel as MessageChannel, direction: "OUTBOUND", body: _message, customerId: invoice.customerId, sentAt: new Date() } });
       return { id: msg.id };
     },
+    getBucketCounts: async (
+      roundId?: string,
+      paymentMethod?: string,
+      search?: string
+    ): Promise<Record<DebtBucket, number>> => {
+      const ctx = await computeBucketContext(prisma);
+      const entries = await Promise.all(
+        DEBT_BUCKETS.map(async (bucket) => {
+          const where = buildBucketWhere(bucket, { roundId, paymentMethod, search }, ctx);
+          const count = await prisma.invoice.count({ where });
+          return [bucket, count] as const;
+        })
+      );
+      return Object.fromEntries(entries) as Record<DebtBucket, number>;
+    },
     getKpis: async () => {
-      const now = new Date();
-      const sevenDaysFromNow = new Date(now.getTime() + 7 * 86_400_000);
-      const [failedPayments, upcomingVisits] = await Promise.all([
-        prisma.payment.findMany({ where: { status: "FAILED", method: "GOCARDLESS" }, select: { visitId: true } }),
-        prisma.visit.findMany({ where: { date: { gte: now, lte: sevenDaysFromNow } }, select: { property: { select: { customerId: true } } } }),
-      ]);
-      const failedVisitIds = [...new Set(failedPayments.map((p) => p.visitId).filter(Boolean) as string[])];
-      const upcomingCustomerIds = [...new Set(upcomingVisits.map((v) => v.property.customerId))];
+      const { failedVisitIds, upcomingCustomerIds } = await computeBucketContext(prisma);
 
       const [totalOutstandingsAgg, badDebtAgg, failedGoCardless, dueBeforeClean, holdCustomers] = await Promise.all([
         prisma.invoice.aggregate({ _sum: { amount: true }, where: { status: "SENT", customer: { badDebt: false } } }),

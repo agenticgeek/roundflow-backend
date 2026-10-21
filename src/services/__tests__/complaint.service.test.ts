@@ -7,6 +7,7 @@ function makePrisma() {
       create: vi.fn(),
       findUnique: vi.fn(),
       findMany: vi.fn(),
+      count: vi.fn().mockResolvedValue(0),
       update: vi.fn(),
     },
     customer: { findUnique: vi.fn() },
@@ -88,6 +89,50 @@ it("logComplaint throws 404 when technicianId does not exist", async () => {
       technicianId: "bad",
     })
   ).rejects.toMatchObject({ statusCode: 404 });
+});
+
+it("logComplaint succeeds when propertyId is given and the property exists", async () => {
+  const prisma = makePrisma();
+  (prisma.customer.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1" });
+  (prisma.property.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "p1" });
+  (prisma.complaint.create as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: "cmp1", status: "OPEN", severity: "LOW",
+    title: "Missed clean", description: null, issueType: null,
+    customerId: "c1", propertyId: "p1", technicianId: null,
+    revisitDate: null, createdAt: new Date(),
+    customer: { id: "c1", name: "Jane Doe" },
+    property: null, technician: null,
+  });
+
+  const result = await createComplaintService(prisma).logComplaint({
+    customerId: "c1",
+    title: "Missed clean",
+    propertyId: "p1",
+  });
+
+  expect(result.propertyId).toBe("p1");
+});
+
+it("logComplaint succeeds when technicianId is given and the technician has accepted their invite", async () => {
+  const prisma = makePrisma();
+  (prisma.customer.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1" });
+  (prisma.technician.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "t1", profileId: "prof-1" });
+  (prisma.complaint.create as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: "cmp1", status: "OPEN", severity: "LOW",
+    title: "Missed clean", description: null, issueType: null,
+    customerId: "c1", propertyId: null, technicianId: "t1",
+    revisitDate: null, createdAt: new Date(),
+    customer: { id: "c1", name: "Jane Doe" },
+    property: null, technician: null,
+  });
+
+  const result = await createComplaintService(prisma).logComplaint({
+    customerId: "c1",
+    title: "Missed clean",
+    technicianId: "t1",
+  });
+
+  expect(result.technicianId).toBe("t1");
 });
 
 it("logComplaint throws 400 when technician has not accepted their invite", async () => {
@@ -297,12 +342,51 @@ it("assignTechnician sets technicianId on the complaint", async () => {
 
 // ── listComplaints ──────────────────────────────────────────────────────────
 
-it("listComplaints returns an array", async () => {
+it("listComplaints returns a paginated rows array", async () => {
   const prisma = makePrisma();
   (prisma.complaint.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
 
   const result = await createComplaintService(prisma).listComplaints({});
-  expect(Array.isArray(result)).toBe(true);
+  expect(Array.isArray(result.rows)).toBe(true);
+  expect(result.pagination).toEqual({ page: 1, pageSize: 50, total: 0, totalPages: 0 });
+});
+
+it("listComplaints threads page/pageSize into take/skip and returns matching pagination metadata", async () => {
+  const prisma = makePrisma();
+  (prisma.complaint.count as ReturnType<typeof vi.fn>).mockResolvedValue(120);
+  (prisma.complaint.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+  const result = await createComplaintService(prisma).listComplaints({ page: 3, pageSize: 20 });
+
+  const args = (prisma.complaint.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(args.take).toBe(20);
+  expect(args.skip).toBe(40);
+  expect(result.pagination).toEqual({ page: 3, pageSize: 20, total: 120, totalPages: 6 });
+});
+
+it("listComplaints maps each returned row through toDetail", async () => {
+  const prisma = makePrisma();
+  (prisma.complaint.count as ReturnType<typeof vi.fn>).mockResolvedValue(1);
+  (prisma.complaint.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([baseComplaint]);
+
+  const result = await createComplaintService(prisma).listComplaints({});
+
+  expect(result.rows).toHaveLength(1);
+  expect(result.rows[0].id).toBe("cmp1");
+  expect(result.rows[0].customerName).toBe("Jane Doe");
+});
+
+it("listComplaints clamps pageSize to a max of 100 and page to a min of 1", async () => {
+  const prisma = makePrisma();
+  (prisma.complaint.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+  const result = await createComplaintService(prisma).listComplaints({ page: 0, pageSize: 500 });
+
+  const args = (prisma.complaint.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(args.take).toBe(100);
+  expect(args.skip).toBe(0);
+  expect(result.pagination.page).toBe(1);
+  expect(result.pagination.pageSize).toBe(100);
 });
 
 it("listComplaints passes status filter to prisma", async () => {

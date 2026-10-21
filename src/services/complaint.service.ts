@@ -31,6 +31,20 @@ export interface ComplaintListFilters {
   search?: string;
   status?: ComplaintStatus;
   technicianId?: string;
+  page?: number;
+  pageSize?: number;
+}
+
+export interface ComplaintPagination {
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+}
+
+export interface PaginatedComplaints {
+  rows: ComplaintDetail[];
+  pagination: ComplaintPagination;
 }
 
 export interface MessageDetail {
@@ -49,7 +63,7 @@ type MessageRow = Prisma.MessageGetPayload<object>;
 class ComplaintService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
-  async listComplaints(filters: ComplaintListFilters): Promise<ComplaintDetail[]> {
+  async listComplaints(filters: ComplaintListFilters): Promise<PaginatedComplaints> {
     const where: Record<string, unknown> = {};
     if (filters.status) where.status = filters.status;
     if (filters.technicianId) where.technicianId = filters.technicianId;
@@ -60,13 +74,25 @@ class ComplaintService {
       ];
     }
 
-    const complaints = await this.prisma.complaint.findMany({
-      where,
-      include: INCLUDE,
-      orderBy: { createdAt: "desc" },
-    });
+    const pageNum = Math.max(1, filters.page ?? 1);
+    const pageSizeNum = Math.min(100, Math.max(1, filters.pageSize ?? 50));
+    const skip = (pageNum - 1) * pageSizeNum;
 
-    return complaints.map((c) => this.toDetail(c));
+    const [total, complaints] = await Promise.all([
+      this.prisma.complaint.count({ where }),
+      this.prisma.complaint.findMany({
+        where,
+        include: INCLUDE,
+        orderBy: { createdAt: "desc" },
+        take: pageSizeNum,
+        skip,
+      }),
+    ]);
+
+    return {
+      rows: complaints.map((c) => this.toDetail(c)),
+      pagination: { page: pageNum, pageSize: pageSizeNum, total, totalPages: Math.ceil(total / pageSizeNum) },
+    };
   }
 
   async getComplaint(complaintId: string): Promise<ComplaintDetail> {

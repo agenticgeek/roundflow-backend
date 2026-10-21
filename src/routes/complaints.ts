@@ -3,7 +3,7 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
-import { asObject, h, requireString, optString, optId } from "../lib/http";
+import { asObject, h, requireString, optString, optId, parsePageParams } from "../lib/http";
 import { createComplaintService, ComplaintCreateInput, ComplaintListFilters } from "../services/complaint.service";
 import { createReportsService } from "../services/reports.service";
 import { ComplaintStatus, Severity } from "../generated/tenant-client";
@@ -39,9 +39,12 @@ function optComplaintStatus(v: unknown): ComplaintStatus | undefined {
 complaintsRouter.get(
   "/",
   h(async (req, res) => {
+    const { page, pageSize } = parsePageParams(req.query as Record<string, unknown>);
     const filters: ComplaintListFilters = {
       status: optComplaintStatus(req.query.status),
       search: typeof req.query.search === "string" ? req.query.search : undefined,
+      page,
+      pageSize,
     };
 
     if (req.query.assignedTo !== undefined && req.query.assignedTo !== "me") {

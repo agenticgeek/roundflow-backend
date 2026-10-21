@@ -24,15 +24,24 @@ debtRouter.get("/kpis", h(async (req, res) => {
   return res.json(kpis);
 }));
 
-// GET /debt/board?bucket=&roundId=&paymentMethod=&page=&pageSize=
+// GET /debt/board?bucket=&roundId=&paymentMethod=&search=&page=&pageSize=
 debtRouter.get("/board", h(async (req, res) => {
-  const { bucket, roundId, paymentMethod } = req.query as Record<string, string | undefined>;
+  const { bucket, roundId, paymentMethod, search } = req.query as Record<string, string | undefined>;
   if (!bucket) return res.status(400).json({ error: "bucket query param is required" });
   const { page, pageSize } = parsePageParams(req.query as Record<string, unknown>, {
     defaultPageSize: 50,
     maxPageSize: 100,
   });
-  const result = await svc(req).getBoard(bucket, roundId, paymentMethod, page, pageSize);
+  const result = await svc(req).getBoard(bucket, roundId, paymentMethod, page, pageSize, search);
+  return res.json(result);
+}));
+
+// GET /debt/board/counts?roundId=&paymentMethod=&search=
+// All 7 bucket-tab counts in a single call, replacing the frontend's
+// previous pattern of one `GET /debt/board?pageSize=1` request per tab.
+debtRouter.get("/board/counts", h(async (req, res) => {
+  const { roundId, paymentMethod, search } = req.query as Record<string, string | undefined>;
+  const result = await svc(req).getBucketCounts(roundId, paymentMethod, search);
   return res.json(result);
 }));
 

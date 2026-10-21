@@ -1,6 +1,9 @@
 import { CleaningFrequency, DayOfWeek, RoundStatus, VisitStatus, IssueType, Prisma } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
+import { getCachedBusinessSettings } from "./settings.service";
+import { todayRange } from "../lib/dates";
+import { createMessageService } from "./message.service";
 
 // ---- input types ----------------------------------------------------------
 
@@ -56,6 +59,11 @@ export interface RoundDetail {
 
 // ---- planner output types -------------------------------------------------
 
+export interface OccurrenceTechnicianRef {
+  id: string;
+  name: string | null;
+}
+
 export interface OccurrenceSummary {
   date: string;          // "YYYY-MM-DD" (UTC)
   stopCount: number;
@@ -64,6 +72,8 @@ export interface OccurrenceSummary {
   completionPct: number; // 0–100, rounded
   holdCount: number;
   issueCount: number;
+  // Every distinct technician with at least one stop on this date, deduped by id.
+  technicians: OccurrenceTechnicianRef[];
 }
 
 export interface PlannerStop {
@@ -129,6 +139,7 @@ export interface PushMissedInput {
   reason: string;
   technicianId?: string | null;
   notifyCustomers: boolean;
+  message?: string | null;
 }
 
 export interface PushMissedResult {
@@ -219,6 +230,17 @@ class RoundService {
   private async assertRoundExists(roundId: string): Promise<void> {
     const r = await this.prisma.round.findUnique({ where: { id: roundId }, select: { id: true } });
     if (!r) throw new AppError(404, "Round not found");
+  }
+
+  // The operational day is closed once BusinessSettings.lastClosedDate equals
+  // today's UTC date string (see today.service.ts closeDay()). Reassign and
+  // Push Missed must not silently mutate visits after Close Day has run.
+  private async assertDayNotClosed(): Promise<void> {
+    const settings = await getCachedBusinessSettings(this.prisma);
+    const today = todayRange().start.toISOString().slice(0, 10);
+    if (settings?.lastClosedDate === today) {
+      throw new AppError(409, "Operational day has already been closed");
+    }
   }
 
   // ---- update ----
@@ -330,6 +352,7 @@ class RoundService {
         paymentHold: true,
         price: true,
         _count: { select: { issues: true } },
+        technician: { select: { id: true, name: true } },
       },
       orderBy: { date: "asc" },
     });
@@ -352,6 +375,7 @@ class RoundService {
         totalValue: vs.reduce((acc, v) => acc + v.price.toNumber(), 0),
         holdCount: vs.filter((v) => v.paymentHold).length,
         issueCount: vs.reduce((acc, v) => acc + v._count.issues, 0),
+        technicians: this.dedupeTechnicians(vs, (v) => v.technician),
       })
     );
   }
@@ -391,6 +415,7 @@ class RoundService {
         paymentHold: true,
         price: true,
         _count: { select: { issues: true } },
+        technician: { select: { id: true, name: true } },
       },
       orderBy: { date: "asc" },
     });
@@ -425,6 +450,7 @@ class RoundService {
               totalValue: vs.reduce((acc, v) => acc + v.price.toNumber(), 0),
               holdCount: vs.filter((v) => v.paymentHold).length,
               issueCount: vs.reduce((acc, v) => acc + v._count.issues, 0),
+              technicians: this.dedupeTechnicians(vs, (v) => v.technician),
             })
           )
         : [];
@@ -508,7 +534,13 @@ class RoundService {
   private aggregateStats(
     date: string,
     stopCount: number,
-    counts: { completedCount: number; totalValue: number; holdCount: number; issueCount: number }
+    counts: {
+      completedCount: number;
+      totalValue: number;
+      holdCount: number;
+      issueCount: number;
+      technicians: OccurrenceTechnicianRef[];
+    }
   ): OccurrenceSummary {
     return {
       date,
@@ -518,12 +550,29 @@ class RoundService {
     };
   }
 
+  // Dedupe technician refs by id, preserving first-seen order. `ref` extracts
+  // the (possibly null — unassigned stop) technician reference from each item.
+  private dedupeTechnicians<T>(
+    items: T[],
+    ref: (item: T) => OccurrenceTechnicianRef | null
+  ): OccurrenceTechnicianRef[] {
+    const map = new Map<string, OccurrenceTechnicianRef>();
+    for (const item of items) {
+      const t = ref(item);
+      if (t) map.set(t.id, t);
+    }
+    return [...map.values()];
+  }
+
   private toSummary(stops: PlannerStop[]): Omit<OccurrenceSummary, "date"> {
     const { date: _d, ...rest } = this.aggregateStats("", stops.length, {
       completedCount: stops.filter((s) => s.status === VisitStatus.COMPLETED).length,
       totalValue: stops.reduce((acc, s) => acc + s.price, 0),
       holdCount: stops.filter((s) => s.paymentHold).length,
       issueCount: stops.reduce((acc, s) => acc + s.issues.length, 0),
+      technicians: this.dedupeTechnicians(stops, (s) =>
+        s.technicianId ? { id: s.technicianId, name: s.technicianName } : null
+      ),
     });
     return rest;
   }
@@ -612,6 +661,7 @@ class RoundService {
     }
 
     await this.assertRoundExists(roundId);
+    await this.assertDayNotClosed();
 
     // Validate the target technician is active and has accepted their invite
     const toTech = await this.prisma.technician.findUnique({
@@ -651,6 +701,7 @@ class RoundService {
     input: PushMissedInput
   ): Promise<PushMissedResult> {
     await this.assertRoundExists(roundId);
+    await this.assertDayNotClosed();
 
     const start = new Date();
     start.setUTCHours(0, 0, 0, 0);
@@ -663,6 +714,15 @@ class RoundService {
       throw new AppError(400, '"newDate" must be after today');
     }
 
+    // Resolve affected customers BEFORE the update, while the SCHEDULED/today
+    // filter still identifies exactly the visits about to be pushed.
+    const affected = input.notifyCustomers
+      ? await this.prisma.visit.findMany({
+          where: { roundId, date: { gte: start, lt: end }, status: VisitStatus.SCHEDULED },
+          select: { property: { select: { customerId: true } } },
+        })
+      : [];
+
     const result = await this.prisma.visit.updateMany({
       where: {
         roundId,
@@ -674,6 +734,21 @@ class RoundService {
         ...(input.technicianId !== undefined ? { technicianId: input.technicianId } : {}),
       },
     });
+
+    if (input.notifyCustomers && affected.length > 0) {
+      const customerIds = [...new Set(affected.map((v) => v.property.customerId))];
+      const body =
+        input.message?.trim() ||
+        `Your clean has been rescheduled. Reason: ${input.reason}`;
+      const messageService = createMessageService(this.prisma);
+      for (const customerId of customerIds) {
+        try {
+          await messageService.send({ customerId, channel: "sms", body });
+        } catch (err) {
+          console.error(`[rounds] push-missed notify failed for customer ${customerId}:`, err);
+        }
+      }
+    }
 
     return { pushedCount: result.count };
   }

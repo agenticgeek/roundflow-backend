@@ -18,12 +18,13 @@ vi.mock("../../middleware/requireRole", () => ({
 
 const getKpis = vi.fn();
 const getBoard = vi.fn();
+const getBucketCounts = vi.fn();
 const sendReminder = vi.fn();
 const sendPaymentLink = vi.fn();
 const flagBadDebt = vi.fn();
 const flagHold = vi.fn();
 vi.mock("../../services/debt.service", () => ({
-  createDebtService: vi.fn(() => ({ getKpis, getBoard, sendReminder, sendPaymentLink, flagBadDebt, flagHold })),
+  createDebtService: vi.fn(() => ({ getKpis, getBoard, getBucketCounts, sendReminder, sendPaymentLink, flagBadDebt, flagHold })),
 }));
 
 vi.mock("../../lib/crypto", () => ({
@@ -98,18 +99,38 @@ describe("GET /debt/board", () => {
     expect(res.status).toBe(400);
   });
 
-  it("passes through optional roundId/paymentMethod and paginated results", async () => {
+  it("passes through optional roundId/paymentMethod/search and paginated results", async () => {
     getBoard.mockResolvedValue({ items: [], total: 0 });
-    const res = await request(makeApp()).get("/debt/board?bucket=overdue&roundId=round-1&paymentMethod=STRIPE&page=2&pageSize=10");
+    const res = await request(makeApp()).get("/debt/board?bucket=overdue&roundId=round-1&paymentMethod=STRIPE&page=2&pageSize=10&search=smith");
     expect(res.status).toBe(200);
-    expect(getBoard).toHaveBeenCalledWith("overdue", "round-1", "STRIPE", 2, 10);
+    expect(getBoard).toHaveBeenCalledWith("overdue", "round-1", "STRIPE", 2, 10, "smith");
   });
 
-  it("defaults roundId/paymentMethod to undefined and uses default pagination", async () => {
+  it("defaults roundId/paymentMethod/search to undefined and uses default pagination", async () => {
     getBoard.mockResolvedValue({ items: [], total: 0 });
     const res = await request(makeApp()).get("/debt/board?bucket=overdue");
     expect(res.status).toBe(200);
-    expect(getBoard).toHaveBeenCalledWith("overdue", undefined, undefined, 1, 50);
+    expect(getBoard).toHaveBeenCalledWith("overdue", undefined, undefined, 1, 50, undefined);
+  });
+});
+
+describe("GET /debt/board/counts", () => {
+  it("returns all 7 bucket counts with no filters", async () => {
+    getBucketCounts.mockResolvedValue({
+      BAD_DEBT: 1, ON_HOLD: 2, FAILED_GC: 3, DUE_BEFORE_CLEAN: 4,
+      SEVEN_DAYS_OVER: 5, FOURTEEN_DAYS_OVER: 6, ALL: 7,
+    });
+    const res = await request(makeApp()).get("/debt/board/counts");
+    expect(res.status).toBe(200);
+    expect(res.body.ALL).toBe(7);
+    expect(getBucketCounts).toHaveBeenCalledWith(undefined, undefined, undefined);
+  });
+
+  it("passes through roundId/paymentMethod/search filters", async () => {
+    getBucketCounts.mockResolvedValue({});
+    const res = await request(makeApp()).get("/debt/board/counts?roundId=round-1&paymentMethod=STRIPE&search=smith");
+    expect(res.status).toBe(200);
+    expect(getBucketCounts).toHaveBeenCalledWith("round-1", "STRIPE", "smith");
   });
 });
 

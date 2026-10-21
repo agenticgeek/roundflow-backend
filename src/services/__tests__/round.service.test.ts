@@ -1,6 +1,15 @@
-import { it, expect, vi } from "vitest";
+import { it, expect, vi, beforeEach } from "vitest";
 import { createRoundService } from "../round.service";
 import { CleaningFrequency, RoundStatus } from "../../generated/tenant-client";
+
+const sendMessage = vi.fn();
+vi.mock("../message.service", () => ({
+  createMessageService: vi.fn(() => ({ send: sendMessage })),
+}));
+
+beforeEach(() => {
+  sendMessage.mockReset();
+});
 
 function makePrisma() {
   const prisma = {
@@ -9,6 +18,9 @@ function makePrisma() {
     technician: { findUnique: vi.fn(), findMany: vi.fn() },
     visit: { findMany: vi.fn(), updateMany: vi.fn() },
     roundTechnician: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn() },
+    // Defaults to "no settings row" (day not closed) so pre-existing tests
+    // that don't care about Close Day behave the same as before it existed.
+    businessSettings: { findFirst: vi.fn().mockResolvedValue(null) },
     $transaction: vi.fn(),
   } as unknown as Parameters<typeof createRoundService>[0];
   // Default: $transaction runs the callback immediately with the same client
@@ -78,6 +90,7 @@ function makeVisit(overrides: Partial<{
   paymentHold: boolean;
   price: { toNumber: () => number };
   _count: { issues: number };
+  technician: { id: string; name: string | null } | null;
 }> = {}) {
   return {
     roundId: "r1",
@@ -86,6 +99,7 @@ function makeVisit(overrides: Partial<{
     paymentHold: false,
     price: { toNumber: () => 0 },
     _count: { issues: 0 },
+    technician: null,
     ...overrides,
   };
 }
@@ -207,4 +221,281 @@ it("listOccurrencesForRounds throws 400 when the date range exceeds 90 days", as
       new Date("2026-05-01T00:00:00.000Z"),
     )
   ).rejects.toMatchObject({ statusCode: 400 });
+});
+
+it("listOccurrencesForRounds dedupes technicians per round/date and skips unassigned visits", async () => {
+  const prisma = makePrisma();
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    makeVisit({ roundId: "r1", technician: { id: "t1", name: "James" } }),
+    makeVisit({ roundId: "r1", technician: { id: "t1", name: "James" } }),
+    makeVisit({ roundId: "r1", technician: { id: "t2", name: "Priya" } }),
+    makeVisit({ roundId: "r1", technician: null }),
+  ]);
+  const result = await createRoundService(prisma).listOccurrencesForRounds(
+    ["r1"],
+    new Date("2026-01-01T00:00:00.000Z"),
+    new Date("2026-01-05T00:00:00.000Z"),
+  );
+  const occ = result.find((r) => r.roundId === "r1")!.occurrences[0];
+  expect(occ.technicians).toEqual([
+    { id: "t1", name: "James" },
+    { id: "t2", name: "Priya" },
+  ]);
+});
+
+it("listOccurrencesForRounds returns an empty technicians array for a round with zero matching visits", async () => {
+  const prisma = makePrisma();
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  const result = await createRoundService(prisma).listOccurrencesForRounds(
+    ["r1"],
+    new Date("2026-01-01T00:00:00.000Z"),
+    new Date("2026-01-05T00:00:00.000Z"),
+  );
+  expect(result[0].occurrences).toEqual([]);
+});
+
+// ---- listOccurrences (single round) ----------------------------------------
+
+it("listOccurrences throws 404 when the round does not exist", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+  await expect(
+    createRoundService(prisma).listOccurrences("missing", new Date("2026-01-01T00:00:00.000Z"), new Date("2026-01-05T00:00:00.000Z"))
+  ).rejects.toMatchObject({ statusCode: 404 });
+});
+
+it("listOccurrences throws 400 when neither from nor to is given", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1" });
+  await expect(createRoundService(prisma).listOccurrences("r1")).rejects.toMatchObject({ statusCode: 400 });
+});
+
+it("listOccurrences throws 400 when from is after to", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1" });
+  await expect(
+    createRoundService(prisma).listOccurrences("r1", new Date("2026-02-01T00:00:00.000Z"), new Date("2026-01-01T00:00:00.000Z"))
+  ).rejects.toMatchObject({ statusCode: 400 });
+});
+
+it("listOccurrences throws 400 when the date range exceeds 90 days", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1" });
+  await expect(
+    createRoundService(prisma).listOccurrences("r1", new Date("2026-01-01T00:00:00.000Z"), new Date("2026-05-01T00:00:00.000Z"))
+  ).rejects.toMatchObject({ statusCode: 400 });
+});
+
+it("listOccurrences dedupes technicians per date and skips unassigned visits", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1" });
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    { date: new Date("2026-01-01T00:00:00.000Z"), status: "COMPLETED", paymentHold: false, price: { toNumber: () => 50 }, _count: { issues: 0 }, technician: { id: "t1", name: "James" } },
+    { date: new Date("2026-01-01T00:00:00.000Z"), status: "SCHEDULED", paymentHold: false, price: { toNumber: () => 40 }, _count: { issues: 0 }, technician: { id: "t1", name: "James" } },
+    { date: new Date("2026-01-01T00:00:00.000Z"), status: "SCHEDULED", paymentHold: false, price: { toNumber: () => 30 }, _count: { issues: 0 }, technician: null },
+  ]);
+  const result = await createRoundService(prisma).listOccurrences(
+    "r1",
+    new Date("2026-01-01T00:00:00.000Z"),
+    new Date("2026-01-02T00:00:00.000Z"),
+  );
+  expect(result).toHaveLength(1);
+  expect(result[0].technicians).toEqual([{ id: "t1", name: "James" }]);
+});
+
+// ---- getOccurrence ----------------------------------------------------------
+
+it("getOccurrence throws 404 when the round does not exist", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+  await expect(createRoundService(prisma).getOccurrence("missing", "2026-01-01")).rejects.toMatchObject({ statusCode: 404 });
+});
+
+it("getOccurrence throws 400 for an invalid date", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1", name: "Round A" });
+  await expect(createRoundService(prisma).getOccurrence("r1", "not-a-date")).rejects.toMatchObject({ statusCode: 400 });
+});
+
+it("getOccurrence returns stops and a summary with deduped technicians", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1", name: "Round A" });
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    {
+      id: "v1", propertyId: "p1", price: { toNumber: () => 40 }, status: "COMPLETED", paymentHold: false,
+      technicianId: "t1", completedAt: new Date("2026-01-01T10:00:00.000Z"),
+      technician: { id: "t1", name: "James" },
+      property: { propertyName: "12 Main St", addressLine: "12 Main St", postcode: "NE1 1AA", customer: { name: "John Smith" } },
+      issues: [],
+    },
+    {
+      id: "v2", propertyId: "p2", price: { toNumber: () => 30 }, status: "SCHEDULED", paymentHold: true,
+      technicianId: "t1", completedAt: null,
+      technician: { id: "t1", name: "James" },
+      property: { propertyName: null, addressLine: "14 Main St", postcode: "NE1 1AB", customer: null },
+      issues: [{ id: "i1", type: "ACCESS_PROBLEM", note: "Locked gate" }],
+    },
+  ]);
+  const result = await createRoundService(prisma).getOccurrence("r1", "2026-01-01");
+  expect(result.roundId).toBe("r1");
+  expect(result.stops).toHaveLength(2);
+  expect(result.summary.technicians).toEqual([{ id: "t1", name: "James" }]);
+  expect(result.summary.holdCount).toBe(1);
+  expect(result.summary.issueCount).toBe(1);
+});
+
+it("reassignTechnician throws 400 when fromTechnicianId and toTechnicianId are the same", async () => {
+  const prisma = makePrisma();
+  await expect(
+    createRoundService(prisma).reassignTechnician("r1", {
+      fromTechnicianId: "t1",
+      toTechnicianId: "t1",
+      scope: "remaining",
+      notify: false,
+    })
+  ).rejects.toMatchObject({ statusCode: 400 });
+  expect(prisma.round.findUnique).not.toHaveBeenCalled();
+});
+
+// ---- Close Day guard (reassignTechnician / pushMissedJobs) -----------------
+
+it("reassignTechnician throws 409 when the operational day is already closed", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1" });
+  const today = new Date().toISOString().slice(0, 10);
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ lastClosedDate: today });
+  await expect(
+    createRoundService(prisma).reassignTechnician("r1", {
+      fromTechnicianId: "t1",
+      toTechnicianId: "t2",
+      scope: "remaining",
+      notify: false,
+    })
+  ).rejects.toMatchObject({ statusCode: 409 });
+  expect(prisma.visit.updateMany).not.toHaveBeenCalled();
+});
+
+it("reassignTechnician succeeds when the day is not closed", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1" });
+  (prisma.technician.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "t2", active: true, profileId: "p2" });
+  (prisma.visit.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 3 });
+  const result = await createRoundService(prisma).reassignTechnician("r1", {
+    fromTechnicianId: "t1",
+    toTechnicianId: "t2",
+    scope: "all",
+    notify: false,
+  });
+  expect(result).toEqual({ updatedCount: 3 });
+});
+
+it("pushMissedJobs throws 409 when the operational day is already closed", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1" });
+  const today = new Date().toISOString().slice(0, 10);
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ lastClosedDate: today });
+  const tomorrow = new Date(Date.now() + 2 * 86_400_000);
+  await expect(
+    createRoundService(prisma).pushMissedJobs("r1", { newDate: tomorrow, reason: "Weather", notifyCustomers: false })
+  ).rejects.toMatchObject({ statusCode: 409 });
+  expect(prisma.visit.updateMany).not.toHaveBeenCalled();
+});
+
+it("pushMissedJobs throws 400 when newDate is not after today", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1" });
+  await expect(
+    createRoundService(prisma).pushMissedJobs("r1", { newDate: new Date(), reason: "x", notifyCustomers: false })
+  ).rejects.toMatchObject({ statusCode: 400 });
+});
+
+it("pushMissedJobs does not query affected visits or send messages when notifyCustomers is false", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1" });
+  (prisma.visit.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 2 });
+  const tomorrow = new Date(Date.now() + 2 * 86_400_000);
+  const result = await createRoundService(prisma).pushMissedJobs("r1", {
+    newDate: tomorrow, reason: "Weather", notifyCustomers: false,
+  });
+  expect(result).toEqual({ pushedCount: 2 });
+  expect(prisma.visit.findMany).not.toHaveBeenCalled();
+  expect(sendMessage).not.toHaveBeenCalled();
+});
+
+it("pushMissedJobs sends one deduped message per affected customer when notifyCustomers is true", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1" });
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    { property: { customerId: "c1" } },
+    { property: { customerId: "c1" } },
+    { property: { customerId: "c2" } },
+  ]);
+  (prisma.visit.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 3 });
+  sendMessage.mockResolvedValue({ status: "sent" });
+  const tomorrow = new Date(Date.now() + 2 * 86_400_000);
+  await createRoundService(prisma).pushMissedJobs("r1", {
+    newDate: tomorrow, reason: "Weather delay", notifyCustomers: true,
+  });
+  expect(sendMessage).toHaveBeenCalledTimes(2);
+  expect(sendMessage).toHaveBeenCalledWith({ customerId: "c1", channel: "sms", body: "Your clean has been rescheduled. Reason: Weather delay" });
+  expect(sendMessage).toHaveBeenCalledWith({ customerId: "c2", channel: "sms", body: "Your clean has been rescheduled. Reason: Weather delay" });
+});
+
+it("pushMissedJobs uses the caller-provided message verbatim (trimmed) instead of the reason fallback", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1" });
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ property: { customerId: "c1" } }]);
+  (prisma.visit.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+  sendMessage.mockResolvedValue({ status: "sent" });
+  const tomorrow = new Date(Date.now() + 2 * 86_400_000);
+  await createRoundService(prisma).pushMissedJobs("r1", {
+    newDate: tomorrow, reason: "Weather delay", notifyCustomers: true, message: "  Sorry, we're rescheduling you.  ",
+  });
+  expect(sendMessage).toHaveBeenCalledWith({ customerId: "c1", channel: "sms", body: "Sorry, we're rescheduling you." });
+});
+
+it("pushMissedJobs falls back to the reason-based message when message is only whitespace", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1" });
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ property: { customerId: "c1" } }]);
+  (prisma.visit.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 });
+  sendMessage.mockResolvedValue({ status: "sent" });
+  const tomorrow = new Date(Date.now() + 2 * 86_400_000);
+  await createRoundService(prisma).pushMissedJobs("r1", {
+    newDate: tomorrow, reason: "Weather delay", notifyCustomers: true, message: "   ",
+  });
+  expect(sendMessage).toHaveBeenCalledWith({ customerId: "c1", channel: "sms", body: "Your clean has been rescheduled. Reason: Weather delay" });
+});
+
+it("pushMissedJobs does not send anything when notifyCustomers is true but no visits matched", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1" });
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (prisma.visit.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 0 });
+  const tomorrow = new Date(Date.now() + 2 * 86_400_000);
+  const result = await createRoundService(prisma).pushMissedJobs("r1", {
+    newDate: tomorrow, reason: "Weather", notifyCustomers: true,
+  });
+  expect(result).toEqual({ pushedCount: 0 });
+  expect(sendMessage).not.toHaveBeenCalled();
+});
+
+it("pushMissedJobs logs and continues when a per-customer send fails (best-effort)", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1" });
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    { property: { customerId: "c1" } },
+    { property: { customerId: "c2" } },
+  ]);
+  (prisma.visit.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 2 });
+  sendMessage.mockRejectedValueOnce(new Error("GHL down")).mockResolvedValueOnce({ status: "sent" });
+  const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+  const tomorrow = new Date(Date.now() + 2 * 86_400_000);
+  const result = await createRoundService(prisma).pushMissedJobs("r1", {
+    newDate: tomorrow, reason: "Weather", notifyCustomers: true,
+  });
+  expect(result).toEqual({ pushedCount: 2 });
+  expect(sendMessage).toHaveBeenCalledTimes(2);
+  expect(consoleErrorSpy).toHaveBeenCalled();
+  consoleErrorSpy.mockRestore();
 });
