@@ -13,7 +13,9 @@ paymentsRouter.use(requireAuth);
 paymentsRouter.use(requireTenantAccess);
 paymentsRouter.use(requireBusinessAccess());
 
-const FRONTEND_URL = process.env.FRONTEND_URL?.split(",")[0].trim() ?? "";
+function frontendUrl(): string {
+  return process.env.FRONTEND_URL?.split(",")[0].trim() ?? "";
+}
 
 async function loadStripeClient(req: Request) {
   const bs = await req.tenantPrisma!.businessSettings.findFirst({
@@ -56,6 +58,7 @@ paymentsRouter.post(
     const stripe = await loadStripeClient(req);
     const tenantId = await getTenantId(req);
 
+    const FRONTEND_URL = frontendUrl();
     const result = await createOneTimeSession(stripe, req.tenantPrisma!, {
       tenantId,
       customerId: customer.id,
@@ -96,6 +99,7 @@ paymentsRouter.post(
     const stripe = await loadStripeClient(req);
     const tenantId = await getTenantId(req);
 
+    const FRONTEND_URL = frontendUrl();
     const result = await createSetupSession(stripe, req.tenantPrisma!, {
       tenantId,
       customerId,

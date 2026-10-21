@@ -382,11 +382,39 @@ settingsRouter.post(
         gocardlessConnected: false,
         gocardlessAccessTokenEncrypted: null,
         gocardlessWebhookSecretEncrypted: null,
+        gocardlessWebhookSigningSecretEncrypted: null,
         gocardlessEnvironment: null,
       },
     });
     invalidateCachedBusinessSettings(req.tenantPrisma!);
     res.json({ status: "disconnected" });
+  })
+);
+
+// PATCH /settings/payment/gocardless/webhook-secret — GoCardless has no API to
+// create webhook endpoints (dashboard-only), so the admin must manually add one
+// pointing at the URL returned by /payment/gocardless/connect, then paste the
+// *real* signing secret GoCardless shows them here. That secret — not a value
+// RoundFlow invents — is what verifies incoming webhook signatures.
+settingsRouter.patch(
+  "/payment/gocardless/webhook-secret",
+  h(async (req, res) => {
+    await svc(req).assertSetupComplete();
+    const body = asObject(req.body);
+    const secret = requireString(body.secret, "secret");
+
+    const bs = await req.tenantPrisma!.businessSettings.findFirst({
+      select: { gocardlessConnected: true },
+    });
+    if (!bs?.gocardlessConnected) {
+      throw new AppError(409, "GoCardless is not connected for this account");
+    }
+
+    await req.tenantPrisma!.businessSettings.updateMany({
+      data: { gocardlessWebhookSigningSecretEncrypted: encrypt(secret) },
+    });
+    invalidateCachedBusinessSettings(req.tenantPrisma!);
+    res.json({ status: "saved" });
   })
 );
 
@@ -400,7 +428,11 @@ settingsRouter.get(
   })
 );
 
-// GET /settings/stripe/callback — Stripe redirects here after the admin authorises
+// GET /settings/stripe/callback — Stripe redirects here after the admin authorises.
+// Unlike GoCardless, there is nothing further to configure: webhook delivery for
+// Stripe runs through one platform-level Connect webhook (see
+// docs/handoff/backend) set up once, not per tenant, so no webhook URL/secret
+// needs to be generated or handed back to the frontend here.
 settingsRouter.get(
   "/stripe/callback",
   h(async (req, res) => {
@@ -409,23 +441,27 @@ settingsRouter.get(
     if (!code || !state) throw new AppError(400, "Missing code or state from Stripe");
 
     const tokens = await exchangeStripeCode(code);
+    const tenantId = req.profile!.tenantId;
 
-    const webhookSecret = randomBytes(32).toString("hex");
     await req.tenantPrisma!.businessSettings.updateMany({
       data: {
-        stripeConnected:             true,
-        stripeConnectAccountId:      tokens.stripe_user_id,
-        stripePublishableKey:        tokens.stripe_publishable_key,
-        stripeSecretKeyEncrypted:    encrypt(tokens.access_token),
-        stripeWebhookSecretEncrypted: encrypt(webhookSecret),
+        stripeConnected:          true,
+        stripeConnectAccountId:   tokens.stripe_user_id,
+        stripePublishableKey:     tokens.stripe_publishable_key,
+        stripeSecretKeyEncrypted: encrypt(tokens.access_token),
       },
+    });
+    // Mirrored onto the public Tenant row so the platform-level Connect
+    // webhook can resolve `event.account` -> tenant without first knowing
+    // which tenant schema to look in.
+    await prisma.tenant.update({
+      where: { id: tenantId },
+      data: { stripeConnectAccountId: tokens.stripe_user_id },
     });
     invalidateCachedBusinessSettings(req.tenantPrisma!);
 
-    const tenantId = req.profile!.tenantId;
-    const webhookUrl = `${process.env.PUBLIC_API_URL}/webhooks/stripe?tenantId=${tenantId}&secret=${webhookSecret}`;
     const frontendUrl = process.env.FRONTEND_URL!.split(",")[0].trim();
-    res.redirect(`${frontendUrl}/settings/integrations?stripe=connected&webhookUrl=${encodeURIComponent(webhookUrl)}`);
+    res.redirect(`${frontendUrl}/settings/integrations?stripe=connected`);
   })
 );
 
@@ -433,14 +469,18 @@ settingsRouter.post(
   "/stripe/disconnect",
   h(async (req, res) => {
     await svc(req).assertSetupComplete();
+    const tenantId = req.profile!.tenantId;
     await req.tenantPrisma!.businessSettings.updateMany({
       data: {
-        stripeConnected:             false,
-        stripeConnectAccountId:      null,
-        stripePublishableKey:        null,
-        stripeSecretKeyEncrypted:    null,
-        stripeWebhookSecretEncrypted: null,
+        stripeConnected:          false,
+        stripeConnectAccountId:   null,
+        stripePublishableKey:     null,
+        stripeSecretKeyEncrypted: null,
       },
+    });
+    await prisma.tenant.update({
+      where: { id: tenantId },
+      data: { stripeConnectAccountId: null },
     });
     invalidateCachedBusinessSettings(req.tenantPrisma!);
     res.json({ status: "disconnected" });

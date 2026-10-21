@@ -245,3 +245,88 @@ it("saveBusinessProfile refreshes the memo: a subsequent read in the same reques
   // refreshed memo, not a second findFirst.
   expect(prisma.businessSettings.findFirst).toHaveBeenCalledTimes(1);
 });
+
+// ---- payment setup (wizard step 2) -------------------------------------------
+
+it("getPaymentSetup returns the BusinessSettings singleton", async () => {
+  const prisma = makePrisma();
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+    uniqueId: "singleton",
+    paymentRule: "COLLECT_AFTER_VISIT",
+    gocardlessConnected: true,
+    stripeConnected: false,
+  });
+
+  const result = await createSetupService(prisma).getPaymentSetup();
+
+  expect(result?.paymentRule).toBe("COLLECT_AFTER_VISIT");
+});
+
+it("getPaymentSetup returns null before setup has started", async () => {
+  const prisma = makePrisma();
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+
+  const result = await createSetupService(prisma).getPaymentSetup();
+
+  expect(result).toBeNull();
+});
+
+it("savePaymentSetup persists paymentRule/debtHoldEnabled/vatInInvoices and the connect flags", async () => {
+  const prisma = makePrisma();
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+  (prisma.businessSettings.upsert as ReturnType<typeof vi.fn>).mockResolvedValue({
+    uniqueId: "singleton",
+    paymentRule: "COLLECT_BEFORE_VISIT",
+    debtHoldEnabled: true,
+    vatInInvoices: true,
+    gocardlessConnected: true,
+    stripeConnected: true,
+  });
+
+  const result = await createSetupService(prisma).savePaymentSetup({
+    paymentRule: "COLLECT_BEFORE_VISIT",
+    debtHoldEnabled: true,
+    vatInInvoices: true,
+    gocardlessConnected: true,
+    stripeConnected: true,
+  });
+
+  expect(prisma.businessSettings.upsert).toHaveBeenCalledWith({
+    where: { uniqueId: "singleton" },
+    update: {
+      paymentRule: "COLLECT_BEFORE_VISIT",
+      debtHoldEnabled: true,
+      vatInInvoices: true,
+      gocardlessConnected: true,
+      stripeConnected: true,
+    },
+    create: {
+      paymentRule: "COLLECT_BEFORE_VISIT",
+      debtHoldEnabled: true,
+      vatInInvoices: true,
+      gocardlessConnected: true,
+      stripeConnected: true,
+    },
+  });
+  expect(result.gocardlessConnected).toBe(true);
+});
+
+it("savePaymentSetup passes through undefined fields untouched (partial update)", async () => {
+  const prisma = makePrisma();
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+  (prisma.businessSettings.upsert as ReturnType<typeof vi.fn>).mockResolvedValue({ uniqueId: "singleton" });
+
+  await createSetupService(prisma).savePaymentSetup({ stripeConnected: true });
+
+  expect(prisma.businessSettings.upsert).toHaveBeenCalledWith(
+    expect.objectContaining({
+      update: {
+        paymentRule: undefined,
+        debtHoldEnabled: undefined,
+        vatInInvoices: undefined,
+        gocardlessConnected: undefined,
+        stripeConnected: true,
+      },
+    })
+  );
+});
