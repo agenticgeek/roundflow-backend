@@ -469,8 +469,8 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
 
   Complaint: {
     type: "object",
-    description: "A customer service complaint record.",
-    required: ["id", "status", "severity", "title", "customerId", "customerName", "createdAt"],
+    description: "A customer service complaint record. GET /complaints/{id} (and every mutation response) includes the derived propertyAddress/technicianName/messageCount fields alongside the stored columns.",
+    required: ["id", "status", "severity", "title", "customerId", "customerName", "messageCount", "createdAt"],
     properties: {
       id: { type: "string" },
       status: { type: "string", enum: ["OPEN", "IN_REVIEW", "REVISIT_BOOKED", "RESOLVED"], example: "OPEN" },
@@ -481,8 +481,14 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       customerId: { type: "string" },
       customerName: { type: "string", example: "David Harris" },
       propertyId: { type: "string", nullable: true },
+      propertyAddress: { type: "string", nullable: true, description: "Derived from the linked Property, when there is one." },
       technicianId: { type: "string", nullable: true },
+      technicianName: { type: "string", nullable: true, description: "Derived from the linked Technician, when there is one." },
       revisitDate: { type: "string", format: "date", nullable: true, example: "2026-09-10" },
+      messageCount: { type: "integer", description: "Total messages in this complaint's thread." },
+      resolvedAt: { ...dateTime, nullable: true, description: "Set by POST .../resolve; cleared by POST .../reopen." },
+      resolvedBy: { type: "string", nullable: true, description: "Profile id of the user who resolved it." },
+      notes: { type: "string", nullable: true, description: "Optional resolution notes, set via the `notes` field of POST .../resolve." },
       createdAt: dateTime,
     },
     example: {
@@ -495,9 +501,25 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       customerId: "cld123",
       customerName: "David Harris",
       propertyId: "prp456",
+      propertyAddress: "12 Market Street",
       technicianId: null,
+      technicianName: null,
       revisitDate: null,
+      messageCount: 2,
+      resolvedAt: null,
+      resolvedBy: null,
+      notes: null,
       createdAt: "2026-09-01T09:14:00.000Z",
+    },
+  },
+
+  ComplaintsListResult: {
+    type: "object",
+    description: "GET /complaints — paginated.",
+    required: ["rows", "pagination"],
+    properties: {
+      rows: { type: "array", items: ref("Complaint") },
+      pagination: ref("Pagination"),
     },
   },
 
@@ -687,6 +709,883 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       serviceName: { type: "string", nullable: true },
       technicianId: { type: "string", nullable: true },
       technicianName: { type: "string", nullable: true },
+    },
+  },
+
+  // ---- Shared ----
+  Pagination: {
+    type: "object",
+    description: "Shared page-metadata shape returned alongside `rows` by every paginated list endpoint.",
+    required: ["page", "pageSize", "total", "totalPages"],
+    properties: {
+      page: { type: "integer" },
+      pageSize: { type: "integer" },
+      total: { type: "integer" },
+      totalPages: { type: "integer" },
+    },
+  },
+
+  // ---- Rounds ----
+  RoundSummary: {
+    type: "object",
+    description: "One row from GET /rounds — Round plus derived counts (no technician list; see RoundDetail for that).",
+    required: ["id", "name", "status", "technicianCount", "propertyCount"],
+    properties: {
+      id: { type: "string" },
+      name: { type: "string" },
+      frequency: nullableRef("CleaningFrequency"),
+      defaultDay: nullableRef("DayOfWeek"),
+      status: ref("RoundStatus"),
+      serviceAreaId: { type: "string", nullable: true },
+      serviceAreaName: { type: "string", nullable: true },
+      technicianCount: { type: "integer" },
+      propertyCount: { type: "integer" },
+    },
+  },
+
+  TechnicianRef: {
+    type: "object",
+    description: "Minimal technician reference embedded in RoundDetail.technicians.",
+    required: ["id", "active"],
+    properties: {
+      id: { type: "string" },
+      name: { type: "string", nullable: true },
+      active: { type: "boolean" },
+    },
+  },
+
+  RoundDetail: {
+    type: "object",
+    description: "GET /rounds/{id}, and the create/update/set-technicians responses — adds the full technician list in place of RoundSummary's count.",
+    required: ["id", "name", "status", "technicians", "propertyCount"],
+    properties: {
+      id: { type: "string" },
+      name: { type: "string" },
+      frequency: nullableRef("CleaningFrequency"),
+      defaultDay: nullableRef("DayOfWeek"),
+      description: { type: "string", nullable: true },
+      status: ref("RoundStatus"),
+      serviceAreaId: { type: "string", nullable: true },
+      serviceAreaName: { type: "string", nullable: true },
+      technicians: { type: "array", items: ref("TechnicianRef") },
+      propertyCount: { type: "integer" },
+    },
+  },
+
+  OccurrenceTechnicianRef: {
+    type: "object",
+    required: ["id"],
+    properties: {
+      id: { type: "string" },
+      name: { type: "string", nullable: true },
+    },
+  },
+
+  OccurrenceSummary: {
+    type: "object",
+    description: "One calendar day's aggregate stats for a round (planner calendar view).",
+    required: ["date", "stopCount", "totalValue", "completedCount", "completionPct", "holdCount", "issueCount", "technicians"],
+    properties: {
+      date: { type: "string", format: "date", description: "UTC calendar date (YYYY-MM-DD)." },
+      stopCount: { type: "integer" },
+      totalValue: { type: "number" },
+      completedCount: { type: "integer" },
+      completionPct: { type: "integer", description: "0–100, rounded. 0 when stopCount is 0." },
+      holdCount: { type: "integer" },
+      issueCount: { type: "integer" },
+      technicians: { type: "array", items: ref("OccurrenceTechnicianRef"), description: "Every distinct technician with ≥ 1 stop on this date, deduped by id." },
+    },
+  },
+
+  PlannerStopIssue: {
+    type: "object",
+    required: ["id", "type"],
+    properties: {
+      id: { type: "string" },
+      type: ref("IssueType"),
+      note: { type: "string", nullable: true },
+    },
+  },
+
+  PlannerStop: {
+    type: "object",
+    description: "One property stop within a planner occurrence (list/map view).",
+    required: ["visitId", "propertyId", "addressLine", "postcode", "price", "status", "paymentHold", "issues"],
+    properties: {
+      visitId: { type: "string" },
+      propertyId: { type: "string" },
+      propertyName: { type: "string", nullable: true },
+      addressLine: { type: "string" },
+      postcode: { type: "string" },
+      customerName: { type: "string", nullable: true },
+      price: { type: "number" },
+      status: ref("VisitStatus"),
+      paymentHold: { type: "boolean" },
+      technicianId: { type: "string", nullable: true },
+      technicianName: { type: "string", nullable: true },
+      issues: { type: "array", items: ref("PlannerStopIssue") },
+      completedAt: { ...dateTime, nullable: true },
+    },
+  },
+
+  OccurrenceDetail: {
+    type: "object",
+    description: "GET /rounds/{id}/planner/occurrences/{date} — every stop for one calendar day, plus the same aggregate stats as OccurrenceSummary (minus date, given separately here).",
+    required: ["roundId", "roundName", "date", "stops", "summary"],
+    properties: {
+      roundId: { type: "string" },
+      roundName: { type: "string" },
+      date: { type: "string", format: "date" },
+      stops: { type: "array", items: ref("PlannerStop") },
+      summary: {
+        type: "object",
+        required: ["stopCount", "totalValue", "completedCount", "completionPct", "holdCount", "issueCount", "technicians"],
+        properties: {
+          stopCount: { type: "integer" },
+          totalValue: { type: "number" },
+          completedCount: { type: "integer" },
+          completionPct: { type: "integer" },
+          holdCount: { type: "integer" },
+          issueCount: { type: "integer" },
+          technicians: { type: "array", items: ref("OccurrenceTechnicianRef") },
+        },
+      },
+    },
+  },
+
+  RoundOccurrenceBatchItem: {
+    type: "object",
+    description: "One round's occurrence list within the batched GET /rounds/planner/occurrences response. An unknown/stale round id simply gets an empty occurrences array — the call never 404s because one id is invalid.",
+    required: ["roundId", "occurrences"],
+    properties: {
+      roundId: { type: "string" },
+      occurrences: { type: "array", items: ref("OccurrenceSummary") },
+    },
+  },
+
+  DayStopsForRound: {
+    type: "object",
+    description: "One round's stops within the batched GET /rounds/planner/occurrences/{date} response. An unknown/stale round id gets an empty stops array.",
+    required: ["roundId", "stops"],
+    properties: {
+      roundId: { type: "string" },
+      stops: { type: "array", items: ref("PlannerStop") },
+    },
+  },
+
+  GenerateVisitsResult: {
+    type: "object",
+    required: ["visitsGenerated"],
+    properties: {
+      visitsGenerated: { type: "integer", description: "Visits created for this round right now, instead of waiting for the next nightly generation run." },
+    },
+  },
+
+  TodayPanelStop: {
+    type: "object",
+    required: ["visitId", "addressLine", "status", "paymentHold", "hasIssue"],
+    properties: {
+      visitId: { type: "string" },
+      customerName: { type: "string", nullable: true },
+      addressLine: { type: "string" },
+      status: ref("VisitStatus"),
+      paymentHold: { type: "boolean" },
+      hasIssue: { type: "boolean" },
+      issueFlag: { type: "string", nullable: true, description: "First issue's note text; null when there's no note text or no issues." },
+    },
+  },
+
+  TodayPanel: {
+    type: "object",
+    description: "GET /rounds/{id}/today — a single round's Today panel (Screen 13).",
+    required: ["roundId", "roundName", "status", "progress", "stops"],
+    properties: {
+      roundId: { type: "string" },
+      roundName: { type: "string" },
+      technicianId: { type: "string", nullable: true },
+      technicianName: { type: "string", nullable: true },
+      status: { type: "string", enum: ["not_started", "in_progress", "completed"] },
+      progress: {
+        type: "object",
+        required: ["total", "completed", "skipped", "issues"],
+        properties: {
+          total: { type: "integer" },
+          completed: { type: "integer" },
+          skipped: { type: "integer" },
+          issues: { type: "integer" },
+        },
+      },
+      stops: { type: "array", items: ref("TodayPanelStop") },
+    },
+  },
+
+  ReassignResult: {
+    type: "object",
+    required: ["updatedCount"],
+    properties: { updatedCount: { type: "integer", description: "Visits whose technicianId was switched." } },
+  },
+
+  PushMissedResult: {
+    type: "object",
+    required: ["pushedCount"],
+    properties: { pushedCount: { type: "integer", description: "SCHEDULED visits moved to the new date." } },
+  },
+
+  // ---- Today's Work (GET /today, POST /today/close) ----
+  TodayKpi: {
+    type: "object",
+    required: ["totalStops", "inProgress", "completed", "skipped", "issues", "paymentHolds", "valueCompleted"],
+    properties: {
+      totalStops: { type: "integer" },
+      inProgress: { type: "integer" },
+      completed: { type: "integer" },
+      skipped: { type: "integer" },
+      issues: { type: "integer", description: "Visits today with ≥ 1 issue." },
+      paymentHolds: { type: "integer" },
+      valueCompleted: { type: "number" },
+    },
+  },
+
+  TodayRoundRow: {
+    type: "object",
+    required: ["roundId", "roundName", "status", "total", "completed", "skipped", "issueCount", "paymentHolds", "value"],
+    properties: {
+      roundId: { type: "string" },
+      roundName: { type: "string" },
+      technicianId: { type: "string", nullable: true },
+      technicianName: { type: "string", nullable: true },
+      status: { type: "string", enum: ["not_started", "in_progress", "completed"] },
+      total: { type: "integer" },
+      completed: { type: "integer" },
+      skipped: { type: "integer" },
+      issueCount: { type: "integer" },
+      paymentHolds: { type: "integer" },
+      value: { type: "number", description: "Sum of completed-visit prices for this round today; 0 until the first completion." },
+      etaMinutes: { type: "integer", nullable: true, description: "remaining stops × 20; null once there's nothing left to do." },
+    },
+  },
+
+  TodayTechnicianCard: {
+    type: "object",
+    required: ["technicianId", "completed", "remaining", "issueCount", "onTrack"],
+    properties: {
+      technicianId: { type: "string" },
+      technicianName: { type: "string", nullable: true },
+      completed: { type: "integer" },
+      remaining: { type: "integer" },
+      roundName: { type: "string", nullable: true },
+      issueCount: { type: "integer" },
+      onTrack: { type: "boolean", description: "True when issueCount is 0." },
+    },
+  },
+
+  TodaysWorkAggregate: {
+    type: "object",
+    description: "GET /today — Today's Work aggregate (Screen 12): KPI tiles, rounds table, technician workload cards.",
+    required: ["date", "dayClosed", "kpi", "rounds", "technicians"],
+    properties: {
+      date: { type: "string", format: "date" },
+      dayClosed: { type: "boolean", description: "True once POST /today/close has run for this date." },
+      kpi: ref("TodayKpi"),
+      rounds: { type: "array", items: ref("TodayRoundRow") },
+      technicians: { type: "array", items: ref("TodayTechnicianCard") },
+    },
+  },
+
+  CloseDaySummary: {
+    type: "object",
+    description: "POST /today/close response — a snapshot of the day right before closing.",
+    required: ["completedJobs", "skippedJobs", "outstanding", "issues", "paymentHolds", "revenue"],
+    properties: {
+      completedJobs: { type: "integer" },
+      skippedJobs: { type: "integer", description: "Includes visits just marked SKIPPED by this call when unfinishedAction is mark_as_skipped." },
+      outstanding: { type: "integer", description: "Visits pushed to the next working day; 0 when unfinishedAction is mark_as_skipped." },
+      issues: { type: "integer" },
+      paymentHolds: { type: "integer" },
+      revenue: { type: "number", description: "Sum of completed-visit prices for the day." },
+    },
+  },
+
+  // ---- Technicians (new directory router — distinct from /settings/technicians) ----
+  TechnicianServiceAreaRow: {
+    type: "object",
+    required: ["serviceAreaId", "serviceAreaName", "assignedAt"],
+    properties: {
+      serviceAreaId: { type: "string" },
+      serviceAreaName: { type: "string" },
+      assignedAt: dateTime,
+    },
+  },
+
+  TechnicianListItem: {
+    type: "object",
+    description: "Base shape shared by GET /technicians/{id}, and the response of POST /technicians / PATCH /technicians/{id}. Distinct from the Settings → /settings/technicians directory (TechnicianWithDisplayName) — this router adds email/notes/serviceAreas and today/round derived data.",
+    required: ["id", "active", "appStatus", "serviceAreas", "createdAt"],
+    properties: {
+      id: { type: "string" },
+      name: { type: "string", nullable: true },
+      phone: { type: "string", nullable: true },
+      role: { type: "string", nullable: true },
+      email: { type: "string", nullable: true },
+      notes: { type: "string", nullable: true },
+      active: { type: "boolean" },
+      appStatus: { type: "string", enum: ["PENDING_INVITE", "ACTIVE", "INACTIVE"] },
+      serviceAreas: { type: "array", items: ref("TechnicianServiceAreaRow") },
+      createdAt: dateTime,
+    },
+  },
+
+  TodayStats: {
+    type: "object",
+    required: ["total", "completed", "skipped", "remaining"],
+    properties: {
+      total: { type: "integer" },
+      completed: { type: "integer" },
+      skipped: { type: "integer" },
+      remaining: { type: "integer" },
+    },
+  },
+
+  TechnicianListRow: {
+    description: "GET /technicians row — TechnicianListItem plus round names and today's job stats, computed up front so the frontend doesn't have to fan out one GET /technicians/{id} call per row.",
+    allOf: [
+      ref("TechnicianListItem"),
+      {
+        type: "object",
+        required: ["roundNames", "todayStats"],
+        properties: {
+          roundNames: { type: "array", items: { type: "string" } },
+          todayStats: ref("TodayStats"),
+        },
+      },
+    ],
+  },
+
+  WorkloadRoundRow: {
+    type: "object",
+    required: ["roundId", "roundName", "total", "completed", "skipped", "remaining"],
+    properties: {
+      roundId: { type: "string" },
+      roundName: { type: "string" },
+      total: { type: "integer" },
+      completed: { type: "integer" },
+      skipped: { type: "integer" },
+      remaining: { type: "integer" },
+    },
+  },
+
+  TechnicianDetail: {
+    description: "GET /technicians/{id} — TechnicianListItem plus round names and a per-round breakdown of today's workload.",
+    allOf: [
+      ref("TechnicianListItem"),
+      {
+        type: "object",
+        required: ["roundNames", "todayWorkload"],
+        properties: {
+          roundNames: { type: "array", items: { type: "string" } },
+          todayWorkload: { type: "array", items: ref("WorkloadRoundRow") },
+        },
+      },
+    ],
+  },
+
+  // ---- Messages ----
+  MessageSendResult: {
+    type: "object",
+    required: ["status"],
+    properties: { status: { type: "string", enum: ["sent"] } },
+  },
+
+  MessageBulkResult: {
+    type: "object",
+    required: ["queued"],
+    properties: {
+      queued: {
+        type: "integer",
+        description: "Number of recipients the message was actually sent to. Best-effort: a per-recipient failure is logged and skipped, not surfaced as an error.",
+      },
+    },
+  },
+
+  // ---- Setup steps 9–12 ----
+  Customer: {
+    type: "object",
+    description: "Raw Customer row, as created by Setup step 9 (not the transformed CustomerListRow/CustomerDetail shapes used elsewhere).",
+    properties: {
+      id: { type: "string" },
+      name: { type: "string" },
+      phone: { type: "string", nullable: true },
+      landline: { type: "string", nullable: true },
+      email: { type: "string", nullable: true },
+      status: ref("LifecycleStatus"),
+      ghlContactId: { type: "string", nullable: true },
+      stripeCustomerId: { type: "string", nullable: true },
+      stripeDefaultPaymentMethodId: { type: "string", nullable: true },
+      gocardlessCustomerId: { type: "string", nullable: true },
+      gocardlessMandateId: { type: "string", nullable: true },
+      gocardlessMandateStatus: { type: "string", nullable: true },
+      paymentMethod: nullableRef("PaymentMethod"),
+      badDebt: { type: "boolean" },
+      holdNextClean: { type: "boolean" },
+      holdReason: { type: "string", nullable: true },
+      holdSince: { ...dateTime, nullable: true },
+      createdAt: dateTime,
+      updatedAt: dateTime,
+    },
+  },
+
+  ServicePlan: {
+    type: "object",
+    description: "Raw ServicePlan row (PATCH /service-plans/{id}, pause/resume, and the plans created by Setup step 9).",
+    properties: {
+      id: { type: "string" },
+      propertyId: { type: "string" },
+      serviceId: { type: "string", nullable: true },
+      price: money,
+      cleanMethod: { type: "string", nullable: true },
+      paymentMethod: nullableRef("PaymentMethod"),
+      cleaningFrequency: nullableRef("CleaningFrequency"),
+      status: ref("LifecycleStatus"),
+      nextDueDate: { ...dateTime, nullable: true },
+      lastCompleted: { ...dateTime, nullable: true },
+      pauseStartDate: { ...dateTime, nullable: true },
+      pauseEndDate: { ...dateTime, nullable: true },
+      createdAt: dateTime,
+      updatedAt: dateTime,
+    },
+  },
+
+  SetupPropertyResult: {
+    type: "object",
+    description: "One property added during Setup step 9 — the created Customer, Property, and its ServicePlan(s).",
+    required: ["customer", "property", "servicePlan", "servicePlans"],
+    properties: {
+      customer: ref("Customer"),
+      property: ref("Property"),
+      servicePlan: ref("ServicePlan"),
+      servicePlans: { type: "array", items: ref("ServicePlan"), description: "Every plan created for this row — length > 1 only when serviceIds had more than one entry. servicePlan above is always servicePlans[0] (kept for backward compatibility)." },
+    },
+  },
+
+  SetupPropertyRowError: {
+    type: "object",
+    required: ["row", "field", "message"],
+    properties: {
+      row: { type: "integer", description: "0-based index into the submitted properties[] array." },
+      field: { type: "string" },
+      message: { type: "string" },
+    },
+  },
+
+  BulkSetupPropertyResult: {
+    type: "object",
+    required: ["created", "failed", "results", "errors"],
+    properties: {
+      created: { type: "integer" },
+      failed: { type: "integer" },
+      results: { type: "array", items: ref("SetupPropertyResult") },
+      errors: { type: "array", items: ref("SetupPropertyRowError") },
+      idempotent: {
+        type: "boolean",
+        description: "True when this exact idempotencyKey was already processed by an earlier call. `results` is empty in that case (not reconstructed), but `created` reflects the original run's count.",
+      },
+    },
+  },
+
+  RoundAssignmentResult: {
+    type: "object",
+    required: ["roundId", "roundName", "propertyCount", "technicianIds", "technicians"],
+    properties: {
+      roundId: { type: "string" },
+      roundName: { type: "string" },
+      defaultDay: { type: "string", nullable: true },
+      serviceAreaName: { type: "string", nullable: true },
+      propertyCount: { type: "integer" },
+      technicianIds: { type: "array", items: { type: "string" } },
+      technicians: {
+        type: "array",
+        items: { type: "object", properties: { id: { type: "string" }, name: { type: "string", nullable: true } } },
+      },
+    },
+  },
+
+  WorkloadEntry: {
+    type: "object",
+    required: ["technicianId", "roundCount"],
+    properties: {
+      technicianId: { type: "string" },
+      name: { type: "string", nullable: true },
+      roundCount: { type: "integer" },
+    },
+  },
+
+  Step10Result: {
+    type: "object",
+    description: "GET and POST /setup/step/10 share this shape — the full round/technician assignment board.",
+    required: ["totalRounds", "technicianCount", "unassignedCount", "assignments", "workload"],
+    properties: {
+      totalRounds: { type: "integer" },
+      technicianCount: { type: "integer", description: "Active technicians only." },
+      unassignedCount: { type: "integer", description: "ACTIVE rounds with zero technicians assigned." },
+      assignments: { type: "array", items: ref("RoundAssignmentResult") },
+      workload: { type: "array", items: ref("WorkloadEntry") },
+    },
+  },
+
+  ActivationStatus: {
+    type: "object",
+    required: ["activated", "visitsGenerated"],
+    properties: {
+      activated: { type: "boolean", description: "True once at least one SCHEDULED visit exists." },
+      visitsGenerated: { type: "integer" },
+    },
+  },
+
+  ActivationResult: {
+    type: "object",
+    required: ["visitsGenerated"],
+    properties: { visitsGenerated: { type: "integer" } },
+  },
+
+  ReviewChecklistItem: {
+    type: "object",
+    required: ["label", "complete"],
+    properties: {
+      label: { type: "string" },
+      complete: { type: "boolean" },
+    },
+  },
+
+  ReviewChecklist: {
+    type: "object",
+    required: ["checklist", "allComplete"],
+    properties: {
+      checklist: { type: "array", items: ref("ReviewChecklistItem") },
+      allComplete: { type: "boolean" },
+    },
+  },
+
+  // ---- Debt ----
+  DebtKpis: {
+    type: "object",
+    required: ["totalOutstandings", "badDebt", "failedGoCardless", "dueBeforeClean", "holdNextClean"],
+    properties: {
+      totalOutstandings: { type: "number", description: "Sum of SENT invoice amounts, excluding bad-debt customers." },
+      badDebt: { type: "number", description: "Sum of SENT invoice amounts for customers flagged badDebt." },
+      failedGoCardless: { type: "integer" },
+      dueBeforeClean: { type: "integer" },
+      holdNextClean: { type: "integer", description: "Distinct customers currently on hold." },
+    },
+  },
+
+  DebtBoardRow: {
+    type: "object",
+    required: ["invoiceId", "invoiceNumber", "amount", "customerId", "customerName", "addressLine", "badDebt", "holdNextClean"],
+    properties: {
+      invoiceId: { type: "string" },
+      invoiceNumber: { type: "string" },
+      amount: { type: "number" },
+      dueDate: { ...dateTime, nullable: true },
+      customerId: { type: "string" },
+      customerName: { type: "string" },
+      addressLine: { type: "string", description: "Empty string when the invoice has no linked visit." },
+      postcode: { type: "string", nullable: true },
+      paymentMethod: nullableRef("PaymentMethod"),
+      lastContactedAt: { ...dateTime, nullable: true, description: "Most recent OUTBOUND message to this customer, across any channel." },
+      badDebt: { type: "boolean" },
+      holdNextClean: { type: "boolean" },
+    },
+  },
+
+  DebtBoardResult: {
+    type: "object",
+    required: ["rows", "pagination"],
+    properties: {
+      rows: { type: "array", items: ref("DebtBoardRow") },
+      pagination: ref("Pagination"),
+    },
+  },
+
+  DebtBucketCounts: {
+    type: "object",
+    description: "All 7 bucket-tab counts in one call — replaces the old one-GET-/debt/board-per-tab pattern.",
+    required: ["BAD_DEBT", "ON_HOLD", "FAILED_GC", "DUE_BEFORE_CLEAN", "SEVEN_DAYS_OVER", "FOURTEEN_DAYS_OVER", "ALL"],
+    properties: {
+      BAD_DEBT: { type: "integer" },
+      ON_HOLD: { type: "integer" },
+      FAILED_GC: { type: "integer" },
+      DUE_BEFORE_CLEAN: { type: "integer" },
+      SEVEN_DAYS_OVER: { type: "integer" },
+      FOURTEEN_DAYS_OVER: { type: "integer" },
+      ALL: { type: "integer", description: "Catch-all bucket: everything not already in one of the other 6." },
+    },
+  },
+
+  DebtInvoiceDetail: {
+    type: "object",
+    description: "GET /debt/{id} — the fields the board row doesn't carry (phone/email/round/next visit/mandate/recent visits).",
+    required: ["invoiceId", "invoiceNumber", "amount", "status", "customerId", "customerName", "recentVisits"],
+    properties: {
+      invoiceId: { type: "string" },
+      invoiceNumber: { type: "string" },
+      amount: { type: "number" },
+      dueDate: { ...dateTime, nullable: true },
+      status: ref("InvoiceStatus"),
+      customerId: { type: "string" },
+      customerName: { type: "string" },
+      phone: { type: "string", nullable: true },
+      email: { type: "string", nullable: true },
+      roundId: { type: "string", nullable: true },
+      roundName: { type: "string", nullable: true },
+      nextVisitDate: { ...dateTime, nullable: true, description: "Next SCHEDULED/IN_PROGRESS visit for this customer." },
+      mandateId: { type: "string", nullable: true },
+      mandateStatus: { type: "string", nullable: true },
+      recentVisits: {
+        type: "array",
+        description: "Most recent 5 visits for this customer, newest first.",
+        items: {
+          type: "object",
+          properties: {
+            visitId: { type: "string" },
+            date: dateTime,
+            status: ref("VisitStatus"),
+            amount: { type: "number" },
+          },
+        },
+      },
+    },
+  },
+
+  PaymentLinkResult: {
+    type: "object",
+    required: ["id", "paymentUrl", "provider"],
+    properties: {
+      id: { type: "string", description: "The outbound Message record created for this link." },
+      paymentUrl: { type: "string" },
+      provider: { type: "string", enum: ["stripe", "static"], description: "stripe when a real Stripe Checkout session was created; static otherwise (falls back to the pay.roundflow.app link)." },
+      expiresAt: { ...dateTime, nullable: true, description: "Set only when provider is stripe." },
+    },
+  },
+
+  ReminderResult: {
+    type: "object",
+    required: ["id"],
+    properties: { id: { type: "string", description: "The outbound Message record created for this reminder." } },
+  },
+
+  BadDebtFlagResult: {
+    type: "object",
+    required: ["customerId", "badDebt"],
+    properties: {
+      customerId: { type: "string" },
+      badDebt: { type: "boolean" },
+    },
+  },
+
+  HoldFlagResult: {
+    type: "object",
+    required: ["customerId", "holdNextClean"],
+    properties: {
+      customerId: { type: "string" },
+      holdNextClean: { type: "boolean" },
+      holdReason: { type: "string", nullable: true },
+      holdSince: { ...dateTime, nullable: true },
+    },
+  },
+
+  // ---- Reports ----
+  ActivityLogRow: {
+    type: "object",
+    required: ["id", "type", "message", "createdAt"],
+    properties: {
+      id: { type: "string" },
+      type: { type: "string", example: "ROUND_UPDATED" },
+      message: { type: "string" },
+      actorRole: { type: "string", nullable: true },
+      actorName: { type: "string", nullable: true, description: "Resolved from the public-schema Profile matching the log's actorId." },
+      createdAt: dateTime,
+    },
+  },
+
+  ReportsActivityResult: {
+    type: "object",
+    required: ["rows", "pagination"],
+    properties: {
+      rows: { type: "array", items: ref("ActivityLogRow") },
+      pagination: ref("Pagination"),
+    },
+  },
+
+  ReportsVisitRow: {
+    type: "object",
+    required: ["visitId", "date", "property", "status", "amount"],
+    properties: {
+      visitId: { type: "string" },
+      date: dateTime,
+      property: { type: "string" },
+      postcode: { type: "string", nullable: true },
+      round: { type: "string", nullable: true },
+      technician: { type: "string", nullable: true },
+      status: ref("VisitStatus"),
+      amount: { type: "number" },
+    },
+  },
+
+  ReportsVisitsResult: {
+    type: "object",
+    required: ["rows", "pagination"],
+    properties: {
+      rows: { type: "array", items: ref("ReportsVisitRow") },
+      pagination: ref("Pagination"),
+    },
+  },
+
+  ReportsTechnicianRow: {
+    type: "object",
+    required: ["technicianId", "completed", "skipped", "efficiency", "revenueImpact"],
+    properties: {
+      technicianId: { type: "string" },
+      name: { type: "string", nullable: true },
+      email: { type: "string", nullable: true },
+      completed: { type: "integer" },
+      skipped: { type: "integer" },
+      efficiency: { type: "integer", description: "completed / (completed + skipped) × 100, rounded. 0 when there are no completed-or-skipped visits." },
+      revenueImpact: { type: "number", description: "Sum of completed-visit prices for this technician in the period." },
+    },
+  },
+
+  ReportsTechniciansResult: {
+    type: "object",
+    required: ["rows", "pagination"],
+    properties: {
+      rows: { type: "array", items: ref("ReportsTechnicianRow") },
+      pagination: ref("Pagination"),
+    },
+  },
+
+  ReportsRevenueRow: {
+    type: "object",
+    required: ["date", "amount"],
+    properties: {
+      date: { type: "string", format: "date" },
+      amount: { type: "number" },
+    },
+  },
+
+  ReportsSummary: {
+    type: "object",
+    required: ["totalRevenue", "completedVisits", "completedRounds", "undonePayments"],
+    properties: {
+      totalRevenue: { type: "number", description: "Sum of completed-visit prices in the period." },
+      completedVisits: { type: "integer" },
+      completedRounds: { type: "integer", description: "Distinct rounds with ≥ 1 completed visit in the period." },
+      undonePayments: { type: "number", description: "Sum of SENT invoice amounts (all time, not period-scoped)." },
+    },
+  },
+
+  // ---- Invoices ----
+  InvoiceLineItem: {
+    type: "object",
+    required: ["description", "amount"],
+    properties: {
+      description: { type: "string" },
+      technicianName: { type: "string", nullable: true },
+      amount: { type: "number" },
+    },
+  },
+
+  InvoicePreview: {
+    type: "object",
+    description: "GET /invoices/preview and /invoices/preview/pdf — a not-yet-saved invoice computed live from a visit. 409 if the visit already has an invoice.",
+    required: ["invoiceNumber", "invoiceDate", "visitDate", "lineItems", "subtotal", "vatAmount", "total", "amount", "currency"],
+    properties: {
+      invoiceNumber: { type: "string" },
+      invoiceDate: { type: "string", format: "date" },
+      visitDate: { type: "string", format: "date" },
+      dueDate: { type: "string", format: "date", nullable: true, description: "Always null for a preview — only set once created via POST /invoices." },
+      paymentMethod: nullableRef("PaymentMethod"),
+      customer: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          addressLine: { type: "string" },
+          postcode: { type: "string", nullable: true },
+          email: { type: "string", nullable: true },
+          phone: { type: "string", nullable: true },
+        },
+      },
+      lineItems: { type: "array", items: ref("InvoiceLineItem") },
+      subtotal: { type: "number" },
+      vatAmount: { type: "number", description: "0 when BusinessSettings.vatInInvoices is false." },
+      total: { type: "number" },
+      amount: { type: "number", description: "Alias of total, for convenience." },
+      currency: { type: "string", description: "Business currency symbol, e.g. \"£\".", example: "£" },
+      business: {
+        type: "object",
+        properties: {
+          name: { type: "string", nullable: true },
+          email: { type: "string", nullable: true },
+        },
+      },
+    },
+  },
+
+  InvoiceDetail: {
+    type: "object",
+    description: "GET /invoices/{id} — the saved invoice with line items, technician, visit date, and a VAT/subtotal breakdown. Degrades gracefully (visitId/visitDate/technicianName/roundName all null, lineItems empty) when the invoice has no linked visit — unlike the PDF route, which 409s in that case.",
+    required: ["id", "invoiceNumber", "status", "amount", "sentToCustomer", "createdAt", "customerId", "lineItems", "subtotal", "vatAmount"],
+    properties: {
+      id: { type: "string" },
+      invoiceNumber: { type: "string" },
+      status: ref("InvoiceStatus"),
+      amount: { type: "number" },
+      dueDate: { type: "string", format: "date", nullable: true },
+      notes: { type: "string", nullable: true },
+      sentToCustomer: { type: "boolean" },
+      sentAt: { ...dateTime, nullable: true },
+      createdAt: dateTime,
+      customerId: { type: "string" },
+      visitId: { type: "string", nullable: true },
+      visitDate: { ...dateTime, nullable: true },
+      technicianName: { type: "string", nullable: true },
+      roundName: { type: "string", nullable: true },
+      paymentMethod: nullableRef("PaymentMethod"),
+      customer: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          email: { type: "string", nullable: true },
+          phone: { type: "string", nullable: true },
+          addressLine: { type: "string", nullable: true },
+          postcode: { type: "string", nullable: true },
+        },
+      },
+      lineItems: { type: "array", items: ref("InvoiceLineItem") },
+      subtotal: { type: "number" },
+      vatAmount: { type: "number" },
+    },
+  },
+
+  InvoiceActionResult: {
+    type: "object",
+    description: "Shared response shape for POST /invoices (create) and POST /invoices/{id}/send.",
+    required: ["id", "invoiceNumber", "status", "sentToCustomer"],
+    properties: {
+      id: { type: "string" },
+      invoiceNumber: { type: "string" },
+      status: ref("InvoiceStatus"),
+      sentToCustomer: { type: "boolean" },
+      sentAt: { ...dateTime, nullable: true },
+    },
+  },
+
+  // ---- Payments ----
+  StripeSessionResult: {
+    type: "object",
+    required: ["url", "sessionId"],
+    properties: {
+      url: { type: "string", description: "Hosted Stripe Checkout URL to redirect the customer to." },
+      sessionId: { type: "string", description: "The persisted StripeSession row id (not Stripe's own session id)." },
     },
   },
 };
@@ -1305,6 +2204,316 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       notes: "One-off gutter clean — customer rang in",
       paymentMethod: "CASH",
     },
+  },
+
+  // ---- Rounds ----
+  RoundCreateInput: {
+    type: "object",
+    required: ["name", "frequency", "serviceAreaId"],
+    properties: {
+      name: { type: "string", minLength: 1 },
+      frequency: ref("CleaningFrequency"),
+      serviceAreaId: { type: "string", description: "Must exist (404 if not)." },
+      defaultDay: nullableRef("DayOfWeek"),
+      description: { type: "string", nullable: true },
+    },
+    example: { name: "Alnwick Monday", frequency: "FOUR_WEEKLY", serviceAreaId: "csa_example", defaultDay: "MON" },
+  },
+
+  RoundUpdateInput: {
+    type: "object",
+    description: "Partial update. frequency: null clears it. serviceAreaId: null unassigns the area. Omitted fields are left unchanged.",
+    properties: {
+      name: { type: "string", minLength: 1 },
+      frequency: nullableRef("CleaningFrequency"),
+      serviceAreaId: { type: "string", nullable: true },
+      defaultDay: nullableRef("DayOfWeek"),
+      description: { type: "string", nullable: true },
+      status: ref("RoundStatus"),
+    },
+  },
+
+  SetRoundTechniciansInput: {
+    type: "object",
+    required: ["technicianIds"],
+    properties: {
+      technicianIds: {
+        type: "array",
+        items: { type: "string" },
+        description: "Replaces the round's technician list wholesale (empty array clears it). Every id must reference an active, invite-accepted technician.",
+      },
+    },
+    example: { technicianIds: ["t1", "t2"] },
+  },
+
+  ReassignTechnicianInput: {
+    type: "object",
+    required: ["fromTechnicianId", "toTechnicianId", "scope"],
+    properties: {
+      fromTechnicianId: { type: "string" },
+      toTechnicianId: { type: "string", description: "Must be an active, invite-accepted technician." },
+      scope: { type: "string", enum: ["remaining", "all"], description: "remaining = only today's SCHEDULED/IN_PROGRESS visits; all = also COMPLETED/SKIPPED." },
+      note: { type: "string", nullable: true },
+      notify: { type: "boolean", default: false },
+    },
+    example: { fromTechnicianId: "t1", toTechnicianId: "t2", scope: "remaining", notify: false },
+  },
+
+  PushMissedVisitsInput: {
+    type: "object",
+    required: ["newDate", "reason"],
+    properties: {
+      newDate: { type: "string", format: "date", description: "Must be strictly after today." },
+      reason: { type: "string", minLength: 1 },
+      technicianId: { type: "string", nullable: true, description: "Reassign the pushed visits to this technician. Omit to leave the technician unchanged." },
+      notifyCustomers: { type: "boolean", default: false },
+      message: { type: "string", nullable: true, description: "Custom SMS text. Falls back to a default rescheduled-clean message mentioning reason." },
+    },
+    example: { newDate: "2026-09-20", reason: "Heavy rain", notifyCustomers: true },
+  },
+
+  // ---- Technicians (new directory router) ----
+  TechnicianDirectoryCreateInput: {
+    type: "object",
+    description: "POST /technicians — distinct from TechnicianCreateInput (used by /settings/technicians): adds email/notes/serviceAreaId and an optional invite send.",
+    properties: {
+      name: { type: "string", nullable: true },
+      phone: { type: "string", nullable: true },
+      role: { type: "string", nullable: true },
+      email: { type: "string", nullable: true, description: "Required when sendInvite is true." },
+      notes: { type: "string", nullable: true },
+      serviceAreaId: { type: "string", nullable: true, description: "Must exist (404 if not)." },
+      sendInvite: { type: "boolean", default: false, description: "When true, also creates a TenantInvite and emails it. 409 if a pending invite for this email already exists; 503 if the email fails to send." },
+    },
+    example: { name: "James Fisher", role: "Senior", phone: "+44 7700 900111", email: "james@example.com", sendInvite: true },
+  },
+
+  TechnicianDirectoryUpdateInput: {
+    type: "object",
+    description: "PATCH /technicians/{id} — partial update, all fields optional. Email is re-validated and lower-cased.",
+    properties: {
+      name: { type: "string", nullable: true },
+      phone: { type: "string", nullable: true },
+      role: { type: "string", nullable: true },
+      email: { type: "string", nullable: true },
+      notes: { type: "string", nullable: true },
+      active: { type: "boolean" },
+      serviceAreaId: { type: "string", nullable: true, description: "null clears all service areas; an id replaces with that single area (404 if it doesn't exist)." },
+    },
+  },
+
+  // ---- Messages ----
+  MessageSendInput: {
+    type: "object",
+    required: ["channel", "body"],
+    description: "Either propertyId or customerId is required (a property resolves to its customer).",
+    properties: {
+      propertyId: { type: "string", nullable: true },
+      customerId: { type: "string", nullable: true },
+      channel: { type: "string", enum: ["sms", "email", "whatsapp"], description: "Case-insensitive." },
+      body: { type: "string", minLength: 1 },
+    },
+    example: { customerId: "cld123", channel: "sms", body: "Reminder: your clean is scheduled for tomorrow." },
+  },
+
+  MessageBulkInput: {
+    type: "object",
+    required: ["roundId", "channel", "body"],
+    properties: {
+      roundId: { type: "string" },
+      channel: { type: "string", enum: ["sms", "email", "whatsapp"], description: "Case-insensitive." },
+      body: { type: "string", minLength: 1 },
+      excludePaymentHold: { type: "boolean", default: false, description: "Drop any customer whose round properties all have a payment-hold visit." },
+    },
+    example: { roundId: "r1", channel: "sms", body: "Your clean has been rescheduled due to weather.", excludePaymentHold: true },
+  },
+
+  // ---- Setup steps 9–12 ----
+  SetupPropertyInput: {
+    type: "object",
+    description: "Setup step 9 — one-time property creation during the wizard. Does not reuse POST /properties.",
+    required: ["customerName", "fullAddress", "postcode", "serviceAreaId", "price", "roundId"],
+    properties: {
+      customerName: { type: "string", minLength: 1 },
+      propertyName: { type: "string", nullable: true },
+      phone: { type: "string", nullable: true },
+      landline: { type: "string", nullable: true },
+      email: { type: "string", nullable: true },
+      fullAddress: { type: "string", minLength: 1 },
+      postcode: { type: "string", minLength: 1 },
+      serviceAreaId: { type: "string" },
+      propertyType: { type: "string", nullable: true },
+      price: { type: "number", minimum: 0, description: "Combined/total price across whichever service(s) this row represents." },
+      cleaningFrequency: ref("CleaningFrequency"),
+      paymentMethod: ref("PaymentMethod"),
+      serviceId: { type: "string", nullable: true },
+      serviceIds: {
+        type: "array",
+        items: { type: "string" },
+        nullable: true,
+        description: "When given (non-empty), one ServicePlan is created per id instead of a single plan for serviceId, splitting price evenly across them (remainder pence on the last plan).",
+      },
+      accessNotes: { type: "string", nullable: true },
+      riskNotes: { type: "string", nullable: true },
+      roundId: { type: "string", description: "Required during setup so the property is schedulable. Must reference an ACTIVE round." },
+    },
+    example: {
+      customerName: "John Smith",
+      fullAddress: "12 Market Street",
+      postcode: "NE66 1SS",
+      serviceAreaId: "csa_example",
+      price: 35,
+      roundId: "rnd_example",
+    },
+  },
+
+  SetupPropertyBulkInput: {
+    type: "object",
+    required: ["properties"],
+    description: "Setup step 9 bulk import. Accepts up to 1000 rows, processed in batches of 100 (each batch its own transaction) — a row or batch that fails is reported in `errors[]` by its original row index and does not abort the others.",
+    properties: {
+      properties: { type: "array", items: ref("SetupPropertyInput"), maxItems: 1000 },
+      idempotencyKey: {
+        type: "string",
+        nullable: true,
+        description: "Pass to make a retried call (e.g. after a client timeout) safe: a repeat call with the same key returns the original result (created count) instead of re-creating the same rows. Sent in the JSON body — not an Idempotency-Key header.",
+      },
+    },
+  },
+
+  RoundTechnicianAssignmentInput: {
+    type: "object",
+    required: ["roundId", "technicianIds"],
+    properties: {
+      roundId: { type: "string", description: "Must reference an ACTIVE round." },
+      technicianIds: {
+        type: "array",
+        items: { type: "string" },
+        description: "Every id must reference an active technician. Replaces this round's assignments; a round not included in the request is left untouched.",
+      },
+    },
+    example: { roundId: "rnd_example", technicianIds: ["t1", "t2"] },
+  },
+
+  ActivationInput: {
+    type: "object",
+    required: ["startDate", "cycleWeeks"],
+    description: "Setup step 11 — generates the initial batch of SCHEDULED visits. roundIds is required (and must be non-empty) when generateAll is false.",
+    properties: {
+      generateAll: { type: "boolean", default: true, description: "true = every ACTIVE round; false = only roundIds." },
+      startDate: { type: "string", format: "date", description: "Must be today or in the future." },
+      cycleWeeks: { type: "integer", minimum: 1, maximum: 52, description: "How many weeks of visits to generate up front." },
+      roundIds: { type: "array", items: { type: "string" }, description: "Required when generateAll is false." },
+    },
+    example: { generateAll: true, startDate: "2026-10-01", cycleWeeks: 4 },
+  },
+
+  // ---- Debt ----
+  DebtRemindInput: {
+    type: "object",
+    required: ["channel", "message"],
+    properties: {
+      channel: ref("MessageChannel"),
+      message: { type: "string", minLength: 1 },
+    },
+    example: { channel: "SMS", message: "Reminder: invoice INV-2026-004 is overdue." },
+  },
+
+  DebtPaymentLinkInput: {
+    type: "object",
+    required: ["message"],
+    description: "Creates a real Stripe Checkout session if Stripe is connected and the invoice isn't PAID/VOID; otherwise falls back to the static pay.roundflow.app link. Requires the customer to have an email address.",
+    properties: {
+      message: { type: "string", minLength: 1 },
+    },
+    example: { message: "Here's your payment link for INV-2026-004." },
+  },
+
+  DebtBadDebtInput: {
+    type: "object",
+    required: ["flag"],
+    properties: { flag: { type: "boolean" } },
+    example: { flag: true },
+  },
+
+  DebtHoldInput: {
+    type: "object",
+    required: ["flag"],
+    properties: {
+      flag: { type: "boolean" },
+      reason: { type: "string", nullable: true, description: "Only applied when flag is true." },
+      date: { type: "string", format: "date", nullable: true, description: "holdSince. Defaults to now when flag is true and omitted." },
+      notify: { type: "boolean", description: "Send an SMS to the customer. Only applies when flag is true." },
+      message: { type: "string", nullable: true, description: "Custom SMS text when notify is true. Falls back to a default hold message." },
+    },
+    example: { flag: true, reason: "2 payments overdue", notify: true },
+  },
+
+  // ---- Today ----
+  CloseDayInput: {
+    type: "object",
+    required: ["unfinishedAction"],
+    properties: {
+      unfinishedAction: {
+        type: "string",
+        enum: ["push_to_tomorrow", "mark_as_skipped"],
+        description: "What to do with today's still-SCHEDULED/IN_PROGRESS visits.",
+      },
+    },
+    example: { unfinishedAction: "push_to_tomorrow" },
+  },
+
+  // ---- Invoices ----
+  InvoiceCreateInput: {
+    type: "object",
+    required: ["visitId"],
+    properties: {
+      visitId: { type: "string", description: "The visit must not already have an invoice (409 if it does)." },
+      notes: { type: "string", nullable: true },
+      dueDate: { type: "string", format: "date", nullable: true },
+      sendEmail: { type: "boolean", default: false, description: "Accepted but not yet wired to actual delivery (GHL outbox is stubbed)." },
+    },
+    example: { visitId: "vis_example", dueDate: "2026-10-15" },
+  },
+
+  // ---- Payments ----
+  StripeCheckoutInput: {
+    type: "object",
+    required: ["invoiceId"],
+    description: "Creates a one-time Stripe Checkout session for an invoice. Returns the existing PENDING session's URL instead of creating a duplicate if one already exists.",
+    properties: { invoiceId: { type: "string" } },
+    example: { invoiceId: "inv_example" },
+  },
+
+  StripeSetupInput: {
+    type: "object",
+    required: ["customerId"],
+    description: "Creates a Stripe Checkout Session in 'setup' mode to save a card for future automatic charges.",
+    properties: { customerId: { type: "string" } },
+    example: { customerId: "cld123" },
+  },
+
+  // ---- Service Plans ----
+  ServicePlanUpdateInput: {
+    type: "object",
+    description: "PATCH /service-plans/{id} — partial update, all fields optional. Targets one ServicePlan directly by id (a property with 2+ plans can have each edited independently).",
+    properties: {
+      price: { type: "number", minimum: 0, exclusiveMinimum: true, maximum: 9999.99 },
+      cleanMethod: { type: "string", nullable: true },
+      paymentMethod: nullableRef("PaymentMethod"),
+      cleaningFrequency: nullableRef("CleaningFrequency"),
+    },
+    example: { price: 40, cleaningFrequency: "SIX_WEEKLY" },
+  },
+
+  // ---- Complaints (step-9/resolve update) ----
+  ResolveComplaintInput: {
+    type: "object",
+    description: "Optional resolution notes, persisted alongside resolvedAt/resolvedBy.",
+    properties: {
+      notes: { type: "string", nullable: true },
+    },
+    example: { notes: "Returned next day; customer confirmed satisfied." },
   },
 };
 
@@ -2232,16 +3441,18 @@ const paths: OpenAPIV3.PathsObject = {
   "/complaints": {
     get: {
       tags: ["Complaints"],
-      summary: "List Complaints — return all complaints, newest first",
-      description: "Optional query params: `status` (OPEN|IN_REVIEW|REVISIT_BOOKED|RESOLVED), `search` (title or customer name), `assignedTo=me` (filter to current user's technician). TECHNICIAN role receives 403.",
+      summary: "List Complaints — paginated, newest first",
+      description: "Paginated (`page`/`pageSize`, default 1/50, max pageSize 100) — returns `{ rows, pagination }`, not a bare array. Optional filters: `status` (OPEN|IN_REVIEW|REVISIT_BOOKED|RESOLVED), `search` (title or customer name), `assignedTo=me` (filter to current user's technician). TECHNICIAN role receives 403.",
       parameters: [
         { name: "status", in: "query", required: false, schema: { type: "string", enum: ["OPEN", "IN_REVIEW", "REVISIT_BOOKED", "RESOLVED"] } },
         { name: "search", in: "query", required: false, schema: { type: "string" }, description: "Case-insensitive search on title or customer name." },
         { name: "assignedTo", in: "query", required: false, schema: { type: "string", enum: ["me"] }, description: "Pass `me` to return only complaints assigned to the calling user's technician record." },
         { name: "technicianId", in: "query", required: false, schema: { type: "string" }, description: "Filter by specific technician ID. Ignored when `assignedTo=me`." },
+        { name: "page", in: "query", required: false, schema: { type: "integer", minimum: 1, default: 1 } },
+        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } },
       ],
       responses: {
-        "200": jsonResponse("Complaint list.", { type: "array", items: ref("Complaint") }),
+        "200": jsonResponse("Paginated complaint list.", ref("ComplaintsListResult")),
         "400": ERR[400],
         "401": ERR[401],
         "403": ERR[403],
@@ -2337,9 +3548,12 @@ const paths: OpenAPIV3.PathsObject = {
     post: {
       tags: ["Complaints"],
       summary: "Resolve — mark complaint as RESOLVED",
+      description: "Sets resolvedAt (now) and resolvedBy (the calling user's Profile id). Optional `notes` body field is persisted alongside them.",
       parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+      requestBody: jsonBody(ref("ResolveComplaintInput"), false),
       responses: {
         "200": jsonResponse("Updated complaint.", ref("Complaint")),
+        "400": ERR[400],
         "401": ERR[401],
         "403": ERR[403],
         "404": ERR[404],
@@ -2571,6 +3785,13 @@ const paths: OpenAPIV3.PathsObject = {
           schema: { type: "string", enum: ["6m", "12m"], default: "6m" },
           description: "Number of months to include. Defaults to `6m` (last 6 calendar months including current).",
         },
+        {
+          name: "technicianIds",
+          in: "query",
+          required: false,
+          schema: { type: "string" },
+          description: "Comma-separated technician IDs. When given, restricts the chart data to visits assigned to one of these technicians.",
+        },
       ],
       responses: {
         "200": jsonResponse("Chart data.", ref("DashboardChartData")),
@@ -2596,6 +3817,920 @@ const paths: OpenAPIV3.PathsObject = {
         "401": ERR[401],
         "403": ERR[403],
         "404": ERR[404],
+      },
+    },
+  },
+
+  // =====================================================================
+  // Rounds — CRUD, planner (calendar + list/map views), today panel,
+  // reassign, push-missed, on-demand visit generation. ADMIN/MANAGER only.
+  // =====================================================================
+  "/rounds": {
+    get: {
+      tags: ["Rounds"],
+      summary: "List rounds",
+      description: "Optional `status` filter (ACTIVE|DRAFT|ARCHIVED).",
+      parameters: [
+        { name: "status", in: "query", required: false, schema: { type: "string", enum: ["ACTIVE", "DRAFT", "ARCHIVED"] } },
+      ],
+      responses: {
+        "200": jsonResponse("Round list.", { type: "array", items: ref("RoundSummary") }),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+    post: {
+      tags: ["Rounds"],
+      summary: "Create a round",
+      description: "Always created ACTIVE. `frequency` and `serviceAreaId` are required; `serviceAreaId` must reference an existing service area (404 if not).",
+      requestBody: jsonBody(ref("RoundCreateInput")),
+      responses: {
+        "201": jsonResponse("Created round.", ref("RoundDetail")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/rounds/planner/occurrences": {
+    get: {
+      tags: ["Rounds"],
+      summary: "Batched calendar view across multiple rounds",
+      description:
+        "One call in place of one GET /rounds/{id}/planner/occurrences per round. `roundIds` is a required comma-separated list (max 50 ids). At least one of `from`/`to` is required; the range must not exceed 90 days. An id with no matching visits simply gets an empty `occurrences` array — a stale/unknown round id never fails the whole call.",
+      parameters: [
+        { name: "roundIds", in: "query", required: true, schema: { type: "string" }, description: "Comma-separated round IDs, max 50." },
+        { name: "from", in: "query", required: false, schema: { type: "string", format: "date" } },
+        { name: "to", in: "query", required: false, schema: { type: "string", format: "date" } },
+      ],
+      responses: {
+        "200": jsonResponse("One entry per requested round id.", { type: "array", items: ref("RoundOccurrenceBatchItem") }),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+
+  "/rounds/planner/occurrences/{date}": {
+    get: {
+      tags: ["Rounds"],
+      summary: "Batched day stops (list/map view) across multiple rounds",
+      description:
+        "One call in place of one GET /rounds/{id}/planner/occurrences/{date} per round. `roundIds` is a required comma-separated list (max 50 ids). An id with no matching visits simply gets an empty `stops` array.",
+      parameters: [
+        { name: "date", in: "path", required: true, schema: { type: "string", format: "date" } },
+        { name: "roundIds", in: "query", required: true, schema: { type: "string" }, description: "Comma-separated round IDs, max 50." },
+      ],
+      responses: {
+        "200": jsonResponse("One entry per requested round id.", { type: "array", items: ref("DayStopsForRound") }),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+
+  "/rounds/{id}": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Rounds"],
+      summary: "Get round detail",
+      description: "Round plus its full technician list and property count.",
+      responses: {
+        "200": jsonResponse("Round detail.", ref("RoundDetail")),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+    patch: {
+      tags: ["Rounds"],
+      summary: "Update a round (partial)",
+      description: "`frequency: null` clears it; `serviceAreaId` (if given) must exist (404 if not); `status` can be set directly (e.g. to ARCHIVED).",
+      requestBody: jsonBody(ref("RoundUpdateInput")),
+      responses: {
+        "200": jsonResponse("Updated round.", ref("RoundDetail")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/rounds/{id}/planner/occurrences": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Rounds"],
+      summary: "Occurrence list (calendar view)",
+      description: "One aggregate-stats row per calendar date with ≥1 visit. At least one of `from`/`to` is required; the range must not exceed 90 days.",
+      parameters: [
+        { name: "from", in: "query", required: false, schema: { type: "string", format: "date" } },
+        { name: "to", in: "query", required: false, schema: { type: "string", format: "date" } },
+      ],
+      responses: {
+        "200": jsonResponse("Occurrence summaries.", { type: "array", items: ref("OccurrenceSummary") }),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/rounds/{id}/planner/occurrences/{date}": {
+    get: {
+      tags: ["Rounds"],
+      summary: "Occurrence detail (list/map view)",
+      description: "Every stop scheduled on this round for this calendar date, plus the same aggregate stats as the calendar view.",
+      parameters: [
+        { name: "id", in: "path", required: true, schema: { type: "string" } },
+        { name: "date", in: "path", required: true, schema: { type: "string", format: "date" } },
+      ],
+      responses: {
+        "200": jsonResponse("Occurrence detail.", ref("OccurrenceDetail")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/rounds/{id}/technicians": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    put: {
+      tags: ["Rounds"],
+      summary: "Replace the round's technician list",
+      description: "Full replace semantics — send the complete list you want to keep. An empty array clears all assignments. Every id must reference an active, invite-accepted technician (400 otherwise); unknown ids 404.",
+      requestBody: jsonBody(ref("SetRoundTechniciansInput")),
+      responses: {
+        "200": jsonResponse("Updated round.", ref("RoundDetail")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/rounds/{id}/today": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Rounds"],
+      summary: "Today panel for this round (Screen 13)",
+      responses: {
+        "200": jsonResponse("Today panel.", ref("TodayPanel")),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/rounds/{id}/reassign": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    post: {
+      tags: ["Rounds"],
+      summary: "Reassign technician for today's visits (M15)",
+      description:
+        "Bulk-moves today's visits on this round from `fromTechnicianId` to `toTechnicianId`. `scope: \"remaining\"` only touches SCHEDULED/IN_PROGRESS visits; `\"all\"` also includes COMPLETED/SKIPPED. 409 if the operational day has already been closed.",
+      requestBody: jsonBody(ref("ReassignTechnicianInput")),
+      responses: {
+        "200": jsonResponse("Reassignment result.", ref("ReassignResult")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": errorResponse("Round or target technician not found.", "Target technician not found"),
+        "409": errorResponse("Operational day has already been closed.", "Operational day has already been closed"),
+      },
+    },
+  },
+
+  "/rounds/{id}/push-missed": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    post: {
+      tags: ["Rounds"],
+      summary: "Push today's missed jobs to a new date (M22)",
+      description:
+        "Moves every SCHEDULED visit on this round, scheduled today, to `newDate` (must be strictly after today). Optionally reassigns `technicianId` at the same time and/or SMS-notifies the affected customers (best-effort — a per-customer send failure is logged, not surfaced). 409 if the operational day has already been closed.",
+      requestBody: jsonBody(ref("PushMissedVisitsInput")),
+      responses: {
+        "200": jsonResponse("Push-missed result.", ref("PushMissedResult")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+        "409": errorResponse("Operational day has already been closed.", "Operational day has already been closed"),
+      },
+    },
+  },
+
+  "/rounds/{id}/generate-visits": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    post: {
+      tags: ["Rounds"],
+      summary: "Generate due visits for this round now",
+      description:
+        "Runs the same per-round visit-generation logic as the nightly cron job, immediately, for just this round — useful for a round created after setup that would otherwise wait for the next nightly run. The round must be ACTIVE.",
+      responses: {
+        "200": jsonResponse("Generation result.", ref("GenerateVisitsResult")),
+        "400": errorResponse("Round must be ACTIVE to generate visits.", "Round must be ACTIVE to generate visits"),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  // =====================================================================
+  // Technicians — directory (list/detail/create/update) with round names
+  // and today's job stats. Distinct from Settings → /settings/technicians,
+  // which is the invite-pending-only editor. ADMIN/MANAGER only.
+  // =====================================================================
+  "/technicians": {
+    get: {
+      tags: ["Technicians"],
+      summary: "List technicians",
+      description: "Each row includes the technician's round names and today's job stats (total/completed/skipped/remaining), computed up front.",
+      responses: {
+        "200": jsonResponse("Technician list.", { type: "array", items: ref("TechnicianListRow") }),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+    post: {
+      tags: ["Technicians"],
+      summary: "Create a technician",
+      description:
+        "Creates an invite-pending technician (profileId = null) unless `sendInvite` is true, in which case an email is required and a TenantInvite is also created and emailed. 409 if a pending invite for that email already exists; 503 if the technician was created but the invite email failed to send (retry with POST /invites).",
+      requestBody: jsonBody(ref("TechnicianDirectoryCreateInput")),
+      responses: {
+        "201": jsonResponse("Created technician.", ref("TechnicianListItem")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": errorResponse("serviceAreaId not found.", "Service area not found"),
+        "409": errorResponse("A pending invite for this email already exists, or the email already belongs to a technician.", "A pending invite for this email already exists. Use POST /invites to resend."),
+        "503": errorResponse("Technician created but the invite email failed to send.", "Technician created but invite email failed. Retry with POST /invites."),
+      },
+    },
+  },
+
+  "/technicians/{id}": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Technicians"],
+      summary: "Get technician detail",
+      description: "Adds round names and a per-round breakdown of today's workload (total/completed/skipped/remaining per round).",
+      responses: {
+        "200": jsonResponse("Technician detail.", ref("TechnicianDetail")),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+    patch: {
+      tags: ["Technicians"],
+      summary: "Update a technician (partial)",
+      requestBody: jsonBody(ref("TechnicianDirectoryUpdateInput")),
+      responses: {
+        "200": jsonResponse("Updated technician.", ref("TechnicianListItem")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  // =====================================================================
+  // Messages — direct GoHighLevel-backed send (single customer or bulk to
+  // a round). ADMIN/MANAGER only.
+  // =====================================================================
+  "/messages/send": {
+    post: {
+      tags: ["Messages"],
+      summary: "Send one message to a single customer",
+      description: "Resolves the customer by `customerId`, or by `propertyId` (looked up to its property's customer) — one of the two is required. 409 if GoHighLevel isn't connected.",
+      requestBody: jsonBody(ref("MessageSendInput")),
+      responses: {
+        "201": jsonResponse("Sent.", ref("MessageSendResult")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": errorResponse("Property or customer not found.", "Customer not found"),
+        "409": errorResponse("GoHighLevel is not connected.", "GoHighLevel is not connected"),
+      },
+    },
+  },
+
+  "/messages/bulk": {
+    post: {
+      tags: ["Messages"],
+      summary: "Broadcast one message to every customer in a round",
+      description:
+        "Sends right now — no scheduling. `excludePaymentHold: true` drops any customer whose round properties all have a payment-hold visit. Best-effort: a per-recipient failure is logged and skipped; `queued` counts successes, not attempts. 409 if GoHighLevel isn't connected.",
+      requestBody: jsonBody(ref("MessageBulkInput")),
+      responses: {
+        "201": jsonResponse("Broadcast result.", ref("MessageBulkResult")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "409": errorResponse("GoHighLevel is not connected.", "GoHighLevel is not connected"),
+      },
+    },
+  },
+
+  // =====================================================================
+  // Setup: Steps 9–12 (Steps 1–8, /setup/status and /setup/complete are
+  // documented above).
+  // =====================================================================
+  "/setup/step/9": {
+    get: {
+      tags: ["Setup"],
+      summary: "Step 9 — list properties added so far",
+      responses: {
+        "200": jsonResponse("Setup properties.", { type: "array", items: ref("SetupPropertyResult") }),
+        "401": ERR[401],
+      },
+    },
+    post: {
+      tags: ["Setup"],
+      summary: "Step 9 — add one property",
+      description:
+        "One-time setup property creation — does not reuse POST /properties. Call multiple times to add multiple properties. `roundId` is required (and must reference an ACTIVE round) so the property counts toward step 9/10 completion.",
+      requestBody: jsonBody(ref("SetupPropertyInput")),
+      responses: {
+        "201": jsonResponse("Created property.", ref("SetupPropertyResult")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+
+  "/setup/step/9/bulk": {
+    post: {
+      tags: ["Setup"],
+      summary: "Step 9 — bulk import properties",
+      description:
+        "Accepts up to 1000 rows in `properties[]`, processed in batches of 100 (each batch its own transaction). A row that fails validation, or a batch that fails to commit, is reported in `errors[]` by its original row index — it does not abort the other, valid rows in the same request. Pass `idempotencyKey` in the body (not a header) to make a retried call safe: a repeat call with the same key short-circuits to the original result (`idempotent: true`, `results` empty) instead of re-creating the rows. Responds `201` whenever anything was created, or this was an idempotent replay; responds `400` only when every row failed and it wasn't an idempotent replay.",
+      requestBody: jsonBody(ref("SetupPropertyBulkInput")),
+      responses: {
+        "201": jsonResponse("Import result — some or all rows created (or an idempotent replay).", ref("BulkSetupPropertyResult")),
+        "400": jsonResponse("Every row failed validation or failed to commit.", ref("BulkSetupPropertyResult")),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+
+  "/setup/step/10": {
+    get: {
+      tags: ["Setup"],
+      summary: "Step 10 — current round/technician assignment board",
+      responses: {
+        "200": jsonResponse("Assignment board.", ref("Step10Result")),
+        "401": ERR[401],
+      },
+    },
+    post: {
+      tags: ["Setup"],
+      summary: "Step 10 — assign technicians to rounds",
+      description:
+        "Body is a raw JSON array (not wrapped in an object) of `{ roundId, technicianIds }`. Replaces assignments for each round included in the request (idempotent); a round not included is left untouched. Every `roundId` must reference an ACTIVE round and every `technicianId` an active technician, and `roundId` must not repeat within the array.",
+      requestBody: jsonBody({ type: "array", items: ref("RoundTechnicianAssignmentInput") }),
+      responses: {
+        "200": jsonResponse("Updated assignment board.", ref("Step10Result")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+
+  "/setup/step/11": {
+    get: {
+      tags: ["Setup"],
+      summary: "Step 11 — activation status",
+      description: "`activated` is derived from whether any SCHEDULED visit exists yet.",
+      responses: {
+        "200": jsonResponse("Activation status.", ref("ActivationStatus")),
+        "401": ERR[401],
+      },
+    },
+    post: {
+      tags: ["Setup"],
+      summary: "Step 11 — activate system & generate visits",
+      description:
+        "Generates the initial batch of SCHEDULED visits for every property on the targeted round(s), from `startDate` through `startDate + cycleWeeks`. `startDate` must be today or later. 409 if the system is already activated (setup already complete); 404 if `generateAll: false` and none of the given `roundIds` matched an ACTIVE round.",
+      requestBody: jsonBody(ref("ActivationInput")),
+      responses: {
+        "200": jsonResponse("Activation result.", ref("ActivationResult")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": errorResponse("None of the specified roundIds were found.", "None of the specified roundIds were found"),
+        "409": errorResponse("System is already activated.", "System is already activated — setup is complete"),
+      },
+    },
+  },
+
+  "/setup/step/12": {
+    get: {
+      tags: ["Setup"],
+      summary: "Step 12 — review & launch checklist",
+      description: "A human-readable checklist derived from the overall setup status (same underlying step data as GET /setup/status).",
+      responses: {
+        "200": jsonResponse("Checklist.", ref("ReviewChecklist")),
+        "401": ERR[401],
+      },
+    },
+  },
+
+  // =====================================================================
+  // Debt — collections board, invoice detail, reminders, payment links,
+  // bad-debt/hold flags. ADMIN/MANAGER only.
+  // =====================================================================
+  "/debt/kpis": {
+    get: {
+      tags: ["Debt"],
+      summary: "Debt KPI cards",
+      responses: {
+        "200": jsonResponse("Debt KPIs.", ref("DebtKpis")),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+
+  "/debt/board": {
+    get: {
+      tags: ["Debt"],
+      summary: "Debt board — paginated invoice rows for one bucket tab",
+      description:
+        "`bucket` is required. The 6 named buckets are mutually exclusive by construction; anything else (including the literal `ALL`) falls into the catch-all \"everything not in the other buckets\" bucket.",
+      parameters: [
+        { name: "bucket", in: "query", required: true, schema: { type: "string", enum: ["BAD_DEBT", "ON_HOLD", "FAILED_GC", "DUE_BEFORE_CLEAN", "SEVEN_DAYS_OVER", "FOURTEEN_DAYS_OVER", "ALL"] } },
+        { name: "roundId", in: "query", required: false, schema: { type: "string" } },
+        { name: "paymentMethod", in: "query", required: false, schema: ref("PaymentMethod") },
+        { name: "search", in: "query", required: false, schema: { type: "string" }, description: "Case-insensitive search on customer name or property address." },
+        { name: "page", in: "query", required: false, schema: { type: "integer", minimum: 1, default: 1 } },
+        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } },
+      ],
+      responses: {
+        "200": jsonResponse("Paginated debt board rows.", ref("DebtBoardResult")),
+        "400": errorResponse("bucket query param is required.", "bucket query param is required"),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+
+  "/debt/board/counts": {
+    get: {
+      tags: ["Debt"],
+      summary: "All 7 bucket-tab counts in one call",
+      description: "Replaces the previous frontend pattern of one GET /debt/board?pageSize=1 request per tab.",
+      parameters: [
+        { name: "roundId", in: "query", required: false, schema: { type: "string" } },
+        { name: "paymentMethod", in: "query", required: false, schema: ref("PaymentMethod") },
+        { name: "search", in: "query", required: false, schema: { type: "string" } },
+      ],
+      responses: {
+        "200": jsonResponse("Bucket counts.", ref("DebtBucketCounts")),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+
+  "/debt/{id}": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" }, description: "Invoice id." }],
+    get: {
+      tags: ["Debt"],
+      summary: "Invoice detail for the debt detail panel",
+      description: "Fields the board row doesn't carry: phone/email, round, next scheduled visit, GoCardless mandate, and the 5 most recent visits.",
+      responses: {
+        "200": jsonResponse("Invoice detail.", ref("DebtInvoiceDetail")),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/debt/{id}/remind": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" }, description: "Invoice id." }],
+    post: {
+      tags: ["Debt"],
+      summary: "Send a payment reminder",
+      description: "Sends `message` over `channel` and logs it as an outbound Message. 400 if `channel` is EMAIL and the customer has no email address.",
+      requestBody: jsonBody(ref("DebtRemindInput")),
+      responses: {
+        "200": jsonResponse("Reminder sent.", ref("ReminderResult")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/debt/{id}/payment-link": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" }, description: "Invoice id." }],
+    post: {
+      tags: ["Debt"],
+      summary: "Send a payment link",
+      description:
+        "Creates a real Stripe Checkout session (reusing an existing PENDING one for this invoice if present) when Stripe is connected and the invoice isn't PAID/VOID; otherwise falls back to the static pay.roundflow.app link. Requires the customer to have an email address.",
+      requestBody: jsonBody(ref("DebtPaymentLinkInput")),
+      responses: {
+        "200": jsonResponse("Payment link sent.", ref("PaymentLinkResult")),
+        "400": errorResponse("message is required, or the customer has no email address.", "message is required"),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/debt/{id}/bad-debt": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" }, description: "Invoice id." }],
+    patch: {
+      tags: ["Debt"],
+      summary: "Flag/unflag the customer as bad debt",
+      requestBody: jsonBody(ref("DebtBadDebtInput")),
+      responses: {
+        "200": jsonResponse("Updated flag.", ref("BadDebtFlagResult")),
+        "400": errorResponse("flag (boolean) is required.", "flag (boolean) is required"),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/debt/{id}/hold": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" }, description: "Invoice id." }],
+    patch: {
+      tags: ["Debt"],
+      summary: "Put/release the customer's next-clean hold",
+      description: "`reason`/`date`/`notify`/`message` are only meaningful when `flag` is true. `notify: true` sends an SMS (best-effort — a send failure is logged, not surfaced as an error).",
+      requestBody: jsonBody(ref("DebtHoldInput")),
+      responses: {
+        "200": jsonResponse("Updated hold state.", ref("HoldFlagResult")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  // =====================================================================
+  // Reports — activity log, visit/technician/revenue reports, CSV export.
+  // ADMIN/MANAGER only.
+  // =====================================================================
+  "/reports/activity": {
+    get: {
+      tags: ["Reports"],
+      summary: "Activity log — paginated",
+      description: "Optional `type` filter and `from`/`to` date-range filter (both YYYY-MM-DD, inclusive). `actorName` is resolved from the control-plane Profile matching each log row's actorId.",
+      parameters: [
+        { name: "type", in: "query", required: false, schema: { type: "string" }, example: "ROUND_UPDATED" },
+        { name: "from", in: "query", required: false, schema: { type: "string", format: "date" } },
+        { name: "to", in: "query", required: false, schema: { type: "string", format: "date" } },
+        { name: "page", in: "query", required: false, schema: { type: "integer", minimum: 1, default: 1 } },
+        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } },
+      ],
+      responses: {
+        "200": jsonResponse("Paginated activity log.", ref("ReportsActivityResult")),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+
+  "/reports/visits": {
+    get: {
+      tags: ["Reports"],
+      summary: "Visit report — paginated",
+      parameters: [
+        { name: "period", in: "query", required: false, schema: { type: "string", enum: ["today", "last7", "last30"], default: "last30" } },
+        { name: "status", in: "query", required: false, schema: ref("VisitStatus") },
+        { name: "page", in: "query", required: false, schema: { type: "integer", minimum: 1, default: 1 } },
+        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } },
+      ],
+      responses: {
+        "200": jsonResponse("Paginated visit rows.", ref("ReportsVisitsResult")),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+
+  "/reports/technicians": {
+    get: {
+      tags: ["Reports"],
+      summary: "Technician performance report — paginated",
+      parameters: [
+        { name: "period", in: "query", required: false, schema: { type: "string", enum: ["today", "last7", "last30"], default: "last30" } },
+        { name: "page", in: "query", required: false, schema: { type: "integer", minimum: 1, default: 1 } },
+        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } },
+      ],
+      responses: {
+        "200": jsonResponse("Paginated technician rows.", ref("ReportsTechniciansResult")),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+
+  "/reports/revenue": {
+    get: {
+      tags: ["Reports"],
+      summary: "Daily revenue series",
+      description: "Not paginated — one row per day with ≥1 completed visit in the period.",
+      parameters: [
+        { name: "period", in: "query", required: false, schema: { type: "string", enum: ["today", "last7", "last30"], default: "last30" } },
+      ],
+      responses: {
+        "200": jsonResponse("Revenue rows.", { type: "array", items: ref("ReportsRevenueRow") }),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+
+  "/reports/summary": {
+    get: {
+      tags: ["Reports"],
+      summary: "Summary totals for the period",
+      parameters: [
+        { name: "period", in: "query", required: false, schema: { type: "string", enum: ["today", "last7", "last30"], default: "last30" } },
+      ],
+      responses: {
+        "200": jsonResponse("Summary totals.", ref("ReportsSummary")),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+
+  "/reports/export": {
+    get: {
+      tags: ["Reports"],
+      summary: "CSV export",
+      description:
+        "Unlike /reports/visits and /reports/technicians, this always exports the FULL (unpaginated) result set for the period — every row, not just the UI's current page — as `text/csv`. `type=revenue` exports the same rows as GET /reports/revenue.",
+      parameters: [
+        { name: "type", in: "query", required: false, schema: { type: "string", enum: ["visits", "technicians", "revenue"], default: "visits" } },
+        { name: "period", in: "query", required: false, schema: { type: "string", enum: ["today", "last7", "last30"], default: "last30" } },
+        { name: "status", in: "query", required: false, schema: ref("VisitStatus"), description: "Only applies when type=visits." },
+      ],
+      responses: {
+        "200": {
+          description: "CSV file. `Content-Disposition: attachment; filename=\"{type}-{period}.csv\"`.",
+          content: { "text/csv": { schema: { type: "string" } } },
+        },
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+
+  // =====================================================================
+  // Today — Today's Work aggregate (Screen 12) and Close Operational Day
+  // (M21). ADMIN/MANAGER only.
+  // =====================================================================
+  "/today": {
+    get: {
+      tags: ["Today"],
+      summary: "Today's Work aggregate (Screen 12)",
+      description: "KPI tiles, per-round rows, and per-technician workload cards for today.",
+      responses: {
+        "200": jsonResponse("Today's Work.", ref("TodaysWorkAggregate")),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+
+  "/today/close": {
+    post: {
+      tags: ["Today"],
+      summary: "Close Operational Day (M21)",
+      description:
+        "`unfinishedAction: \"push_to_tomorrow\"` moves every still-SCHEDULED/IN_PROGRESS visit to the next working day (Mon–Fri, skipping weekends) and resets IN_PROGRESS back to SCHEDULED; `\"mark_as_skipped\"` marks them SKIPPED in place. 409 if the day is already closed, or if BusinessSettings hasn't been configured yet.",
+      requestBody: jsonBody(ref("CloseDayInput")),
+      responses: {
+        "200": jsonResponse("Close-of-day summary.", ref("CloseDaySummary")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "409": errorResponse("Operational day has already been closed, or settings aren't configured.", "Operational day has already been closed"),
+      },
+    },
+  },
+
+  // =====================================================================
+  // Invoices — preview (unsaved), detail, PDF render, create, send.
+  // ADMIN/MANAGER only.
+  // =====================================================================
+  "/invoices/preview": {
+    get: {
+      tags: ["Invoices"],
+      summary: "Preview an invoice for a visit (not saved)",
+      description: "Computed live from the visit — nothing is persisted. 409 if the visit already has an invoice.",
+      parameters: [{ name: "visitId", in: "query", required: true, schema: { type: "string" } }],
+      responses: {
+        "200": jsonResponse("Invoice preview.", ref("InvoicePreview")),
+        "400": errorResponse("visitId query param is required.", "visitId query param is required"),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+        "409": errorResponse("Visit already has an invoice.", "Visit already has an invoice"),
+      },
+    },
+  },
+
+  "/invoices/preview/pdf": {
+    get: {
+      tags: ["Invoices"],
+      summary: "Preview an invoice for a visit, as a PDF",
+      description: "Same data as GET /invoices/preview, rendered to PDF with `status: \"PREVIEW\"`. Registered ahead of /invoices/{id}/pdf so \"preview\" is never captured as an invoice id.",
+      parameters: [{ name: "visitId", in: "query", required: true, schema: { type: "string" } }],
+      responses: {
+        "200": { description: "Inline PDF.", content: { "application/pdf": { schema: { type: "string", format: "binary" } } } },
+        "400": errorResponse("visitId query param is required.", "visitId query param is required"),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+        "409": errorResponse("Visit already has an invoice.", "Visit already has an invoice"),
+      },
+    },
+  },
+
+  "/invoices/{id}": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Invoices"],
+      summary: "Get invoice detail (JSON)",
+      description:
+        "Line items, technician, visit date, and a VAT/subtotal breakdown. Unlike GET /invoices/{id}/pdf, this degrades gracefully (nulls/empty lineItems) for a standalone invoice with no linked visit instead of 409ing.",
+      responses: {
+        "200": jsonResponse("Invoice detail.", ref("InvoiceDetail")),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/invoices/{id}/pdf": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Invoices"],
+      summary: "Rendered invoice PDF (download/print)",
+      description: "409 if the invoice has no linked visit — there's nothing to render (use GET /invoices/{id} for a visit-less invoice's plain JSON detail instead).",
+      responses: {
+        "200": { description: "Inline PDF.", content: { "application/pdf": { schema: { type: "string", format: "binary" } } } },
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+        "409": errorResponse("Invoice has no linked visit to render.", "Invoice has no linked visit to render"),
+      },
+    },
+  },
+
+  "/invoices": {
+    post: {
+      tags: ["Invoices"],
+      summary: "Create (save) an invoice for a visit",
+      description: "409 if the visit already has an invoice.",
+      requestBody: jsonBody(ref("InvoiceCreateInput")),
+      responses: {
+        "201": jsonResponse("Created invoice.", ref("InvoiceActionResult")),
+        "400": errorResponse("visitId is required.", "visitId is required"),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+        "409": errorResponse("Visit already has an invoice.", "Visit already has an invoice"),
+      },
+    },
+  },
+
+  "/invoices/{id}/send": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    post: {
+      tags: ["Invoices"],
+      summary: "Send an invoice to the customer",
+      description: "Marks the invoice SENT. 400 if the customer has no email address; 409 if it's already SENT.",
+      responses: {
+        "200": jsonResponse("Updated invoice.", ref("InvoiceActionResult")),
+        "400": errorResponse("Customer has no email address.", "Customer has no email address — cannot send invoice"),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+        "409": errorResponse("Invoice has already been sent.", "Invoice has already been sent"),
+      },
+    },
+  },
+
+  // =====================================================================
+  // Payments — Stripe Checkout session creation (one-time payment, and
+  // card-on-file setup). ADMIN/MANAGER only.
+  // =====================================================================
+  "/payments/stripe/checkout": {
+    post: {
+      tags: ["Payments"],
+      summary: "Create a one-time Stripe Checkout session for an invoice",
+      description:
+        "Returns the existing PENDING session's URL (200) instead of creating a duplicate if one already exists for this invoice; otherwise creates a new one (201). 400 if Stripe isn't connected. 409 if the invoice is already PAID or VOID.",
+      requestBody: jsonBody(ref("StripeCheckoutInput")),
+      responses: {
+        "201": jsonResponse("New checkout session.", ref("StripeSessionResult")),
+        "400": errorResponse("Stripe is not connected.", "Stripe is not connected. Go to Settings → Payment to connect."),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+        "409": errorResponse("Invoice is already paid or void.", "Invoice is already paid"),
+      },
+    },
+  },
+
+  "/payments/stripe/setup": {
+    post: {
+      tags: ["Payments"],
+      summary: "Create a Stripe Checkout session to save a card",
+      description: "'setup' mode — no charge is made; saves a payment method for future automatic charges. 400 if Stripe isn't connected.",
+      requestBody: jsonBody(ref("StripeSetupInput")),
+      responses: {
+        "201": jsonResponse("New setup session.", ref("StripeSessionResult")),
+        "400": errorResponse("Stripe is not connected.", "Stripe is not connected. Go to Settings → Payment to connect."),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  // =====================================================================
+  // Service Plans — per-plan price/method/frequency edits, pause/resume.
+  // Targets one ServicePlan directly by id (a property with 2+ plans can
+  // have each edited independently). ADMIN/MANAGER only.
+  // =====================================================================
+  "/service-plans/{id}": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    patch: {
+      tags: ["Service Plans"],
+      summary: "Update a service plan (partial)",
+      description: "Price, clean method, payment method, cleaning frequency.",
+      requestBody: jsonBody(ref("ServicePlanUpdateInput")),
+      responses: {
+        "200": jsonResponse("Updated service plan.", ref("ServicePlan")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/service-plans/{id}/pause": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    post: {
+      tags: ["Service Plans"],
+      summary: "Pause a service plan",
+      description: "Mirrors POST /properties/{id}/pause. `reason` is required by the UI but not persisted (no column).",
+      requestBody: jsonBody(ref("PauseServiceInput")),
+      responses: {
+        "200": jsonResponse("Paused service plan.", ref("ServicePlan")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+        "409": errorResponse("Service plan is already paused.", "Service plan is already paused"),
+      },
+    },
+  },
+
+  "/service-plans/{id}/resume": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    post: {
+      tags: ["Service Plans"],
+      summary: "Resume a paused service plan",
+      responses: {
+        "200": jsonResponse("Resumed service plan.", ref("ServicePlan")),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+        "409": errorResponse("Service plan is not paused.", "Service plan is not paused"),
       },
     },
   },
@@ -2648,7 +4783,7 @@ export const openApiDocument: OpenAPIV3.Document = {
         "Login (token minted by Supabase — external) and the current user's profile.",
     },
     { name: "Health", description: "Liveness." },
-    { name: "Setup", description: "First-run Setup Wizard (8 steps)." },
+    { name: "Setup", description: "First-run Setup Wizard (12 steps)." },
     { name: "Settings", description: "Post-completion settings editing. Mutations (PATCH, POST, DELETE) require setup to be complete; GETs are always open." },
     { name: "Invites", description: "Tenant invite flow — send, validate, and accept invites for new technicians/managers." },
     { name: "Customers", description: "M2 — customer/property list + aggregate detail (Screens 14/15). Reads: any role; mutations: ADMIN/MANAGER." },
@@ -2657,6 +4792,15 @@ export const openApiDocument: OpenAPIV3.Document = {
     { name: "Complaints", description: "Customer service complaint queue — log, review, schedule revisits, resolve, reopen. All mutations: ADMIN/MANAGER only." },
     { name: "Dashboard", description: "Dashboard screen data — KPI cards, alert counts, today's rounds, technician performance, and chart series. ADMIN/MANAGER only." },
     { name: "Emergencies", description: "Technician emergency reporting and reassignment flow — report, list, inspect, pick a replacement, and confirm reassignment." },
+    { name: "Rounds", description: "Round CRUD, the planner (calendar + list/map views, including batched multi-round variants), the Today panel, reassign, push-missed, and on-demand visit generation. ADMIN/MANAGER only." },
+    { name: "Technicians", description: "Technician directory — list/detail/create/update with round names and today's job stats. Distinct from Settings → /settings/technicians, which is the invite-pending-only editor. ADMIN/MANAGER only." },
+    { name: "Messages", description: "Direct GoHighLevel-backed messaging — send to a single customer, or broadcast to every customer in a round. ADMIN/MANAGER only." },
+    { name: "Debt", description: "Collections — the debt board (paginated, bucketed), bucket counts, invoice detail, reminders, payment links, and bad-debt/hold flags. ADMIN/MANAGER only." },
+    { name: "Reports", description: "Activity log and visit/technician/revenue reporting, plus a CSV export. ADMIN/MANAGER only." },
+    { name: "Today", description: "Today's Work aggregate (Screen 12) and Close Operational Day (M21). ADMIN/MANAGER only." },
+    { name: "Invoices", description: "Invoice preview (unsaved), detail, PDF rendering, create, and send. ADMIN/MANAGER only." },
+    { name: "Payments", description: "Stripe Checkout session creation — one-time invoice payment and card-on-file setup. ADMIN/MANAGER only." },
+    { name: "Service Plans", description: "Per-plan price/method/frequency edits and pause/resume, targeting one ServicePlan directly by id. ADMIN/MANAGER only." },
   ],
   // Global default: all operations require the Bearer token unless they
   // override with `security: []` (e.g. /health).

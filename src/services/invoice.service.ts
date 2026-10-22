@@ -117,14 +117,37 @@ class InvoiceService {
     }));
   }
 
+  // Richer than listCustomerInvoices: adds line items, technician, visit
+  // date and a VAT/subtotal breakdown — the same data getRenderData()
+  // assembles for the PDF, but tolerant of a standalone invoice with no
+  // linked visit (getRenderData() 409s in that case; this degrades
+  // gracefully instead, since a plain JSON detail view is also meant to
+  // work for invoices that were never tied to a visit).
   async getInvoice(invoiceId: string) {
-    const invoice = await this.prisma.invoice.findUnique({ where: { id: invoiceId } });
+    const invoice = await this.prisma.invoice.findUnique({
+      where: { id: invoiceId },
+      include: {
+        customer: { select: { id: true, name: true, email: true, phone: true, paymentMethod: true } },
+        visit: { include: visitInvoiceInclude },
+      },
+    });
     if (!invoice) throw new AppError(404, "Invoice not found");
+
+    const settings = await getCachedBusinessSettings(this.prisma);
+    const total = invoice.amount.toNumber();
+    const vatAmount = settings?.vatInInvoices ? +(total - total / 1.2).toFixed(2) : 0;
+    const subtotal = +(total - vatAmount).toFixed(2);
+
+    const visit = invoice.visit;
+    const serviceName = visit?.service?.name ?? "Window Cleaning Service";
+    const roundPart = visit?.round ? ` — ${visit.round.name}` : "";
+    const datePart = visit ? ` — ${toDateStr(visit.date)}` : "";
+
     return {
       id: invoice.id,
       invoiceNumber: invoice.invoiceNumber,
       status: invoice.status,
-      amount: invoice.amount.toNumber(),
+      amount: total,
       dueDate: invoice.dueDate,
       notes: invoice.notes,
       sentToCustomer: invoice.sentToCustomer,
@@ -132,6 +155,22 @@ class InvoiceService {
       createdAt: invoice.createdAt,
       customerId: invoice.customerId,
       visitId: invoice.visitId ?? null,
+      visitDate: visit?.date ?? null,
+      technicianName: visit?.technician?.name ?? null,
+      roundName: visit?.round?.name ?? null,
+      paymentMethod: visit?.paymentMethod ?? invoice.customer.paymentMethod ?? null,
+      customer: {
+        name: invoice.customer.name,
+        email: invoice.customer.email,
+        phone: invoice.customer.phone,
+        addressLine: visit?.property.addressLine ?? null,
+        postcode: visit?.property.postcode ?? null,
+      },
+      lineItems: visit
+        ? [{ description: `${serviceName}${roundPart}${datePart}`, technicianName: visit.technician?.name ?? null, amount: subtotal }]
+        : [],
+      subtotal,
+      vatAmount,
     };
   }
 

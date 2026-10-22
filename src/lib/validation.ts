@@ -188,3 +188,22 @@ export function optMessageChannel(v: unknown): MessageChannel | undefined {
 export function isValidEmail(v: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
 }
+
+// ---- Technician role --------------------------------------------------------
+// Technician.role is a free-text DB column (not a Prisma enum — changing the
+// column type would need a backfill of existing free-text production values),
+// but both write paths (POST/PATCH /technicians and POST/PATCH
+// /settings/technicians) previously accepted ANY string with zero validation.
+// This is the one shared vocabulary both routers validate against.
+export const TECHNICIAN_ROLES = ["TRAINEE", "STANDARD", "SENIOR", "LEAD"] as const;
+export type TechnicianRole = (typeof TECHNICIAN_ROLES)[number];
+
+/** Optional technician role: undefined = omitted, null/"" = clear, else validate. */
+export function optTechnicianRole(v: unknown): TechnicianRole | null | undefined {
+  if (v === undefined) return undefined;
+  if (v === null || v === "") return null;
+  if (typeof v === "string" && (TECHNICIAN_ROLES as readonly string[]).includes(v)) {
+    return v as TechnicianRole;
+  }
+  throw new AppError(400, `"role" must be one of: ${TECHNICIAN_ROLES.join(", ")}`);
+}

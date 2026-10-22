@@ -1,6 +1,11 @@
-import { it, expect, vi } from "vitest";
+import { it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("../../lib/email", () => ({}));
+
+const sendMessage = vi.fn();
+vi.mock("../message.service", () => ({
+  createMessageService: vi.fn(() => ({ send: sendMessage })),
+}));
 
 import { createDebtService } from "../debt.service";
 
@@ -8,13 +13,17 @@ function makePrisma() {
   return {
     invoice: { findMany: vi.fn(), findUnique: vi.fn(), update: vi.fn(), count: vi.fn(), aggregate: vi.fn() },
     customer: { findUnique: vi.fn(), update: vi.fn() },
-    visit: { findMany: vi.fn() },
+    visit: { findMany: vi.fn(), findFirst: vi.fn() },
     payment: { findMany: vi.fn() },
     message: { create: vi.fn(), findFirst: vi.fn() },
     businessSettings: { findFirst: vi.fn() },
     $queryRaw: vi.fn(),
   } as unknown as Parameters<typeof createDebtService>[0];
 }
+
+beforeEach(() => {
+  sendMessage.mockReset();
+});
 
 // ---- helpers for getBoard tests -------------------------------------------
 
@@ -439,6 +448,108 @@ it("getBoard combines roundId and paymentMethod with a bucket filter", async () 
   expect(callArgs.where.customer).toMatchObject({ paymentMethod: "CARD", badDebt: false, holdNextClean: true });
 });
 
+// ---- getBoard: search param ------------------------------------------------------
+
+it("getBoard with no search leaves where.AND untouched for a named bucket", async () => {
+  const prisma = makePrisma();
+  setupBoard(prisma, [inv()]);
+  await createDebtService(prisma).getBoard("BAD_DEBT");
+  const callArgs = (prisma.invoice.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(callArgs.where.AND).toBeUndefined();
+});
+
+it("getBoard with search adds an OR clause on customer name / property address for a named bucket", async () => {
+  const prisma = makePrisma();
+  setupBoard(prisma, [inv()]);
+  await createDebtService(prisma).getBoard("BAD_DEBT", undefined, undefined, undefined, undefined, "smith");
+  const callArgs = (prisma.invoice.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(callArgs.where.AND).toEqual([
+    {
+      OR: [
+        { customer: { name: { contains: "smith", mode: "insensitive" } } },
+        { visit: { property: { addressLine: { contains: "smith", mode: "insensitive" } } } },
+      ],
+    },
+  ]);
+});
+
+it("getBoard with search on the default bucket appends to the existing AND array rather than replacing it", async () => {
+  const prisma = makePrisma();
+  setupBoard(prisma, [inv()]);
+  await createDebtService(prisma).getBoard("INVOICE_SENT", undefined, undefined, undefined, undefined, "smith");
+  const callArgs = (prisma.invoice.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(callArgs.where.AND).toHaveLength(3);
+  expect(callArgs.where.AND[2]).toEqual({
+    OR: [
+      { customer: { name: { contains: "smith", mode: "insensitive" } } },
+      { visit: { property: { addressLine: { contains: "smith", mode: "insensitive" } } } },
+    ],
+  });
+});
+
+// ---- getBucketCounts ---------------------------------------------------------------
+
+it("getBucketCounts is a function", () => {
+  expect(typeof createDebtService(makePrisma()).getBucketCounts).toBe("function");
+});
+
+it("getBucketCounts returns a count for all 7 bucket tabs in one call", async () => {
+  const prisma = makePrisma();
+  (prisma.payment.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (prisma.invoice.count as ReturnType<typeof vi.fn>).mockResolvedValue(3);
+  const result = await createDebtService(prisma).getBucketCounts();
+  expect(result).toEqual({
+    BAD_DEBT: 3,
+    ON_HOLD: 3,
+    FAILED_GC: 3,
+    DUE_BEFORE_CLEAN: 3,
+    SEVEN_DAYS_OVER: 3,
+    FOURTEEN_DAYS_OVER: 3,
+    ALL: 3,
+  });
+  expect(prisma.invoice.count).toHaveBeenCalledTimes(7);
+});
+
+it("getBucketCounts only computes the failed/upcoming context once, not once per bucket", async () => {
+  const prisma = makePrisma();
+  (prisma.payment.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (prisma.invoice.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
+  await createDebtService(prisma).getBucketCounts();
+  expect(prisma.payment.findMany).toHaveBeenCalledTimes(1);
+  expect(prisma.visit.findMany).toHaveBeenCalledTimes(1);
+});
+
+it("getBucketCounts threads roundId/paymentMethod/search into every bucket's where clause", async () => {
+  const prisma = makePrisma();
+  (prisma.payment.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (prisma.invoice.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
+  await createDebtService(prisma).getBucketCounts("round-1", "CARD", "smith");
+  const calls = (prisma.invoice.count as ReturnType<typeof vi.fn>).mock.calls;
+  expect(calls).toHaveLength(7);
+  for (const [{ where }] of calls) {
+    expect(where.visit).toMatchObject({ property: { roundId: "round-1" } });
+    expect(where.customer).toMatchObject({ paymentMethod: "CARD" });
+    expect(where.AND).toBeDefined();
+  }
+});
+
+it("getBucketCounts distinguishes BAD_DEBT (true) from every other bucket (false) in the where clause", async () => {
+  const prisma = makePrisma();
+  (prisma.payment.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (prisma.invoice.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
+  await createDebtService(prisma).getBucketCounts();
+  const calls = (prisma.invoice.count as ReturnType<typeof vi.fn>).mock.calls as Array<[{ where: { customer: { badDebt?: boolean } } }]>;
+  // DEBT_BUCKETS order: BAD_DEBT, ON_HOLD, FAILED_GC, DUE_BEFORE_CLEAN, SEVEN_DAYS_OVER, FOURTEEN_DAYS_OVER, ALL
+  expect(calls[0][0].where.customer.badDebt).toBe(true);
+  for (const [{ where }] of calls.slice(1)) {
+    expect(where.customer.badDebt).toBe(false);
+  }
+});
+
 // ---- getBoard: pagination ---------------------------------------------------------
 
 it("getBoard defaults to page=1, pageSize=50 (take/skip passed to findMany)", async () => {
@@ -536,6 +647,88 @@ it("flagHold sets holdNextClean on the customer and returns it", async () => {
   expect(result.holdNextClean).toBe(true);
 });
 
+it("flagHold defaults reason to null and date to now when setting the hold with no options", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", customerId: "c1" });
+  (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1", holdNextClean: true, holdReason: null, holdSince: new Date() });
+  await createDebtService(prisma).flagHold("inv-1", true);
+  const call = (prisma.customer.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(call.data.holdNextClean).toBe(true);
+  expect(call.data.holdReason).toBeNull();
+  expect(call.data.holdSince).toBeInstanceOf(Date);
+});
+
+it("flagHold persists a given reason and date", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", customerId: "c1" });
+  (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1", holdNextClean: true });
+  const date = new Date("2026-02-01");
+  await createDebtService(prisma).flagHold("inv-1", true, { reason: "Non-payment", date });
+  expect(prisma.customer.update).toHaveBeenCalledWith({
+    where: { id: "c1" },
+    data: { holdNextClean: true, holdReason: "Non-payment", holdSince: date },
+  });
+});
+
+it("flagHold clears holdReason/holdSince when flag is false, ignoring any reason/date given", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", customerId: "c1" });
+  (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1", holdNextClean: false, holdReason: null, holdSince: null });
+  await createDebtService(prisma).flagHold("inv-1", false, { reason: "ignored", date: new Date() });
+  expect(prisma.customer.update).toHaveBeenCalledWith({
+    where: { id: "c1" },
+    data: { holdNextClean: false, holdReason: null, holdSince: null },
+  });
+});
+
+it("flagHold does not notify when notify is false/omitted", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", customerId: "c1" });
+  (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1", holdNextClean: true });
+  await createDebtService(prisma).flagHold("inv-1", true);
+  expect(sendMessage).not.toHaveBeenCalled();
+});
+
+it("flagHold does not notify when flag is false even if notify is true", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", customerId: "c1" });
+  (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1", holdNextClean: false });
+  await createDebtService(prisma).flagHold("inv-1", false, { notify: true });
+  expect(sendMessage).not.toHaveBeenCalled();
+});
+
+it("flagHold sends the given message when notify is true", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", customerId: "c1" });
+  (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1", holdNextClean: true });
+  sendMessage.mockResolvedValue({ status: "sent" });
+  await createDebtService(prisma).flagHold("inv-1", true, { notify: true, message: "You're on hold" });
+  expect(sendMessage).toHaveBeenCalledWith({ customerId: "c1", channel: "sms", body: "You're on hold" });
+});
+
+it("flagHold falls back to a default message when notify is true but message is blank", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", customerId: "c1" });
+  (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1", holdNextClean: true });
+  sendMessage.mockResolvedValue({ status: "sent" });
+  await createDebtService(prisma).flagHold("inv-1", true, { notify: true, message: "   " });
+  expect(sendMessage).toHaveBeenCalledWith({
+    customerId: "c1", channel: "sms", body: "Your next clean is on hold until this is resolved.",
+  });
+});
+
+it("flagHold swallows a notify send failure (best-effort)", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", customerId: "c1" });
+  (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1", holdNextClean: true });
+  sendMessage.mockRejectedValue(new Error("GHL down"));
+  const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+  const result = await createDebtService(prisma).flagHold("inv-1", true, { notify: true });
+  expect(result.holdNextClean).toBe(true);
+  expect(consoleErrorSpy).toHaveBeenCalled();
+  consoleErrorSpy.mockRestore();
+});
+
 it("sendPaymentLink is a function", () => {
   expect(typeof createDebtService(makePrisma()).sendPaymentLink).toBe("function");
 });
@@ -560,4 +753,113 @@ it("sendPaymentLink records a Message and returns its id", async () => {
   (prisma.message.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "msg-2" });
   const result = await createDebtService(prisma).sendPaymentLink("inv-1", "Pay now");
   expect(result.id).toBe("msg-2");
+});
+
+it("sendPaymentLink defaults provider to 'static' and expiresAt to null with no options", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", invoiceNumber: "INV-2026-001", customerId: "c1", customer: { id: "c1", name: "John", email: "j@example.com" } });
+  (prisma.message.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "msg-2" });
+  const result = await createDebtService(prisma).sendPaymentLink("inv-1", "Pay now");
+  expect(result.provider).toBe("static");
+  expect(result.expiresAt).toBeNull();
+  expect(result.paymentUrl).toBe("https://pay.roundflow.app/i/INV-2026-001");
+});
+
+it("sendPaymentLink surfaces the given provider, overrideUrl and expiresAt", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", invoiceNumber: "INV-2026-001", customerId: "c1", customer: { id: "c1", name: "John", email: "j@example.com" } });
+  (prisma.message.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "msg-3" });
+  const expiresAt = new Date("2026-03-01");
+  const result = await createDebtService(prisma).sendPaymentLink("inv-1", "Pay now", {
+    overrideUrl: "https://checkout.stripe.com/pay/cs_1", provider: "stripe", expiresAt,
+  });
+  expect(result).toEqual({ id: "msg-3", paymentUrl: "https://checkout.stripe.com/pay/cs_1", provider: "stripe", expiresAt });
+});
+
+// ---- getInvoiceDetail --------------------------------------------------------
+
+it("getInvoiceDetail is a function", () => {
+  expect(typeof createDebtService(makePrisma()).getInvoiceDetail).toBe("function");
+});
+
+it("getInvoiceDetail throws 404 when the invoice does not exist", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+  await expect(createDebtService(prisma).getInvoiceDetail("missing")).rejects.toMatchObject({ statusCode: 404 });
+});
+
+it("getInvoiceDetail returns phone/email/round/mandate/nextVisit/recentVisits", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: "inv-1",
+    invoiceNumber: "INV-2026-001",
+    amount: { toNumber: () => 85 },
+    dueDate: new Date("2026-02-01"),
+    status: "SENT",
+    customerId: "c1",
+    customer: {
+      id: "c1", name: "Jane Doe", phone: "07123456789", email: "jane@example.com",
+      gocardlessMandateId: "MD123", gocardlessMandateStatus: "active",
+    },
+    visit: { property: { roundId: "r1", round: { name: "Alnwick Monday" } } },
+  });
+  const nextVisitDate = new Date("2026-02-15");
+  (prisma.visit.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ date: nextVisitDate });
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    { id: "v1", date: new Date("2026-01-01"), status: "COMPLETED", price: { toNumber: () => 35 } },
+  ]);
+
+  const result = await createDebtService(prisma).getInvoiceDetail("inv-1");
+
+  expect(result).toMatchObject({
+    invoiceId: "inv-1",
+    invoiceNumber: "INV-2026-001",
+    amount: 85,
+    customerName: "Jane Doe",
+    phone: "07123456789",
+    email: "jane@example.com",
+    roundId: "r1",
+    roundName: "Alnwick Monday",
+    nextVisitDate,
+    mandateId: "MD123",
+    mandateStatus: "active",
+  });
+  expect(result.recentVisits).toEqual([{ visitId: "v1", date: new Date("2026-01-01"), status: "COMPLETED", amount: 35 }]);
+});
+
+it("getInvoiceDetail defaults round/nextVisitDate to null when the invoice has no linked visit or upcoming visit", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: "inv-1", invoiceNumber: "INV-1", amount: { toNumber: () => 10 }, dueDate: null, status: "SENT",
+    customerId: "c1",
+    customer: { id: "c1", name: "Jane", phone: null, email: null, gocardlessMandateId: null, gocardlessMandateStatus: null },
+    visit: null,
+  });
+  (prisma.visit.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+  const result = await createDebtService(prisma).getInvoiceDetail("inv-1");
+
+  expect(result.roundId).toBeNull();
+  expect(result.roundName).toBeNull();
+  expect(result.nextVisitDate).toBeNull();
+  expect(result.recentVisits).toEqual([]);
+});
+
+it("getInvoiceDetail caps recent visits at 5, newest first", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: "inv-1", invoiceNumber: "INV-1", amount: { toNumber: () => 10 }, dueDate: null, status: "SENT",
+    customerId: "c1",
+    customer: { id: "c1", name: "Jane", phone: null, email: null, gocardlessMandateId: null, gocardlessMandateStatus: null },
+    visit: null,
+  });
+  (prisma.visit.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+  await createDebtService(prisma).getInvoiceDetail("inv-1");
+
+  const call = (prisma.visit.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(call.take).toBe(5);
+  expect(call.orderBy).toEqual({ date: "desc" });
 });

@@ -98,16 +98,22 @@ export interface SetupPropertyInput {
   customerName: string;
   propertyName?: string | null;
   phone?: string | null;
+  landline?: string | null;
   email?: string | null;
   fullAddress: string;
   postcode: string;
   serviceAreaId: string;
   propertyType?: string | null;
-  // Service plan
+  // Service plan: `price` is the combined/total price across whichever
+  // service(s) this row represents.
   price: number;
   cleaningFrequency?: string | null;
   paymentMethod?: string | null;
   serviceId?: string | null;
+  // When given (non-empty), one ServicePlan is created per id instead of a
+  // single plan for `serviceId`, splitting `price` evenly across them
+  // (remainder pence assigned to the last plan so the total stays exact).
+  serviceIds?: string[] | null;
   // Notes
   accessNotes?: string | null;
   riskNotes?: string | null;
@@ -130,12 +136,29 @@ export interface ActivationInput {
 export interface SetupPropertyResult {
   customer: Customer;
   property: Property;
+  // Kept for backward compatibility with existing callers: the first/only
+  // plan. Equal to servicePlans[0].
   servicePlan: ServicePlan;
+  // Every plan created for this property — length > 1 only when the row
+  // supplied serviceIds with more than one entry.
+  servicePlans: ServicePlan[];
+}
+
+export interface SetupPropertyRowError {
+  row: number; // 0-based index into the submitted properties[] array
+  field: string;
+  message: string;
 }
 
 export interface BulkSetupPropertyResult {
   created: number;
+  failed: number;
   results: SetupPropertyResult[];
+  errors: SetupPropertyRowError[];
+  // true when this exact idempotencyKey was already processed by an earlier
+  // call — `results` is empty in that case (not reconstructed), but
+  // `created` reflects the original run's count.
+  idempotent?: boolean;
 }
 
 export interface RoundAssignmentResult {
@@ -192,6 +215,31 @@ export interface ActivationResult {
 //
 // Phase 2 is a whole-schema migration + ~30 query edits, not a two-method swap.
 // The interface boundary and thin routes are correct and will not need changing.
+
+// Splits `total` across `count` plans, each rounded to 2dp; the last plan
+// absorbs the rounding remainder so the parts always sum back to `total`.
+function splitPrice(total: number, index: number, count: number): number {
+  if (count <= 1) return total;
+  const base = Math.floor((total / count) * 100) / 100;
+  if (index < count - 1) return base;
+  return Math.round((total - base * (count - 1)) * 100) / 100;
+}
+
+// One row's service-plan entries: a single plan for `serviceId` by default,
+// or one plan per id in `serviceIds` (splitting `price` evenly) when given.
+function servicePlanEntries(
+  input: Pick<SetupPropertyInput, "serviceId" | "serviceIds" | "price">
+): { serviceId: string | null; price: number }[] {
+  if (input.serviceIds && input.serviceIds.length > 0) {
+    const ids = input.serviceIds;
+    return ids.map((serviceId, index) => ({
+      serviceId,
+      price: splitPrice(input.price, index, ids.length),
+    }));
+  }
+  return [{ serviceId: input.serviceId ?? null, price: input.price }];
+}
+
 class SetupService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
@@ -553,6 +601,7 @@ class SetupService {
       customer: p.customer,
       property: p,
       servicePlan: p.servicePlans[0],
+      servicePlans: p.servicePlans,
     })).filter((r) => r.servicePlan != null) as SetupPropertyResult[];
   }
 
@@ -591,6 +640,7 @@ class SetupService {
         data: {
           name: input.customerName,
           phone: input.phone ?? null,
+          landline: input.landline ?? null,
           email: input.email ?? null,
           paymentMethod: (input.paymentMethod as PaymentMethod) ?? null,
         },
@@ -608,74 +658,104 @@ class SetupService {
           roundId: input.roundId,
         },
       });
-      const servicePlan = await tx.servicePlan.create({
-        data: {
-          propertyId: property.id,
-          serviceId: input.serviceId ?? null,
-          price: input.price,
-          paymentMethod: (input.paymentMethod as PaymentMethod) ?? null,
-          cleaningFrequency: (input.cleaningFrequency as CleaningFrequency) ?? null,
-        },
-      });
-      return { customer, property, servicePlan };
+      const servicePlans: ServicePlan[] = [];
+      for (const entry of servicePlanEntries(input)) {
+        servicePlans.push(
+          await tx.servicePlan.create({
+            data: {
+              propertyId: property.id,
+              serviceId: entry.serviceId,
+              price: entry.price,
+              paymentMethod: (input.paymentMethod as PaymentMethod) ?? null,
+              cleaningFrequency: (input.cleaningFrequency as CleaningFrequency) ?? null,
+            },
+          })
+        );
+      }
+      return { customer, property, servicePlan: servicePlans[0], servicePlans };
     });
   }
 
   async bulkAddSetupProperties(
-    inputs: SetupPropertyInput[]
+    inputs: SetupPropertyInput[],
+    idempotencyKey?: string
   ): Promise<BulkSetupPropertyResult> {
-    if (inputs.length === 0) return { created: 0, results: [] };
+    if (idempotencyKey) {
+      const existing = await this.prisma.bulkImportAttempt.findUnique({ where: { idempotencyKey } });
+      if (existing) {
+        return { created: existing.createdCount, failed: 0, results: [], errors: [], idempotent: true };
+      }
+    }
 
-    // Validate enums upfront across all rows
-    for (let i = 0; i < inputs.length; i++) {
-      const inp = inputs[i];
+    if (inputs.length === 0) return { created: 0, failed: 0, results: [], errors: [] };
+
+    const errors: SetupPropertyRowError[] = [];
+
+    // Per-row enum/value validation. Unlike the old all-or-nothing version,
+    // an invalid row is recorded and excluded — it no longer aborts every
+    // other (valid) row in the same request.
+    let candidates: { input: SetupPropertyInput; originalIndex: number }[] = [];
+    inputs.forEach((inp, i) => {
       if (inp.propertyType && !(Object.values(PropertyType) as string[]).includes(inp.propertyType)) {
-        throw new AppError(400, `Row ${i}: Invalid propertyType: ${inp.propertyType}`);
+        errors.push({ row: i, field: "propertyType", message: `Invalid propertyType: ${inp.propertyType}` });
+        return;
       }
       if (inp.cleaningFrequency && !(Object.values(CleaningFrequency) as string[]).includes(inp.cleaningFrequency)) {
-        throw new AppError(400, `Row ${i}: Invalid cleaningFrequency: ${inp.cleaningFrequency}`);
+        errors.push({ row: i, field: "cleaningFrequency", message: `Invalid cleaningFrequency: ${inp.cleaningFrequency}` });
+        return;
       }
       if (inp.paymentMethod && !(Object.values(PaymentMethod) as string[]).includes(inp.paymentMethod)) {
-        throw new AppError(400, `Row ${i}: Invalid paymentMethod: ${inp.paymentMethod}`);
+        errors.push({ row: i, field: "paymentMethod", message: `Invalid paymentMethod: ${inp.paymentMethod}` });
+        return;
       }
-      if (inp.price < 0) throw new AppError(400, `Row ${i}: price must be >= 0`);
-    }
-
-    // Pre-validate FK existence in bulk before touching transactions
-    const distinctAreaIds = [...new Set(inputs.map((i) => i.serviceAreaId))];
-    const foundAreas = await this.prisma.serviceArea.findMany({
-      where: { id: { in: distinctAreaIds } },
-      select: { id: true },
+      if (inp.price < 0) {
+        errors.push({ row: i, field: "price", message: "price must be >= 0" });
+        return;
+      }
+      candidates.push({ input: inp, originalIndex: i });
     });
-    const foundAreaSet = new Set(foundAreas.map((a) => a.id));
-    const missingAreas = distinctAreaIds.filter((id) => !foundAreaSet.has(id));
-    if (missingAreas.length > 0) {
-      throw new AppError(400, `serviceAreaId not found: ${missingAreas.join(", ")}`);
-    }
 
-    const distinctRoundIds = [...new Set(inputs.map((i) => i.roundId))];
-    const foundRounds = await this.prisma.round.findMany({
-      where: { id: { in: distinctRoundIds } },
-      select: { id: true, status: true },
-    });
-    const foundRoundMap = new Map(foundRounds.map((r) => [r.id, r]));
-    const missingRounds = distinctRoundIds.filter((id) => !foundRoundMap.has(id));
-    if (missingRounds.length > 0) {
-      throw new AppError(400, `roundId not found: ${missingRounds.join(", ")}`);
-    }
-    const inactiveRounds = distinctRoundIds.filter(
-      (id) => foundRoundMap.get(id)!.status !== RoundStatus.ACTIVE
-    );
-    if (inactiveRounds.length > 0) {
-      throw new AppError(400, `roundId must reference an ACTIVE round: ${inactiveRounds.join(", ")}`);
+    // Per-row FK existence/status checks, batched across all still-valid rows.
+    if (candidates.length > 0) {
+      const distinctAreaIds = [...new Set(candidates.map((c) => c.input.serviceAreaId))];
+      const foundAreas = await this.prisma.serviceArea.findMany({
+        where: { id: { in: distinctAreaIds } },
+        select: { id: true },
+      });
+      const foundAreaSet = new Set(foundAreas.map((a) => a.id));
+
+      const distinctRoundIds = [...new Set(candidates.map((c) => c.input.roundId))];
+      const foundRounds = await this.prisma.round.findMany({
+        where: { id: { in: distinctRoundIds } },
+        select: { id: true, status: true },
+      });
+      const foundRoundMap = new Map(foundRounds.map((r) => [r.id, r]));
+
+      const stillValid: typeof candidates = [];
+      for (const c of candidates) {
+        if (!foundAreaSet.has(c.input.serviceAreaId)) {
+          errors.push({ row: c.originalIndex, field: "serviceAreaId", message: `serviceAreaId not found: ${c.input.serviceAreaId}` });
+          continue;
+        }
+        const round = foundRoundMap.get(c.input.roundId);
+        if (!round) {
+          errors.push({ row: c.originalIndex, field: "roundId", message: `roundId not found: ${c.input.roundId}` });
+          continue;
+        }
+        if (round.status !== RoundStatus.ACTIVE) {
+          errors.push({ row: c.originalIndex, field: "roundId", message: "roundId must reference an ACTIVE round" });
+          continue;
+        }
+        stillValid.push(c);
+      }
+      candidates = stillValid;
     }
 
     const BATCH_SIZE = 100;
     const allResults: SetupPropertyResult[] = [];
 
-    for (let batchStart = 0; batchStart < inputs.length; batchStart += BATCH_SIZE) {
-      const batch = inputs.slice(batchStart, batchStart + BATCH_SIZE);
-      const batchIndex = Math.floor(batchStart / BATCH_SIZE);
+    for (let batchStart = 0; batchStart < candidates.length; batchStart += BATCH_SIZE) {
+      const batch = candidates.slice(batchStart, batchStart + BATCH_SIZE);
 
       // IDs generated up front so customer/property/servicePlan rows can be
       // inserted with createMany (3 queries per batch) instead of looping
@@ -687,76 +767,106 @@ class SetupService {
       // transaction". The array form of $transaction below sends all three
       // createMany statements as one batched (non-interactive) request, so
       // there's no long-lived transaction to time out.
-      const rows = batch.map((inp) => ({
+      const rows = batch.map(({ input: inp, originalIndex }) => ({
         inp,
+        originalIndex,
         customerId: randomUUID(),
         propertyId: randomUUID(),
-        servicePlanId: randomUUID(),
+        plans: servicePlanEntries(inp).map((entry) => ({ ...entry, id: randomUUID() })),
       }));
 
-      await this.prisma.$transaction([
-        this.prisma.customer.createMany({
-          data: rows.map(({ inp, customerId }) => ({
-            id: customerId,
-            name: inp.customerName,
-            phone: inp.phone ?? null,
-            email: inp.email ?? null,
-            paymentMethod: (inp.paymentMethod as PaymentMethod) ?? null,
-          })),
-        }),
-        this.prisma.property.createMany({
-          data: rows.map(({ inp, customerId, propertyId }) => ({
-            id: propertyId,
-            customerId,
-            propertyName: inp.propertyName ?? null,
-            addressLine: inp.fullAddress,
-            postcode: inp.postcode,
-            serviceAreaId: inp.serviceAreaId,
-            propertyType: (inp.propertyType as PropertyType) ?? null,
-            accessNotes: inp.accessNotes ?? null,
-            riskNotes: inp.riskNotes ?? null,
-            roundId: inp.roundId,
-          })),
-        }),
-        this.prisma.servicePlan.createMany({
-          data: rows.map(({ inp, propertyId, servicePlanId }) => ({
-            id: servicePlanId,
-            propertyId,
-            serviceId: inp.serviceId ?? null,
-            price: inp.price,
-            paymentMethod: (inp.paymentMethod as PaymentMethod) ?? null,
-            cleaningFrequency: (inp.cleaningFrequency as CleaningFrequency) ?? null,
-          })),
-        }),
-      ]).catch((err) => {
-        throw new AppError(
-          500,
-          `Batch ${batchIndex} (rows ${batchStart}–${batchStart + batch.length - 1}) failed: ${err instanceof Error ? err.message : String(err)}`
-        );
-      });
+      try {
+        await this.prisma.$transaction([
+          this.prisma.customer.createMany({
+            data: rows.map(({ inp, customerId }) => ({
+              id: customerId,
+              name: inp.customerName,
+              phone: inp.phone ?? null,
+              landline: inp.landline ?? null,
+              email: inp.email ?? null,
+              paymentMethod: (inp.paymentMethod as PaymentMethod) ?? null,
+            })),
+          }),
+          this.prisma.property.createMany({
+            data: rows.map(({ inp, customerId, propertyId }) => ({
+              id: propertyId,
+              customerId,
+              propertyName: inp.propertyName ?? null,
+              addressLine: inp.fullAddress,
+              postcode: inp.postcode,
+              serviceAreaId: inp.serviceAreaId,
+              propertyType: (inp.propertyType as PropertyType) ?? null,
+              accessNotes: inp.accessNotes ?? null,
+              riskNotes: inp.riskNotes ?? null,
+              roundId: inp.roundId,
+            })),
+          }),
+          this.prisma.servicePlan.createMany({
+            data: rows.flatMap(({ inp, propertyId, plans }) =>
+              plans.map((plan) => ({
+                id: plan.id,
+                propertyId,
+                serviceId: plan.serviceId,
+                price: plan.price,
+                paymentMethod: (inp.paymentMethod as PaymentMethod) ?? null,
+                cleaningFrequency: (inp.cleaningFrequency as CleaningFrequency) ?? null,
+              }))
+            ),
+          }),
+        ]);
+      } catch (err) {
+        // Array-form $transaction is all-or-nothing per batch: nothing in
+        // this batch was committed, but earlier batches (and the next ones)
+        // are unaffected — report every row in this batch as failed and
+        // keep going instead of aborting the whole import.
+        const message = err instanceof Error ? err.message : String(err);
+        for (const { originalIndex } of batch) {
+          errors.push({ row: originalIndex, field: "batch", message });
+        }
+        continue;
+      }
 
       // createMany doesn't return the created rows — refetch by the IDs we
       // just assigned so the response shape (full customer/property/plan
       // records) is unchanged for callers.
+      const allPlanIds = rows.flatMap((r) => r.plans.map((p) => p.id));
       const [customers, properties, servicePlans] = await Promise.all([
         this.prisma.customer.findMany({ where: { id: { in: rows.map((r) => r.customerId) } } }),
         this.prisma.property.findMany({ where: { id: { in: rows.map((r) => r.propertyId) } } }),
-        this.prisma.servicePlan.findMany({ where: { id: { in: rows.map((r) => r.servicePlanId) } } }),
+        this.prisma.servicePlan.findMany({ where: { id: { in: allPlanIds } } }),
       ]);
       const customerById = new Map(customers.map((c) => [c.id, c]));
       const propertyById = new Map(properties.map((p) => [p.id, p]));
       const servicePlanById = new Map(servicePlans.map((sp) => [sp.id, sp]));
 
       for (const row of rows) {
+        const plans = row.plans.map((p) => servicePlanById.get(p.id)!);
         allResults.push({
           customer: customerById.get(row.customerId)!,
           property: propertyById.get(row.propertyId)!,
-          servicePlan: servicePlanById.get(row.servicePlanId)!,
+          servicePlan: plans[0],
+          servicePlans: plans,
         });
       }
     }
 
-    return { created: allResults.length, results: allResults };
+    const createdCount = allResults.length;
+
+    if (idempotencyKey) {
+      await this.prisma.bulkImportAttempt
+        .create({ data: { idempotencyKey, createdCount } })
+        .catch(() => {
+          // Best-effort: a race against a concurrent identical retry means
+          // the import already happened either way — nothing to recover.
+        });
+    }
+
+    return {
+      created: createdCount,
+      failed: inputs.length - createdCount,
+      results: allResults,
+      errors,
+    };
   }
 
   // ── Step 10: Assign Technicians to Rounds ───────────────────────────────

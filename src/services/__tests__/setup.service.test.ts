@@ -37,6 +37,7 @@ function makePrisma() {
       createMany: vi.fn().mockResolvedValue({ count: 0 }),
     },
     visit: { findMany: vi.fn(), createMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
+    bulkImportAttempt: { findUnique: vi.fn().mockResolvedValue(null), create: vi.fn().mockResolvedValue({}) },
     // Supports both the interactive callback form ($transaction(cb)) used by
     // other steps and the array/batched form ($transaction([...])) used by
     // bulkAddSetupProperties.
@@ -67,12 +68,149 @@ function makeInput(overrides: Partial<{
   };
 }
 
+// ── getSetupProperties ──────────────────────────────────────────────────────
+
+it("getSetupProperties maps each property's servicePlans through and drops properties with no plan", async () => {
+  const prisma = makePrisma();
+  (prisma.property.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    { id: "p1", customer: { id: "c1" }, servicePlans: [{ id: "sp1" }] },
+    { id: "p2", customer: { id: "c2" }, servicePlans: [] },
+  ]);
+
+  const result = await createSetupService(prisma).getSetupProperties();
+
+  expect(result).toHaveLength(1);
+  expect(result[0]).toMatchObject({
+    customer: { id: "c1" },
+    servicePlan: { id: "sp1" },
+    servicePlans: [{ id: "sp1" }],
+  });
+});
+
+// ── addSetupProperty (single) ──────────────────────────────────────────────
+
+it("addSetupProperty throws 400 for an invalid propertyType", async () => {
+  const prisma = makePrisma();
+  await expect(
+    createSetupService(prisma).addSetupProperty({ ...makeInput(), propertyType: "IGLOO" })
+  ).rejects.toMatchObject({ statusCode: 400 });
+});
+
+it("addSetupProperty throws 400 for an invalid cleaningFrequency", async () => {
+  const prisma = makePrisma();
+  await expect(
+    createSetupService(prisma).addSetupProperty({ ...makeInput(), cleaningFrequency: "DAILY" })
+  ).rejects.toMatchObject({ statusCode: 400 });
+});
+
+it("addSetupProperty throws 400 for an invalid paymentMethod", async () => {
+  const prisma = makePrisma();
+  await expect(
+    createSetupService(prisma).addSetupProperty({ ...makeInput(), paymentMethod: "CRYPTO" })
+  ).rejects.toMatchObject({ statusCode: 400 });
+});
+
+it("addSetupProperty throws 400 when serviceAreaId does not exist", async () => {
+  const prisma = makePrisma();
+  (prisma.serviceArea.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+  await expect(
+    createSetupService(prisma).addSetupProperty(makeInput())
+  ).rejects.toMatchObject({ statusCode: 400 });
+});
+
+it("addSetupProperty throws 400 when roundId does not exist", async () => {
+  const prisma = makePrisma();
+  (prisma.serviceArea.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeServiceArea("area1"));
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+  await expect(
+    createSetupService(prisma).addSetupProperty(makeInput())
+  ).rejects.toMatchObject({ statusCode: 400 });
+});
+
+it("addSetupProperty throws 400 when the round is not ACTIVE", async () => {
+  const prisma = makePrisma();
+  (prisma.serviceArea.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeServiceArea("area1"));
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeRound("round1", RoundStatus.DRAFT));
+  await expect(
+    createSetupService(prisma).addSetupProperty(makeInput())
+  ).rejects.toMatchObject({ statusCode: 400 });
+});
+
+it("addSetupProperty throws 400 for a negative price", async () => {
+  const prisma = makePrisma();
+  (prisma.serviceArea.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeServiceArea("area1"));
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeRound("round1"));
+  await expect(
+    createSetupService(prisma).addSetupProperty({ ...makeInput(), price: -1 })
+  ).rejects.toMatchObject({ statusCode: 400 });
+});
+
+it("addSetupProperty creates one plan at the full price when serviceIds is not given", async () => {
+  const prisma = makePrisma();
+  // addSetupProperty runs inside the interactive-callback form of
+  // $transaction; the shared makePrisma() default hands the callback a
+  // brand-new (unconfigured) mock client, so reuse this test's own `prisma`
+  // instead, matching the pattern in round.service.test.ts.
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((fn: (tx: typeof prisma) => Promise<unknown>) => fn(prisma));
+  (prisma.serviceArea.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeServiceArea("area1"));
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeRound("round1"));
+  (prisma.customer.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1" });
+  (prisma.property.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "p1" });
+  (prisma.servicePlan.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1", price: 35 });
+
+  const result = await createSetupService(prisma).addSetupProperty({ ...makeInput(), price: 35, serviceId: "svc-a" });
+
+  expect(prisma.servicePlan.create).toHaveBeenCalledTimes(1);
+  expect(prisma.servicePlan.create).toHaveBeenCalledWith({
+    data: expect.objectContaining({ serviceId: "svc-a", price: 35, propertyId: "p1" }),
+  });
+  expect(result.servicePlans).toEqual([{ id: "sp1", price: 35 }]);
+  expect(result.servicePlan).toBe(result.servicePlans[0]);
+});
+
+it("addSetupProperty creates one plan per serviceIds entry, splitting price evenly", async () => {
+  const prisma = makePrisma();
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((fn: (tx: typeof prisma) => Promise<unknown>) => fn(prisma));
+  (prisma.serviceArea.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeServiceArea("area1"));
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeRound("round1"));
+  (prisma.customer.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1" });
+  (prisma.property.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "p1" });
+  (prisma.servicePlan.create as ReturnType<typeof vi.fn>)
+    .mockResolvedValueOnce({ id: "sp1", serviceId: "svc-a", price: 25 })
+    .mockResolvedValueOnce({ id: "sp2", serviceId: "svc-b", price: 25 });
+
+  const result = await createSetupService(prisma).addSetupProperty({
+    ...makeInput(), price: 50, serviceIds: ["svc-a", "svc-b"],
+  });
+
+  expect(prisma.servicePlan.create).toHaveBeenCalledTimes(2);
+  expect(prisma.servicePlan.create).toHaveBeenNthCalledWith(1, { data: expect.objectContaining({ serviceId: "svc-a", price: 25 }) });
+  expect(prisma.servicePlan.create).toHaveBeenNthCalledWith(2, { data: expect.objectContaining({ serviceId: "svc-b", price: 25 }) });
+  expect(result.servicePlans).toHaveLength(2);
+});
+
+it("addSetupProperty writes landline through to the created customer", async () => {
+  const prisma = makePrisma();
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((fn: (tx: typeof prisma) => Promise<unknown>) => fn(prisma));
+  (prisma.serviceArea.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeServiceArea("area1"));
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeRound("round1"));
+  (prisma.customer.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1" });
+  (prisma.property.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "p1" });
+  (prisma.servicePlan.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1" });
+
+  await createSetupService(prisma).addSetupProperty({ ...makeInput(), landline: "01234567890" });
+
+  expect(prisma.customer.create).toHaveBeenCalledWith({
+    data: expect.objectContaining({ landline: "01234567890" }),
+  });
+});
+
 // ── bulkAddSetupProperties ─────────────────────────────────────────────────
 
-it("bulkAddSetupProperties: empty input returns { created: 0, results: [] }", async () => {
+it("bulkAddSetupProperties: empty input returns { created: 0, failed: 0, results: [], errors: [] }", async () => {
   const prisma = makePrisma();
   const result = await createSetupService(prisma).bulkAddSetupProperties([]);
-  expect(result).toEqual({ created: 0, results: [] });
+  expect(result).toEqual({ created: 0, failed: 0, results: [], errors: [] });
 });
 
 it("bulkAddSetupProperties: 3 valid rows returns created: 3", async () => {
@@ -90,40 +228,63 @@ it("bulkAddSetupProperties: 3 valid rows returns created: 3", async () => {
   expect(prisma.servicePlan.createMany).toHaveBeenCalledTimes(1);
 });
 
-it("bulkAddSetupProperties: unknown serviceAreaId throws 400 before any insert", async () => {
+it("bulkAddSetupProperties: unknown serviceAreaId is reported as a row error, not an aborting throw", async () => {
   const prisma = makePrisma();
   (prisma.serviceArea.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]); // no areas found
   (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeRound("round1")]);
 
-  await expect(
-    createSetupService(prisma).bulkAddSetupProperties([makeInput()])
-  ).rejects.toMatchObject({ statusCode: 400, message: expect.stringContaining("area1") });
+  const result = await createSetupService(prisma).bulkAddSetupProperties([makeInput()]);
 
+  expect(result.created).toBe(0);
+  expect(result.failed).toBe(1);
+  expect(result.errors).toEqual([
+    { row: 0, field: "serviceAreaId", message: expect.stringContaining("area1") },
+  ]);
   expect(prisma.$transaction).not.toHaveBeenCalled();
 });
 
-it("bulkAddSetupProperties: unknown roundId throws 400 before any insert", async () => {
+it("bulkAddSetupProperties: unknown roundId is reported as a row error, not an aborting throw", async () => {
   const prisma = makePrisma();
   (prisma.serviceArea.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeServiceArea("area1")]);
   (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]); // no rounds found
 
-  await expect(
-    createSetupService(prisma).bulkAddSetupProperties([makeInput()])
-  ).rejects.toMatchObject({ statusCode: 400, message: expect.stringContaining("round1") });
+  const result = await createSetupService(prisma).bulkAddSetupProperties([makeInput()]);
 
+  expect(result.errors).toEqual([
+    { row: 0, field: "roundId", message: expect.stringContaining("round1") },
+  ]);
   expect(prisma.$transaction).not.toHaveBeenCalled();
 });
 
-it("bulkAddSetupProperties: inactive round throws 400 before any insert", async () => {
+it("bulkAddSetupProperties: inactive round is reported as a row error, not an aborting throw", async () => {
   const prisma = makePrisma();
   (prisma.serviceArea.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeServiceArea("area1")]);
   (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeRound("round1", RoundStatus.DRAFT)]);
 
-  await expect(
-    createSetupService(prisma).bulkAddSetupProperties([makeInput()])
-  ).rejects.toMatchObject({ statusCode: 400, message: expect.stringContaining("ACTIVE") });
+  const result = await createSetupService(prisma).bulkAddSetupProperties([makeInput()]);
 
+  expect(result.errors).toEqual([
+    { row: 0, field: "roundId", message: expect.stringContaining("ACTIVE") },
+  ]);
   expect(prisma.$transaction).not.toHaveBeenCalled();
+});
+
+it("bulkAddSetupProperties: a bad row doesn't block other valid rows in the same request", async () => {
+  const prisma = makePrisma();
+  (prisma.serviceArea.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeServiceArea("area1")]);
+  (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeRound("round1")]);
+
+  const result = await createSetupService(prisma).bulkAddSetupProperties([
+    makeInput(),
+    { ...makeInput(), serviceAreaId: "missing-area" },
+    makeInput(),
+  ]);
+
+  expect(result.created).toBe(2);
+  expect(result.failed).toBe(1);
+  expect(result.errors).toEqual([
+    { row: 1, field: "serviceAreaId", message: expect.stringContaining("missing-area") },
+  ]);
 });
 
 it("bulkAddSetupProperties: 150 rows fires two transactions", async () => {
@@ -138,15 +299,173 @@ it("bulkAddSetupProperties: 150 rows fires two transactions", async () => {
   expect(prisma.$transaction).toHaveBeenCalledTimes(2); // batch 1: 100, batch 2: 50
 });
 
-it("bulkAddSetupProperties: invalid propertyType throws 400 before FK checks", async () => {
+it("bulkAddSetupProperties: invalid propertyType is a row error and skips FK checks for that row", async () => {
   const prisma = makePrisma();
   const input = { ...makeInput(), propertyType: "IGLOO" };
 
-  await expect(
-    createSetupService(prisma).bulkAddSetupProperties([input])
-  ).rejects.toMatchObject({ statusCode: 400, message: expect.stringContaining("propertyType") });
+  const result = await createSetupService(prisma).bulkAddSetupProperties([input]);
 
+  expect(result.errors).toEqual([
+    { row: 0, field: "propertyType", message: expect.stringContaining("propertyType") },
+  ]);
   expect(prisma.serviceArea.findMany).not.toHaveBeenCalled();
+});
+
+it("bulkAddSetupProperties: invalid cleaningFrequency is reported as a row error", async () => {
+  const prisma = makePrisma();
+  const input = { ...makeInput(), cleaningFrequency: "DAILY" };
+  const result = await createSetupService(prisma).bulkAddSetupProperties([input]);
+  expect(result.errors).toEqual([
+    { row: 0, field: "cleaningFrequency", message: expect.stringContaining("cleaningFrequency") },
+  ]);
+});
+
+it("bulkAddSetupProperties: invalid paymentMethod is reported as a row error", async () => {
+  const prisma = makePrisma();
+  const input = { ...makeInput(), paymentMethod: "CRYPTO" };
+  const result = await createSetupService(prisma).bulkAddSetupProperties([input]);
+  expect(result.errors).toEqual([
+    { row: 0, field: "paymentMethod", message: expect.stringContaining("paymentMethod") },
+  ]);
+});
+
+it("bulkAddSetupProperties: a negative price is reported as a row error", async () => {
+  const prisma = makePrisma();
+  const input = { ...makeInput(), price: -5 };
+  const result = await createSetupService(prisma).bulkAddSetupProperties([input]);
+  expect(result.errors).toEqual([
+    { row: 0, field: "price", message: expect.stringContaining("price") },
+  ]);
+});
+
+it("bulkAddSetupProperties: a batch DB failure is reported per-row and does not throw", async () => {
+  const prisma = makePrisma();
+  (prisma.serviceArea.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeServiceArea("area1")]);
+  (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeRound("round1")]);
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementationOnce(() =>
+    Promise.reject(new Error("db exploded"))
+  );
+
+  const result = await createSetupService(prisma).bulkAddSetupProperties([makeInput(), makeInput()]);
+
+  expect(result.created).toBe(0);
+  expect(result.failed).toBe(2);
+  expect(result.errors).toEqual([
+    { row: 0, field: "batch", message: "db exploded" },
+    { row: 1, field: "batch", message: "db exploded" },
+  ]);
+});
+
+it("bulkAddSetupProperties: a failed batch doesn't stop a later batch from succeeding", async () => {
+  const prisma = makePrisma();
+  (prisma.serviceArea.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeServiceArea("area1")]);
+  (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeRound("round1")]);
+  (prisma.$transaction as ReturnType<typeof vi.fn>)
+    .mockImplementationOnce(() => Promise.reject(new Error("batch 1 failed")))
+    .mockImplementationOnce((arg: any) => Promise.all(arg));
+
+  const inputs = Array.from({ length: 150 }, () => makeInput());
+  const result = await createSetupService(prisma).bulkAddSetupProperties(inputs);
+
+  expect(result.created).toBe(50); // batch 2 (rows 100-149) succeeded
+  expect(result.failed).toBe(100); // batch 1 (rows 0-99) failed
+  expect(result.errors).toHaveLength(100);
+  expect(result.errors.every((e) => e.field === "batch")).toBe(true);
+});
+
+it("bulkAddSetupProperties: landline is written through to the created customer", async () => {
+  const prisma = makePrisma();
+  (prisma.serviceArea.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeServiceArea("area1")]);
+  (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeRound("round1")]);
+
+  await createSetupService(prisma).bulkAddSetupProperties([{ ...makeInput(), landline: "01234567890" }]);
+
+  const call = (prisma.customer.createMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(call.data[0].landline).toBe("01234567890");
+});
+
+it("bulkAddSetupProperties: serviceIds creates one ServicePlan per id, splitting price evenly", async () => {
+  const prisma = makePrisma();
+  (prisma.serviceArea.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeServiceArea("area1")]);
+  (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeRound("round1")]);
+
+  const result = await createSetupService(prisma).bulkAddSetupProperties([
+    { ...makeInput(), price: 100, serviceIds: ["svc-a", "svc-b", "svc-c"] },
+  ]);
+
+  const call = (prisma.servicePlan.createMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(call.data).toHaveLength(3);
+  expect(call.data.map((p: { serviceId: string }) => p.serviceId)).toEqual(["svc-a", "svc-b", "svc-c"]);
+  // 100 / 3 = 33.33.., floored to 33.33 for the first two, remainder on the last.
+  expect(call.data[0].price).toBe(33.33);
+  expect(call.data[1].price).toBe(33.33);
+  expect(call.data[2].price).toBe(33.34);
+  expect(call.data[0].price + call.data[1].price + call.data[2].price).toBe(100);
+  expect(result.results[0].servicePlans).toHaveLength(3);
+  expect(result.results[0].servicePlan).toBe(result.results[0].servicePlans[0]);
+});
+
+it("bulkAddSetupProperties: a single serviceId (no serviceIds) still creates exactly one plan at the full price", async () => {
+  const prisma = makePrisma();
+  (prisma.serviceArea.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeServiceArea("area1")]);
+  (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeRound("round1")]);
+
+  await createSetupService(prisma).bulkAddSetupProperties([
+    { ...makeInput(), price: 50, serviceId: "svc-a" },
+  ]);
+
+  const call = (prisma.servicePlan.createMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(call.data).toHaveLength(1);
+  expect(call.data[0]).toMatchObject({ serviceId: "svc-a", price: 50 });
+});
+
+// ---- idempotency -----------------------------------------------------------
+
+it("bulkAddSetupProperties: a repeat call with the same idempotencyKey returns the original count without re-inserting", async () => {
+  const prisma = makePrisma();
+  (prisma.bulkImportAttempt.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: "a1", idempotencyKey: "key-1", createdCount: 3,
+  });
+
+  const result = await createSetupService(prisma).bulkAddSetupProperties([makeInput()], "key-1");
+
+  expect(result).toEqual({ created: 3, failed: 0, results: [], errors: [], idempotent: true });
+  expect(prisma.serviceArea.findMany).not.toHaveBeenCalled();
+  expect(prisma.$transaction).not.toHaveBeenCalled();
+});
+
+it("bulkAddSetupProperties: records a BulkImportAttempt after a successful run when idempotencyKey is given", async () => {
+  const prisma = makePrisma();
+  (prisma.serviceArea.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeServiceArea("area1")]);
+  (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeRound("round1")]);
+
+  await createSetupService(prisma).bulkAddSetupProperties([makeInput()], "key-2");
+
+  expect(prisma.bulkImportAttempt.create).toHaveBeenCalledWith({
+    data: { idempotencyKey: "key-2", createdCount: 1 },
+  });
+});
+
+it("bulkAddSetupProperties: does not record a BulkImportAttempt when no idempotencyKey is given", async () => {
+  const prisma = makePrisma();
+  (prisma.serviceArea.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeServiceArea("area1")]);
+  (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeRound("round1")]);
+
+  await createSetupService(prisma).bulkAddSetupProperties([makeInput()]);
+
+  expect(prisma.bulkImportAttempt.findUnique).not.toHaveBeenCalled();
+  expect(prisma.bulkImportAttempt.create).not.toHaveBeenCalled();
+});
+
+it("bulkAddSetupProperties: swallows a BulkImportAttempt create race (e.g. concurrent identical retry)", async () => {
+  const prisma = makePrisma();
+  (prisma.serviceArea.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeServiceArea("area1")]);
+  (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeRound("round1")]);
+  (prisma.bulkImportAttempt.create as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("unique violation"));
+
+  const result = await createSetupService(prisma).bulkAddSetupProperties([makeInput()], "key-3");
+
+  expect(result.created).toBe(1);
 });
 
 // ── getStatus: step 10 "all active rounds assigned" ────────────────────────

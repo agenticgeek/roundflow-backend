@@ -4,9 +4,11 @@ import express from "express";
 
 const mockBulkResult = {
   created: 1,
+  failed: 0,
   results: [
-    { customer: { id: "c1" }, property: { id: "p1" }, servicePlan: { id: "sp1" } },
+    { customer: { id: "c1" }, property: { id: "p1" }, servicePlan: { id: "sp1" }, servicePlans: [{ id: "sp1" }] },
   ],
+  errors: [],
 };
 
 const mockSetupSvc = {
@@ -158,4 +160,97 @@ it("POST /setup/step/9/bulk when properties is not an array returns 400", async 
     .post("/setup/step/9/bulk")
     .send({ properties: "not-an-array" });
   expect(res.status).toBe(400);
+});
+
+it("POST /setup/step/9/bulk reports a real field name (not 'unknown') for a parse failure", async () => {
+  const app = makeApp();
+  const badRow = { ...validRow, roundId: undefined };
+  const res = await request(app)
+    .post("/setup/step/9/bulk")
+    .send({ properties: [badRow] });
+  expect(res.status).toBe(400);
+  expect(res.body.errors).toEqual([
+    { row: 0, field: "roundId", message: expect.any(String) },
+  ]);
+});
+
+it("POST /setup/step/9/bulk remaps a service-level row error back to the original row index after a parse failure earlier in the array", async () => {
+  mockSetupSvc.bulkAddSetupProperties.mockResolvedValueOnce({
+    created: 0,
+    failed: 1,
+    results: [],
+    // The service only ever saw the one valid row, so it reports row 0 —
+    // the route must remap that back to its real position (row 2).
+    errors: [{ row: 0, field: "serviceAreaId", message: "serviceAreaId not found: bad-area" }],
+  });
+  const app = makeApp();
+  const res = await request(app).post("/setup/step/9/bulk").send({
+    properties: [
+      { ...validRow, roundId: undefined }, // row 0: parse failure
+      { ...validRow, customerName: undefined }, // row 1: parse failure
+      { ...validRow, serviceAreaId: "bad-area" }, // row 2: the only row that reaches the service
+    ],
+  });
+  expect(res.status).toBe(400);
+  expect(res.body.errors).toEqual(
+    expect.arrayContaining([
+      { row: 0, field: "roundId", message: expect.any(String) },
+      { row: 1, field: "customerName", message: expect.any(String) },
+      { row: 2, field: "serviceAreaId", message: "serviceAreaId not found: bad-area" },
+    ])
+  );
+  expect(mockSetupSvc.bulkAddSetupProperties).toHaveBeenCalledWith(
+    [expect.objectContaining({ serviceAreaId: "bad-area" })],
+    undefined
+  );
+});
+
+it("POST /setup/step/9/bulk passes landline, serviceIds and idempotencyKey through", async () => {
+  mockSetupSvc.bulkAddSetupProperties.mockResolvedValueOnce(mockBulkResult);
+  const app = makeApp();
+  const res = await request(app).post("/setup/step/9/bulk").send({
+    idempotencyKey: "import-123",
+    properties: [{ ...validRow, landline: "01234567890", serviceIds: ["svc-a", "svc-b"] }],
+  });
+  expect(res.status).toBe(201);
+  expect(mockSetupSvc.bulkAddSetupProperties).toHaveBeenCalledWith(
+    [expect.objectContaining({ landline: "01234567890", serviceIds: ["svc-a", "svc-b"] })],
+    "import-123"
+  );
+});
+
+it("POST /setup/step/9/bulk returns 201 with idempotent:true and skips calling the service when a prior identical idempotencyKey already ran", async () => {
+  mockSetupSvc.bulkAddSetupProperties.mockResolvedValueOnce({
+    created: 5, failed: 0, results: [], errors: [], idempotent: true,
+  });
+  const app = makeApp();
+  const res = await request(app)
+    .post("/setup/step/9/bulk")
+    .send({ idempotencyKey: "already-ran", properties: [validRow] });
+  expect(res.status).toBe(201);
+  expect(res.body).toMatchObject({ created: 5, idempotent: true });
+});
+
+it("POST /setup/step/9/bulk returns 400 (not 201) when every submitted row fails", async () => {
+  mockSetupSvc.bulkAddSetupProperties.mockResolvedValueOnce({
+    created: 0, failed: 1, results: [],
+    errors: [{ row: 0, field: "serviceAreaId", message: "serviceAreaId not found: bad" }],
+  });
+  const app = makeApp();
+  const res = await request(app)
+    .post("/setup/step/9/bulk")
+    .send({ properties: [{ ...validRow, serviceAreaId: "bad" }] });
+  expect(res.status).toBe(400);
+});
+
+it("POST /setup/step/9 (single) passes landline and serviceIds through", async () => {
+  mockSetupSvc.addSetupProperty.mockResolvedValueOnce(mockBulkResult.results[0]);
+  const app = makeApp();
+  const res = await request(app)
+    .post("/setup/step/9")
+    .send({ ...validRow, landline: "01234567890", serviceIds: ["svc-a", "svc-b"] });
+  expect(res.status).toBe(201);
+  expect(mockSetupSvc.addSetupProperty).toHaveBeenCalledWith(
+    expect.objectContaining({ landline: "01234567890", serviceIds: ["svc-a", "svc-b"] })
+  );
 });

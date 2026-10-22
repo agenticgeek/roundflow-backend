@@ -175,12 +175,19 @@ export function createDashboardService(prisma: TenantPrismaClient) {
       return rounds;
     },
 
-    getChartData: async (range: "6m" | "12m"): Promise<DashboardChartData> => {
+    getChartData: async (
+      range: "6m" | "12m",
+      technicianIds?: string[]
+    ): Promise<DashboardChartData> => {
       const monthCount = range === "12m" ? 12 : 6;
       const now = new Date();
       // Start at the beginning of (monthCount) months ago
       const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - monthCount + 1, 1));
       const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+      const technicianFilter =
+        technicianIds && technicianIds.length > 0
+          ? { technicianId: { in: technicianIds } }
+          : {};
 
       // Two independent queries instead of one LEFT JOIN Visit→Issue: summing
       // v.price through a one-to-many join duplicates a visit's price once
@@ -191,11 +198,13 @@ export function createDashboardService(prisma: TenantPrismaClient) {
       const [visitGroups, issueRows] = await Promise.all([
         prisma.visit.groupBy({
           by: ["date"],
-          where: { date: { gte: start, lt: end }, status: "COMPLETED" },
+          where: { date: { gte: start, lt: end }, status: "COMPLETED", ...technicianFilter },
           _sum: { price: true },
         }),
         prisma.issue.findMany({
-          where: { visit: { date: { gte: start, lt: end }, status: "COMPLETED" } },
+          where: {
+            visit: { date: { gte: start, lt: end }, status: "COMPLETED", ...technicianFilter },
+          },
           select: { visit: { select: { date: true } } },
         }),
       ]);

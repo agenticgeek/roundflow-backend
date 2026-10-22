@@ -344,3 +344,76 @@ it("updatePaymentRules invalidates the settings cache", async () => {
   expect(after).toEqual(fresh);
   expect(prisma.businessSettings.findFirst).toHaveBeenCalledTimes(2);
 });
+
+// ---- Technician Management: serviceAreas + appStatus alignment with /technicians ----
+
+function makeTechRow(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "t1",
+    profileId: null,
+    name: "James",
+    phone: null,
+    role: null,
+    email: null,
+    notes: null,
+    active: true,
+    avatarUrl: null,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    serviceAreas: [],
+    ...overrides,
+  };
+}
+
+it("getTechnicians derives serviceAreas and appStatus the same way /technicians does", async () => {
+  const prisma = makePrisma();
+  (prisma.technician.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    makeTechRow({
+      profileId: null,
+      serviceAreas: [{ serviceAreaId: "sa1", assignedAt: new Date(), serviceArea: { name: "Alnwick" } }],
+    }),
+  ]);
+  const svc = createSettingsService(prisma, "schema_get_technicians");
+
+  const [tech] = await svc.getTechnicians();
+
+  expect(tech.appStatus).toBe("PENDING_INVITE");
+  expect(tech.serviceAreas).toEqual([
+    { serviceAreaId: "sa1", serviceAreaName: "Alnwick", assignedAt: expect.any(Date) },
+  ]);
+});
+
+it("createTechnician returns the enriched shape (displayName, appStatus, serviceAreas)", async () => {
+  const prisma = makePrisma();
+  (prisma.technician.create as ReturnType<typeof vi.fn>).mockResolvedValue(
+    makeTechRow({ name: "New Tech", profileId: null, active: true })
+  );
+  const svc = createSettingsService(prisma, "schema_create_technician");
+
+  const tech = await svc.createTechnician({ name: "New Tech" });
+
+  expect(tech.displayName).toBe("New Tech");
+  expect(tech.appStatus).toBe("PENDING_INVITE");
+  expect(tech.serviceAreas).toEqual([]);
+});
+
+it("updateTechnician 404s when the technician does not exist", async () => {
+  const prisma = makePrisma();
+  (prisma.technician.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+  const svc = createSettingsService(prisma, "schema_update_technician_404");
+
+  await expect(svc.updateTechnician("missing", { name: "X" })).rejects.toMatchObject({ statusCode: 404 });
+});
+
+it("updateTechnician returns the enriched shape and reflects an ACTIVE appStatus once a profile is attached", async () => {
+  const prisma = makePrisma();
+  (prisma.technician.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeTechRow());
+  (prisma.technician.update as ReturnType<typeof vi.fn>).mockResolvedValue(
+    makeTechRow({ profileId: "p1", active: true })
+  );
+  const svc = createSettingsService(prisma, "schema_update_technician");
+
+  const tech = await svc.updateTechnician("t1", { active: true });
+
+  expect(tech.appStatus).toBe("ACTIVE");
+});

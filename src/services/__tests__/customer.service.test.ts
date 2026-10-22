@@ -140,6 +140,39 @@ it("getCustomerDetail returns servicePlans array with 2 items when property has 
   expect(result.servicePlans[1].id).toBe("sp2");
   expect(result.servicePlans[1].serviceName).toBe("Gutters");
   expect(result.tabs.servicePlans).toHaveLength(2);
+  // Both plans are ACTIVE; primaryPlan()'s rule picks the first one found.
+  expect(result.servicePlans[0].isPrimary).toBe(true);
+  expect(result.servicePlans[1].isPrimary).toBe(false);
+});
+
+it("getCustomerDetail marks exactly one servicePlan as isPrimary: true when a later plan is ACTIVE and an earlier one is CANCELLED", async () => {
+  const prisma = makePrisma();
+  const plans = [
+    { id: "sp1", serviceId: null, service: null, price: 40, cleanMethod: null, paymentMethod: null, cleaningFrequency: "FOUR_WEEKLY", status: LifecycleStatus.CANCELLED, nextDueDate: null, lastCompleted: null, pauseStartDate: null, pauseEndDate: null },
+    { id: "sp2", serviceId: null, service: null, price: 80, cleanMethod: null, paymentMethod: null, cleaningFrequency: "TWELVE_WEEKLY", status: LifecycleStatus.ACTIVE, nextDueDate: null, lastCompleted: null, pauseStartDate: null, pauseEndDate: null },
+  ];
+  (prisma.customer.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeCustomerWithPlans(plans));
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(makeSettings());
+
+  const result = await createCustomerService(prisma).getCustomerDetail("c1", UserRole.ADMIN);
+
+  expect(result.servicePlans.find((p) => p.id === "sp1")?.isPrimary).toBe(false);
+  expect(result.servicePlans.find((p) => p.id === "sp2")?.isPrimary).toBe(true);
+});
+
+it("getCustomerDetail falls back the primary plan to servicePlans[0] when none are ACTIVE, marking only that one isPrimary", async () => {
+  const prisma = makePrisma();
+  const plans = [
+    { id: "sp1", serviceId: null, service: null, price: 40, cleanMethod: null, paymentMethod: null, cleaningFrequency: "FOUR_WEEKLY", status: LifecycleStatus.CANCELLED, nextDueDate: null, lastCompleted: null, pauseStartDate: null, pauseEndDate: null },
+    { id: "sp2", serviceId: null, service: null, price: 80, cleanMethod: null, paymentMethod: null, cleaningFrequency: "TWELVE_WEEKLY", status: LifecycleStatus.CANCELLED, nextDueDate: null, lastCompleted: null, pauseStartDate: null, pauseEndDate: null },
+  ];
+  (prisma.customer.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeCustomerWithPlans(plans));
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(makeSettings());
+
+  const result = await createCustomerService(prisma).getCustomerDetail("c1", UserRole.ADMIN);
+
+  expect(result.servicePlans.find((p) => p.id === "sp1")?.isPrimary).toBe(true);
+  expect(result.servicePlans.find((p) => p.id === "sp2")?.isPrimary).toBe(false);
 });
 
 it("getCustomerDetail standingInfo uses active plan frequency when multiple plans exist", async () => {
@@ -696,4 +729,134 @@ it("getCustomerDetail sorts multiple scheduled visits, evaluates the paymentHold
   // paymentHold is true on a COMPLETED visit only — not an open one — so onHold is false.
   expect(result.standingInfo.paymentStatus).not.toBe("hold");
   expect(result.tabs.notes).toEqual([{ ...customer.properties[0].notes[0], authorName: null }]);
+});
+
+// ── per-plan writes: updateServicePlan / pauseServicePlan / resumeServicePlan ──
+
+it("updateServicePlan throws 404 when the plan does not exist", async () => {
+  const prisma = makePrisma();
+  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+
+  await expect(
+    createCustomerService(prisma).updateServicePlan("missing", { price: 50 })
+  ).rejects.toMatchObject({ statusCode: 404 });
+});
+
+it("updateServicePlan only writes fields that were actually provided", async () => {
+  const prisma = makePrisma();
+  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1" });
+  (prisma.servicePlan.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1", price: 50 });
+
+  await createCustomerService(prisma).updateServicePlan("sp1", { price: 50 });
+
+  expect(prisma.servicePlan.update).toHaveBeenCalledWith({
+    where: { id: "sp1" },
+    data: { price: 50 },
+  });
+});
+
+it("updateServicePlan writes every provided field (cleanMethod, paymentMethod, cleaningFrequency)", async () => {
+  const prisma = makePrisma();
+  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1" });
+  (prisma.servicePlan.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1" });
+
+  await createCustomerService(prisma).updateServicePlan("sp1", {
+    cleanMethod: "Water Fed Pole",
+    paymentMethod: "GOCARDLESS" as never,
+    cleaningFrequency: "FOUR_WEEKLY" as never,
+  });
+
+  expect(prisma.servicePlan.update).toHaveBeenCalledWith({
+    where: { id: "sp1" },
+    data: {
+      cleanMethod: "Water Fed Pole",
+      paymentMethod: "GOCARDLESS",
+      cleaningFrequency: "FOUR_WEEKLY",
+    },
+  });
+});
+
+it("updateServicePlan sends an empty data object when nothing is provided", async () => {
+  const prisma = makePrisma();
+  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1" });
+  (prisma.servicePlan.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1" });
+
+  await createCustomerService(prisma).updateServicePlan("sp1", {});
+
+  expect(prisma.servicePlan.update).toHaveBeenCalledWith({ where: { id: "sp1" }, data: {} });
+});
+
+it("pauseServicePlan throws 404 when the plan does not exist", async () => {
+  const prisma = makePrisma();
+  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+
+  await expect(
+    createCustomerService(prisma).pauseServicePlan("missing", { pauseStartDate: new Date() })
+  ).rejects.toMatchObject({ statusCode: 404 });
+});
+
+it("pauseServicePlan throws 409 when the plan is already paused", async () => {
+  const prisma = makePrisma();
+  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1", status: LifecycleStatus.PAUSED });
+
+  await expect(
+    createCustomerService(prisma).pauseServicePlan("sp1", { pauseStartDate: new Date() })
+  ).rejects.toMatchObject({ statusCode: 409 });
+});
+
+it("pauseServicePlan sets PAUSED + pauseStartDate/pauseEndDate on that specific plan", async () => {
+  const prisma = makePrisma();
+  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1", status: LifecycleStatus.ACTIVE });
+  (prisma.servicePlan.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1", status: LifecycleStatus.PAUSED });
+  const start = new Date("2026-02-01");
+  const end = new Date("2026-03-01");
+
+  await createCustomerService(prisma).pauseServicePlan("sp1", { pauseStartDate: start, pauseEndDate: end });
+
+  expect(prisma.servicePlan.update).toHaveBeenCalledWith({
+    where: { id: "sp1" },
+    data: { status: LifecycleStatus.PAUSED, pauseStartDate: start, pauseEndDate: end },
+  });
+});
+
+it("pauseServicePlan defaults pauseEndDate to null when omitted", async () => {
+  const prisma = makePrisma();
+  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1", status: LifecycleStatus.ACTIVE });
+  (prisma.servicePlan.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1" });
+
+  await createCustomerService(prisma).pauseServicePlan("sp1", { pauseStartDate: new Date("2026-02-01") });
+
+  const call = (prisma.servicePlan.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(call.data.pauseEndDate).toBeNull();
+});
+
+it("resumeServicePlan throws 404 when the plan does not exist", async () => {
+  const prisma = makePrisma();
+  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+
+  await expect(
+    createCustomerService(prisma).resumeServicePlan("missing")
+  ).rejects.toMatchObject({ statusCode: 404 });
+});
+
+it("resumeServicePlan throws 409 when the plan is not paused", async () => {
+  const prisma = makePrisma();
+  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1", status: LifecycleStatus.ACTIVE });
+
+  await expect(
+    createCustomerService(prisma).resumeServicePlan("sp1")
+  ).rejects.toMatchObject({ statusCode: 409 });
+});
+
+it("resumeServicePlan sets ACTIVE and clears the pause window on that specific plan", async () => {
+  const prisma = makePrisma();
+  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1", status: LifecycleStatus.PAUSED });
+  (prisma.servicePlan.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1", status: LifecycleStatus.ACTIVE });
+
+  await createCustomerService(prisma).resumeServicePlan("sp1");
+
+  expect(prisma.servicePlan.update).toHaveBeenCalledWith({
+    where: { id: "sp1" },
+    data: { status: LifecycleStatus.ACTIVE, pauseStartDate: null, pauseEndDate: null },
+  });
 });

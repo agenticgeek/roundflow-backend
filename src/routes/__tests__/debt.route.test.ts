@@ -18,12 +18,14 @@ vi.mock("../../middleware/requireRole", () => ({
 
 const getKpis = vi.fn();
 const getBoard = vi.fn();
+const getBucketCounts = vi.fn();
 const sendReminder = vi.fn();
 const sendPaymentLink = vi.fn();
 const flagBadDebt = vi.fn();
 const flagHold = vi.fn();
+const getInvoiceDetail = vi.fn();
 vi.mock("../../services/debt.service", () => ({
-  createDebtService: vi.fn(() => ({ getKpis, getBoard, sendReminder, sendPaymentLink, flagBadDebt, flagHold })),
+  createDebtService: vi.fn(() => ({ getKpis, getBoard, getBucketCounts, sendReminder, sendPaymentLink, flagBadDebt, flagHold, getInvoiceDetail })),
 }));
 
 vi.mock("../../lib/crypto", () => ({
@@ -42,6 +44,7 @@ vi.mock("../../integrations/ghl/sync", () => ({
 }));
 
 import { debtRouter } from "../debt";
+import { AppError } from "../../lib/app-error";
 
 function makeTenantPrisma() {
   return {
@@ -98,18 +101,38 @@ describe("GET /debt/board", () => {
     expect(res.status).toBe(400);
   });
 
-  it("passes through optional roundId/paymentMethod and paginated results", async () => {
+  it("passes through optional roundId/paymentMethod/search and paginated results", async () => {
     getBoard.mockResolvedValue({ items: [], total: 0 });
-    const res = await request(makeApp()).get("/debt/board?bucket=overdue&roundId=round-1&paymentMethod=STRIPE&page=2&pageSize=10");
+    const res = await request(makeApp()).get("/debt/board?bucket=overdue&roundId=round-1&paymentMethod=STRIPE&page=2&pageSize=10&search=smith");
     expect(res.status).toBe(200);
-    expect(getBoard).toHaveBeenCalledWith("overdue", "round-1", "STRIPE", 2, 10);
+    expect(getBoard).toHaveBeenCalledWith("overdue", "round-1", "STRIPE", 2, 10, "smith");
   });
 
-  it("defaults roundId/paymentMethod to undefined and uses default pagination", async () => {
+  it("defaults roundId/paymentMethod/search to undefined and uses default pagination", async () => {
     getBoard.mockResolvedValue({ items: [], total: 0 });
     const res = await request(makeApp()).get("/debt/board?bucket=overdue");
     expect(res.status).toBe(200);
-    expect(getBoard).toHaveBeenCalledWith("overdue", undefined, undefined, 1, 50);
+    expect(getBoard).toHaveBeenCalledWith("overdue", undefined, undefined, 1, 50, undefined);
+  });
+});
+
+describe("GET /debt/board/counts", () => {
+  it("returns all 7 bucket counts with no filters", async () => {
+    getBucketCounts.mockResolvedValue({
+      BAD_DEBT: 1, ON_HOLD: 2, FAILED_GC: 3, DUE_BEFORE_CLEAN: 4,
+      SEVEN_DAYS_OVER: 5, FOURTEEN_DAYS_OVER: 6, ALL: 7,
+    });
+    const res = await request(makeApp()).get("/debt/board/counts");
+    expect(res.status).toBe(200);
+    expect(res.body.ALL).toBe(7);
+    expect(getBucketCounts).toHaveBeenCalledWith(undefined, undefined, undefined);
+  });
+
+  it("passes through roundId/paymentMethod/search filters", async () => {
+    getBucketCounts.mockResolvedValue({});
+    const res = await request(makeApp()).get("/debt/board/counts?roundId=round-1&paymentMethod=STRIPE&search=smith");
+    expect(res.status).toBe(200);
+    expect(getBucketCounts).toHaveBeenCalledWith("round-1", "STRIPE", "smith");
   });
 });
 
@@ -166,7 +189,7 @@ describe("POST /debt/:id/payment-link", () => {
     const res = await request(makeApp(tp)).post("/debt/inv-1/payment-link").send({ message: "Please pay" });
 
     expect(res.status).toBe(200);
-    expect(sendPaymentLink).toHaveBeenCalledWith("inv-1", "Please pay");
+    expect(sendPaymentLink).toHaveBeenCalledWith("inv-1", "Please pay", { provider: "static" });
     expect(createOneTimeSession).not.toHaveBeenCalled();
   });
 
@@ -179,7 +202,7 @@ describe("POST /debt/:id/payment-link", () => {
     const res = await request(makeApp(tp)).post("/debt/inv-1/payment-link").send({ message: "Please pay" });
 
     expect(res.status).toBe(200);
-    expect(sendPaymentLink).toHaveBeenCalledWith("inv-1", "Please pay");
+    expect(sendPaymentLink).toHaveBeenCalledWith("inv-1", "Please pay", { provider: "static" });
   });
 
   it("falls back to the static link when the invoice is already PAID", async () => {
@@ -191,7 +214,7 @@ describe("POST /debt/:id/payment-link", () => {
     const res = await request(makeApp(tp)).post("/debt/inv-1/payment-link").send({ message: "Please pay" });
 
     expect(res.status).toBe(200);
-    expect(sendPaymentLink).toHaveBeenCalledWith("inv-1", "Please pay");
+    expect(sendPaymentLink).toHaveBeenCalledWith("inv-1", "Please pay", { provider: "static" });
   });
 
   it("falls back to the static link when the invoice is VOID", async () => {
@@ -203,20 +226,25 @@ describe("POST /debt/:id/payment-link", () => {
     const res = await request(makeApp(tp)).post("/debt/inv-1/payment-link").send({ message: "Please pay" });
 
     expect(res.status).toBe(200);
-    expect(sendPaymentLink).toHaveBeenCalledWith("inv-1", "Please pay");
+    expect(sendPaymentLink).toHaveBeenCalledWith("inv-1", "Please pay", { provider: "static" });
   });
 
-  it("reuses an existing PENDING checkout session's url", async () => {
+  it("reuses an existing PENDING checkout session's url and surfaces its provider/expiresAt", async () => {
     const tp = makeTenantPrisma();
+    const expiresAt = new Date("2026-03-01T00:00:00.000Z");
     tp.businessSettings.findFirst.mockResolvedValue({ stripeConnected: true, stripeSecretKeyEncrypted: "enc" });
     tp.invoice.findUnique.mockResolvedValue({ id: "inv-1", status: "DRAFT", customerId: "cust-1", invoiceNumber: "INV-1", amount: 35 });
-    tp.stripeSession.findFirst.mockResolvedValue({ url: "https://checkout.stripe.com/pay/cs_existing" });
-    sendPaymentLink.mockResolvedValue({ id: "msg-1", paymentUrl: "https://checkout.stripe.com/pay/cs_existing" });
+    tp.stripeSession.findFirst.mockResolvedValue({ url: "https://checkout.stripe.com/pay/cs_existing", expiresAt });
+    sendPaymentLink.mockResolvedValue({ id: "msg-1", paymentUrl: "https://checkout.stripe.com/pay/cs_existing", provider: "stripe", expiresAt });
 
     const res = await request(makeApp(tp)).post("/debt/inv-1/payment-link").send({ message: "Please pay" });
 
     expect(res.status).toBe(200);
-    expect(sendPaymentLink).toHaveBeenCalledWith("inv-1", "Please pay", "https://checkout.stripe.com/pay/cs_existing");
+    expect(sendPaymentLink).toHaveBeenCalledWith("inv-1", "Please pay", {
+      overrideUrl: "https://checkout.stripe.com/pay/cs_existing",
+      provider: "stripe",
+      expiresAt,
+    });
     expect(createOneTimeSession).not.toHaveBeenCalled();
   });
 
@@ -241,7 +269,11 @@ describe("POST /debt/:id/payment-link", () => {
       expect.objectContaining({ tenantId: "tenant-1", customerId: "cust-1", invoiceId: "inv-1" })
     );
     expect(tp.stripeSession.create).toHaveBeenCalled();
-    expect(sendPaymentLink).toHaveBeenCalledWith("inv-1", "Please pay", "https://checkout.stripe.com/pay/cs_new_123");
+    expect(sendPaymentLink).toHaveBeenCalledWith("inv-1", "Please pay", {
+      overrideUrl: "https://checkout.stripe.com/pay/cs_new_123",
+      provider: "stripe",
+      expiresAt: null,
+    });
   });
 
   it("falls back to an empty-string frontend URL when FRONTEND_URL is unset", async () => {
@@ -300,10 +332,70 @@ describe("PATCH /debt/:id/hold", () => {
     expect(res.status).toBe(400);
   });
 
-  it("flags hold next clean", async () => {
+  it("flags hold next clean with no extra fields", async () => {
     flagHold.mockResolvedValue({ customerId: "cust-1", holdNextClean: true });
     const res = await request(makeApp()).patch("/debt/inv-1/hold").send({ flag: true });
     expect(res.status).toBe(200);
-    expect(flagHold).toHaveBeenCalledWith("inv-1", true);
+    expect(flagHold).toHaveBeenCalledWith("inv-1", true, {
+      reason: undefined, date: undefined, notify: undefined, message: undefined,
+    });
+  });
+
+  it("400s when reason is not a string", async () => {
+    const res = await request(makeApp()).patch("/debt/inv-1/hold").send({ flag: true, reason: 123 });
+    expect(res.status).toBe(400);
+    expect(flagHold).not.toHaveBeenCalled();
+  });
+
+  it("400s when notify is not a boolean", async () => {
+    const res = await request(makeApp()).patch("/debt/inv-1/hold").send({ flag: true, notify: "yes" });
+    expect(res.status).toBe(400);
+    expect(flagHold).not.toHaveBeenCalled();
+  });
+
+  it("400s when date is not a valid ISO date", async () => {
+    const res = await request(makeApp()).patch("/debt/inv-1/hold").send({ flag: true, date: "not-a-date" });
+    expect(res.status).toBe(400);
+    expect(flagHold).not.toHaveBeenCalled();
+  });
+
+  it("passes reason, date, notify and message through to the service", async () => {
+    flagHold.mockResolvedValue({ customerId: "cust-1", holdNextClean: true, holdReason: "Non-payment", holdSince: new Date() });
+    const res = await request(makeApp()).patch("/debt/inv-1/hold").send({
+      flag: true, reason: "Non-payment", date: "2026-02-01T00:00:00.000Z", notify: true, message: "You're on hold",
+    });
+    expect(res.status).toBe(200);
+    expect(flagHold).toHaveBeenCalledWith("inv-1", true, {
+      reason: "Non-payment",
+      date: new Date("2026-02-01T00:00:00.000Z"),
+      notify: true,
+      message: "You're on hold",
+    });
+  });
+
+  it("clears the hold when flag is false", async () => {
+    flagHold.mockResolvedValue({ customerId: "cust-1", holdNextClean: false, holdReason: null, holdSince: null });
+    const res = await request(makeApp()).patch("/debt/inv-1/hold").send({ flag: false });
+    expect(res.status).toBe(200);
+    expect(flagHold).toHaveBeenCalledWith("inv-1", false, {
+      reason: undefined, date: undefined, notify: undefined, message: undefined,
+    });
+  });
+});
+
+describe("GET /debt/:id", () => {
+  it("returns the invoice detail", async () => {
+    const detail = { invoiceId: "inv-1", customerName: "Jane", phone: "07123456789" };
+    getInvoiceDetail.mockResolvedValue(detail);
+    const res = await request(makeApp()).get("/debt/inv-1");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(detail);
+    expect(getInvoiceDetail).toHaveBeenCalledWith("inv-1");
+  });
+
+  it("404s when the service rejects with AppError(404)", async () => {
+    getInvoiceDetail.mockRejectedValue(new AppError(404, "Invoice not found"));
+    const res = await request(makeApp()).get("/debt/missing");
+    expect(res.status).toBe(404);
   });
 });

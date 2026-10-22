@@ -10,7 +10,7 @@ import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
 import { invalidateCachedBusinessSettings } from "../services/settings.service";
-import { validateWorkingDays, assertPositiveInt, assertNonNegative, requireMessageChannel, optMessageChannel } from "../lib/validation";
+import { validateWorkingDays, assertPositiveInt, assertNonNegative, requireMessageChannel, optMessageChannel, optTechnicianRole } from "../lib/validation";
 import {
   asObject,
   h,
@@ -281,7 +281,7 @@ settingsRouter.post(
     const input: TechnicianCreateInput = {
       name: optString(body.name, "name"),
       phone: optString(body.phone, "phone"),
-      role: optString(body.role, "role"),
+      role: optTechnicianRole(body.role),
       active: optBool(body.active, "active"),
     };
     res.status(201).json(await svc(req).createTechnician(input));
@@ -295,7 +295,7 @@ settingsRouter.patch(
     const input: TechnicianUpdateInput = {
       name: optString(body.name, "name"),
       phone: optString(body.phone, "phone"),
-      role: optString(body.role, "role"),
+      role: optTechnicianRole(body.role),
       active: optBool(body.active, "active"),
     };
     res.json(await svc(req).updateTechnician(req.params.id, input));

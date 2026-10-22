@@ -254,6 +254,8 @@ model Customer {
   paymentMethod                PaymentMethod?
   badDebt       Boolean         @default(false)
   holdNextClean Boolean         @default(false)
+  holdReason    String?
+  holdSince     DateTime?
   properties    Property[]
   invoices      Invoice[]
   payments      Payment[]
@@ -454,6 +456,11 @@ model Complaint {
   severity     Severity        @default(LOW)
   status       ComplaintStatus @default(OPEN)
   revisitDate  DateTime?
+  resolvedAt   DateTime?
+  // References public.Profile.id (control-plane schema) — same cross-schema
+  // pattern as ActivityLog.actorId; no Prisma relation possible here.
+  resolvedBy   String?
+  notes        String?
   messages     Message[]
   photos       Photo[]
   createdAt    DateTime        @default(now())
@@ -720,4 +727,13 @@ model WebhookEvent {
   receivedAt DateTime @default(now()) @db.Timestamptz
 
   @@unique([source, externalId])
+}
+
+// Idempotency dedup for POST /setup/step/9/bulk — a client-supplied key lets
+// a retried request (e.g. after a timeout) detect the import already ran.
+model BulkImportAttempt {
+  id             String   @id @default(cuid())
+  idempotencyKey String   @unique
+  createdCount   Int
+  createdAt      DateTime @default(now()) @db.Timestamptz
 }

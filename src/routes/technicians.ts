@@ -6,7 +6,7 @@ import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
 import { asObject, h, optBool, optId, optReqString, optString } from "../lib/http";
-import { isValidEmail } from "../lib/validation";
+import { isValidEmail, optTechnicianRole } from "../lib/validation";
 import { sendInviteEmail, INVITE_TTL_DAYS } from "../lib/email";
 import {
   createTechnicianService,
@@ -51,7 +51,7 @@ techniciansRouter.post(
 
     const name = optReqString(body.name, "name") ?? null;
     const phone = optString(body.phone, "phone") ?? null;
-    const role = optString(body.role, "role") ?? null;
+    const role = optTechnicianRole(body.role) ?? null;
     const emailRaw = optString(body.email, "email") ?? null;
     const notes = optString(body.notes, "notes") ?? null;
     const serviceAreaId = optId(body.serviceAreaId, "serviceAreaId") ?? null;
@@ -132,7 +132,7 @@ techniciansRouter.patch(
     const input: UpdateTechnicianInput = {
       name: optString(body.name, "name"),
       phone: optString(body.phone, "phone"),
-      role: optString(body.role, "role"),
+      role: optTechnicianRole(body.role),
       notes: optString(body.notes, "notes"),
       active: optBool(body.active, "active"),
       serviceAreaId: optId(body.serviceAreaId, "serviceAreaId"),

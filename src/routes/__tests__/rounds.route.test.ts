@@ -1,4 +1,4 @@
-import { it, expect, vi } from "vitest";
+import { it, expect, vi, describe } from "vitest";
 import request from "supertest";
 import express from "express";
 
@@ -8,6 +8,10 @@ const mockBatchResult = [
 ];
 
 const listOccurrencesForRounds = vi.fn().mockResolvedValue(mockBatchResult);
+const pushMissedJobs = vi.fn();
+const listDayStopsForRounds = vi.fn();
+const generateVisitsNow = vi.fn();
+const getOccurrence = vi.fn();
 
 vi.mock("../../services/round.service", () => ({
   createRoundService: vi.fn(() => ({
@@ -18,10 +22,12 @@ vi.mock("../../services/round.service", () => ({
     updateRound: vi.fn(),
     setTechnicians: vi.fn(),
     listOccurrences: vi.fn(),
-    getOccurrence: vi.fn(),
+    getOccurrence,
     getTodayPanel: vi.fn(),
     reassignTechnician: vi.fn(),
-    pushMissedJobs: vi.fn(),
+    pushMissedJobs,
+    listDayStopsForRounds,
+    generateVisitsNow,
   })),
 }));
 
@@ -165,4 +171,162 @@ it("GET /rounds/:id/planner/occurrences returns 400 for day-of-month 00", async 
   const app = makeApp();
   const res = await request(app).get("/rounds/round-1/planner/occurrences?to=2026-01-00");
   expect(res.status).toBe(400);
+});
+
+// ---------------------------------------------------------------------------
+// GET /rounds/:id/planner/occurrences/:date — single-round day detail
+// ---------------------------------------------------------------------------
+
+describe("GET /rounds/:id/planner/occurrences/:date", () => {
+  it("returns 200 with the occurrence detail (happy path)", async () => {
+    const detail = { roundId: "round-1", roundName: "Alnwick Monday", date: "2026-01-01", stops: [], summary: {} };
+    getOccurrence.mockResolvedValueOnce(detail);
+    const res = await request(makeApp()).get("/rounds/round-1/planner/occurrences/2026-01-01");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(detail);
+    expect(getOccurrence).toHaveBeenCalledWith("round-1", "2026-01-01");
+  });
+
+  it("400s for a nonexistent calendar date (Feb 30) — regression: a regex-only shape check would have let this through", async () => {
+    getOccurrence.mockClear();
+    const res = await request(makeApp()).get("/rounds/round-1/planner/occurrences/2026-02-30");
+    expect(res.status).toBe(400);
+    expect(getOccurrence).not.toHaveBeenCalled();
+  });
+
+  it("400s for day-of-month 00", async () => {
+    const res = await request(makeApp()).get("/rounds/round-1/planner/occurrences/2026-01-00");
+    expect(res.status).toBe(400);
+  });
+
+  it("400s for a malformed date string", async () => {
+    const res = await request(makeApp()).get("/rounds/round-1/planner/occurrences/not-a-date");
+    expect(res.status).toBe(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /rounds/:id/push-missed
+// ---------------------------------------------------------------------------
+
+describe("POST /rounds/:id/push-missed", () => {
+  it("passes the optional message field through to the service", async () => {
+    pushMissedJobs.mockResolvedValueOnce({ pushedCount: 2 });
+    const app = makeApp();
+    const res = await request(app)
+      .post("/rounds/r1/push-missed")
+      .send({ newDate: "2099-01-01", reason: "Weather", notifyCustomers: true, message: "Sorry!" });
+    expect(res.status).toBe(200);
+    expect(pushMissedJobs).toHaveBeenCalledWith(
+      "r1",
+      expect.objectContaining({ reason: "Weather", notifyCustomers: true, message: "Sorry!" })
+    );
+  });
+
+  it("defaults message to undefined when omitted", async () => {
+    pushMissedJobs.mockResolvedValueOnce({ pushedCount: 0 });
+    const app = makeApp();
+    const res = await request(app)
+      .post("/rounds/r1/push-missed")
+      .send({ newDate: "2099-01-01", reason: "Weather" });
+    expect(res.status).toBe(200);
+    expect(pushMissedJobs).toHaveBeenCalledWith(
+      "r1",
+      expect.objectContaining({ message: undefined })
+    );
+  });
+
+  it("400s when newDate is not a YYYY-MM-DD string", async () => {
+    const app = makeApp();
+    const res = await request(app)
+      .post("/rounds/r1/push-missed")
+      .send({ newDate: "01/01/2099", reason: "Weather" });
+    expect(res.status).toBe(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /rounds/planner/occurrences/:date — batched day stops
+// ---------------------------------------------------------------------------
+
+describe("GET /rounds/planner/occurrences/:date", () => {
+  it("returns 200 with per-round stops (happy path)", async () => {
+    const mockDayStops = [{ roundId: "r1", stops: [{ visitId: "v1" }] }, { roundId: "r2", stops: [] }];
+    listDayStopsForRounds.mockResolvedValueOnce(mockDayStops);
+    const app = makeApp();
+    const res = await request(app).get("/rounds/planner/occurrences/2026-01-01?roundIds=r1,r2");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(mockDayStops);
+    expect(listDayStopsForRounds).toHaveBeenCalledWith(["r1", "r2"], "2026-01-01");
+  });
+
+  it("trims whitespace and drops empty entries in roundIds", async () => {
+    listDayStopsForRounds.mockResolvedValueOnce([]);
+    const app = makeApp();
+    await request(app).get("/rounds/planner/occurrences/2026-01-01?roundIds=%20r1%20,,r2");
+    expect(listDayStopsForRounds).toHaveBeenCalledWith(["r1", "r2"], "2026-01-01");
+  });
+
+  it("400s when roundIds is missing", async () => {
+    const app = makeApp();
+    const res = await request(app).get("/rounds/planner/occurrences/2026-01-01");
+    expect(res.status).toBe(400);
+  });
+
+  it("400s when roundIds is blank", async () => {
+    const app = makeApp();
+    const res = await request(app).get("/rounds/planner/occurrences/2026-01-01?roundIds=%20,,");
+    expect(res.status).toBe(400);
+  });
+
+  it("400s when more than 50 roundIds are given", async () => {
+    const app = makeApp();
+    const ids = Array.from({ length: 51 }, (_, i) => `r${i}`).join(",");
+    const res = await request(app).get(`/rounds/planner/occurrences/2026-01-01?roundIds=${ids}`);
+    expect(res.status).toBe(400);
+  });
+
+  it("400s for an invalid date", async () => {
+    listDayStopsForRounds.mockClear();
+    const app = makeApp();
+    const res = await request(app).get("/rounds/planner/occurrences/not-a-date?roundIds=r1");
+    expect(res.status).toBe(400);
+    expect(listDayStopsForRounds).not.toHaveBeenCalled();
+  });
+
+  it("400s for a nonexistent calendar date (Feb 30)", async () => {
+    const app = makeApp();
+    const res = await request(app).get("/rounds/planner/occurrences/2026-02-30?roundIds=r1");
+    expect(res.status).toBe(400);
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// POST /rounds/:id/generate-visits
+// ---------------------------------------------------------------------------
+
+describe("POST /rounds/:id/generate-visits", () => {
+  it("returns 200 with the visitsGenerated count", async () => {
+    generateVisitsNow.mockResolvedValueOnce({ visitsGenerated: 3 });
+    const app = makeApp();
+    const res = await request(app).post("/rounds/r1/generate-visits");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ visitsGenerated: 3 });
+    expect(generateVisitsNow).toHaveBeenCalledWith("r1");
+  });
+
+  it("404s when the service rejects with AppError(404)", async () => {
+    generateVisitsNow.mockRejectedValueOnce(new AppError(404, "Round not found"));
+    const app = makeApp();
+    const res = await request(app).post("/rounds/missing/generate-visits");
+    expect(res.status).toBe(404);
+  });
+
+  it("400s when the service rejects because the round is not ACTIVE", async () => {
+    generateVisitsNow.mockRejectedValueOnce(new AppError(400, "Round must be ACTIVE to generate visits"));
+    const app = makeApp();
+    const res = await request(app).post("/rounds/r1/generate-visits");
+    expect(res.status).toBe(400);
+  });
 });

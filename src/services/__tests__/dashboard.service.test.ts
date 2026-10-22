@@ -210,6 +210,37 @@ it("getChartData: month labels align correctly across a year boundary (Nov-Apr w
   vi.useRealTimers();
 });
 
+it("getChartData: no technicianIds omits the technicianId filter from both queries", async () => {
+  const prisma = makePrisma();
+  (prisma.visit.groupBy as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (prisma.issue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  await createDashboardService(prisma).getChartData("6m");
+  const groupByCall = (prisma.visit.groupBy as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  const findManyCall = (prisma.issue.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(groupByCall.where.technicianId).toBeUndefined();
+  expect(findManyCall.where.visit.technicianId).toBeUndefined();
+});
+
+it("getChartData: an empty technicianIds array omits the technicianId filter", async () => {
+  const prisma = makePrisma();
+  (prisma.visit.groupBy as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (prisma.issue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  await createDashboardService(prisma).getChartData("6m", []);
+  const groupByCall = (prisma.visit.groupBy as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(groupByCall.where.technicianId).toBeUndefined();
+});
+
+it("getChartData: technicianIds filters both the revenue groupBy and the issue findMany", async () => {
+  const prisma = makePrisma();
+  (prisma.visit.groupBy as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (prisma.issue.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  await createDashboardService(prisma).getChartData("6m", ["t1", "t2"]);
+  const groupByCall = (prisma.visit.groupBy as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  const findManyCall = (prisma.issue.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(groupByCall.where.technicianId).toEqual({ in: ["t1", "t2"] });
+  expect(findManyCall.where.visit.technicianId).toEqual({ in: ["t1", "t2"] });
+});
+
 it("getChartData: 12m range returns 12 months", async () => {
   const prisma = makePrisma();
   (prisma.visit.groupBy as ReturnType<typeof vi.fn>).mockResolvedValue([]);

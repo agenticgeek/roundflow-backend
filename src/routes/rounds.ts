@@ -93,6 +93,36 @@ roundsRouter.get(
 );
 
 // ==========================================================================
+// GET /rounds/planner/occurrences/:date — batched day stops (List/Map view)
+//   across multiple rounds in one call: ?roundIds=a,b,c
+//   Registered before "/:id" so this two-segment literal path ("planner")
+//   can't be shadowed by the ":id" param route.
+// ==========================================================================
+roundsRouter.get(
+  "/planner/occurrences/:date",
+  h(async (req, res) => {
+    const rawRoundIds = req.query.roundIds;
+    if (typeof rawRoundIds !== "string" || rawRoundIds.trim() === "") {
+      throw new AppError(400, '"roundIds" is required and must be a comma-separated list of round IDs');
+    }
+    const roundIds = rawRoundIds
+      .split(",")
+      .map((id) => id.trim())
+      .filter((id) => id.length > 0);
+    if (roundIds.length === 0) {
+      throw new AppError(400, '"roundIds" is required and must be a comma-separated list of round IDs');
+    }
+    if (roundIds.length > 50) {
+      throw new AppError(400, '"roundIds" must not contain more than 50 round IDs');
+    }
+
+    parseOptionalDateOnly(req.params.date, "date");
+
+    res.json(await svc(req).listDayStopsForRounds(roundIds, req.params.date));
+  })
+);
+
+// ==========================================================================
 // GET /rounds/:id — round detail with technicians and property count
 // ==========================================================================
 roundsRouter.get(
@@ -148,11 +178,12 @@ roundsRouter.get(
 roundsRouter.get(
   "/:id/planner/occurrences/:date",
   h(async (req, res) => {
-    const { date } = req.params;
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-      throw new AppError(400, '"date" must be a valid YYYY-MM-DD date');
-    }
-    res.json(await svc(req).getOccurrence(req.params.id, date));
+    // A regex-only shape check would accept a syntactically well-formed but
+    // nonexistent calendar date (e.g. 2026-02-30) — new Date(...) silently
+    // rolls it over instead of throwing. parseOptionalDateOnly round-trips
+    // the parsed parts to catch that (see its own doc comment).
+    parseOptionalDateOnly(req.params.date, "date");
+    res.json(await svc(req).getOccurrence(req.params.id, req.params.date));
   })
 );
 
@@ -238,11 +269,30 @@ roundsRouter.post(
       reason: requireString(body.reason, "reason"),
       technicianId: optId(body.technicianId, "technicianId"),
       notifyCustomers: optBool(body.notifyCustomers, "notifyCustomers") ?? false,
+      message: optString(body.message, "message"),
     };
     const result = await svc(req).pushMissedJobs(req.params.id, input);
     void createReportsService(req.tenantPrisma!).logActivity(
       "VISITS_PUSHED",
       `Visits pushed to ${input.newDate.toISOString().slice(0, 10)} in round: ${req.params.id}`,
+      req.profile?.id,
+      req.profile?.role ?? undefined,
+    );
+    res.json(result);
+  })
+);
+
+// ==========================================================================
+// POST /rounds/:id/generate-visits — generate due visits for this round now,
+//   instead of waiting for the next nightly runVisitGeneration() cron run.
+// ==========================================================================
+roundsRouter.post(
+  "/:id/generate-visits",
+  h(async (req, res) => {
+    const result = await svc(req).generateVisitsNow(req.params.id);
+    void createReportsService(req.tenantPrisma!).logActivity(
+      "VISITS_GENERATED",
+      `Generated ${result.visitsGenerated} visit(s) for round: ${req.params.id}`,
       req.profile?.id,
       req.profile?.role ?? undefined,
     );

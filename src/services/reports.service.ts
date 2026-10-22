@@ -1,6 +1,19 @@
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
+import { prisma as publicPrisma } from "../lib/prisma";
 
 type Period = "today" | "last7" | "last30";
+
+export interface Pagination {
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+}
+
+export interface PaginatedResult<T> {
+  rows: T[];
+  pagination: Pagination;
+}
 
 function periodRange(period: Period): { gte: Date; lte: Date } {
   const now = new Date();
@@ -12,28 +25,184 @@ function periodRange(period: Period): { gte: Date; lte: Date } {
   return { gte, lte };
 }
 
+function paginate(page: number | undefined, pageSize: number | undefined): { pageNum: number; pageSizeNum: number; skip: number } {
+  const pageNum = Math.max(1, page ?? 1);
+  const pageSizeNum = Math.min(100, Math.max(1, pageSize ?? 50));
+  return { pageNum, pageSizeNum, skip: (pageNum - 1) * pageSizeNum };
+}
+
+function toPagination(pageNum: number, pageSizeNum: number, total: number): Pagination {
+  return { page: pageNum, pageSize: pageSizeNum, total, totalPages: Math.ceil(total / pageSizeNum) };
+}
+
+export interface TechnicianReportRow {
+  technicianId: string;
+  name: string | null;
+  email: string | null;
+  completed: number;
+  skipped: number;
+  efficiency: number;
+  revenueImpact: number;
+}
+
+// Shared by getTechnicians (paginated) and getTechniciansExport (full set) —
+// builds the complete, deterministically-ordered technician row list for the
+// period; callers decide whether to slice it.
+async function buildTechnicianRows(prisma: TenantPrismaClient, period: Period): Promise<TechnicianReportRow[]> {
+  const range = periodRange(period);
+  // One grouped row per (technicianId, status) combination within the period,
+  // with counts/sum computed in SQL instead of a full-row findMany + JS reduce.
+  const groups = await prisma.visit.groupBy({
+    by: ["technicianId", "status"],
+    where: { date: range, technicianId: { not: null } },
+    _count: true,
+    _sum: { price: true },
+  });
+
+  const technicianIds = Array.from(
+    new Set(
+      (groups as Array<{ technicianId: string | null }>)
+        .map((g) => g.technicianId)
+        .filter((id): id is string => !!id)
+    )
+  );
+  const technicians = technicianIds.length > 0
+    ? await prisma.technician.findMany({
+        where: { id: { in: technicianIds } },
+        select: { id: true, name: true, email: true },
+      })
+    : [];
+  const techInfo = new Map(technicians.map((t) => [t.id, t]));
+
+  const map = new Map<string, { name: string | null; email: string | null; completed: number; skipped: number; revenue: number }>();
+  for (const g of groups as Array<{
+    technicianId: string | null;
+    status: string;
+    _count: number;
+    _sum: { price: { toNumber(): number } | null };
+  }>) {
+    if (!g.technicianId) continue;
+    const info = techInfo.get(g.technicianId);
+    const existing = map.get(g.technicianId) ?? {
+      name: info?.name ?? null,
+      email: info?.email ?? null,
+      completed: 0,
+      skipped: 0,
+      revenue: 0,
+    };
+    if (g.status === "COMPLETED") {
+      existing.completed += g._count;
+      existing.revenue += g._sum.price?.toNumber() ?? 0;
+    }
+    if (g.status === "SKIPPED") existing.skipped += g._count;
+    map.set(g.technicianId, existing);
+  }
+  return Array.from(map.entries())
+    .map(([id, s]) => ({
+      technicianId: id,
+      name: s.name,
+      email: s.email,
+      completed: s.completed,
+      skipped: s.skipped,
+      efficiency: s.completed + s.skipped > 0 ? Math.round((s.completed / (s.completed + s.skipped)) * 100) : 0,
+      revenueImpact: s.revenue,
+    }))
+    // Deterministic order so pagination is stable across pages (the
+    // source Map's insertion order depends on groupBy's row order).
+    .sort((a, b) => (a.name ?? "").localeCompare(b.name ?? "") || a.technicianId.localeCompare(b.technicianId));
+}
+
 export function createReportsService(prisma: TenantPrismaClient) {
   return {
     logActivity: async (type: string, message: string, actorId?: string, actorRole?: string) => {
       await prisma.activityLog.create({ data: { type, message, actorId: actorId ?? null, actorRole: actorRole ?? null } });
     },
-    getActivity: async (type?: string) => {
+    getActivity: async (
+      type?: string,
+      from?: Date,
+      to?: Date,
+      page?: number,
+      pageSize?: number
+    ): Promise<PaginatedResult<{ id: string; type: string; message: string; actorRole: string | null; actorName: string | null; createdAt: Date }>> => {
+      const { pageNum, pageSizeNum, skip } = paginate(page, pageSize);
       const where: Record<string, unknown> = {};
       if (type) where.type = type;
-      const logs = await prisma.activityLog.findMany({
-        where,
-        orderBy: { createdAt: "desc" },
-        take: 100,
-      });
-      return logs.map((l) => ({
-        id: l.id,
-        type: l.type,
-        message: l.message,
-        actorRole: l.actorRole ?? null,
-        createdAt: l.createdAt,
-      }));
+      if (from || to) {
+        where.createdAt = { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) };
+      }
+      const [total, logs] = await Promise.all([
+        prisma.activityLog.count({ where }),
+        prisma.activityLog.findMany({
+          where,
+          orderBy: { createdAt: "desc" },
+          take: pageSizeNum,
+          skip,
+        }),
+      ]);
+
+      // ActivityLog.actorId references Profile.id in the control-plane
+      // (public) schema, not this tenant schema — resolved with a second,
+      // cross-schema lookup rather than a Prisma relation/include.
+      const actorIds = [...new Set(logs.map((l) => l.actorId).filter((id): id is string => !!id))];
+      const actors = actorIds.length > 0
+        ? await publicPrisma.profile.findMany({ where: { id: { in: actorIds } }, select: { id: true, name: true } })
+        : [];
+      const actorNameMap = new Map(actors.map((a) => [a.id, a.name]));
+
+      return {
+        rows: logs.map((l) => ({
+          id: l.id,
+          type: l.type,
+          message: l.message,
+          actorRole: l.actorRole ?? null,
+          actorName: l.actorId ? actorNameMap.get(l.actorId) ?? null : null,
+          createdAt: l.createdAt,
+        })),
+        pagination: toPagination(pageNum, pageSizeNum, total),
+      };
     },
-    getVisits: async (period: string, status?: string) => {
+    getVisits: async (
+      period: string,
+      status?: string,
+      page?: number,
+      pageSize?: number
+    ): Promise<PaginatedResult<{ visitId: string; date: Date; property: string; postcode: string | null; round: string | null; technician: string | null; status: string; amount: number }>> => {
+      const { pageNum, pageSizeNum, skip } = paginate(page, pageSize);
+      const range = periodRange(period as Period);
+      const where: Record<string, unknown> = { date: range };
+      if (status) where.status = status;
+      const [total, visits] = await Promise.all([
+        prisma.visit.count({ where }),
+        prisma.visit.findMany({
+          where,
+          select: {
+            id: true, date: true, status: true, price: true,
+            property: { select: { addressLine: true, postcode: true } },
+            round: { select: { name: true } },
+            technician: { select: { name: true } },
+          },
+          orderBy: { date: "desc" },
+          take: pageSizeNum,
+          skip,
+        }),
+      ]);
+      return {
+        rows: visits.map((v) => ({
+          visitId: v.id,
+          date: v.date,
+          property: v.property?.addressLine ?? "",
+          postcode: v.property?.postcode ?? null,
+          round: v.round?.name ?? null,
+          technician: v.technician?.name ?? null,
+          status: v.status,
+          amount: v.price.toNumber(),
+        })),
+        pagination: toPagination(pageNum, pageSizeNum, total),
+      };
+    },
+    // Full (unpaginated) visit rows for the period — used by CSV export,
+    // which must export everything, not just the UI's current page.
+    getVisitsExport: async (period: string, status?: string) => {
       const range = periodRange(period as Period);
       const where: Record<string, unknown> = { date: range };
       if (status) where.status = status;
@@ -58,65 +227,16 @@ export function createReportsService(prisma: TenantPrismaClient) {
         amount: v.price.toNumber(),
       }));
     },
-    getTechnicians: async (period: string) => {
-      const range = periodRange(period as Period);
-      // One grouped row per (technicianId, status) combination within the period,
-      // with counts/sum computed in SQL instead of a full-row findMany + JS reduce.
-      const groups = await prisma.visit.groupBy({
-        by: ["technicianId", "status"],
-        where: { date: range, technicianId: { not: null } },
-        _count: true,
-        _sum: { price: true },
-      });
-
-      const technicianIds = Array.from(
-        new Set(
-          (groups as Array<{ technicianId: string | null }>)
-            .map((g) => g.technicianId)
-            .filter((id): id is string => !!id)
-        )
-      );
-      const technicians = technicianIds.length > 0
-        ? await prisma.technician.findMany({
-            where: { id: { in: technicianIds } },
-            select: { id: true, name: true, email: true },
-          })
-        : [];
-      const techInfo = new Map(technicians.map((t) => [t.id, t]));
-
-      const map = new Map<string, { name: string | null; email: string | null; completed: number; skipped: number; revenue: number }>();
-      for (const g of groups as Array<{
-        technicianId: string | null;
-        status: string;
-        _count: number;
-        _sum: { price: { toNumber(): number } | null };
-      }>) {
-        if (!g.technicianId) continue;
-        const info = techInfo.get(g.technicianId);
-        const existing = map.get(g.technicianId) ?? {
-          name: info?.name ?? null,
-          email: info?.email ?? null,
-          completed: 0,
-          skipped: 0,
-          revenue: 0,
-        };
-        if (g.status === "COMPLETED") {
-          existing.completed += g._count;
-          existing.revenue += g._sum.price?.toNumber() ?? 0;
-        }
-        if (g.status === "SKIPPED") existing.skipped += g._count;
-        map.set(g.technicianId, existing);
-      }
-      return Array.from(map.entries()).map(([id, s]) => ({
-        technicianId: id,
-        name: s.name,
-        email: s.email,
-        completed: s.completed,
-        skipped: s.skipped,
-        efficiency: s.completed + s.skipped > 0 ? Math.round((s.completed / (s.completed + s.skipped)) * 100) : 0,
-        revenueImpact: s.revenue,
-      }));
+    getTechnicians: async (period: string, page?: number, pageSize?: number) => {
+      const rows = await buildTechnicianRows(prisma, period as Period);
+      const { pageNum, pageSizeNum, skip } = paginate(page, pageSize);
+      return {
+        rows: rows.slice(skip, skip + pageSizeNum),
+        pagination: toPagination(pageNum, pageSizeNum, rows.length),
+      };
     },
+    // Full (unpaginated) technician rows for the period — used by CSV export.
+    getTechniciansExport: async (period: string) => buildTechnicianRows(prisma, period as Period),
     getRevenue: async (period: string) => {
       const range = periodRange(period as Period);
       // Daily-granularity grouping requires date truncation, which Prisma's groupBy

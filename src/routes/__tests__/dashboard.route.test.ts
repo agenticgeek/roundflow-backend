@@ -149,6 +149,60 @@ it("GET /dashboard/charts returns 200 with parallel month arrays", async () => {
   expect(res.body.revenuePerHour).toBeNull();
 });
 
+it("GET /dashboard/charts with no technicianIds calls the service with undefined", async () => {
+  const app = makeApp();
+  const getChartData = vi.fn().mockResolvedValue(mockChartData);
+  const svcModule = await import("../../services/dashboard.service.js");
+  (svcModule.createDashboardService as ReturnType<typeof vi.fn>).mockReturnValueOnce({
+    getKpis: vi.fn(),
+    getAlerts: vi.fn(),
+    getTodaysRounds: vi.fn(),
+    getTechnicianKpis: vi.fn(),
+    getChartData,
+  });
+  await request(app).get("/dashboard/charts?range=6m");
+  expect(getChartData).toHaveBeenCalledWith("6m", undefined);
+});
+
+it("GET /dashboard/charts?technicianIds=a,b,c parses a comma-separated filter and trims whitespace", async () => {
+  const app = makeApp();
+  const getChartData = vi.fn().mockResolvedValue(mockChartData);
+  const svcModule = await import("../../services/dashboard.service.js");
+  (svcModule.createDashboardService as ReturnType<typeof vi.fn>).mockReturnValueOnce({
+    getKpis: vi.fn(),
+    getAlerts: vi.fn(),
+    getTodaysRounds: vi.fn(),
+    getTechnicianKpis: vi.fn(),
+    getChartData,
+  });
+  await request(app).get("/dashboard/charts?range=12m&technicianIds=a,%20b,c");
+  expect(getChartData).toHaveBeenCalledWith("12m", ["a", "b", "c"]);
+});
+
+it("GET /dashboard/technician-kpis defaults period to monthly for any value other than 'yearly'", async () => {
+  const app = makeApp();
+  const getTechnicianKpis = vi.fn().mockResolvedValue(mockTechnicianKpis);
+  const svcModule = await import("../../services/dashboard.service.js");
+  (svcModule.createDashboardService as ReturnType<typeof vi.fn>).mockReturnValueOnce({
+    getKpis: vi.fn(), getAlerts: vi.fn(), getTodaysRounds: vi.fn(), getChartData: vi.fn(),
+    getTechnicianKpis,
+  });
+  await request(app).get("/dashboard/technician-kpis");
+  expect(getTechnicianKpis).toHaveBeenCalledWith("monthly");
+});
+
+it("GET /dashboard/technician-kpis?period=yearly passes 'yearly' through", async () => {
+  const app = makeApp();
+  const getTechnicianKpis = vi.fn().mockResolvedValue(mockTechnicianKpis);
+  const svcModule = await import("../../services/dashboard.service.js");
+  (svcModule.createDashboardService as ReturnType<typeof vi.fn>).mockReturnValueOnce({
+    getKpis: vi.fn(), getAlerts: vi.fn(), getTodaysRounds: vi.fn(), getChartData: vi.fn(),
+    getTechnicianKpis,
+  });
+  await request(app).get("/dashboard/technician-kpis?period=yearly");
+  expect(getTechnicianKpis).toHaveBeenCalledWith("yearly");
+});
+
 it("GET /dashboard/technician-kpis returns 200 with per-technician rows", async () => {
   const app = makeApp();
   const res = await request(app).get("/dashboard/technician-kpis?period=monthly");

@@ -7,6 +7,7 @@ function makePrisma() {
       create: vi.fn(),
       findUnique: vi.fn(),
       findMany: vi.fn(),
+      count: vi.fn().mockResolvedValue(0),
       update: vi.fn(),
     },
     customer: { findUnique: vi.fn() },
@@ -22,7 +23,7 @@ const baseComplaint = {
   customerId: "c1", propertyId: null, technicianId: null,
   revisitDate: null, createdAt: new Date(),
   customer: { id: "c1", name: "Jane Doe" },
-  property: null, technician: null,
+  property: null, technician: null, _count: { messages: 0 },
 };
 
 it("createComplaintService returns an object", () => {
@@ -38,7 +39,7 @@ it("logComplaint sets status OPEN by default", async () => {
     customerId: "c1", propertyId: null, technicianId: null,
     revisitDate: null, createdAt: new Date(),
     customer: { id: "c1", name: "Jane Doe" },
-    property: null, technician: null,
+    property: null, technician: null, _count: { messages: 0 },
   });
 
   await createComplaintService(prisma).logComplaint({
@@ -90,6 +91,50 @@ it("logComplaint throws 404 when technicianId does not exist", async () => {
   ).rejects.toMatchObject({ statusCode: 404 });
 });
 
+it("logComplaint succeeds when propertyId is given and the property exists", async () => {
+  const prisma = makePrisma();
+  (prisma.customer.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1" });
+  (prisma.property.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "p1" });
+  (prisma.complaint.create as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: "cmp1", status: "OPEN", severity: "LOW",
+    title: "Missed clean", description: null, issueType: null,
+    customerId: "c1", propertyId: "p1", technicianId: null,
+    revisitDate: null, createdAt: new Date(),
+    customer: { id: "c1", name: "Jane Doe" },
+    property: null, technician: null, _count: { messages: 0 },
+  });
+
+  const result = await createComplaintService(prisma).logComplaint({
+    customerId: "c1",
+    title: "Missed clean",
+    propertyId: "p1",
+  });
+
+  expect(result.propertyId).toBe("p1");
+});
+
+it("logComplaint succeeds when technicianId is given and the technician has accepted their invite", async () => {
+  const prisma = makePrisma();
+  (prisma.customer.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1" });
+  (prisma.technician.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "t1", profileId: "prof-1" });
+  (prisma.complaint.create as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: "cmp1", status: "OPEN", severity: "LOW",
+    title: "Missed clean", description: null, issueType: null,
+    customerId: "c1", propertyId: null, technicianId: "t1",
+    revisitDate: null, createdAt: new Date(),
+    customer: { id: "c1", name: "Jane Doe" },
+    property: null, technician: null, _count: { messages: 0 },
+  });
+
+  const result = await createComplaintService(prisma).logComplaint({
+    customerId: "c1",
+    title: "Missed clean",
+    technicianId: "t1",
+  });
+
+  expect(result.technicianId).toBe("t1");
+});
+
 it("logComplaint throws 400 when technician has not accepted their invite", async () => {
   const prisma = makePrisma();
   (prisma.customer.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1" });
@@ -115,7 +160,7 @@ it("logComplaint sets severity from input", async () => {
     customerId: "c1", propertyId: null, technicianId: null,
     revisitDate: null, createdAt: new Date(),
     customer: { id: "c1", name: "Jane Doe" },
-    property: null, technician: null,
+    property: null, technician: null, _count: { messages: 0 },
   });
 
   await createComplaintService(prisma).logComplaint({
@@ -146,7 +191,7 @@ it("markInReview sets status IN_REVIEW", async () => {
     customerId: "c1", propertyId: null, technicianId: null,
     revisitDate: null, createdAt: new Date(),
     customer: { id: "c1", name: "Jane Doe" },
-    property: null, technician: null,
+    property: null, technician: null, _count: { messages: 0 },
   });
 
   await createComplaintService(prisma).markInReview("cmp1");
@@ -173,13 +218,38 @@ it("resolve sets status RESOLVED", async () => {
     customerId: "c1", propertyId: null, technicianId: null,
     revisitDate: null, createdAt: new Date(),
     customer: { id: "c1", name: "Jane Doe" },
-    property: null, technician: null,
+    property: null, technician: null, _count: { messages: 0 },
   });
 
   await createComplaintService(prisma).resolve("cmp1");
 
   const args = (prisma.complaint.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
   expect(args.data.status).toBe("RESOLVED");
+});
+
+it("resolve defaults resolvedBy/notes to null and stamps resolvedAt when no options are given", async () => {
+  const prisma = makePrisma();
+  (prisma.complaint.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "cmp1" });
+  (prisma.complaint.update as ReturnType<typeof vi.fn>).mockResolvedValue(baseComplaint);
+
+  await createComplaintService(prisma).resolve("cmp1");
+
+  const args = (prisma.complaint.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(args.data.resolvedBy).toBeNull();
+  expect(args.data.notes).toBeNull();
+  expect(args.data.resolvedAt).toBeInstanceOf(Date);
+});
+
+it("resolve persists the given notes and resolvedBy", async () => {
+  const prisma = makePrisma();
+  (prisma.complaint.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "cmp1" });
+  (prisma.complaint.update as ReturnType<typeof vi.fn>).mockResolvedValue(baseComplaint);
+
+  await createComplaintService(prisma).resolve("cmp1", { notes: "Revisited and fixed", resolvedBy: "profile-1" });
+
+  const args = (prisma.complaint.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(args.data.notes).toBe("Revisited and fixed");
+  expect(args.data.resolvedBy).toBe("profile-1");
 });
 
 it("scheduleRevisit throws 404 when complaint does not exist", async () => {
@@ -209,7 +279,7 @@ it("scheduleRevisit sets status REVISIT_BOOKED and revisitDate", async () => {
     customerId: "c1", propertyId: null, technicianId: null,
     revisitDate: new Date("2026-09-10T00:00:00.000Z"), createdAt: new Date(),
     customer: { id: "c1", name: "Jane Doe" },
-    property: null, technician: null,
+    property: null, technician: null, _count: { messages: 0 },
   });
 
   await createComplaintService(prisma).scheduleRevisit("cmp1", "2026-09-10");
@@ -237,13 +307,25 @@ it("reopen sets status OPEN", async () => {
     customerId: "c1", propertyId: null, technicianId: null,
     revisitDate: null, createdAt: new Date(),
     customer: { id: "c1", name: "Jane Doe" },
-    property: null, technician: null,
+    property: null, technician: null, _count: { messages: 0 },
   });
 
   await createComplaintService(prisma).reopen("cmp1");
 
   const args = (prisma.complaint.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
   expect(args.data.status).toBe("OPEN");
+});
+
+it("reopen clears resolvedAt and resolvedBy", async () => {
+  const prisma = makePrisma();
+  (prisma.complaint.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "cmp1" });
+  (prisma.complaint.update as ReturnType<typeof vi.fn>).mockResolvedValue(baseComplaint);
+
+  await createComplaintService(prisma).reopen("cmp1");
+
+  const args = (prisma.complaint.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(args.data.resolvedAt).toBeNull();
+  expect(args.data.resolvedBy).toBeNull();
 });
 
 it("assignTechnician throws 404 when complaint does not exist", async () => {
@@ -285,7 +367,7 @@ it("assignTechnician sets technicianId on the complaint", async () => {
     customerId: "c1", propertyId: null, technicianId: "t1",
     revisitDate: null, createdAt: new Date(),
     customer: { id: "c1", name: "Jane Doe" },
-    property: null, technician: { id: "t1", name: "James" },
+    property: null, technician: { id: "t1", name: "James" }, _count: { messages: 0 },
   });
 
   await createComplaintService(prisma).assignTechnician("cmp1", "t1");
@@ -297,12 +379,51 @@ it("assignTechnician sets technicianId on the complaint", async () => {
 
 // ── listComplaints ──────────────────────────────────────────────────────────
 
-it("listComplaints returns an array", async () => {
+it("listComplaints returns a paginated rows array", async () => {
   const prisma = makePrisma();
   (prisma.complaint.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
 
   const result = await createComplaintService(prisma).listComplaints({});
-  expect(Array.isArray(result)).toBe(true);
+  expect(Array.isArray(result.rows)).toBe(true);
+  expect(result.pagination).toEqual({ page: 1, pageSize: 50, total: 0, totalPages: 0 });
+});
+
+it("listComplaints threads page/pageSize into take/skip and returns matching pagination metadata", async () => {
+  const prisma = makePrisma();
+  (prisma.complaint.count as ReturnType<typeof vi.fn>).mockResolvedValue(120);
+  (prisma.complaint.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+  const result = await createComplaintService(prisma).listComplaints({ page: 3, pageSize: 20 });
+
+  const args = (prisma.complaint.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(args.take).toBe(20);
+  expect(args.skip).toBe(40);
+  expect(result.pagination).toEqual({ page: 3, pageSize: 20, total: 120, totalPages: 6 });
+});
+
+it("listComplaints maps each returned row through toDetail", async () => {
+  const prisma = makePrisma();
+  (prisma.complaint.count as ReturnType<typeof vi.fn>).mockResolvedValue(1);
+  (prisma.complaint.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([baseComplaint]);
+
+  const result = await createComplaintService(prisma).listComplaints({});
+
+  expect(result.rows).toHaveLength(1);
+  expect(result.rows[0].id).toBe("cmp1");
+  expect(result.rows[0].customerName).toBe("Jane Doe");
+});
+
+it("listComplaints clamps pageSize to a max of 100 and page to a min of 1", async () => {
+  const prisma = makePrisma();
+  (prisma.complaint.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+  const result = await createComplaintService(prisma).listComplaints({ page: 0, pageSize: 500 });
+
+  const args = (prisma.complaint.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(args.take).toBe(100);
+  expect(args.skip).toBe(0);
+  expect(result.pagination.page).toBe(1);
+  expect(result.pagination.pageSize).toBe(100);
 });
 
 it("listComplaints passes status filter to prisma", async () => {
@@ -352,6 +473,48 @@ it("getComplaint returns the complaint", async () => {
 
   const result = await createComplaintService(prisma).getComplaint("cmp1");
   expect(result.id).toBe("cmp1");
+});
+
+it("getComplaint maps technicianName, propertyAddress, messageCount, resolvedAt/resolvedBy and notes", async () => {
+  const prisma = makePrisma();
+  (prisma.complaint.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: "cmp1", status: "RESOLVED", severity: "LOW",
+    title: "Missed clean", description: null, issueType: null,
+    customerId: "c1", propertyId: "p1", technicianId: "t1",
+    revisitDate: null, createdAt: new Date(),
+    customer: { id: "c1", name: "Jane Doe" },
+    property: { id: "p1", addressLine: "12 Market Street" },
+    technician: { id: "t1", name: "James Smith" },
+    _count: { messages: 3 },
+    resolvedAt: new Date("2026-02-01T00:00:00.000Z"),
+    resolvedBy: "profile-1",
+    notes: "Revisited and fixed",
+  });
+
+  const result = await createComplaintService(prisma).getComplaint("cmp1");
+
+  expect(result).toMatchObject({
+    technicianName: "James Smith",
+    propertyAddress: "12 Market Street",
+    messageCount: 3,
+    resolvedAt: "2026-02-01T00:00:00.000Z",
+    resolvedBy: "profile-1",
+    notes: "Revisited and fixed",
+  });
+});
+
+it("getComplaint defaults technicianName/propertyAddress/resolvedAt to null when unset", async () => {
+  const prisma = makePrisma();
+  (prisma.complaint.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(baseComplaint);
+
+  const result = await createComplaintService(prisma).getComplaint("cmp1");
+
+  expect(result.technicianName).toBeNull();
+  expect(result.propertyAddress).toBeNull();
+  expect(result.resolvedAt).toBeNull();
+  expect(result.resolvedBy).toBeNull();
+  expect(result.notes).toBeNull();
+  expect(result.messageCount).toBe(0);
 });
 
 // ── getMessages ─────────────────────────────────────────────────────────────
