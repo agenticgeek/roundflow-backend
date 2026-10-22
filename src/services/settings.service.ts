@@ -10,6 +10,8 @@ import type {
 import { Prisma as TenantPrisma } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
+import { deriveAppStatus, techInclude, mapServiceAreas } from "./technician.service";
+import type { TechnicianServiceAreaRow } from "./technician.service";
 
 // This is the post-completion editing surface for the same data the Setup
 // Wizard seeds (see docs/SETTINGS_API_DESIGN.md). Separate from SetupService:
@@ -104,6 +106,7 @@ export type AppStatus = "PENDING_INVITE" | "ACTIVE" | "INACTIVE";
 export interface TechnicianWithDisplayName extends Technician {
   displayName: string | null;
   appStatus: AppStatus;
+  serviceAreas: TechnicianServiceAreaRow[];
 }
 
 export interface MessageTemplateInput {
@@ -453,6 +456,7 @@ class SettingsService {
 
   async getTechnicians(): Promise<TechnicianWithDisplayName[]> {
     const techs = await this.prisma.technician.findMany({
+      include: techInclude,
       orderBy: { createdAt: "asc" },
     });
     return techs.map((t) => ({
@@ -460,20 +464,16 @@ class SettingsService {
       // Profile.name resolution is deferred until per-request tenant client is
       // wired (cross-schema lookup required). Use admin label for now.
       displayName: t.name ?? null,
-      appStatus:
-        t.profileId === null
-          ? "PENDING_INVITE"
-          : t.active
-            ? "ACTIVE"
-            : "INACTIVE",
+      appStatus: deriveAppStatus(t.active, t.profileId),
+      serviceAreas: mapServiceAreas(t),
     }));
   }
 
   async createTechnician(
     input: TechnicianCreateInput
-  ): Promise<Technician> {
+  ): Promise<TechnicianWithDisplayName> {
     // Single invite-pending create (profileId = null) — not the wizard's bulk replace.
-    return this.prisma.technician.create({
+    const tech = await this.prisma.technician.create({
       data: {
         profileId: null,
         name: input.name ?? null,
@@ -481,16 +481,23 @@ class SettingsService {
         role: input.role ?? null,
         active: input.active ?? true,
       },
+      include: techInclude,
     });
+    return {
+      ...tech,
+      displayName: tech.name ?? null,
+      appStatus: deriveAppStatus(tech.active, tech.profileId),
+      serviceAreas: mapServiceAreas(tech),
+    };
   }
 
   async updateTechnician(
     id: string,
     input: TechnicianUpdateInput
-  ): Promise<Technician> {
+  ): Promise<TechnicianWithDisplayName> {
     const existing = await this.prisma.technician.findUnique({ where: { id } });
     if (!existing) throw new AppError(404, "Technician not found");
-    return this.prisma.technician.update({
+    const tech = await this.prisma.technician.update({
       where: { id },
       data: {
         name: input.name,
@@ -498,7 +505,14 @@ class SettingsService {
         role: input.role,
         active: input.active,
       },
+      include: techInclude,
     });
+    return {
+      ...tech,
+      displayName: tech.name ?? null,
+      appStatus: deriveAppStatus(tech.active, tech.profileId),
+      serviceAreas: mapServiceAreas(tech),
+    };
   }
 
   async deleteTechnician(id: string): Promise<void> {

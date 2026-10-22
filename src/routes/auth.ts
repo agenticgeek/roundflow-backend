@@ -4,9 +4,21 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { requireAuth } from "../middleware/requireAuth";
 import { provisionTenantSchema } from "../lib/tenant-provisioning";
+import { getTenantPrismaForSchema } from "../lib/tenant-prisma-manager";
+import { seedTenantDefaults } from "../lib/tenant-defaults";
 import { AppError } from "../lib/app-error";
 import { h, requireString, optString, asObject } from "../lib/http";
 import { mergePreferences } from "../lib/preferences";
+
+// Best-effort: a brand-new tenant should get default Services/MessageTemplates
+// rows, but a seeding hiccup must never block signup itself — the tenant can
+// still add these manually, and seedTenantDefaults is safe to retry (it only
+// writes when the relevant table is empty).
+async function seedDefaultsBestEffort(schemaName: string): Promise<void> {
+  await seedTenantDefaults(getTenantPrismaForSchema(schemaName)).catch((err) => {
+    console.error(`[signup] seedTenantDefaults failed for ${schemaName}:`, err);
+  });
+}
 
 export const authRouter = Router();
 
@@ -98,6 +110,7 @@ authRouter.post(
       // Profile+Tenant row but crashed before provisionTenantSchema completed.
       // provisionTenantSchema is idempotent: no-op if already fully provisioned.
       await provisionTenantSchema(existing.tenant.schemaName);
+      await seedDefaultsBestEffort(existing.tenant.schemaName);
       return res.json({ profile: existing, tenantId: existing.tenantId });
     }
 
@@ -129,6 +142,7 @@ authRouter.post(
       });
 
       await provisionTenantSchema(result.profile.tenant.schemaName);
+      await seedDefaultsBestEffort(result.profile.tenant.schemaName);
       return res.status(201).json(result);
     } catch (err: unknown) {
       // Concurrent signup calls can both pass the findUnique check before
@@ -145,6 +159,7 @@ authRouter.post(
         });
         if (profile) {
           await provisionTenantSchema(profile.tenant.schemaName);
+          await seedDefaultsBestEffort(profile.tenant.schemaName);
           return res.json({ profile, tenantId: profile.tenantId });
         }
       }

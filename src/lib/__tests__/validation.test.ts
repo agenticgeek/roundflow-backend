@@ -1,5 +1,5 @@
 import { it, expect } from "vitest";
-import { parseOptionalDateOnly } from "../validation";
+import { parseOptionalDateOnly, optTechnicianRole } from "../validation";
 
 it("parseOptionalDateOnly returns undefined when the value is omitted", () => {
   expect(parseOptionalDateOnly(undefined, "from")).toBeUndefined();
@@ -44,4 +44,27 @@ it("parseOptionalDateOnly accepts Feb 29 on a real leap year but rejects it othe
 it("parseOptionalDateOnly accepts day-of-month 31 only in a 31-day month", () => {
   expect(parseOptionalDateOnly("2026-01-31", "from")).toEqual(new Date(Date.UTC(2026, 0, 31)));
   expect(() => parseOptionalDateOnly("2026-04-31", "from")).toThrowError(/valid calendar date/);
+});
+
+// ---- optTechnicianRole -------------------------------------------------------
+
+it("optTechnicianRole returns undefined when omitted", () => {
+  expect(optTechnicianRole(undefined)).toBeUndefined();
+});
+
+it("optTechnicianRole treats null and empty string as clear", () => {
+  expect(optTechnicianRole(null)).toBeNull();
+  expect(optTechnicianRole("")).toBeNull();
+});
+
+it("optTechnicianRole accepts a valid role", () => {
+  expect(optTechnicianRole("SENIOR")).toBe("SENIOR");
+});
+
+it("optTechnicianRole rejects an unrecognised role", () => {
+  expect(() => optTechnicianRole("Team Lead")).toThrowError(/"role" must be one of/);
+});
+
+it("optTechnicianRole rejects a non-string value", () => {
+  expect(() => optTechnicianRole(42)).toThrowError(/"role" must be one of/);
 });

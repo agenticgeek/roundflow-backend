@@ -10,7 +10,10 @@ import { todayRange } from "../lib/dates";
 
 export type { AppStatus };
 
-function deriveAppStatus(active: boolean, profileId: string | null): AppStatus {
+// Exported so settings.service.ts's /settings/technicians write path can
+// derive the same appStatus and serviceAreas shape as this (newer) router,
+// instead of maintaining a second, drifting copy of this logic.
+export function deriveAppStatus(active: boolean, profileId: string | null): AppStatus {
   if (!active) return "INACTIVE";
   if (profileId === null) return "PENDING_INVITE";
   return "ACTIVE";
@@ -93,7 +96,7 @@ export interface UpdateTechnicianInput {
 
 // ---- Prisma includes --------------------------------------------------------
 
-const techInclude = {
+export const techInclude = {
   serviceAreas: {
     select: {
       serviceAreaId: true,
@@ -103,9 +106,9 @@ const techInclude = {
   },
 } satisfies Prisma.TechnicianInclude;
 
-type TechWithAreas = Prisma.TechnicianGetPayload<{ include: typeof techInclude }>;
+export type TechWithAreas = Prisma.TechnicianGetPayload<{ include: typeof techInclude }>;
 
-function mapServiceAreas(tech: TechWithAreas): TechnicianServiceAreaRow[] {
+export function mapServiceAreas(tech: TechWithAreas): TechnicianServiceAreaRow[] {
   return tech.serviceAreas.map((sa) => ({
     serviceAreaId: sa.serviceAreaId,
     serviceAreaName: sa.serviceArea.name,
