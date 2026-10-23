@@ -25,6 +25,12 @@ vi.mock("../../services/reports.service", () => ({
   createReportsService: vi.fn(() => ({ logActivity: vi.fn() })),
 }));
 
+const queueGhlEvent = vi.fn().mockResolvedValue(undefined);
+vi.mock("../../integrations/ghl/sync", () => ({
+  queueGhlEvent: (...args: unknown[]) => queueGhlEvent(...args),
+  syncMessageToGhl: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("../../middleware/requireAuth", () => ({
   requireAuth: (_req: any, _res: any, next: any) => next(),
 }));
@@ -117,14 +123,16 @@ it("GET /complaints passes an explicit technicianId query param through", async 
 
 describe("POST /complaints/:id/resolve", () => {
   it("passes notes and the caller's profile id as resolvedBy", async () => {
-    resolve.mockResolvedValue({ id: "cmp1", status: "RESOLVED" });
-    const res = await request(makeApp()).post("/complaints/cmp1/resolve").send({ notes: "Fixed on revisit" });
+    resolve.mockResolvedValue({ id: "cmp1", status: "RESOLVED", customerId: "cust-1" });
+    const tp = {};
+    const res = await request(makeApp(tp)).post("/complaints/cmp1/resolve").send({ notes: "Fixed on revisit" });
     expect(res.status).toBe(200);
     expect(resolve).toHaveBeenCalledWith("cmp1", { notes: "Fixed on revisit", resolvedBy: "profile-1" });
+    expect(queueGhlEvent).toHaveBeenCalledWith(tp, "complaint.resolved", "cust-1");
   });
 
   it("defaults notes to undefined when omitted", async () => {
-    resolve.mockResolvedValue({ id: "cmp1", status: "RESOLVED" });
+    resolve.mockResolvedValue({ id: "cmp1", status: "RESOLVED", customerId: "cust-2" });
     const res = await request(makeApp()).post("/complaints/cmp1/resolve").send({});
     expect(res.status).toBe(200);
     expect(resolve).toHaveBeenCalledWith("cmp1", { notes: undefined, resolvedBy: "profile-1" });

@@ -138,7 +138,7 @@ describe("PATCH /visits/:id/complete", () => {
           data: expect.objectContaining({ method: PaymentMethod.GOCARDLESS, status: "PENDING", gocardlessId: "PM123" }),
         })
       );
-      expect(queueGhlEvent).toHaveBeenCalledWith(tp, "visit.completed", "cust-1");
+      expect(queueGhlEvent).toHaveBeenCalledWith(tp, "visit.completed", "cust-1", { visitId: "visit-1" });
     });
 
     it("skips charging when the mandate is not active", async () => {

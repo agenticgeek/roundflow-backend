@@ -168,6 +168,7 @@ complaintsRouter.post(
       notes: optString(body.notes, "notes"),
       resolvedBy: req.profile?.id ?? null,
     });
+    queueGhlEvent(req.tenantPrisma!, "complaint.resolved", result.customerId).catch(console.error);
     res.json(result);
   })
 );

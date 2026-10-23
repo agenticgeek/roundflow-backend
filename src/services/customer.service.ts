@@ -202,6 +202,7 @@ export interface PaymentRow {
   amount: number | null;
   paymentStatus: PaymentStatus | null;
   paymentId: string | null;
+  method: PaymentMethod | null;
   invoiceStatus: string | null;
   invoiceId: string | null;
   invoiceNumber: string | null;
@@ -631,6 +632,7 @@ class CustomerService {
                 amount: this.num(v.payment?.amount ?? v.price),
                 paymentStatus: v.payment?.status ?? null,
                 paymentId: v.payment?.id ?? null,
+                method: v.payment?.method ?? null,
                 invoiceStatus: v.invoice?.status ?? null,
                 invoiceId: v.invoice?.id ?? null,
                 invoiceNumber: v.invoice?.invoiceNumber ?? null,

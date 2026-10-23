@@ -1,5 +1,11 @@
 # RoundFlow Backend Architecture
 
+> **Superseded for GHL/automation content.** This was the original design doc, written before the GHL
+> integration was built. Several details here (file paths, token storage location, event types) no longer
+> match the code. For the current, code-verified state — and for ongoing updates as the GHL/automation
+> work progresses — see [`ARCHITECTURE_LATEST.md`](ARCHITECTURE_LATEST.md). Sections 1–9, 11, 12 below are
+> still accurate; section 10 (GHL Integration) is the stale one.
+
 ## 1. Overview
 
 RoundFlow is a multi-tenant SaaS backend for UK window-cleaning businesses. Each business (tenant) operates in complete isolation — they share the same Express/TypeScript process and the same PostgreSQL instance, but their operational data lives in a dedicated Postgres schema. The backend is deployed on Railway and communicates with a React frontend; it has no HTML rendering concerns.
