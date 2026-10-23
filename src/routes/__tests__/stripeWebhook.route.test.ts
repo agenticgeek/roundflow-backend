@@ -23,8 +23,13 @@ function makeTenantPrisma() {
     webhookEvent: { create: vi.fn().mockResolvedValue({}) },
     stripeSession: { findUnique: vi.fn(), update: vi.fn().mockResolvedValue({}), updateMany: vi.fn().mockResolvedValue({}) },
     customer: { update: vi.fn().mockResolvedValue({}) },
-    invoice: { findUnique: vi.fn(), update: vi.fn().mockResolvedValue({}) },
-    payment: { create: vi.fn().mockResolvedValue({}), update: vi.fn().mockResolvedValue({}), findFirst: vi.fn() },
+    invoice: { findUnique: vi.fn(), update: vi.fn().mockResolvedValue({}), updateMany: vi.fn().mockResolvedValue({}) },
+    payment: {
+      create: vi.fn().mockResolvedValue({}),
+      update: vi.fn().mockResolvedValue({}),
+      findFirst: vi.fn(),
+      findUnique: vi.fn(),
+    },
     $transaction: vi.fn((ops: Promise<unknown>[]) => Promise.all(ops)),
   };
 }
@@ -348,31 +353,42 @@ describe("POST /webhooks/stripe — payment_intent.payment_failed", () => {
     expect(tp.payment.findFirst).not.toHaveBeenCalled();
   });
 
-  it("updates an existing Payment row to FAILED", async () => {
+  it("updates an existing Payment row to FAILED and queues a GHL event", async () => {
     const tp = setup();
     tp.invoice.findUnique.mockResolvedValue({ id: "inv-1", customerId: "cust-1", visitId: "visit-1", amount: 35 });
-    tp.payment.findFirst.mockResolvedValue({ id: "pay-1" });
+    const row = { id: "pay-1", customerId: "cust-1", visitId: "visit-1", paidAt: null };
+    tp.payment.findFirst.mockResolvedValue(row);
+    tp.payment.findUnique.mockResolvedValue(row);
 
     await send(makeApp());
 
     await vi.waitFor(() => expect(tp.payment.update).toHaveBeenCalledWith({
       where: { id: "pay-1" },
-      data: { status: "FAILED" },
+      data: { status: "FAILED", paidAt: null },
     }));
+    await vi.waitFor(() => expect(queueGhlEvent).toHaveBeenCalledWith(tp, "payment.failed", "cust-1"));
   });
 
-  it("creates a new FAILED Payment row when none exists yet", async () => {
+  it("creates a new Payment row and queues a GHL event when none exists yet", async () => {
     const tp = setup();
     tp.invoice.findUnique.mockResolvedValue({ id: "inv-1", customerId: "cust-1", visitId: null, amount: 35 });
     tp.payment.findFirst.mockResolvedValue(null);
+    const created = { id: "pay-new", customerId: "cust-1", visitId: null, paidAt: null };
+    tp.payment.create.mockResolvedValue(created);
+    tp.payment.findUnique.mockResolvedValue(created);
 
     await send(makeApp());
 
     await vi.waitFor(() => expect(tp.payment.create).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ customerId: "cust-1", visitId: undefined, amount: 35, status: "FAILED", stripeId: "pi_1" }),
+        data: expect.objectContaining({ customerId: "cust-1", visitId: undefined, amount: 35, stripeId: "pi_1" }),
       })
     ));
+    await vi.waitFor(() => expect(tp.payment.update).toHaveBeenCalledWith({
+      where: { id: "pay-new" },
+      data: { status: "FAILED", paidAt: null },
+    }));
+    await vi.waitFor(() => expect(queueGhlEvent).toHaveBeenCalledWith(tp, "payment.failed", "cust-1"));
   });
 });
 

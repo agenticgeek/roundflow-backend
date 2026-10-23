@@ -7,7 +7,8 @@ import { h, asObject, requireString } from "../lib/http";
 import { decrypt } from "../lib/crypto";
 import { getStripeClient } from "../integrations/stripe/client";
 import { createOneTimeSession, createSetupSession } from "../integrations/stripe/checkout";
-import { StripeSessionType } from "../generated/tenant-client";
+import { StripeSessionType, PaymentMethod, PaymentStatus } from "../generated/tenant-client";
+import { createPaymentService } from "../services/payment.service";
 export const paymentsRouter = Router();
 paymentsRouter.use(requireAuth);
 paymentsRouter.use(requireTenantAccess);
@@ -83,6 +84,32 @@ paymentsRouter.post(
     });
 
     return res.status(201).json({ url: session.url, sessionId: session.id });
+  })
+);
+
+// PATCH /payments/:id/status — manual reconciliation for payment methods with
+// no settlement webhook (BACS, cheque). GoCardless/Stripe stay webhook-only;
+// overriding those here could race with the real webhook arriving later.
+paymentsRouter.patch(
+  "/:id/status",
+  h(async (req, res) => {
+    const body = asObject(req.body);
+    const status = requireString(body.status, "status");
+    if (status !== "PAID" && status !== "FAILED") {
+      throw new AppError(400, "status must be PAID or FAILED");
+    }
+
+    const payment = await req.tenantPrisma!.payment.findUnique({ where: { id: req.params.id } });
+    if (!payment) throw new AppError(404, "Payment not found");
+    if (payment.method !== PaymentMethod.BACS && payment.method !== PaymentMethod.CHEQUE) {
+      throw new AppError(409, "Only BACS and cheque payments can be manually reconciled");
+    }
+    if (payment.status === PaymentStatus.PAID) {
+      throw new AppError(409, "Payment is already paid and cannot be changed");
+    }
+
+    const updated = await createPaymentService(req.tenantPrisma!).applyOutcome(req.params.id, status);
+    return res.json(updated);
   })
 );
 

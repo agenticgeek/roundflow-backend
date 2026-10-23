@@ -34,7 +34,13 @@ function makeTenantPrisma() {
   return {
     businessSettings: { findFirst: vi.fn() },
     webhookEvent: { create: vi.fn().mockResolvedValue({}) },
-    payment: { updateMany: vi.fn().mockResolvedValue({}), findFirst: vi.fn() },
+    payment: {
+      updateMany: vi.fn().mockResolvedValue({}),
+      findFirst: vi.fn(),
+      findUnique: vi.fn(),
+      update: vi.fn().mockResolvedValue({}),
+    },
+    invoice: { updateMany: vi.fn().mockResolvedValue({}) },
     customer: { updateMany: vi.fn().mockResolvedValue({}) },
   };
 }
@@ -222,7 +228,9 @@ describe("POST /webhooks/gocardless — event processing", () => {
       { id: "ev_2", resource_type: "payments", action: "paid", links: { payment: "PM2" } },
     ]);
     tp.webhookEvent.create.mockRejectedValueOnce(new Error("db down")).mockResolvedValueOnce({});
-    tp.payment.findFirst.mockResolvedValue(null);
+    const row = { id: "pay-2", customerId: "cust-2", visitId: null, paidAt: null };
+    tp.payment.findFirst.mockResolvedValue(row);
+    tp.payment.findUnique.mockResolvedValue(row);
 
     await send("?tenantId=tenant-1&secret=abc");
 
@@ -231,8 +239,8 @@ describe("POST /webhooks/gocardless — event processing", () => {
       expect.any(Error)
     ));
     // the second event in the batch still gets processed
-    await vi.waitFor(() => expect(tp.payment.updateMany).toHaveBeenCalledWith({
-      where: { gocardlessId: "PM2" },
+    await vi.waitFor(() => expect(tp.payment.update).toHaveBeenCalledWith({
+      where: { id: "pay-2" },
       data: { status: "PAID", paidAt: expect.any(Date) },
     }));
     consoleSpy.mockRestore();
@@ -241,7 +249,7 @@ describe("POST /webhooks/gocardless — event processing", () => {
   it("logs and continues when handling an individual event throws", async () => {
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const tp = setup([{ id: "ev_1", resource_type: "payments", action: "paid", links: { payment: "PM1" } }]);
-    tp.payment.updateMany.mockRejectedValue(new Error("boom"));
+    tp.payment.findFirst.mockRejectedValue(new Error("boom"));
 
     await send("?tenantId=tenant-1&secret=abc");
 
@@ -282,36 +290,53 @@ describe("POST /webhooks/gocardless — event processing", () => {
       const tp = setup([{ id: "ev_1", resource_type: "payments", action: "paid", links: {} }]);
       await send("?tenantId=tenant-1&secret=abc");
       await vi.waitFor(() => expect(tp.webhookEvent.create).toHaveBeenCalled());
-      expect(tp.payment.updateMany).not.toHaveBeenCalled();
+      expect(tp.payment.findFirst).not.toHaveBeenCalled();
     });
 
     it("marks PAID and queues a GHL event on 'paid'", async () => {
       const tp = setupPayments("paid");
-      tp.payment.findFirst.mockResolvedValue({ customerId: "cust-1" });
+      const row = { id: "pay-1", customerId: "cust-1", visitId: null, paidAt: null };
+      tp.payment.findFirst.mockResolvedValue(row);
+      tp.payment.findUnique.mockResolvedValue(row);
       await send("?tenantId=tenant-1&secret=abc");
-      await vi.waitFor(() => expect(tp.payment.updateMany).toHaveBeenCalledWith({
-        where: { gocardlessId: "PM1" },
+      await vi.waitFor(() => expect(tp.payment.update).toHaveBeenCalledWith({
+        where: { id: "pay-1" },
         data: { status: "PAID", paidAt: expect.any(Date) },
       }));
       await vi.waitFor(() => expect(queueGhlEvent).toHaveBeenCalledWith(tp, "payment.collected", "cust-1"));
     });
 
-    it("marks PAID on 'confirmed' but skips the GHL queue when no payment row is found", async () => {
+    it("skips the outcome handler on 'confirmed' when no payment row is found", async () => {
       const tp = setupPayments("confirmed");
       tp.payment.findFirst.mockResolvedValue(null);
       await send("?tenantId=tenant-1&secret=abc");
-      await vi.waitFor(() => expect(tp.payment.updateMany).toHaveBeenCalled());
+      await vi.waitFor(() => expect(tp.payment.findFirst).toHaveBeenCalled());
       await new Promise((r) => setTimeout(r, 10));
+      expect(tp.payment.update).not.toHaveBeenCalled();
       expect(queueGhlEvent).not.toHaveBeenCalled();
     });
 
-    it("marks FAILED on 'failed'", async () => {
+    it("skips the outcome handler on 'failed' when no payment row is found", async () => {
       const tp = setupPayments("failed");
+      tp.payment.findFirst.mockResolvedValue(null);
       await send("?tenantId=tenant-1&secret=abc");
-      await vi.waitFor(() => expect(tp.payment.updateMany).toHaveBeenCalledWith({
-        where: { gocardlessId: "PM1" },
-        data: { status: "FAILED" },
+      await vi.waitFor(() => expect(tp.payment.findFirst).toHaveBeenCalled());
+      await new Promise((r) => setTimeout(r, 10));
+      expect(tp.payment.update).not.toHaveBeenCalled();
+      expect(queueGhlEvent).not.toHaveBeenCalled();
+    });
+
+    it("marks FAILED and queues a GHL event on 'failed'", async () => {
+      const tp = setupPayments("failed");
+      const row = { id: "pay-1", customerId: "cust-1", visitId: null, paidAt: null };
+      tp.payment.findFirst.mockResolvedValue(row);
+      tp.payment.findUnique.mockResolvedValue(row);
+      await send("?tenantId=tenant-1&secret=abc");
+      await vi.waitFor(() => expect(tp.payment.update).toHaveBeenCalledWith({
+        where: { id: "pay-1" },
+        data: { status: "FAILED", paidAt: null },
       }));
+      await vi.waitFor(() => expect(queueGhlEvent).toHaveBeenCalledWith(tp, "payment.failed", "cust-1"));
     });
 
     it("marks CANCELLED on 'cancelled'", async () => {

@@ -5,6 +5,7 @@ import { getTenantPrismaForSchema } from "../lib/tenant-prisma-manager";
 import { getStripeClient } from "../integrations/stripe/client";
 import { Prisma, PaymentMethod, PaymentStatus, StripeSessionStatus } from "../generated/tenant-client";
 import { queueGhlEvent } from "../integrations/ghl/sync";
+import { createPaymentService } from "../services/payment.service";
 
 export const stripeWebhookRouter = Router();
 
@@ -176,21 +177,20 @@ async function handlePaymentFailed(
   const invoice = await tp.invoice.findUnique({ where: { id: invoiceId } });
   if (!invoice) return;
 
-  // Upsert payment record as FAILED
-  const existing = await tp.payment.findFirst({ where: { stripeId: pi.id } });
-  if (existing) {
-    await tp.payment.update({ where: { id: existing.id }, data: { status: PaymentStatus.FAILED } });
-  } else {
-    await tp.payment.create({
+  // Upsert payment record, then run it through the shared outcome handler —
+  // same place GoCardless/manual-reconciliation failures go through, so the
+  // payment-failed GHL tag fires regardless of which payment method failed.
+  let payment = await tp.payment.findFirst({ where: { stripeId: pi.id } });
+  if (!payment) {
+    payment = await tp.payment.create({
       data: {
         customerId: invoice.customerId,
         visitId: invoice.visitId ?? undefined,
         amount: invoice.amount,
         method: PaymentMethod.STRIPE,
-        status: PaymentStatus.FAILED,
         stripeId: pi.id,
       },
     });
   }
-
+  await createPaymentService(tp).applyOutcome(payment.id, "FAILED");
 }

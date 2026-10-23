@@ -40,7 +40,10 @@ async function processTenant(schemaName: string): Promise<void> {
           await applyGhlTags(tp, customerId, ["visit-completed"]);
           break;
         case "payment.collected":
-          await applyGhlTags(tp, customerId, ["payment-collected"], ["debt-overdue"]);
+          await applyGhlTags(tp, customerId, ["payment-collected"], ["debt-overdue", "payment-failed"]);
+          break;
+        case "payment.failed":
+          await applyGhlTags(tp, customerId, ["payment-failed"]);
           break;
         case "debt.overdue":
           await applyGhlTags(tp, customerId, ["debt-overdue"]);

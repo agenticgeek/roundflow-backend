@@ -5,7 +5,7 @@ import { prisma } from "../lib/prisma";
 import { getTenantPrismaForSchema } from "../lib/tenant-prisma-manager";
 import { decrypt, safeEqual } from "../lib/crypto";
 import { Prisma, PaymentStatus } from "../generated/tenant-client";
-import { queueGhlEvent } from "../integrations/ghl/sync";
+import { createPaymentService } from "../services/payment.service";
 
 export const gocardlessWebhookRouter = Router();
 
@@ -112,19 +112,11 @@ async function handleEvent(
     if (!gcPaymentId) return;
 
     if (action === "paid" || action === "confirmed") {
-      await tp.payment.updateMany({
-        where: { gocardlessId: gcPaymentId },
-        data: { status: PaymentStatus.PAID, paidAt: new Date() },
-      });
-      const payment = await tp.payment.findFirst({ where: { gocardlessId: gcPaymentId }, select: { customerId: true } });
-      if (payment?.customerId) {
-        queueGhlEvent(tp, "payment.collected", payment.customerId).catch(console.error);
-      }
+      const payment = await tp.payment.findFirst({ where: { gocardlessId: gcPaymentId } });
+      if (payment) await createPaymentService(tp).applyOutcome(payment.id, "PAID");
     } else if (action === "failed") {
-      await tp.payment.updateMany({
-        where: { gocardlessId: gcPaymentId },
-        data: { status: PaymentStatus.FAILED },
-      });
+      const payment = await tp.payment.findFirst({ where: { gocardlessId: gcPaymentId } });
+      if (payment) await createPaymentService(tp).applyOutcome(payment.id, "FAILED");
     } else if (action === "cancelled") {
       await tp.payment.updateMany({
         where: { gocardlessId: gcPaymentId },

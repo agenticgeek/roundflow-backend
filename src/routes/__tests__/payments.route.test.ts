@@ -23,6 +23,11 @@ vi.mock("../../integrations/stripe/client", () => ({
   getStripeClient: vi.fn(() => ({ fake: "stripe-client" })),
 }));
 
+const queueGhlEvent = vi.fn().mockResolvedValue(undefined);
+vi.mock("../../integrations/ghl/sync", () => ({
+  queueGhlEvent: (...args: unknown[]) => queueGhlEvent(...args),
+}));
+
 const createOneTimeSession = vi.fn();
 const createSetupSession = vi.fn();
 vi.mock("../../integrations/stripe/checkout", () => ({
@@ -35,9 +40,10 @@ import { paymentsRouter } from "../payments";
 function makeTenantPrisma() {
   return {
     businessSettings: { findFirst: vi.fn() },
-    invoice: { findUnique: vi.fn() },
+    invoice: { findUnique: vi.fn(), updateMany: vi.fn().mockResolvedValue({}) },
     stripeSession: { findFirst: vi.fn(), create: vi.fn() },
     customer: { findUniqueOrThrow: vi.fn(), findUnique: vi.fn() },
+    payment: { findUnique: vi.fn(), update: vi.fn().mockResolvedValue({}) },
   };
 }
 
@@ -242,5 +248,71 @@ describe("POST /payments/stripe/setup", () => {
         data: expect.objectContaining({ type: StripeSessionType.SETUP }),
       })
     );
+  });
+});
+
+describe("PATCH /payments/:id/status", () => {
+  it("400s when status is not PAID or FAILED", async () => {
+    const tp = makeTenantPrisma();
+    const res = await request(makeApp(tp)).patch("/payments/pay-1/status").send({ status: "PENDING" });
+    expect(res.status).toBe(400);
+  });
+
+  it("404s when the payment does not exist", async () => {
+    const tp = makeTenantPrisma();
+    tp.payment.findUnique.mockResolvedValue(null);
+    const res = await request(makeApp(tp)).patch("/payments/pay-1/status").send({ status: "PAID" });
+    expect(res.status).toBe(404);
+  });
+
+  it("409s for a GoCardless payment (webhook-only, no manual override)", async () => {
+    const tp = makeTenantPrisma();
+    tp.payment.findUnique.mockResolvedValue({ id: "pay-1", method: "GOCARDLESS", status: "PENDING" });
+    const res = await request(makeApp(tp)).patch("/payments/pay-1/status").send({ status: "PAID" });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/BACS and cheque/);
+  });
+
+  it("409s when the payment is already PAID", async () => {
+    const tp = makeTenantPrisma();
+    tp.payment.findUnique.mockResolvedValue({ id: "pay-1", method: "BACS", status: "PAID" });
+    const res = await request(makeApp(tp)).patch("/payments/pay-1/status").send({ status: "FAILED" });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/already paid/);
+  });
+
+  it("marks a BACS payment PAID, flips the invoice, and queues payment.collected", async () => {
+    const tp = makeTenantPrisma();
+    const row = { id: "pay-1", method: "BACS", status: "PENDING", customerId: "cust-1", visitId: "visit-1", paidAt: null };
+    tp.payment.findUnique.mockResolvedValue(row);
+
+    const res = await request(makeApp(tp)).patch("/payments/pay-1/status").send({ status: "PAID" });
+
+    expect(res.status).toBe(200);
+    expect(tp.payment.update).toHaveBeenCalledWith({
+      where: { id: "pay-1" },
+      data: { status: "PAID", paidAt: expect.any(Date) },
+    });
+    expect(tp.invoice.updateMany).toHaveBeenCalledWith({
+      where: { visitId: "visit-1", status: { not: "PAID" } },
+      data: { status: "PAID" },
+    });
+    expect(queueGhlEvent).toHaveBeenCalledWith(tp, "payment.collected", "cust-1");
+  });
+
+  it("marks a CHEQUE payment FAILED and queues payment.failed without touching the invoice", async () => {
+    const tp = makeTenantPrisma();
+    const row = { id: "pay-2", method: "CHEQUE", status: "PENDING", customerId: "cust-2", visitId: "visit-2", paidAt: null };
+    tp.payment.findUnique.mockResolvedValue(row);
+
+    const res = await request(makeApp(tp)).patch("/payments/pay-2/status").send({ status: "FAILED" });
+
+    expect(res.status).toBe(200);
+    expect(tp.payment.update).toHaveBeenCalledWith({
+      where: { id: "pay-2" },
+      data: { status: "FAILED", paidAt: null },
+    });
+    expect(tp.invoice.updateMany).not.toHaveBeenCalled();
+    expect(queueGhlEvent).toHaveBeenCalledWith(tp, "payment.failed", "cust-2");
   });
 });
