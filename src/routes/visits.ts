@@ -159,7 +159,7 @@ visitsRouter.patch(
       }
     }
 
-    queueGhlEvent(req.tenantPrisma!, "visit.completed", customerId).catch(console.error);
+    queueGhlEvent(req.tenantPrisma!, "visit.completed", customerId, { visitId: visit.id }).catch(console.error);
 
     return res.json({ id: updated.id, status: updated.status });
   })

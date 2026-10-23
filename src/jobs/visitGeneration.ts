@@ -1,6 +1,7 @@
 import { prisma } from "../lib/prisma";
 import { getTenantPrismaForSchema, type TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { CleaningFrequency, LifecycleStatus, RoundStatus, VisitStatus } from "../generated/tenant-client";
+import { queueGhlEvent } from "../integrations/ghl/sync";
 
 const FREQ_WEEKS: Record<CleaningFrequency, number> = {
   FOUR_WEEKLY:   4,
@@ -66,6 +67,7 @@ export async function generateForRound(
     where: { roundId: round.id, status: LifecycleStatus.ACTIVE },
     select: {
       id: true,
+      customerId: true,
       servicePlans: {
         where: { status: LifecycleStatus.ACTIVE, nextDueDate: { lte: today } },
         select: { id: true, price: true, nextDueDate: true, cleaningFrequency: true, serviceId: true },
@@ -104,6 +106,12 @@ export async function generateForRound(
         },
       });
       created++;
+
+      // Drives the GHL "Pre-Clean Reminder" workflow (next_clean_date custom
+      // field) — see docs/GHL_AUTOMATION_OWNER_HANDOFF.md §1/§3.
+      queueGhlEvent(tp, "visit.scheduled", property.customerId, {
+        nextCleanDate: visitDate.toISOString().slice(0, 10),
+      }).catch(console.error);
 
       // Advance nextDueDate by one cycle
       await tp.servicePlan.update({

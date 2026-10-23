@@ -708,7 +708,7 @@ model Notification {
 // Outbound GHL event queue — written in same call as operational write, drained by outboxWorker.
 model IntegrationOutbox {
   id          String   @id @default(cuid())
-  eventType   String   // "customer.synced" | "visit.completed" | "payment.collected" | "payment.failed" | "debt.overdue" | "complaint.logged"
+  eventType   String   // "customer.synced" | "visit.completed" | "visit.scheduled" | "payment.collected" | "payment.failed" | "debt.overdue" | "complaint.logged" | "complaint.resolved"
   payload     Json     // always includes { customerId }
   status      String   @default("pending") // pending | sent | failed | dead
   attempts    Int      @default(0)

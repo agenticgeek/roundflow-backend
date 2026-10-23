@@ -56,6 +56,8 @@ type GhlEvent = {
   lastName?: string;
   phone?: string;
   email?: string;
+  address1?: string;
+  postalCode?: string;
   message?: { body?: string; type?: string };
 };
 
@@ -72,9 +74,31 @@ async function processEvent(schemaName: string, event: GhlEvent, eventId?: strin
     }
   }
 
+  // Lead Handoff to RoundFlow (docs/GHL_AUTOMATION_OWNER_HANDOFF.md §3
+  // Workflow 5) — a GHL Workflow's custom-webhook action, fired when a
+  // contact is tagged "ready-for-roundflow". Unlike every other event here,
+  // it carries no `type` field at all. Create-only: once a Customer is
+  // linked via ghlContactId, RoundFlow is master and this is skipped.
+  if (!type && contactId) {
+    const existing = await tp.customer.findFirst({ where: { ghlContactId: contactId }, select: { id: true } });
+    if (existing) return;
+
+    const name = [event.firstName, event.lastName].filter(Boolean).join(" ").trim() || "Unknown";
+
+    await tp.$transaction(async (tx) => {
+      const customer = await tx.customer.create({
+        data: { name, email: event.email ?? null, phone: event.phone ?? null, ghlContactId: contactId },
+      });
+      if (event.address1 && event.postalCode) {
+        await tx.property.create({
+          data: { customerId: customer.id, addressLine: event.address1, postcode: event.postalCode },
+        });
+      }
+    });
+    return;
+  }
+
   // ContactCreate / ContactUpdate — RoundFlow is master; never overwrite operational data.
-  // Inbound contact events are a no-op until the "ready-for-roundflow" tag flow is set up
-  // by the GHL automation owner to create new customers from tagged leads.
   if (type === "ContactCreate" || type === "ContactUpdate") {
     return;
   }
