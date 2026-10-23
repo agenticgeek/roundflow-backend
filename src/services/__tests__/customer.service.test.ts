@@ -1,6 +1,6 @@
 import { it, expect, vi } from "vitest";
 import { createCustomerService } from "../customer.service";
-import { LifecycleStatus, VisitStatus, PaymentStatus } from "../../generated/tenant-client";
+import { LifecycleStatus, VisitStatus, PaymentStatus, PaymentMethod } from "../../generated/tenant-client";
 import { UserRole } from "@prisma/client";
 
 function makePrisma() {
@@ -556,6 +556,80 @@ it("getCustomerDetail caps visitHistory/payments tabs at 50, newest-first, indep
   const visitsInclude = includeArgs.include.properties.include.visits;
   expect(visitsInclude.take).toBe(50);
   expect(visitsInclude.orderBy).toEqual({ date: "desc" });
+});
+
+it("getCustomerDetail includes the payment method on each payments.rows entry", async () => {
+  const prisma = makePrisma();
+  const customer = {
+    id: "c1",
+    name: "Dana",
+    phone: null,
+    email: null,
+    status: LifecycleStatus.ACTIVE,
+    ghlContactId: null,
+    payments: [],
+    properties: [
+      {
+        id: "p1",
+        status: LifecycleStatus.ACTIVE,
+        addressLine: "1 Test St",
+        postcode: "T1 1TT",
+        propertyType: null,
+        accessNotes: null,
+        riskNotes: null,
+        roundId: null,
+        serviceAreaId: null,
+        round: null,
+        serviceArea: null,
+        notes: [],
+        photos: [],
+        servicePlans: [],
+        visits: [
+          {
+            id: "v1",
+            date: new Date("2026-03-01"),
+            status: VisitStatus.COMPLETED,
+            paymentHold: false,
+            notes: null,
+            price: 35,
+            round: null,
+            technician: null,
+            invoice: null,
+            payment: {
+              id: "pay-1",
+              status: PaymentStatus.PENDING,
+              amount: 35,
+              method: PaymentMethod.BACS,
+              gocardlessId: null,
+              stripeId: null,
+            },
+            issues: [],
+          },
+          {
+            id: "v2",
+            date: new Date("2026-02-01"),
+            status: VisitStatus.COMPLETED,
+            paymentHold: false,
+            notes: null,
+            price: 35,
+            round: null,
+            technician: null,
+            invoice: null,
+            payment: null,
+            issues: [],
+          },
+        ],
+      },
+    ],
+  };
+  (prisma.customer.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(customer);
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(makeSettings());
+
+  const result = await createCustomerService(prisma).getCustomerDetail("c1", UserRole.ADMIN);
+
+  const rows = result.tabs.payments?.rows ?? [];
+  expect(rows.find((r) => r.visitId === "v1")?.method).toBe(PaymentMethod.BACS);
+  expect(rows.find((r) => r.visitId === "v2")?.method).toBeNull();
 });
 
 it("getCustomerDetail counts issues from the FULL visit history, not just the 50-visit cap", async () => {
