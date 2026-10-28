@@ -32,6 +32,7 @@ import { ghlWebhookRouter } from "./routes/ghlWebhook";
 import cron from "node-cron";
 import { runVisitGeneration } from "./jobs/visitGeneration";
 import { runOutboxWorker } from "./jobs/outboxWorker";
+import { runGeocodeBackfill } from "./jobs/geocodeBackfill";
 
 const FRONTEND_URL = process.env.FRONTEND_URL;
 if (!FRONTEND_URL) {
@@ -178,6 +179,10 @@ migrateAllTenantSchemas()
     // Every 30s — drain GHL outbox
     cron.schedule("*/30 * * * * *", () => {
       runOutboxWorker().catch((err) => console.error("[outbox] worker failed:", err));
+    });
+    // Every 15 min — geocode any property still missing latitude/longitude
+    cron.schedule("*/15 * * * *", () => {
+      runGeocodeBackfill().catch((err) => console.error("[geocodeBackfill] run failed:", err));
     });
   })
   .catch((err) => {

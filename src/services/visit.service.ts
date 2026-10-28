@@ -24,6 +24,8 @@ export interface VisitDetail {
   propertyId: string;
   addressLine: string;
   postcode: string;
+  latitude: number | null;
+  longitude: number | null;
   customerId: string;
   customerName: string;
   roundId: string | null;
@@ -106,6 +108,8 @@ class VisitService {
       propertyId: visit.propertyId,
       addressLine: visit.property.addressLine,
       postcode: visit.property.postcode,
+      latitude: visit.property.latitude,
+      longitude: visit.property.longitude,
       customerId: visit.property.customer.id,
       customerName: visit.property.customer.name,
       roundId: visit.roundId,

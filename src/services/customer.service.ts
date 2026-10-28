@@ -21,6 +21,32 @@ import { UserRole } from "@prisma/client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 import { getCachedBusinessSettings } from "./settings.service";
+import { geocodePostcode } from "../integrations/geocoding/client";
+
+// Fire-and-forget: geocodes `postcode` and writes the result onto the
+// property. Never thrown by the caller — always chained with
+// `.catch(console.error)` so a slow/broken geocoding provider never delays
+// or fails the request that created/edited the property. A failed or
+// not-found lookup just bumps `geocodeAttempts`; `geocodeBackfill.ts` retries
+// it later. Called with `this.prisma` (never a transaction client) and only
+// after the triggering transaction has committed.
+async function triggerGeocode(tp: TenantPrismaClient, propertyId: string, postcode: string): Promise<void> {
+  let coords: { latitude: number; longitude: number } | null = null;
+  let error: string | null = null;
+  try {
+    coords = await geocodePostcode(postcode);
+    if (!coords) error = "postcode not found";
+  } catch (err) {
+    error = String(err);
+  }
+
+  await tp.property.update({
+    where: { id: propertyId },
+    data: coords
+      ? { latitude: coords.latitude, longitude: coords.longitude, geocodedAt: new Date(), geocodeError: null }
+      : { geocodeAttempts: { increment: 1 }, geocodeError: error },
+  });
+}
 
 // Human-readable labels for CleaningFrequency values — used when naming
 // auto-created rounds in the frequency-change reassignment flow (FR-FREQ-4).
@@ -146,6 +172,8 @@ export interface CustomerListRow {
   propertyId: string;
   addressLine: string;
   postcode: string;
+  latitude: number | null;
+  longitude: number | null;
   roundId: string | null;
   roundName: string | null;
   frequency: CleaningFrequency | null;
@@ -233,6 +261,8 @@ export interface CustomerDetail {
     id: string;
     addressLine: string;
     postcode: string;
+    latitude: number | null;
+    longitude: number | null;
     propertyType: string | null;
     accessNotes: string | null;
     riskNotes: string | null;
@@ -256,6 +286,8 @@ export interface CustomerDetail {
     overview: {
       addressLine: string;
       postcode: string;
+      latitude: number | null;
+      longitude: number | null;
       propertyType: string | null;
       accessNotes: string | null;
       riskNotes: string | null;
@@ -423,6 +455,8 @@ class CustomerService {
         propertyId: property.id,
         addressLine: property.addressLine,
         postcode: property.postcode,
+        latitude: property.latitude,
+        longitude: property.longitude,
         roundId: property.roundId,
         roundName: property.round?.name ?? null,
         frequency: plan?.cleaningFrequency ?? property.round?.frequency ?? null,
@@ -582,6 +616,8 @@ class CustomerService {
             id: property.id,
             addressLine: property.addressLine,
             postcode: property.postcode,
+            latitude: property.latitude,
+            longitude: property.longitude,
             propertyType: property.propertyType,
             accessNotes: property.accessNotes,
             riskNotes: property.riskNotes,
@@ -607,6 +643,8 @@ class CustomerService {
           ? {
               addressLine: property.addressLine,
               postcode: property.postcode,
+              latitude: property.latitude,
+              longitude: property.longitude,
               propertyType: property.propertyType,
               accessNotes: property.accessNotes,
               riskNotes: property.riskNotes,
@@ -715,6 +753,10 @@ class CustomerService {
         await tx.customer.update({ where: { id: customer.id }, data: customerData });
       }
 
+      // Coordinates are keyed on postcode alone (see updateProperty) — only
+      // reset/re-geocode when the postcode itself actually changes.
+      const postcodeChanged = property != null && input.postcode !== undefined && input.postcode !== property.postcode;
+
       if (property) {
         const propertyData: Partial<Prisma.PropertyUpdateInput> = {};
         if (input.addressLine !== undefined) propertyData.addressLine = input.addressLine;
@@ -726,6 +768,13 @@ class CustomerService {
           propertyData.round = input.roundId === null
             ? { disconnect: true }
             : { connect: { id: input.roundId } };
+        }
+        if (postcodeChanged) {
+          propertyData.latitude = null;
+          propertyData.longitude = null;
+          propertyData.geocodedAt = null;
+          propertyData.geocodeAttempts = 0;
+          propertyData.geocodeError = null;
         }
         if (Object.keys(propertyData).length > 0) {
           await tx.property.update({ where: { id: property.id }, data: propertyData });
@@ -747,7 +796,14 @@ class CustomerService {
         customerId: customer.id,
         propertyId: property?.id ?? null,
         servicePlanId: plan?.id ?? null,
+        postcodeChanged,
+        newPostcode: input.postcode,
       };
+    }).then(({ postcodeChanged, newPostcode, ...result }) => {
+      if (postcodeChanged && result.propertyId && newPostcode) {
+        triggerGeocode(this.prisma, result.propertyId, newPostcode).catch(console.error);
+      }
+      return result;
     });
   }
 
@@ -833,7 +889,7 @@ class CustomerService {
     const roundFrequency = await this.resolveRoundFrequency(input.roundId);
     await this.assertServiceAreaExists(input.serviceAreaId);
 
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
       const customer = await tx.customer.create({
         data: {
           name: input.customerName,
@@ -849,6 +905,8 @@ class CustomerService {
       );
       return { customerId: customer.id, propertyId, servicePlanId, assigned: input.roundId != null };
     });
+    triggerGeocode(this.prisma, result.propertyId, input.postcode).catch(console.error);
+    return result;
   }
 
   // ---- add property to existing customer (Property + ServicePlan, atomic) ----
@@ -865,12 +923,14 @@ class CustomerService {
     const roundFrequency = await this.resolveRoundFrequency(input.roundId);
     await this.assertServiceAreaExists(input.serviceAreaId);
 
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
       const { propertyId, servicePlanId } = await this.createPropertyAndPlan(
         tx, customerId, input, roundFrequency
       );
       return { propertyId, servicePlanId, assigned: input.roundId != null };
     });
+    triggerGeocode(this.prisma, result.propertyId, input.postcode).catch(console.error);
+    return result;
   }
 
   // ---- soft-delete property (CANCELLED + cancels active service plans) ----
@@ -915,6 +975,11 @@ class CustomerService {
       ) ?? existing.servicePlans[0] ?? null;
 
     if (input.serviceAreaId) await this.assertServiceAreaExists(input.serviceAreaId);
+
+    // Coordinates are keyed on postcode alone — an addressLine-only edit
+    // (e.g. a unit number) doesn't invalidate them, so only reset/re-geocode
+    // when the postcode itself actually changes.
+    const postcodeChanged = input.postcode !== undefined && input.postcode !== existing.postcode;
 
     // Determine the target round and whether the service plan frequency needs updating.
     let targetRoundId: string | null = existing.roundId;
@@ -1007,8 +1072,14 @@ class CustomerService {
           accessNotes: input.accessNotes,
           riskNotes: input.riskNotes,
           roundId: targetRoundId,
+          ...(postcodeChanged
+            ? { latitude: null, longitude: null, geocodedAt: null, geocodeAttempts: 0, geocodeError: null }
+            : {}),
         },
       });
+    }).then((updated) => {
+      if (postcodeChanged) triggerGeocode(this.prisma, updated.id, updated.postcode).catch(console.error);
+      return updated;
     });
   }
 

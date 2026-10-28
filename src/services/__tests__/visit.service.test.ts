@@ -162,6 +162,31 @@ it("createVisit returns price as a number", async () => {
   expect(result.price).toBe(45);
 });
 
+it("createVisit passes through the property's geocoded latitude/longitude, and null when ungeocoded", async () => {
+  const prisma = makePrisma();
+  (prisma.property.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: "p1", addressLine: "1 High St", postcode: "NE1 1AA",
+    customer: { id: "c1", name: "Jane Doe" },
+  });
+  (prisma.visit.create as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: "v1", date: new Date("2026-09-03T00:00:00.000Z"),
+    status: "SCHEDULED", isOneOff: true, price: { toNumber: () => 45 },
+    notes: null, paymentMethod: null, propertyId: "p1",
+    property: {
+      addressLine: "1 High St", postcode: "NE1 1AA", latitude: 55.4, longitude: -1.7,
+      customer: { id: "c1", name: "Jane Doe" },
+    },
+    round: null, service: null, technician: null,
+  });
+
+  const result = await createVisitService(prisma).createVisit({
+    propertyId: "p1", date: "2026-09-03", price: 45,
+  });
+
+  expect(result.latitude).toBe(55.4);
+  expect(result.longitude).toBe(-1.7);
+});
+
 it("createVisit throws 400 when technicianId has not accepted their invite", async () => {
   const prisma = makePrisma();
   (prisma.property.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({

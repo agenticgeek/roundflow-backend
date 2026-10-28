@@ -83,6 +83,8 @@ export interface PlannerStop {
   propertyName: string | null;
   addressLine: string;
   postcode: string;
+  latitude: number | null;
+  longitude: number | null;
   customerName: string;
   price: number;
   status: VisitStatus;
@@ -116,6 +118,8 @@ export interface TodayPanelStop {
   visitId: string;
   customerName: string | null;
   addressLine: string;
+  latitude: number | null;
+  longitude: number | null;
   status: VisitStatus;
   paymentHold: boolean;
   hasIssue: boolean;
@@ -587,6 +591,8 @@ class RoundService {
       propertyName: v.property.propertyName,
       addressLine: v.property.addressLine,
       postcode: v.property.postcode,
+      latitude: v.property.latitude,
+      longitude: v.property.longitude,
       customerName: v.property.customer?.name ?? null,
       price: v.price.toNumber(),
       status: v.status,
@@ -666,7 +672,9 @@ class RoundService {
     const visits = await this.prisma.visit.findMany({
       where: { roundId, date: { gte: start, lt: end } },
       include: {
-        property: { select: { addressLine: true, customer: { select: { name: true } } } },
+        property: {
+          select: { addressLine: true, latitude: true, longitude: true, customer: { select: { name: true } } },
+        },
         technician: { select: { id: true, name: true } },
         issues: { select: { id: true, note: true }, take: 1 },
       },
@@ -709,6 +717,8 @@ class RoundService {
         visitId: v.id,
         customerName: v.property.customer?.name ?? null,
         addressLine: v.property.addressLine,
+        latitude: v.property.latitude,
+        longitude: v.property.longitude,
         status: v.status,
         paymentHold: v.paymentHold,
         hasIssue: v.issues.length > 0,
