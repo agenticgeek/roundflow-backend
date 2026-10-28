@@ -4,7 +4,14 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
-import { validateWorkingDays, assertPositiveInt, assertPositive } from "../lib/validation";
+import {
+  validateWorkingDays,
+  assertPositiveInt,
+  assertPositive,
+  MAX_NAME_LENGTH,
+  MAX_ADDRESS_LENGTH,
+  MAX_NOTES_LENGTH,
+} from "../lib/validation";
 import {
   asObject,
   asArray,
@@ -72,7 +79,7 @@ setupRouter.post(
   h(async (req, res) => {
     await svc(req).assertSetupIncomplete();
     const body = asObject(req.body);
-    requireString(body.businessName, "businessName");
+    requireString(body.businessName, "businessName", { maxLength: MAX_NAME_LENGTH });
     let bankDetails: BusinessProfileInput["bankDetails"] = undefined;
     if (body.bankDetails !== undefined) {
       if (body.bankDetails === null) {
@@ -242,11 +249,13 @@ setupRouter.post(
   h(async (req, res) => {
     await svc(req).assertSetupIncomplete();
     const raw = asArray<Record<string, unknown>>(req.body, "technicians");
-    const input: TechnicianInput[] = raw.map((t) => ({
-      name: t.name as string | undefined,
-      role: t.role as string | undefined,
-      phone: t.phone as string | undefined,
+    const input: TechnicianInput[] = raw.map((t, i) => ({
+      name: optString(t.name, `technicians[${i}].name`, { maxLength: MAX_NAME_LENGTH }),
+      role: optString(t.role, `technicians[${i}].role`),
+      phone: optString(t.phone, `technicians[${i}].phone`),
+      email: optString(t.email, `technicians[${i}].email`),
       active: typeof t.active === "boolean" ? t.active : undefined,
+      serviceAreaIds: optStringArray(t.serviceAreaIds, `technicians[${i}].serviceAreaIds`),
     }));
     res.json(await svc(req).saveTechnicians(input));
   })
@@ -267,7 +276,7 @@ setupRouter.post(
     const raw = asArray<Record<string, unknown>>(req.body, "serviceAreas");
     if (raw.length === 0) throw new AppError(400, "At least one service area is required.");
     const input: ServiceAreaInput[] = raw.map((a, i) => ({
-      name: requireString(a.name, `serviceAreas[${i}].name`),
+      name: requireString(a.name, `serviceAreas[${i}].name`, { maxLength: MAX_NAME_LENGTH }),
       postcodeSector: a.postcodeSector as string | undefined,
       isDefault: typeof a.isDefault === "boolean" ? a.isDefault : undefined,
     }));
@@ -316,13 +325,13 @@ setupRouter.post(
     const body = asObject(req.body);
 
     const input: SetupPropertyInput = {
-      customerName: requireString(body.customerName, "customerName"),
-      propertyName: optString(body.propertyName, "propertyName") ?? null,
+      customerName: requireString(body.customerName, "customerName", { maxLength: MAX_NAME_LENGTH }),
+      propertyName: optString(body.propertyName, "propertyName", { maxLength: MAX_NAME_LENGTH }) ?? null,
       phone: optString(body.phone, "phone") ?? null,
       landline: optString(body.landline, "landline") ?? null,
       email: optString(body.email, "email") ?? null,
-      fullAddress: requireString(body.fullAddress, "fullAddress"),
-      postcode: requireString(body.postcode, "postcode"),
+      fullAddress: requireString(body.fullAddress, "fullAddress", { maxLength: MAX_ADDRESS_LENGTH }),
+      postcode: requireString(body.postcode, "postcode", { maxLength: MAX_ADDRESS_LENGTH }),
       serviceAreaId: requireString(body.serviceAreaId, "serviceAreaId"),
       propertyType: optString(body.propertyType, "propertyType") ?? null,
       price: assertPositive(requireNumber(body.price, "price"), "price"),
@@ -330,8 +339,8 @@ setupRouter.post(
       paymentMethod: optString(body.paymentMethod, "paymentMethod") ?? null,
       serviceId: optId(body.serviceId, "serviceId") ?? null,
       serviceIds: optStringArray(body.serviceIds, "serviceIds") ?? null,
-      accessNotes: optString(body.accessNotes, "accessNotes") ?? null,
-      riskNotes: optString(body.riskNotes, "riskNotes") ?? null,
+      accessNotes: optString(body.accessNotes, "accessNotes", { maxLength: MAX_NOTES_LENGTH }) ?? null,
+      riskNotes: optString(body.riskNotes, "riskNotes", { maxLength: MAX_NOTES_LENGTH }) ?? null,
       // L-1: roundId is required so the property counts toward step 9 completion.
       // A property with no round cannot be scheduled and would leave step 9 stuck.
       roundId: requireString(body.roundId, "roundId"),
@@ -368,13 +377,13 @@ function need<T>(field: string, parse: () => T): T {
 
 function parseBulkRow(body: Record<string, unknown>): SetupPropertyInput {
   return {
-    customerName: need("customerName", () => requireString(body.customerName, "customerName")),
-    propertyName: need("propertyName", () => optString(body.propertyName, "propertyName") ?? null),
+    customerName: need("customerName", () => requireString(body.customerName, "customerName", { maxLength: MAX_NAME_LENGTH })),
+    propertyName: need("propertyName", () => optString(body.propertyName, "propertyName", { maxLength: MAX_NAME_LENGTH }) ?? null),
     phone: need("phone", () => optString(body.phone, "phone") ?? null),
     landline: need("landline", () => optString(body.landline, "landline") ?? null),
     email: need("email", () => optString(body.email, "email") ?? null),
-    fullAddress: need("fullAddress", () => requireString(body.fullAddress, "fullAddress")),
-    postcode: need("postcode", () => requireString(body.postcode, "postcode")),
+    fullAddress: need("fullAddress", () => requireString(body.fullAddress, "fullAddress", { maxLength: MAX_ADDRESS_LENGTH })),
+    postcode: need("postcode", () => requireString(body.postcode, "postcode", { maxLength: MAX_ADDRESS_LENGTH })),
     serviceAreaId: need("serviceAreaId", () => requireString(body.serviceAreaId, "serviceAreaId")),
     propertyType: need("propertyType", () => optString(body.propertyType, "propertyType") ?? null),
     price: need("price", () => assertPositive(requireNumber(body.price, "price"), "price")),
@@ -382,8 +391,8 @@ function parseBulkRow(body: Record<string, unknown>): SetupPropertyInput {
     paymentMethod: need("paymentMethod", () => optString(body.paymentMethod, "paymentMethod") ?? null),
     serviceId: need("serviceId", () => optId(body.serviceId, "serviceId") ?? null),
     serviceIds: need("serviceIds", () => optStringArray(body.serviceIds, "serviceIds") ?? null),
-    accessNotes: need("accessNotes", () => optString(body.accessNotes, "accessNotes") ?? null),
-    riskNotes: need("riskNotes", () => optString(body.riskNotes, "riskNotes") ?? null),
+    accessNotes: need("accessNotes", () => optString(body.accessNotes, "accessNotes", { maxLength: MAX_NOTES_LENGTH }) ?? null),
+    riskNotes: need("riskNotes", () => optString(body.riskNotes, "riskNotes", { maxLength: MAX_NOTES_LENGTH }) ?? null),
     roundId: need("roundId", () => requireString(body.roundId, "roundId")),
   };
 }

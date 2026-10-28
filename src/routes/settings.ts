@@ -10,7 +10,7 @@ import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
 import { invalidateCachedBusinessSettings } from "../services/settings.service";
-import { validateWorkingDays, assertPositiveInt, assertNonNegative, requireMessageChannel, optMessageChannel, optTechnicianRole } from "../lib/validation";
+import { validateWorkingDays, assertPositiveInt, assertNonNegative, requireMessageChannel, optMessageChannel, optTechnicianRole, isValidEmail, MAX_NAME_LENGTH } from "../lib/validation";
 import {
   asObject,
   h,
@@ -120,7 +120,7 @@ settingsRouter.patch(
     await svc(req).assertSetupComplete();
     const body = asObject(req.body);
     const input: BusinessProfileUpdateInput = {
-      businessName: optString(body.businessName, "businessName"),
+      businessName: optString(body.businessName, "businessName", { maxLength: MAX_NAME_LENGTH }),
       phone: optString(body.phone, "phone"),
       email: optString(body.email, "email"),
       companyNumber: optString(body.companyNumber, "companyNumber"),
@@ -234,7 +234,7 @@ settingsRouter.post(
     await svc(req).assertSetupComplete();
     const body = asObject(req.body);
     const input: ServiceAreaCreateInput = {
-      name: requireString(body.name, "name"),
+      name: requireString(body.name, "name", { maxLength: MAX_NAME_LENGTH }),
       postcodeSector: optString(body.postcodeSector, "postcodeSector"),
       isDefault: optBool(body.isDefault, "isDefault"),
     };
@@ -247,7 +247,7 @@ settingsRouter.patch(
     await svc(req).assertSetupComplete();
     const body = asObject(req.body);
     const input: ServiceAreaUpdateInput = {
-      name: optReqString(body.name, "name"),
+      name: optReqString(body.name, "name", { maxLength: MAX_NAME_LENGTH }),
       postcodeSector: optString(body.postcodeSector, "postcodeSector"),
       isDefault: optBool(body.isDefault, "isDefault"),
     };
@@ -279,11 +279,20 @@ settingsRouter.post(
     await svc(req).assertSetupComplete();
     const body = asObject(req.body);
     const input: TechnicianCreateInput = {
-      name: optString(body.name, "name"),
+      name: optString(body.name, "name", { maxLength: MAX_NAME_LENGTH }),
       phone: optString(body.phone, "phone"),
       role: optTechnicianRole(body.role),
       active: optBool(body.active, "active"),
+      serviceAreaIds: optStringArray(body.serviceAreaIds, "serviceAreaIds"),
     };
+    const emailRaw = optString(body.email, "email");
+    if (emailRaw !== undefined && emailRaw !== null) {
+      const normalised = emailRaw.toLowerCase().trim();
+      if (!isValidEmail(normalised)) throw new AppError(400, "Invalid email address");
+      input.email = normalised;
+    } else {
+      input.email = emailRaw;
+    }
     res.status(201).json(await svc(req).createTechnician(input));
   })
 );
@@ -293,11 +302,21 @@ settingsRouter.patch(
     await svc(req).assertSetupComplete();
     const body = asObject(req.body);
     const input: TechnicianUpdateInput = {
-      name: optString(body.name, "name"),
+      name: optString(body.name, "name", { maxLength: MAX_NAME_LENGTH }),
       phone: optString(body.phone, "phone"),
       role: optTechnicianRole(body.role),
       active: optBool(body.active, "active"),
+      serviceAreaIds: optStringArray(body.serviceAreaIds, "serviceAreaIds"),
     };
+    // Email validated separately to normalise case (mirrors PATCH /technicians/:id)
+    const emailRaw = optString(body.email, "email");
+    if (emailRaw !== undefined && emailRaw !== null) {
+      const normalised = emailRaw.toLowerCase().trim();
+      if (!isValidEmail(normalised)) throw new AppError(400, "Invalid email address");
+      input.email = normalised;
+    } else {
+      input.email = emailRaw; // undefined or null — pass through
+    }
     res.json(await svc(req).updateTechnician(req.params.id, input));
   })
 );

@@ -80,7 +80,10 @@ export interface CreateTechnicianInput {
   role?: string | null;
   email?: string | null;
   notes?: string | null;
-  serviceAreaId?: string | null;
+  // A technician can cover more than one service area (see
+  // TechnicianServiceArea, a true many-to-many join table) — omitted/empty
+  // means no areas assigned.
+  serviceAreaIds?: string[];
 }
 
 export interface UpdateTechnicianInput {
@@ -90,8 +93,8 @@ export interface UpdateTechnicianInput {
   email?: string | null;
   notes?: string | null;
   active?: boolean;
-  // undefined = no change; null = clear all areas; string = replace with this area
-  serviceAreaId?: string | null;
+  // undefined = no change; [] = clear all areas; non-empty = replace with these
+  serviceAreaIds?: string[];
 }
 
 // ---- Prisma includes --------------------------------------------------------
@@ -226,11 +229,26 @@ class TechnicianService {
     };
   }
 
+  // Validates every id in `areaIds` exists; throws AppError(404) naming
+  // whichever ones don't.
+  private async assertServiceAreasExist(
+    prisma: Pick<TenantPrismaClient, "serviceArea">,
+    areaIds: string[]
+  ): Promise<void> {
+    if (areaIds.length === 0) return;
+    const found = await prisma.serviceArea.findMany({
+      where: { id: { in: areaIds } },
+      select: { id: true },
+    });
+    if (found.length === areaIds.length) return;
+    const foundSet = new Set(found.map((a) => a.id));
+    const missing = areaIds.filter((id) => !foundSet.has(id));
+    throw new AppError(404, `Service area(s) not found: ${missing.join(", ")}`);
+  }
+
   async createTechnician(input: CreateTechnicianInput): Promise<TechnicianRecord> {
-    if (input.serviceAreaId) {
-      const area = await this.prisma.serviceArea.findUnique({ where: { id: input.serviceAreaId } });
-      if (!area) throw new AppError(404, "Service area not found");
-    }
+    const areaIds = [...new Set(input.serviceAreaIds ?? [])];
+    await this.assertServiceAreasExist(this.prisma, areaIds);
 
     let tech;
     try {
@@ -241,8 +259,8 @@ class TechnicianService {
           role: input.role ?? null,
           email: input.email ?? null,
           notes: input.notes ?? null,
-          ...(input.serviceAreaId
-            ? { serviceAreas: { create: { serviceAreaId: input.serviceAreaId } } }
+          ...(areaIds.length > 0
+            ? { serviceAreas: { create: areaIds.map((serviceAreaId) => ({ serviceAreaId })) } }
             : {}),
         },
         include: techInclude,
@@ -262,9 +280,10 @@ class TechnicianService {
       const existing = await tx.technician.findUnique({ where: { id } });
       if (!existing) throw new AppError(404, "Technician not found");
 
-      if (input.serviceAreaId !== undefined && input.serviceAreaId !== null) {
-        const area = await tx.serviceArea.findUnique({ where: { id: input.serviceAreaId } });
-        if (!area) throw new AppError(404, "Service area not found");
+      const areaIds =
+        input.serviceAreaIds !== undefined ? [...new Set(input.serviceAreaIds)] : undefined;
+      if (areaIds !== undefined) {
+        await this.assertServiceAreasExist(tx, areaIds);
       }
 
       let tech;
@@ -288,12 +307,12 @@ class TechnicianService {
         throw err;
       }
 
-      // Replace-semantics for service area: null = clear, string = replace
-      if (input.serviceAreaId !== undefined) {
+      // Replace-semantics for service areas: [] = clear all, non-empty = replace
+      if (areaIds !== undefined) {
         await tx.technicianServiceArea.deleteMany({ where: { technicianId: id } });
-        if (input.serviceAreaId !== null) {
-          await tx.technicianServiceArea.create({
-            data: { technicianId: id, serviceAreaId: input.serviceAreaId },
+        if (areaIds.length > 0) {
+          await tx.technicianServiceArea.createMany({
+            data: areaIds.map((serviceAreaId) => ({ technicianId: id, serviceAreaId })),
           });
         }
         // Re-fetch to get fresh serviceAreas after mutation

@@ -78,7 +78,9 @@ export interface TechnicianInput {
   name?: string | null; // admin display label — persisted to Technician.name
   role?: string | null;
   phone?: string | null;
+  email?: string | null;
   active?: boolean;
+  serviceAreaIds?: string[];
 }
 
 export interface ServiceAreaInput {
@@ -352,8 +354,13 @@ class SetupService {
       throw new AppError(409, "Setup is already complete.");
     }
     if (!status.allRequiredComplete) {
+      // Step 12 (Review & Launch) is this very action — it can never be
+      // "complete" beforehand, so it's excluded from allRequiredComplete
+      // above. Apply the same exclusion here, otherwise it always shows up
+      // in the error message alongside any genuinely missing step, even
+      // though the wizard UI never numbers it as a step the user can act on.
       const missing = status.steps
-        .filter((s) => !s.deferred && !s.complete)
+        .filter((s) => !s.deferred && !s.complete && s.step < 12)
         .map((s) => s.step);
       throw new AppError(
         400,
@@ -461,26 +468,66 @@ class SetupService {
   async saveTechnicians(
     input: TechnicianInput[]
   ): Promise<Technician[]> {
+    // Validate every referenced service area up front, outside the
+    // transaction, so a typo'd id fails fast with a clear 400 instead of
+    // surfacing as an FK-violation mid-transaction.
+    const distinctAreaIds = [...new Set(input.flatMap((t) => t.serviceAreaIds ?? []))];
+    if (distinctAreaIds.length > 0) {
+      const found = await this.prisma.serviceArea.findMany({
+        where: { id: { in: distinctAreaIds } },
+        select: { id: true },
+      });
+      const foundSet = new Set(found.map((a) => a.id));
+      const missing = distinctAreaIds.filter((id) => !foundSet.has(id));
+      if (missing.length > 0) {
+        throw new AppError(400, `serviceAreaId(s) not found: ${missing.join(", ")}`);
+      }
+    }
+
+    // IDs generated up front (same reasoning as bulkAddSetupProperties above)
+    // so the service-area join rows can be inserted with createMany in the
+    // same transaction, instead of a second round of per-row lookups.
+    const rows = input.map((t) => ({ ...t, id: randomUUID() }));
+
     // Replace semantics — re-posting step 6 must not append duplicates. Delete
     // only the invite-pending technicians (profileId = null); technicians who
     // have accepted an invite (real profileId) are never touched. Then recreate
     // from the input. Each created technician is invite-pending (profileId = null;
-    // name/email arrive when the invite is accepted).
-    return this.prisma.$transaction(async (tx) => {
-      await tx.technician.deleteMany({ where: { profileId: null } });
-      if (input.length > 0) {
-        await tx.technician.createMany({
-          data: input.map((t) => ({
-            profileId: null,
-            name: t.name ?? null,
-            role: t.role ?? null,
-            phone: t.phone ?? null,
-            active: t.active ?? true,
-          })),
-        });
+    // name/email arrive when the invite is accepted, unless set here directly).
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        await tx.technician.deleteMany({ where: { profileId: null } });
+        if (rows.length > 0) {
+          await tx.technician.createMany({
+            data: rows.map((t) => ({
+              id: t.id,
+              profileId: null,
+              name: t.name ?? null,
+              role: t.role ?? null,
+              phone: t.phone ?? null,
+              email: t.email ?? null,
+              active: t.active ?? true,
+            })),
+          });
+          const areaRows = rows.flatMap((t) =>
+            (t.serviceAreaIds ?? []).map((serviceAreaId) => ({ technicianId: t.id, serviceAreaId }))
+          );
+          if (areaRows.length > 0) {
+            await tx.technicianServiceArea.createMany({ data: areaRows });
+          }
+        }
+        return tx.technician.findMany({ orderBy: { createdAt: "asc" } });
+      });
+    } catch (err) {
+      // Same class of bug as the technician-service/settings-service P2002
+      // fixes above: two rows sharing an email (or colliding with an
+      // already-invited technician's email) previously hit Technician.email's
+      // @unique constraint and surfaced as a raw 500.
+      if (err instanceof TenantPrisma.PrismaClientKnownRequestError && err.code === "P2002") {
+        throw new AppError(409, "Two or more technicians share the same email address.");
       }
-      return tx.technician.findMany({ orderBy: { createdAt: "asc" } });
-    });
+      throw err;
+    }
   }
 
   async getServiceAreas(): Promise<ServiceArea[]> {
