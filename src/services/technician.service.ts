@@ -267,18 +267,26 @@ class TechnicianService {
         if (!area) throw new AppError(404, "Service area not found");
       }
 
-      const tech = await tx.technician.update({
-        where: { id },
-        data: {
-          ...(input.name !== undefined ? { name: input.name } : {}),
-          ...(input.phone !== undefined ? { phone: input.phone } : {}),
-          ...(input.role !== undefined ? { role: input.role } : {}),
-          ...(input.email !== undefined ? { email: input.email } : {}),
-          ...(input.notes !== undefined ? { notes: input.notes } : {}),
-          ...(input.active !== undefined ? { active: input.active } : {}),
-        },
-        include: techInclude,
-      });
+      let tech;
+      try {
+        tech = await tx.technician.update({
+          where: { id },
+          data: {
+            ...(input.name !== undefined ? { name: input.name } : {}),
+            ...(input.phone !== undefined ? { phone: input.phone } : {}),
+            ...(input.role !== undefined ? { role: input.role } : {}),
+            ...(input.email !== undefined ? { email: input.email } : {}),
+            ...(input.notes !== undefined ? { notes: input.notes } : {}),
+            ...(input.active !== undefined ? { active: input.active } : {}),
+          },
+          include: techInclude,
+        });
+      } catch (err) {
+        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+          throw new AppError(409, "A technician with this email already exists");
+        }
+        throw err;
+      }
 
       // Replace-semantics for service area: null = clear, string = replace
       if (input.serviceAreaId !== undefined) {

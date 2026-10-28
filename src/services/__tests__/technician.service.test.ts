@@ -1,6 +1,14 @@
 import { it, expect, vi } from "vitest";
 import { createTechnicianService } from "../technician.service";
-import { VisitStatus } from "../../generated/tenant-client";
+import { VisitStatus, Prisma } from "../../generated/tenant-client";
+import { AppError } from "../../lib/app-error";
+
+function uniqueConstraintError() {
+  return new Prisma.PrismaClientKnownRequestError("Unique constraint failed on the fields: (`email`)", {
+    code: "P2002",
+    clientVersion: "6.19.3",
+  });
+}
 
 function makePrisma() {
   return {
@@ -109,4 +117,71 @@ it("listTechnicians still includes the base technician record fields (toRecord m
   const result = await createTechnicianService(prisma).listTechnicians();
 
   expect(result[0]).toMatchObject({ id: "t1", name: "James", appStatus: "ACTIVE" });
+});
+
+// ---- updateTechnician --------------------------------------------------------
+// Regression coverage for the PATCH /technicians/:id 500: updating a
+// technician to an email already used by another technician hits the
+// @unique constraint on Technician.email. createTechnician already mapped
+// that P2002 to a 409; updateTechnician didn't, so it fell through to the
+// generic 500 handler instead of a clean "already exists" error.
+
+it("updateTechnician maps a duplicate-email unique constraint violation to a 409, not an unhandled error", async () => {
+  const prisma = makePrisma();
+  const txPrisma = {
+    ...makePrisma(),
+    technician: {
+      ...makePrisma().technician,
+      findUnique: vi.fn().mockResolvedValue(makeTech({ id: "t1" })),
+      update: vi.fn().mockRejectedValue(uniqueConstraintError()),
+    },
+  };
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb: any) => cb(txPrisma));
+
+  const promise = createTechnicianService(prisma).updateTechnician("t1", {
+    email: "taken@example.com",
+  });
+
+  await expect(promise).rejects.toBeInstanceOf(AppError);
+  await expect(promise).rejects.toMatchObject({
+    statusCode: 409,
+    message: "A technician with this email already exists",
+  });
+});
+
+it("updateTechnician propagates non-unique-constraint errors unchanged", async () => {
+  const prisma = makePrisma();
+  const boom = new Error("connection lost");
+  const txPrisma = {
+    ...makePrisma(),
+    technician: {
+      ...makePrisma().technician,
+      findUnique: vi.fn().mockResolvedValue(makeTech({ id: "t1" })),
+      update: vi.fn().mockRejectedValue(boom),
+    },
+  };
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb: any) => cb(txPrisma));
+
+  await expect(
+    createTechnicianService(prisma).updateTechnician("t1", { email: "new@example.com" })
+  ).rejects.toBe(boom);
+});
+
+it("updateTechnician returns the updated record when the write succeeds", async () => {
+  const prisma = makePrisma();
+  const txPrisma = {
+    ...makePrisma(),
+    technician: {
+      ...makePrisma().technician,
+      findUnique: vi.fn().mockResolvedValue(makeTech({ id: "t1" })),
+      update: vi.fn().mockResolvedValue(makeTech({ id: "t1", email: "new@example.com" })),
+    },
+  };
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb: any) => cb(txPrisma));
+
+  const result = await createTechnicianService(prisma).updateTechnician("t1", {
+    email: "new@example.com",
+  });
+
+  expect(result.email).toBe("new@example.com");
 });
