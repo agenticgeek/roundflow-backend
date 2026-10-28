@@ -1,6 +1,13 @@
 import { it, expect, vi } from "vitest";
 import { createSetupService } from "../setup.service";
-import { RoundStatus } from "../../generated/tenant-client";
+import { RoundStatus, Prisma } from "../../generated/tenant-client";
+
+function uniqueConstraintError() {
+  return new Prisma.PrismaClientKnownRequestError("Unique constraint failed on the fields: (`email`)", {
+    code: "P2002",
+    clientVersion: "6.19.3",
+  });
+}
 
 function makePrisma() {
   return {
@@ -8,6 +15,7 @@ function makePrisma() {
     service: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
     messageTemplate: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
     technician: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
+    technicianServiceArea: { createMany: vi.fn().mockResolvedValue({ count: 0 }) },
     serviceArea: { findMany: vi.fn(), findUnique: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
     round: {
       findMany: vi.fn().mockResolvedValue([]),
@@ -506,6 +514,72 @@ it("getStatus: every active round has ≥1 technician → step 10 complete", asy
 
   expect(status.steps.find((s) => s.step === 10)?.complete).toBe(true);
   expect(prisma.round.findMany).toHaveBeenCalledTimes(1);
+});
+
+// ── completeSetup: step 12 must never appear as a "missing" step ───────────
+// Regression coverage (QA bug report RF-07): step 12 (Review & Launch) is the
+// completion action itself — it can never be true until completeSetup()
+// finishes, so allRequiredComplete already excludes it (step < 12). The error
+// message's `missing` list didn't apply the same exclusion, so it always
+// listed step 12 alongside any genuinely incomplete step, even though the
+// wizard UI only shows 10 numbered steps.
+
+it("completeSetup's error message excludes step 12 (Review & Launch is the completion action itself, not a real missing step)", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+  await expect(createSetupService(prisma).completeSetup()).rejects.toThrow(
+    "Setup cannot be completed — required steps incomplete: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11"
+  );
+});
+
+// ── saveTechnicians: email + serviceAreaIds (QA bug report RF-05) ──────────
+// POST /setup/step/6 previously only accepted {name, role, phone, active} —
+// email and service-area assignment were silently dropped even if the
+// wizard's "Edit technician" form sent them.
+
+it("saveTechnicians persists email and creates one TechnicianServiceArea row per assigned area", async () => {
+  const prisma = makePrisma();
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((fn: (tx: typeof prisma) => Promise<unknown>) => fn(prisma));
+  (prisma.serviceArea.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ id: "sa1" }, { id: "sa2" }]);
+  (prisma.technician.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+  await createSetupService(prisma).saveTechnicians([
+    { name: "Jess", email: "jess@example.com", serviceAreaIds: ["sa1", "sa2"] },
+  ]);
+
+  expect(prisma.technician.createMany).toHaveBeenCalledWith({
+    data: [expect.objectContaining({ name: "Jess", email: "jess@example.com" })],
+  });
+  const areaCall = (prisma.technicianServiceArea.createMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(areaCall.data).toHaveLength(2);
+  expect(areaCall.data).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ serviceAreaId: "sa1" }),
+      expect.objectContaining({ serviceAreaId: "sa2" }),
+    ])
+  );
+});
+
+it("saveTechnicians rejects an unknown serviceAreaId before writing anything", async () => {
+  const prisma = makePrisma();
+  (prisma.serviceArea.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+  await expect(
+    createSetupService(prisma).saveTechnicians([{ name: "Jess", serviceAreaIds: ["missing-area"] }])
+  ).rejects.toMatchObject({ statusCode: 400, message: expect.stringContaining("missing-area") });
+  expect(prisma.$transaction).not.toHaveBeenCalled();
+});
+
+it("saveTechnicians maps a duplicate-email unique constraint violation to a 409, not an unhandled error", async () => {
+  const prisma = makePrisma();
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation(() =>
+    Promise.reject(uniqueConstraintError())
+  );
+
+  await expect(
+    createSetupService(prisma).saveTechnicians([{ name: "Jess", email: "dupe@example.com" }])
+  ).rejects.toMatchObject({ statusCode: 409 });
 });
 
 // ── getSettings() memoization & upsertSettings() cache refresh ─────────────

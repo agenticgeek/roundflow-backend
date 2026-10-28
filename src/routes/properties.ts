@@ -12,6 +12,9 @@ import {
   parseIsoDate,
   requireNoteType,
   optCleaningFrequency,
+  MAX_NAME_LENGTH,
+  MAX_ADDRESS_LENGTH,
+  MAX_NOTES_LENGTH,
 } from "../lib/validation";
 import {
   createCustomerService,
@@ -41,14 +44,14 @@ propertiesRouter.post(
     const body = asObject(req.body);
     const input: PropertyCreateInput = {
       // Customer (step 1)
-      customerName: requireString(body.customerName, "customerName"),
+      customerName: requireString(body.customerName, "customerName", { maxLength: MAX_NAME_LENGTH }),
       phone: optString(body.phone, "phone"),
       landline: optString(body.landline, "landline"),
       email: optString(body.email, "email"),
       // Property (step 1)
-      addressLine: requireString(body.addressLine, "addressLine").trim(),
-      postcode: requireString(body.postcode, "postcode").trim(),
-      propertyName: optString(body.propertyName, "propertyName"),
+      addressLine: requireString(body.addressLine, "addressLine", { maxLength: MAX_ADDRESS_LENGTH }).trim(),
+      postcode: requireString(body.postcode, "postcode", { maxLength: MAX_ADDRESS_LENGTH }).trim(),
+      propertyName: optString(body.propertyName, "propertyName", { maxLength: MAX_NAME_LENGTH }),
       propertyType: optPropertyType(body.propertyType),
       serviceAreaId: requireString(body.serviceAreaId, "serviceAreaId"),
       // Service Plan (step 2)
@@ -59,8 +62,8 @@ propertiesRouter.post(
       // Schedule (step 3)
       nextDueDate: optIsoDate(body.nextDueDate, "nextDueDate"),
       // Notes (step 4)
-      accessNotes: optString(body.accessNotes, "accessNotes"),
-      riskNotes: optString(body.riskNotes, "riskNotes"),
+      accessNotes: optString(body.accessNotes, "accessNotes", { maxLength: MAX_NOTES_LENGTH }),
+      riskNotes: optString(body.riskNotes, "riskNotes", { maxLength: MAX_NOTES_LENGTH }),
       // Assignment (step 5 / Screen 31) — null = Save & Assign Later (unassigned)
       roundId: optId(body.roundId, "roundId"),
     };
@@ -83,13 +86,13 @@ propertiesRouter.patch(
   h(async (req, res) => {
     const body = asObject(req.body);
     const input: PropertyUpdateInput = {
-      addressLine: optReqString(body.addressLine, "addressLine")?.trim(),
-      postcode: optReqString(body.postcode, "postcode")?.trim(),
-      propertyName: optString(body.propertyName, "propertyName"),
+      addressLine: optReqString(body.addressLine, "addressLine", { maxLength: MAX_ADDRESS_LENGTH })?.trim(),
+      postcode: optReqString(body.postcode, "postcode", { maxLength: MAX_ADDRESS_LENGTH })?.trim(),
+      propertyName: optString(body.propertyName, "propertyName", { maxLength: MAX_NAME_LENGTH }),
       propertyType: optPropertyType(body.propertyType),
       serviceAreaId: optId(body.serviceAreaId, "serviceAreaId"),
-      accessNotes: optString(body.accessNotes, "accessNotes"),
-      riskNotes: optString(body.riskNotes, "riskNotes"),
+      accessNotes: optString(body.accessNotes, "accessNotes", { maxLength: MAX_NOTES_LENGTH }),
+      riskNotes: optString(body.riskNotes, "riskNotes", { maxLength: MAX_NOTES_LENGTH }),
       roundId: optId(body.roundId, "roundId"), // null = unassign; id = assign/reassign
       cleaningFrequency: optCleaningFrequency(body.cleaningFrequency),
     };

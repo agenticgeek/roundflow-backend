@@ -346,6 +346,36 @@ it("getOccurrence returns stops and a summary with deduped technicians", async (
   expect(result.summary.issueCount).toBe(1);
 });
 
+it("getOccurrence passes through a stop's geocoded latitude/longitude, and null when ungeocoded", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1", name: "Round A" });
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    {
+      id: "v1", propertyId: "p1", price: { toNumber: () => 40 }, status: "COMPLETED", paymentHold: false,
+      technicianId: "t1", completedAt: null,
+      technician: { id: "t1", name: "James" },
+      property: {
+        propertyName: "12 Main St", addressLine: "12 Main St", postcode: "NE1 1AA",
+        latitude: 55.4, longitude: -1.7, customer: { name: "John Smith" },
+      },
+      issues: [],
+    },
+    {
+      id: "v2", propertyId: "p2", price: { toNumber: () => 30 }, status: "SCHEDULED", paymentHold: false,
+      technicianId: null, completedAt: null,
+      technician: null,
+      property: {
+        propertyName: null, addressLine: "14 Main St", postcode: "NE1 1AB",
+        latitude: null, longitude: null, customer: null,
+      },
+      issues: [],
+    },
+  ]);
+  const result = await createRoundService(prisma).getOccurrence("r1", "2026-01-01");
+  expect(result.stops[0]).toMatchObject({ latitude: 55.4, longitude: -1.7 });
+  expect(result.stops[1]).toMatchObject({ latitude: null, longitude: null });
+});
+
 // ---- listDayStopsForRounds ---------------------------------------------------
 
 function makeFullStopVisit(overrides: Record<string, unknown> = {}) {
@@ -408,6 +438,38 @@ it("listDayStopsForRounds queries the given date's UTC range for all roundIds at
   expect(call.where.roundId).toEqual({ in: ["r1", "r2"] });
   expect(call.where.date.gte).toEqual(new Date("2026-01-01T00:00:00.000Z"));
   expect(call.where.date.lt).toEqual(new Date("2026-01-02T00:00:00.000Z"));
+});
+
+// ---- getTodayPanel --------------------------------------------------------
+
+it("getTodayPanel throws 404 when the round does not exist", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+  await expect(createRoundService(prisma).getTodayPanel("r1")).rejects.toMatchObject({ statusCode: 404 });
+});
+
+it("getTodayPanel passes through each stop's geocoded latitude/longitude, and null when ungeocoded", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1", name: "Round A" });
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    {
+      id: "v1", status: "SCHEDULED", paymentHold: false, technicianId: "t1",
+      technician: { id: "t1", name: "James" },
+      property: { addressLine: "12 Main St", latitude: 55.4, longitude: -1.7, customer: { name: "John Smith" } },
+      issues: [],
+    },
+    {
+      id: "v2", status: "SCHEDULED", paymentHold: false, technicianId: null,
+      technician: null,
+      property: { addressLine: "14 Main St", latitude: null, longitude: null, customer: null },
+      issues: [],
+    },
+  ]);
+
+  const result = await createRoundService(prisma).getTodayPanel("r1");
+
+  expect(result.stops[0]).toMatchObject({ latitude: 55.4, longitude: -1.7 });
+  expect(result.stops[1]).toMatchObject({ latitude: null, longitude: null });
 });
 
 // ---- generateVisitsNow --------------------------------------------------------

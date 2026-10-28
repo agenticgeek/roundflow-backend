@@ -4,6 +4,15 @@ import {
   getCachedBusinessSettings,
   invalidateCachedBusinessSettings,
 } from "../settings.service";
+import { Prisma } from "../../generated/tenant-client";
+import { AppError } from "../../lib/app-error";
+
+function uniqueConstraintError() {
+  return new Prisma.PrismaClientKnownRequestError("Unique constraint failed on the fields: (`email`)", {
+    code: "P2002",
+    clientVersion: "6.19.3",
+  });
+}
 
 function makePrisma() {
   return {
@@ -416,4 +425,65 @@ it("updateTechnician returns the enriched shape and reflects an ACTIVE appStatus
   const tech = await svc.updateTechnician("t1", { active: true });
 
   expect(tech.appStatus).toBe("ACTIVE");
+});
+
+// Regression coverage (QA bug report RF-05): PATCH /settings/technicians/:id
+// had no handling for the @unique constraint on Technician.email, unlike its
+// sibling in technician.service.ts (PATCH /technicians/:id) — a duplicate
+// email fell through to the generic 500 handler as a raw "Internal Server
+// Error" instead of a clean, actionable error.
+it("updateTechnician maps a duplicate-email unique constraint violation to a 409, not an unhandled error", async () => {
+  const prisma = makePrisma();
+  (prisma.technician.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeTechRow());
+  (prisma.technician.update as ReturnType<typeof vi.fn>).mockRejectedValue(uniqueConstraintError());
+  const svc = createSettingsService(prisma, "schema_update_technician_dupe_email");
+
+  const promise = svc.updateTechnician("t1", { email: "taken@example.com" });
+
+  await expect(promise).rejects.toBeInstanceOf(AppError);
+  await expect(promise).rejects.toMatchObject({
+    statusCode: 409,
+    message: "A technician with this email already exists",
+  });
+});
+
+it("createTechnician maps a duplicate-email unique constraint violation to a 409, not an unhandled error", async () => {
+  const prisma = makePrisma();
+  (prisma.technician.create as ReturnType<typeof vi.fn>).mockRejectedValue(uniqueConstraintError());
+  const svc = createSettingsService(prisma, "schema_create_technician_dupe_email");
+
+  const promise = svc.createTechnician({ name: "New Tech", email: "taken@example.com" });
+
+  await expect(promise).rejects.toMatchObject({ statusCode: 409 });
+});
+
+// Regression coverage: a technician can cover more than one service area
+// (TechnicianServiceArea is a many-to-many join table), but this write path
+// previously had no field for it at all — serviceAreaIds was silently
+// dropped on both create and update.
+it("updateTechnician 404s when a given serviceAreaId does not exist", async () => {
+  const prisma = makePrisma();
+  (prisma.technician.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeTechRow());
+  (prisma.serviceArea.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ id: "sa1" }]);
+  const svc = createSettingsService(prisma, "schema_update_technician_missing_area");
+
+  await expect(
+    svc.updateTechnician("t1", { serviceAreaIds: ["sa1", "sa-missing"] })
+  ).rejects.toMatchObject({ statusCode: 404 });
+});
+
+it("updateTechnician replaces service areas via a nested deleteMany+create on a single update() call", async () => {
+  const prisma = makePrisma();
+  (prisma.technician.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeTechRow());
+  (prisma.serviceArea.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ id: "sa1" }, { id: "sa2" }]);
+  (prisma.technician.update as ReturnType<typeof vi.fn>).mockResolvedValue(makeTechRow());
+  const svc = createSettingsService(prisma, "schema_update_technician_areas");
+
+  await svc.updateTechnician("t1", { serviceAreaIds: ["sa1", "sa2"] });
+
+  const call = (prisma.technician.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(call.data.serviceAreas).toEqual({
+    deleteMany: {},
+    create: [{ serviceAreaId: "sa1" }, { serviceAreaId: "sa2" }],
+  });
 });

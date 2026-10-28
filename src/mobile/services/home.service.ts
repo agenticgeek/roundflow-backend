@@ -6,7 +6,7 @@ import { todayRange } from "../../lib/dates";
 const visitMobileInclude = {
   property: {
     select: {
-      id: true, addressLine: true, postcode: true,
+      id: true, addressLine: true, postcode: true, latitude: true, longitude: true,
       customer: { select: { id: true, name: true, badDebt: true } },
       notes: { select: { id: true, type: true, body: true } },
     },
@@ -27,6 +27,8 @@ function toRow(v: VisitMobile, position: number | null = null): MobileVisitRow {
     customerName: v.property.customer.name,
     addressLine: v.property.addressLine,
     postcode: v.property.postcode,
+    latitude: v.property.latitude,
+    longitude: v.property.longitude,
     roundId: v.roundId,
     roundName: v.round?.name ?? null,
     serviceName: v.service?.name ?? null,

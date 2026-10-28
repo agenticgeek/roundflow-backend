@@ -75,14 +75,19 @@ export interface TechnicianCreateInput {
   name?: string | null;
   phone?: string | null;
   role?: string | null;
+  email?: string | null;
   active?: boolean;
+  serviceAreaIds?: string[];
 }
 
 export interface TechnicianUpdateInput {
   name?: string | null;
   phone?: string | null;
   role?: string | null;
+  email?: string | null;
   active?: boolean;
+  // undefined = no change; [] = clear all areas; non-empty = replace with these
+  serviceAreaIds?: string[];
 }
 
 export interface PaymentRulesUpdateInput {
@@ -454,6 +459,20 @@ class SettingsService {
 
   // ---- Technician Management ----
 
+  // Validates every id in `areaIds` exists; throws AppError(404) naming
+  // whichever ones don't.
+  private async assertServiceAreasExist(areaIds: string[]): Promise<void> {
+    if (areaIds.length === 0) return;
+    const found = await this.prisma.serviceArea.findMany({
+      where: { id: { in: areaIds } },
+      select: { id: true },
+    });
+    if (found.length === areaIds.length) return;
+    const foundSet = new Set(found.map((a) => a.id));
+    const missing = areaIds.filter((id) => !foundSet.has(id));
+    throw new AppError(404, `Service area(s) not found: ${missing.join(", ")}`);
+  }
+
   async getTechnicians(): Promise<TechnicianWithDisplayName[]> {
     const techs = await this.prisma.technician.findMany({
       include: techInclude,
@@ -472,17 +491,36 @@ class SettingsService {
   async createTechnician(
     input: TechnicianCreateInput
   ): Promise<TechnicianWithDisplayName> {
+    const areaIds = [...new Set(input.serviceAreaIds ?? [])];
+    await this.assertServiceAreasExist(areaIds);
+
     // Single invite-pending create (profileId = null) — not the wizard's bulk replace.
-    const tech = await this.prisma.technician.create({
-      data: {
-        profileId: null,
-        name: input.name ?? null,
-        phone: input.phone ?? null,
-        role: input.role ?? null,
-        active: input.active ?? true,
-      },
-      include: techInclude,
-    });
+    let tech;
+    try {
+      tech = await this.prisma.technician.create({
+        data: {
+          profileId: null,
+          name: input.name ?? null,
+          phone: input.phone ?? null,
+          role: input.role ?? null,
+          email: input.email ?? null,
+          active: input.active ?? true,
+          ...(areaIds.length > 0
+            ? { serviceAreas: { create: areaIds.map((serviceAreaId) => ({ serviceAreaId })) } }
+            : {}),
+        },
+        include: techInclude,
+      });
+    } catch (err) {
+      // Mirrors technician.service.ts's createTechnician: without this, a
+      // duplicate-email @unique violation here falls through to the generic
+      // 500 handler instead of a clean 409 (see updateTechnician below —
+      // this path was previously missing it entirely).
+      if (err instanceof TenantPrisma.PrismaClientKnownRequestError && err.code === "P2002") {
+        throw new AppError(409, "A technician with this email already exists");
+      }
+      throw err;
+    }
     return {
       ...tech,
       displayName: tech.name ?? null,
@@ -497,16 +535,52 @@ class SettingsService {
   ): Promise<TechnicianWithDisplayName> {
     const existing = await this.prisma.technician.findUnique({ where: { id } });
     if (!existing) throw new AppError(404, "Technician not found");
-    const tech = await this.prisma.technician.update({
-      where: { id },
-      data: {
-        name: input.name,
-        phone: input.phone,
-        role: input.role,
-        active: input.active,
-      },
-      include: techInclude,
-    });
+
+    const areaIds =
+      input.serviceAreaIds !== undefined ? [...new Set(input.serviceAreaIds)] : undefined;
+    if (areaIds !== undefined) {
+      await this.assertServiceAreasExist(areaIds);
+    }
+
+    let tech;
+    try {
+      tech = await this.prisma.technician.update({
+        where: { id },
+        data: {
+          name: input.name,
+          phone: input.phone,
+          role: input.role,
+          email: input.email,
+          active: input.active,
+          // Replace-semantics for service areas: [] = clear all, non-empty =
+          // replace. Nested deleteMany+create on a single update() is one
+          // query — Prisma applies it atomically, no explicit $transaction
+          // needed.
+          ...(areaIds !== undefined
+            ? {
+                serviceAreas: {
+                  deleteMany: {},
+                  create: areaIds.map((serviceAreaId) => ({ serviceAreaId })),
+                },
+              }
+            : {}),
+        },
+        include: techInclude,
+      });
+    } catch (err) {
+      // Regression fix (RF-05 / QA bug report): updating a technician to an
+      // email already used by another technician hits the @unique
+      // constraint on Technician.email. createTechnician already mapped
+      // that P2002 to a 409 (see above); this path didn't, so it fell
+      // through to the generic 500 handler as a raw "Internal Server Error"
+      // instead of a clean, actionable message — the same class of bug
+      // technician.service.ts's updateTechnician already had to fix.
+      if (err instanceof TenantPrisma.PrismaClientKnownRequestError && err.code === "P2002") {
+        throw new AppError(409, "A technician with this email already exists");
+      }
+      throw err;
+    }
+
     return {
       ...tech,
       displayName: tech.name ?? null,

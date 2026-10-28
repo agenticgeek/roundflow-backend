@@ -228,6 +228,38 @@ it("getTodayVisits returns only visits assigned to the technician for today", as
   expect(result[0].roundName).toBe("Alnwick Monday");
 });
 
+it("getTodayVisits passes through the property's geocoded latitude/longitude, and null when ungeocoded", async () => {
+  const prisma = makePrisma();
+  (prisma.technician.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "t1", profileId: "prof-1" });
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    {
+      id: "v1", status: "SCHEDULED", price: { toNumber: () => 28 },
+      date: new Date(), skipReason: null, completedAt: null,
+      paymentMethod: "DIRECT_DEBIT", notes: null,
+      property: { id: "p1", addressLine: "23 Bailiffgate", postcode: "NE66 1JK", latitude: null, longitude: null,
+        customer: { id: "c1", name: "Sarah Brown", badDebt: false }, notes: [] },
+      round: null,
+      service: null,
+      _count: { issues: 0 },
+    },
+    {
+      id: "v2", status: "SCHEDULED", price: { toNumber: () => 30 },
+      date: new Date(), skipReason: null, completedAt: null,
+      paymentMethod: "CASH", notes: null,
+      property: { id: "p2", addressLine: "45 Bondgate Within", postcode: "NE66 1DJ", latitude: 55.4, longitude: -1.7,
+        customer: { id: "c2", name: "Helen Foster", badDebt: false }, notes: [] },
+      round: null,
+      service: null,
+      _count: { issues: 0 },
+    },
+  ]);
+
+  const result = await createHomeService(prisma).getTodayVisits("prof-1");
+
+  expect(result[0]).toMatchObject({ latitude: null, longitude: null });
+  expect(result[1]).toMatchObject({ latitude: 55.4, longitude: -1.7 });
+});
+
 it("getTodayVisits returns [] when no technician record exists for the profile", async () => {
   const prisma = makePrisma();
   (prisma.technician.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
@@ -320,6 +352,28 @@ it("getVisitDetail returns the visit with property notes", async () => {
 
   expect(visit.id).toBe("v1");
   expect(visit.property.notes).toHaveLength(2);
+});
+
+it("getVisitDetail passes through the property's geocoded latitude/longitude", async () => {
+  const prisma = makePrisma();
+  (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: "v1", status: "IN_PROGRESS", price: { toNumber: () => 52 },
+    paymentMethod: "CASH", notes: null, skipReason: null, completedAt: null,
+    roundId: "r1", propertyId: "p1", technician: null,
+    property: { id: "p1", addressLine: "12 Market Street", postcode: "NE66 1AA", latitude: 55.4, longitude: -1.7,
+      customer: { id: "c1", name: "Tom Atkinson", badDebt: false, invoices: [] },
+      notes: [] },
+    round: { id: "r1", name: "Alnwick Monday" },
+    service: { id: "s1", name: "Full exterior + conservatory" },
+    _count: { issues: 0 },
+  });
+  (prisma.visit.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+  const visit = await createJobDetailService(prisma).getVisitDetail("v1");
+
+  expect(visit.property.latitude).toBe(55.4);
+  expect(visit.property.longitude).toBe(-1.7);
 });
 
 it("getVisitDetail throws 404 when visit does not exist", async () => {

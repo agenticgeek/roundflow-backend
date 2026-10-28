@@ -274,6 +274,11 @@ model Property {
   propertyName  String?
   addressLine   String
   postcode      String
+  latitude        Float?
+  longitude       Float?
+  geocodedAt      DateTime?
+  geocodeAttempts Int       @default(0)
+  geocodeError    String?
   serviceAreaId String?
   serviceArea   ServiceArea?    @relation(fields: [serviceAreaId], references: [id])
   propertyType  PropertyType?

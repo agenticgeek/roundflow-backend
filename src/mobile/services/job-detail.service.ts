@@ -8,7 +8,7 @@ import { evaluateDebtGate } from "./debt-gate";
 const visitDetailInclude = {
   property: {
     select: {
-      id: true, addressLine: true, postcode: true,
+      id: true, addressLine: true, postcode: true, latitude: true, longitude: true,
       customer: {
         select: {
           id: true, name: true, badDebt: true,

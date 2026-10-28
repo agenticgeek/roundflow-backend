@@ -4,6 +4,17 @@ import { AppError } from "./app-error";
 // Shared request-value validators used by both the /setup and /settings routers,
 // so a fix lands in one place (see PR review §9 for the wider dedup this seeds).
 
+// ---- Shared max-length limits -----------------------------------------------
+// Name/address/postcode/notes fields previously had no upper bound anywhere in
+// the stack (DB columns are plain unconstrained `text`, and requireString/
+// optString only checked type + non-empty) — an arbitrarily long value would
+// be accepted, stored, and could break list/detail layouts on the frontend.
+// These are business-reasonable limits, not DB constraints; passed as
+// `{ maxLength }` to requireString/optString/optReqString at each call site.
+export const MAX_NAME_LENGTH = 255; // person/business/technician/property names
+export const MAX_ADDRESS_LENGTH = 255; // address lines, postcodes
+export const MAX_NOTES_LENGTH = 2000; // free-text notes (access/risk notes, etc.)
+
 /** Validate every element of a working-days array against the DayOfWeek enum.
  *  Returns the array unchanged; throws AppError(400) on the first invalid value.
  *  Also catches non-string elements (a number is not a valid enum member). */

@@ -18,6 +18,8 @@ export interface MobileVisitRow {
   customerName: string;
   addressLine: string;
   postcode: string;
+  latitude: number | null;
+  longitude: number | null;
   roundId: string | null;
   roundName: string | null;
   serviceName: string | null;

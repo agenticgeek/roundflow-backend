@@ -5,8 +5,8 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
-import { asObject, h, optBool, optId, optReqString, optString } from "../lib/http";
-import { isValidEmail, optTechnicianRole } from "../lib/validation";
+import { asObject, h, optBool, optReqString, optString, optStringArray } from "../lib/http";
+import { isValidEmail, optTechnicianRole, MAX_NAME_LENGTH, MAX_NOTES_LENGTH } from "../lib/validation";
 import { sendInviteEmail, INVITE_TTL_DAYS } from "../lib/email";
 import {
   createTechnicianService,
@@ -49,12 +49,12 @@ techniciansRouter.post(
   h(async (req, res) => {
     const body = asObject(req.body);
 
-    const name = optReqString(body.name, "name") ?? null;
+    const name = optReqString(body.name, "name", { maxLength: MAX_NAME_LENGTH }) ?? null;
     const phone = optString(body.phone, "phone") ?? null;
     const role = optTechnicianRole(body.role) ?? null;
     const emailRaw = optString(body.email, "email") ?? null;
-    const notes = optString(body.notes, "notes") ?? null;
-    const serviceAreaId = optId(body.serviceAreaId, "serviceAreaId") ?? null;
+    const notes = optString(body.notes, "notes", { maxLength: MAX_NOTES_LENGTH }) ?? null;
+    const serviceAreaIds = optStringArray(body.serviceAreaIds, "serviceAreaIds");
     const sendInvite = optBool(body.sendInvite, "sendInvite") ?? false;
 
     let email: string | null = null;
@@ -81,7 +81,7 @@ techniciansRouter.post(
       }
     }
 
-    const input: CreateTechnicianInput = { name, phone, role, email, notes, serviceAreaId };
+    const input: CreateTechnicianInput = { name, phone, role, email, notes, serviceAreaIds };
     const service = svc(req);
     const tech = await service.createTechnician(input);
 
@@ -130,12 +130,12 @@ techniciansRouter.patch(
     const body = asObject(req.body);
 
     const input: UpdateTechnicianInput = {
-      name: optString(body.name, "name"),
+      name: optString(body.name, "name", { maxLength: MAX_NAME_LENGTH }),
       phone: optString(body.phone, "phone"),
       role: optTechnicianRole(body.role),
-      notes: optString(body.notes, "notes"),
+      notes: optString(body.notes, "notes", { maxLength: MAX_NOTES_LENGTH }),
       active: optBool(body.active, "active"),
-      serviceAreaId: optId(body.serviceAreaId, "serviceAreaId"),
+      serviceAreaIds: optStringArray(body.serviceAreaIds, "serviceAreaIds"),
     };
 
     // Email validated separately to normalise case

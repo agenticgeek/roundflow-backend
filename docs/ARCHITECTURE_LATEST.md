@@ -621,7 +621,23 @@ flowchart TD
 
 Tenant migrations are replayed every time a new tenant schema is provisioned. They are **not** run via `prisma migrate` — they are collected alphabetically and executed as raw SQL inside a transaction by `provisionTenantSchema`. This means every new tenant always gets the full current schema from day one.
 
-Existing tenant schemas are **not** automatically migrated when a new migration is added (that is a Phase 2 concern requiring a migration runner that iterates all `Tenant.schemaName` values and applies pending SQL).
+**Correction (2026-10-29) — existing tenant schemas ARE auto-migrated.** An
+earlier version of this doc said otherwise and called it a "Phase 2 concern";
+that's no longer true (`src/lib/tenant-provisioning.ts`). Every tenant schema
+carries its own `"<schema>"."_migrations"` tracking table. On every server
+startup, `migrateAllTenantSchemas()` (called from `src/index.ts` before
+`app.listen`, see §6) lists every row in `public."Tenant"`, and for each one
+diffs `prisma/tenant/migrations/*` against that tenant's `_migrations` table
+and applies whatever is pending, each migration in its own transaction. A
+tenant provisioned before this tracking existed gets baselined instead —
+every currently-known migration is recorded as already-applied without
+re-running it, since it was already applied during that tenant's original
+provisioning. One tenant's migration failure is logged and skipped, not
+fatal — it does not stop the rest of the fleet, or the app, from starting.
+Net effect: dropping a new `migration.sql` folder into
+`prisma/tenant/migrations/` is sufficient on its own — no separate "migrate
+all tenants" command exists or is needed; the next deploy's startup applies
+it everywhere.
 
 ### Current tenant migration log (updated — the original doc stopped at `20260915000000_technician_emergency`)
 
@@ -658,11 +674,139 @@ Existing tenant schemas are **not** automatically migrated when a new migration 
 | `20261022010000_bulk_import_idempotency` | New `BulkImportAttempt` model — idempotency for `POST /setup/step/9/bulk`. |
 | `20261022020000_debt_hold_reason` | Adds `Customer.holdReason`/`holdSince`. |
 | `20261022030000_complaint_resolution_fields` | Adds `Complaint.resolvedAt`/`resolvedBy`/`notes`. |
+| `20261029000000_property_geocoding` | Adds `Property.latitude`/`longitude`/`geocodedAt`/`geocodeAttempts`/`geocodeError` — see §14. |
 
 ---
 
 ## 13. Status Summary (read this before planning new GHL/automation work)
 
-- ✅ **Built and working:** multi-tenancy, auth/RBAC, outbox pattern, OAuth + PIT GHL connection, outbound contact sync, 4 of 5 tags, inbound `InboundMessage`/`Uninstall` handling, GoCardless native webhook (mandate/payment lifecycle).
+- ✅ **Built and working:** multi-tenancy, auth/RBAC, outbox pattern, OAuth + PIT GHL connection, outbound contact sync, 4 of 5 tags, inbound `InboundMessage`/`Uninstall` handling, GoCardless native webhook (mandate/payment lifecycle), property geocoding (postcode → lat/long, see §14).
 - 🚧 **Documented (handoff doc) but not built:** custom-fields writer, `payment-failed` tag, lead-handoff webhook branch, complaint-resolved tag removal. See §10.7 for the full list — this is the concrete backlog for "what the backend needs before the automation owner can build/test the 5 GHL workflows."
 - 🆕 **New, undocumented elsewhere, decisions still open:** MessageTemplate ↔ GHL Snippet two-way sync (§10.8) — scope decided (SMS templates), GHL API capability and conflict rule still unverified/undecided.
+
+---
+
+## 14. Property Geocoding (Latitude/Longitude)
+
+> Backend/frontend handoffs for this work: `docs/handoff/backend/2026-10-29-property-geocoding-handoff.md` /
+> `docs/handoff/frontend/2026-10-29-property-geocoding-handoff.md`.
+
+### 14.1 Why
+
+`docs/Handoffs/ROUND_PLANNER_HANDOFF.md` §8 and
+`docs/Handoffs/FRONTEND_WIRING_AUDIT_RESPONSE_2026-10-22.md` Part C item 1 both
+flagged the same gap: `Property` had no coordinates at all, so the Round
+Planner's Map view and the Dashboard's (frontend-placeholder, see §SRS)
+"today's stops" map were scoped around the frontend geocoding addresses
+itself. Both docs explicitly deferred fixing this as its own piece of backend
+work. This section is that work.
+
+### 14.2 Provider choice
+
+Coordinates are derived **from `postcode` alone**, via
+[postcodes.io](https://postcodes.io) — free, unauthenticated, UK-only. Chosen
+over a paid maps API (Google/Mapbox) specifically to avoid a new vendor key
+the frontend audit doc worried about ("confirmation the frontend will
+actually have a maps API key configured") — RoundFlow is UK-only today, and
+`addressLine` is a free-text line with no structure to geocode against
+anyway. Precision is postcode-level (not point-level), which is adequate for
+pin placement and route/map views; it is **not** adequate for turn-by-turn
+navigation accuracy.
+
+Because geocoding is postcode-keyed, an `addressLine`-only edit (e.g. a unit
+number) never touches coordinates — only an actual postcode change
+invalidates them.
+
+### 14.3 Schema
+
+```prisma
+model Property {
+  ...
+  latitude        Float?
+  longitude       Float?
+  geocodedAt      DateTime?
+  geocodeAttempts Int       @default(0)
+  geocodeError    String?
+}
+```
+
+All five are nullable/defaulted — no new required input anywhere, no frontend
+form change. `latitude`/`longitude` are `null` until the first successful
+geocode.
+
+### 14.4 Architecture — write-then-backfill, same shape as the GHL outbox
+
+Unlike GHL (§10.3), there's no persisted queue table — the "pending" set is
+just `WHERE latitude IS NULL AND geocodeAttempts < 5` on `Property` itself,
+which plays the same role as `IntegrationOutbox.status = 'pending'`.
+
+```mermaid
+flowchart TB
+    subgraph Write["On create/update (customer.service.ts)"]
+        CP["createProperty / addPropertyToCustomer\n(new property)"]
+        UP["updateProperty / updateCustomer\n(postcode changed)"]
+        TRIG["triggerGeocode(tp, propertyId, postcode)\nfire-and-forget, .catch(console.error)\nnever delays the response"]
+        CP --> TRIG
+        UP -->|"reset lat/long/attempts to null/0 first"| TRIG
+    end
+
+    subgraph Backfill["Every 15 min (src/jobs/geocodeBackfill.ts)"]
+        CRON["runGeocodeBackfill()\nall tenants, Promise.allSettled"]
+        FIND["WHERE latitude IS NULL\nAND geocodeAttempts < 5"]
+        BULK["geocodePostcodesBulk()\nchunked to 100/request"]
+        CRON --> FIND --> BULK
+    end
+
+    TRIG -->|"single lookup"| API["postcodes.io\nsrc/integrations/geocoding/client.ts"]
+    BULK -->|"bulk lookup"| API
+    API --> WRITE[("Property.latitude/longitude\nor geocodeAttempts++/geocodeError")]
+```
+
+- `src/integrations/geocoding/client.ts` — `geocodePostcode` (single,
+  used by the inline trigger) and `geocodePostcodesBulk` (chunked to 100,
+  used by the backfill job). A 404 ("no match") resolves to `null`, not a
+  thrown error; any other non-2xx or network failure throws.
+- `src/jobs/geocodeBackfill.ts` — `runGeocodeBackfill()`, cron-scheduled
+  `*/15 * * * *` in `src/index.ts` next to `runOutboxWorker`/
+  `runVisitGeneration`. Per tenant: pull up to 500 pending properties, bulk
+  lookup, write back coordinates or bump `geocodeAttempts`/`geocodeError`.
+- `customer.service.ts`'s `triggerGeocode()` helper is called with
+  `this.prisma` (never a transaction client) **after** the triggering
+  `$transaction` has committed — an HTTP call never runs inside a DB
+  transaction here.
+
+**Dead-letter, without a status enum.** Unlike the outbox's explicit
+`status: "dead"`, a property that fails 5 times simply stops matching the
+`geocodeAttempts < 5` filter — it's left alone (with its last `geocodeError`
+recorded) rather than retried forever. There is currently no endpoint to
+reset/force a retry; that would mean clearing `geocodeAttempts` back to 0 on
+that property.
+
+### 14.5 Where it's exposed
+
+Every response that already carried a property's `addressLine`/`postcode`
+and feeds a map, planner, or technician-navigation view now also carries
+`latitude`/`longitude` (`number | null`): `PATCH /properties/:id`,
+`GET /customers`, `GET /customers/:id`, `GET /rounds/:id/planner/occurrences/:date`
+(+ the batched multi-round variant), `GET /rounds/:id/today`, `POST /visits`,
+and the mobile technician endpoints (`GET /mobile/rounds/today`,
+`/mobile/visits/today`, `/mobile/completions`, `GET /mobile/visits/:id`).
+Reporting/invoicing/PDF/complaint-detail address text (`reports.service.ts`,
+`debt.service.ts`, `invoice.service.ts`, `complaint.service.ts`,
+`src/integrations/pdf/render.ts`) deliberately was **not** touched — display
+text only, no map/coordinate use. The Dashboard's GPS map
+(`src/routes/dashboard.ts`) is still a frontend-only placeholder with no
+backend endpoint — out of scope here, same as §SRS already noted.
+
+### 14.6 Testing
+
+`src/integrations/geocoding/client.ts` and `src/jobs/geocodeBackfill.ts` are
+brand-new whole files with no pre-existing untested code, so — like the
+`AUDIT_REMEDIATION_FILES` set — they're gated at 100% line/branch/function/
+statement coverage in `vitest.config.ts` (`GEOCODING_FILES`). The callers
+(`customer.service.ts`, `round.service.ts`, `visit.service.ts`, the mobile
+services) mix this change into large, previously-untested files and are
+deliberately not whole-file-gated, for the same reason
+`AUDIT_REMEDIATION_FILES` excludes `round.service.ts`/`customer.service.ts` —
+but every new branch this change introduces in them (geocode
+success/failure/skip, postcode-changed/unchanged) is covered by a test.

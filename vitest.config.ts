@@ -41,6 +41,19 @@ const AUDIT_REMEDIATION_FILES = [
   "src/lib/tenant-defaults.ts",
 ];
 
+// New, whole files added for property geocoding (2026-10-29) — no pre-existing
+// untested legacy code to drag the ratio down, so gated at 100% like
+// AUDIT_REMEDIATION_FILES above. The *callers* of these files
+// (customer.service.ts, round.service.ts, visit.service.ts, the mobile
+// services) mix this change into large, previously-untested files and are
+// deliberately NOT added here, for the same reason AUDIT_REMEDIATION_FILES
+// excludes round.service.ts/customer.service.ts. See
+// docs/handoff/backend/2026-10-29-property-geocoding-handoff.md.
+const GEOCODING_FILES = [
+  "src/integrations/geocoding/client.ts",
+  "src/jobs/geocodeBackfill.ts",
+];
+
 export default defineConfig({
   test: {
     include: ["src/**/*.test.ts"],
@@ -49,7 +62,7 @@ export default defineConfig({
     coverage: {
       provider: "v8",
       reporter: ["text", "html", "lcov"],
-      include: [...PAYMENT_DOMAIN_FILES, ...AUDIT_REMEDIATION_FILES],
+      include: [...PAYMENT_DOMAIN_FILES, ...AUDIT_REMEDIATION_FILES, ...GEOCODING_FILES],
       thresholds: {
         100: true,
         perFile: true,

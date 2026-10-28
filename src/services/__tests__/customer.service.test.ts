@@ -1,7 +1,16 @@
-import { it, expect, vi } from "vitest";
+import { it, expect, vi, beforeEach } from "vitest";
 import { createCustomerService } from "../customer.service";
 import { LifecycleStatus, VisitStatus, PaymentStatus, PaymentMethod } from "../../generated/tenant-client";
 import { UserRole } from "@prisma/client";
+import { geocodePostcode } from "../../integrations/geocoding/client";
+
+vi.mock("../../integrations/geocoding/client", () => ({
+  geocodePostcode: vi.fn(),
+}));
+
+beforeEach(() => {
+  vi.mocked(geocodePostcode).mockReset();
+});
 
 function makePrisma() {
   return {
@@ -59,6 +68,196 @@ it("createProperty writes landline to the customer", async () => {
   expect(capturedCreate.data.landline).toBe("+44 1665 000111");
 });
 
+// ── geocoding triggers ──────────────────────────────────────────────────────
+
+it("createProperty triggers a geocode lookup and writes coordinates onto the property", async () => {
+  const prisma = makePrisma();
+  (prisma.serviceArea.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sa1" });
+  const txPrisma = {
+    ...makePrisma(),
+    customer: { ...makePrisma().customer, create: vi.fn().mockResolvedValue({ id: "c1" }) },
+    serviceArea: { findUnique: vi.fn().mockResolvedValue({ id: "sa1" }) },
+    property: { create: vi.fn().mockResolvedValue({ id: "p1" }) },
+    servicePlan: { create: vi.fn().mockResolvedValue({ id: "sp1" }) },
+    round: { findUnique: vi.fn().mockResolvedValue(null) },
+  };
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb: any) => cb(txPrisma));
+  vi.mocked(geocodePostcode).mockResolvedValue({ latitude: 55.4, longitude: -1.7 });
+
+  await createCustomerService(prisma).createProperty({
+    customerName: "John Smith",
+    addressLine: "12 Market St",
+    postcode: "NE66 1SS",
+    serviceAreaId: "sa1",
+    price: 35,
+  });
+
+  await vi.waitFor(() => expect(prisma.property.update).toHaveBeenCalled());
+  expect(geocodePostcode).toHaveBeenCalledWith("NE66 1SS");
+  expect(prisma.property.update).toHaveBeenCalledWith({
+    where: { id: "p1" },
+    data: { latitude: 55.4, longitude: -1.7, geocodedAt: expect.any(Date), geocodeError: null },
+  });
+});
+
+it("createProperty does not throw and records geocodeAttempts/geocodeError when the postcode has no match", async () => {
+  const prisma = makePrisma();
+  (prisma.serviceArea.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sa1" });
+  const txPrisma = {
+    ...makePrisma(),
+    customer: { ...makePrisma().customer, create: vi.fn().mockResolvedValue({ id: "c1" }) },
+    serviceArea: { findUnique: vi.fn().mockResolvedValue({ id: "sa1" }) },
+    property: { create: vi.fn().mockResolvedValue({ id: "p1" }) },
+    servicePlan: { create: vi.fn().mockResolvedValue({ id: "sp1" }) },
+    round: { findUnique: vi.fn().mockResolvedValue(null) },
+  };
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb: any) => cb(txPrisma));
+  vi.mocked(geocodePostcode).mockResolvedValue(null);
+
+  await expect(
+    createCustomerService(prisma).createProperty({
+      customerName: "John Smith",
+      addressLine: "1 Nowhere Rd",
+      postcode: "ZZ99 9ZZ",
+      serviceAreaId: "sa1",
+      price: 35,
+    })
+  ).resolves.toBeDefined();
+
+  await vi.waitFor(() => expect(prisma.property.update).toHaveBeenCalled());
+  expect(prisma.property.update).toHaveBeenCalledWith({
+    where: { id: "p1" },
+    data: { geocodeAttempts: { increment: 1 }, geocodeError: "postcode not found" },
+  });
+});
+
+it("createProperty does not throw when the geocoding provider itself fails", async () => {
+  const prisma = makePrisma();
+  (prisma.serviceArea.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sa1" });
+  const txPrisma = {
+    ...makePrisma(),
+    customer: { ...makePrisma().customer, create: vi.fn().mockResolvedValue({ id: "c1" }) },
+    serviceArea: { findUnique: vi.fn().mockResolvedValue({ id: "sa1" }) },
+    property: { create: vi.fn().mockResolvedValue({ id: "p1" }) },
+    servicePlan: { create: vi.fn().mockResolvedValue({ id: "sp1" }) },
+    round: { findUnique: vi.fn().mockResolvedValue(null) },
+  };
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb: any) => cb(txPrisma));
+  vi.mocked(geocodePostcode).mockRejectedValue(new Error("network down"));
+
+  await expect(
+    createCustomerService(prisma).createProperty({
+      customerName: "John Smith",
+      addressLine: "1 Nowhere Rd",
+      postcode: "NE66 1SS",
+      serviceAreaId: "sa1",
+      price: 35,
+    })
+  ).resolves.toBeDefined();
+
+  await vi.waitFor(() => expect(prisma.property.update).toHaveBeenCalled());
+  expect(prisma.property.update).toHaveBeenCalledWith({
+    where: { id: "p1" },
+    data: { geocodeAttempts: { increment: 1 }, geocodeError: "Error: network down" },
+  });
+});
+
+it("addPropertyToCustomer triggers a geocode lookup for the new property", async () => {
+  const prisma = makePrisma();
+  (prisma.customer.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1", status: LifecycleStatus.ACTIVE });
+  (prisma.serviceArea.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sa1" });
+  const txPrisma = {
+    ...makePrisma(),
+    serviceArea: { findUnique: vi.fn().mockResolvedValue({ id: "sa1" }) },
+    property: { create: vi.fn().mockResolvedValue({ id: "p2" }) },
+    servicePlan: { create: vi.fn().mockResolvedValue({ id: "sp2" }) },
+    round: { findUnique: vi.fn().mockResolvedValue(null) },
+  };
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb: any) => cb(txPrisma));
+  vi.mocked(geocodePostcode).mockResolvedValue({ latitude: 1, longitude: 2 });
+
+  await createCustomerService(prisma).addPropertyToCustomer("c1", {
+    addressLine: "5 High St",
+    postcode: "NE1 1AA",
+    serviceAreaId: "sa1",
+    price: 20,
+  });
+
+  await vi.waitFor(() => expect(prisma.property.update).toHaveBeenCalled());
+  expect(geocodePostcode).toHaveBeenCalledWith("NE1 1AA");
+  expect(prisma.property.update).toHaveBeenCalledWith({
+    where: { id: "p2" },
+    data: { latitude: 1, longitude: 2, geocodedAt: expect.any(Date), geocodeError: null },
+  });
+});
+
+it("updateProperty resets coordinates and triggers a re-geocode when the postcode changes", async () => {
+  const prisma = makePrisma();
+  (prisma.property.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: "p1", postcode: "NE66 1AA", roundId: null, serviceAreaId: null, round: null, servicePlans: [],
+  });
+  const txPrisma = {
+    ...makePrisma(),
+    property: { update: vi.fn().mockResolvedValue({ id: "p1", postcode: "NE1 9ZZ" }) },
+  };
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb: any) => cb(txPrisma));
+  vi.mocked(geocodePostcode).mockResolvedValue({ latitude: 3, longitude: 4 });
+
+  const result = await createCustomerService(prisma).updateProperty("p1", { postcode: "NE1 9ZZ" });
+
+  expect(txPrisma.property.update).toHaveBeenCalledWith({
+    where: { id: "p1" },
+    data: {
+      addressLine: undefined,
+      postcode: "NE1 9ZZ",
+      propertyName: undefined,
+      propertyType: undefined,
+      serviceAreaId: undefined,
+      accessNotes: undefined,
+      riskNotes: undefined,
+      roundId: null,
+      latitude: null,
+      longitude: null,
+      geocodedAt: null,
+      geocodeAttempts: 0,
+      geocodeError: null,
+    },
+  });
+  expect(result).toEqual({ id: "p1", postcode: "NE1 9ZZ" });
+  await vi.waitFor(() => expect(prisma.property.update).toHaveBeenCalled());
+  expect(geocodePostcode).toHaveBeenCalledWith("NE1 9ZZ");
+});
+
+it("updateProperty leaves coordinates untouched when the postcode is unchanged", async () => {
+  const prisma = makePrisma();
+  (prisma.property.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: "p1", postcode: "NE66 1AA", roundId: null, serviceAreaId: null, round: null, servicePlans: [],
+  });
+  const txPrisma = {
+    ...makePrisma(),
+    property: { update: vi.fn().mockResolvedValue({ id: "p1" }) },
+  };
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb: any) => cb(txPrisma));
+
+  await createCustomerService(prisma).updateProperty("p1", { addressLine: "New Address Line" });
+
+  expect(txPrisma.property.update).toHaveBeenCalledWith({
+    where: { id: "p1" },
+    data: {
+      addressLine: "New Address Line",
+      postcode: undefined,
+      propertyName: undefined,
+      propertyType: undefined,
+      serviceAreaId: undefined,
+      accessNotes: undefined,
+      riskNotes: undefined,
+      roundId: null,
+    },
+  });
+  expect(geocodePostcode).not.toHaveBeenCalled();
+  expect(prisma.property.update).not.toHaveBeenCalled();
+});
+
 it("updateCustomer writes landline when provided", async () => {
   const prisma = makePrisma();
   (prisma.customer.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
@@ -84,6 +283,75 @@ it("updateCustomer writes landline when provided", async () => {
     landline: "+44 1665 000111",
   });
   expect(capturedUpdate.data.landline).toBe("+44 1665 000111");
+});
+
+it("updateCustomer resets coordinates and triggers a re-geocode when the property's postcode changes", async () => {
+  const prisma = makePrisma();
+  (prisma.customer.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: "c1", name: "John", phone: null, landline: null, email: null,
+    properties: [{ id: "p1", postcode: "NE66 1AA", roundId: null, servicePlans: [{ id: "sp1" }] }],
+  });
+  const txPrisma = {
+    ...makePrisma(),
+    property: { update: vi.fn().mockResolvedValue({ id: "p1" }) },
+    round: { findUnique: vi.fn().mockResolvedValue(null) },
+  };
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb: any) => cb(txPrisma));
+  vi.mocked(geocodePostcode).mockResolvedValue({ latitude: 9, longitude: 10 });
+
+  const result = await createCustomerService(prisma).updateCustomer("c1", { postcode: "NE1 9ZZ" });
+
+  expect(txPrisma.property.update).toHaveBeenCalledWith({
+    where: { id: "p1" },
+    data: {
+      postcode: "NE1 9ZZ",
+      latitude: null,
+      longitude: null,
+      geocodedAt: null,
+      geocodeAttempts: 0,
+      geocodeError: null,
+    },
+  });
+  expect(result).toEqual({ customerId: "c1", propertyId: "p1", servicePlanId: "sp1" });
+  await vi.waitFor(() => expect(prisma.property.update).toHaveBeenCalled());
+  expect(geocodePostcode).toHaveBeenCalledWith("NE1 9ZZ");
+});
+
+it("updateCustomer leaves coordinates untouched when the property's postcode is unchanged", async () => {
+  const prisma = makePrisma();
+  (prisma.customer.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: "c1", name: "John", phone: null, landline: null, email: null,
+    properties: [{ id: "p1", postcode: "NE66 1AA", roundId: null, servicePlans: [{ id: "sp1" }] }],
+  });
+  const txPrisma = {
+    ...makePrisma(),
+    property: { update: vi.fn().mockResolvedValue({ id: "p1" }) },
+  };
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb: any) => cb(txPrisma));
+
+  await createCustomerService(prisma).updateCustomer("c1", { addressLine: "New Line" });
+
+  expect(txPrisma.property.update).toHaveBeenCalledWith({
+    where: { id: "p1" },
+    data: { addressLine: "New Line" },
+  });
+  expect(geocodePostcode).not.toHaveBeenCalled();
+  expect(prisma.property.update).not.toHaveBeenCalled();
+});
+
+it("updateCustomer never calls property.update or geocodes when the customer has no property", async () => {
+  const prisma = makePrisma();
+  (prisma.customer.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: "c1", name: "John", phone: null, landline: null, email: null, properties: [],
+  });
+  const txPrisma = makePrisma();
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb: any) => cb(txPrisma));
+
+  const result = await createCustomerService(prisma).updateCustomer("c1", { postcode: "NE1 9ZZ" });
+
+  expect(txPrisma.property.update).not.toHaveBeenCalled();
+  expect(geocodePostcode).not.toHaveBeenCalled();
+  expect(result).toEqual({ customerId: "c1", propertyId: null, servicePlanId: null });
 });
 
 // ── getCustomerDetail: servicePlans array ──────────────────────────────────

@@ -15,7 +15,15 @@ import {
   optId,
   parsePageParams,
 } from "../lib/http";
-import { assertPositive, optPaymentMethod, optPropertyType, optIsoDate } from "../lib/validation";
+import {
+  assertPositive,
+  optPaymentMethod,
+  optPropertyType,
+  optIsoDate,
+  MAX_NAME_LENGTH,
+  MAX_ADDRESS_LENGTH,
+  MAX_NOTES_LENGTH,
+} from "../lib/validation";
 import { createInvoiceService } from "../services/invoice.service";
 import {
   createCustomerService,
@@ -46,7 +54,7 @@ customersRouter.post(
   h(async (req, res) => {
     const body = asObject(req.body);
     const input: CustomerCreateInput = {
-      name: requireString(body.name, "name"),
+      name: requireString(body.name, "name", { maxLength: MAX_NAME_LENGTH }),
       phone: optString(body.phone, "phone"),
       email: optString(body.email, "email"),
       paymentMethod: optPaymentMethod(body.paymentMethod),
@@ -118,16 +126,16 @@ customersRouter.patch(
 
     const input: CustomerUpdateInput = {
       // Customer (name is required-non-null → optReqString rejects null/blank)
-      name: optReqString(body.name, "name"),
+      name: optReqString(body.name, "name", { maxLength: MAX_NAME_LENGTH }),
       phone: optString(body.phone, "phone"),
       landline: optString(body.landline, "landline"),
       email: optString(body.email, "email"),
       // Property
-      addressLine: optReqString(body.addressLine, "addressLine"),
-      postcode: optReqString(body.postcode, "postcode"),
+      addressLine: optReqString(body.addressLine, "addressLine", { maxLength: MAX_ADDRESS_LENGTH }),
+      postcode: optReqString(body.postcode, "postcode", { maxLength: MAX_ADDRESS_LENGTH }),
       propertyType: optPropertyType(body.propertyType),
-      accessNotes: optString(body.accessNotes, "accessNotes"),
-      riskNotes: optString(body.riskNotes, "riskNotes"),
+      accessNotes: optString(body.accessNotes, "accessNotes", { maxLength: MAX_NOTES_LENGTH }),
+      riskNotes: optString(body.riskNotes, "riskNotes", { maxLength: MAX_NOTES_LENGTH }),
       roundId: optId(body.roundId, "roundId"), // null = unassign (OQ-CP4)
       // ServicePlan (Assigned Technician is deferred to M3 — per-Visit)
       price,
@@ -161,9 +169,9 @@ customersRouter.post(
     const price = requireNumber(body.price, "price");
     assertPositive(price, "price", 9999.99);
     const input: PropertyAddInput = {
-      addressLine: requireString(body.addressLine, "addressLine").trim(),
-      postcode: requireString(body.postcode, "postcode").trim(),
-      propertyName: optString(body.propertyName, "propertyName"),
+      addressLine: requireString(body.addressLine, "addressLine", { maxLength: MAX_ADDRESS_LENGTH }).trim(),
+      postcode: requireString(body.postcode, "postcode", { maxLength: MAX_ADDRESS_LENGTH }).trim(),
+      propertyName: optString(body.propertyName, "propertyName", { maxLength: MAX_NAME_LENGTH }),
       propertyType: optPropertyType(body.propertyType),
       serviceAreaId: requireString(body.serviceAreaId, "serviceAreaId"),
       serviceId: optId(body.serviceId, "serviceId"),
@@ -171,8 +179,8 @@ customersRouter.post(
       cleanMethod: optString(body.cleanMethod, "cleanMethod"),
       paymentMethod: optPaymentMethod(body.paymentMethod),
       nextDueDate: optIsoDate(body.nextDueDate, "nextDueDate"),
-      accessNotes: optString(body.accessNotes, "accessNotes"),
-      riskNotes: optString(body.riskNotes, "riskNotes"),
+      accessNotes: optString(body.accessNotes, "accessNotes", { maxLength: MAX_NOTES_LENGTH }),
+      riskNotes: optString(body.riskNotes, "riskNotes", { maxLength: MAX_NOTES_LENGTH }),
       roundId: optId(body.roundId, "roundId"),
     };
     res.status(201).json(await svc(req).addPropertyToCustomer(req.params.id, input));

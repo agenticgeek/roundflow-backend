@@ -36,10 +36,17 @@ export function asArray<T>(body: unknown, key: string): T[] {
 
 // ---- required validators (for create bodies) ------------------------------
 
-export function requireString(v: unknown, field: string): string {
+function checkMaxLength(v: string, field: string, maxLength: number | undefined): void {
+  if (maxLength !== undefined && v.length > maxLength) {
+    throw new AppError(400, `"${field}" must not exceed ${maxLength} characters.`);
+  }
+}
+
+export function requireString(v: unknown, field: string, opts?: { maxLength?: number }): string {
   if (typeof v !== "string" || v.trim() === "") {
     throw new AppError(400, `"${field}" is required and must be a non-empty string.`);
   }
+  checkMaxLength(v, field, opts?.maxLength);
   return v;
 }
 
@@ -54,10 +61,17 @@ export function requireNumber(v: unknown, field: string): number {
 // undefined = omitted (untouched). `null` clears a nullable field; the `*Req*`
 // variants reject null.
 
-export function optString(v: unknown, field: string): string | null | undefined {
+export function optString(
+  v: unknown,
+  field: string,
+  opts?: { maxLength?: number }
+): string | null | undefined {
   if (v === undefined) return undefined;
   if (v === null) return null;
-  if (typeof v === "string") return v;
+  if (typeof v === "string") {
+    checkMaxLength(v, field, opts?.maxLength);
+    return v;
+  }
   throw new AppError(400, `"${field}" must be a string or null.`);
 }
 
@@ -71,9 +85,16 @@ export function optId(value: unknown, field: string): string | null | undefined 
   return value;
 }
 
-export function optReqString(v: unknown, field: string): string | undefined {
+export function optReqString(
+  v: unknown,
+  field: string,
+  opts?: { maxLength?: number }
+): string | undefined {
   if (v === undefined) return undefined;
-  if (typeof v === "string" && v.trim() !== "") return v;
+  if (typeof v === "string" && v.trim() !== "") {
+    checkMaxLength(v, field, opts?.maxLength);
+    return v;
+  }
   throw new AppError(400, `"${field}" must be a non-empty string.`);
 }
 
