@@ -529,8 +529,23 @@ it("completeSetup's error message excludes step 12 (Review & Launch is the compl
   (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
 
   await expect(createSetupService(prisma).completeSetup()).rejects.toThrow(
-    "Setup cannot be completed — required steps incomplete: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11"
+    "Setup cannot be completed — required steps incomplete: 1, 2, 3, 4, 5, 6, 7, 8, 9, 11"
   );
+});
+
+// ── Step 10 is deferred: go-live doesn't require technicians on rounds ─────
+
+it("getStatus: step 10 is deferred and doesn't count toward allRequiredComplete", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    { id: "round1", roundTechnicians: [] },
+  ]);
+
+  const status = await createSetupService(prisma).getStatus();
+
+  const step10 = status.steps.find((s) => s.step === 10);
+  expect(step10?.deferred).toBe(true);
+  expect(step10?.complete).toBe(false);
 });
 
 // ── saveTechnicians: email + serviceAreaIds (QA bug report RF-05) ──────────
