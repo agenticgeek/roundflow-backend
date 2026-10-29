@@ -2744,7 +2744,7 @@ const paths: OpenAPIV3.PathsObject = {
       tags: ["Setup"],
       summary: "Setup progress",
       description:
-        "Per-step completion (derived, not stored) plus `setupCompleted` and `allRequiredComplete`. Required steps: 1,2,3,4,6,7,8. Only step 5 (SMS Templates) is deferred.",
+        "Per-step completion (derived, not stored) plus `setupCompleted` and `allRequiredComplete`. Required steps: 1-9 and 11. Only step 10 (Assign Technicians to Rounds) is deferred — it reports `complete` but doesn't block `POST /setup/complete`.",
       responses: {
         "200": jsonResponse("Current setup status.", ref("SetupStatus")),
         "401": ERR[401],

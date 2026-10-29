@@ -292,7 +292,7 @@ class SetupService {
       this.prisma.property.count({ where: { roundId: { not: null } } }),
       this.prisma.visit.count({ where: { status: VisitStatus.SCHEDULED } }),
       this.prisma.messageTemplate.count(),
-      // Step 10: all ACTIVE rounds must have ≥1 technician assigned.
+      // Step 10: complete when all ACTIVE rounds have ≥1 technician assigned.
       this.prisma.round.findMany({
         where: { status: RoundStatus.ACTIVE },
         include: { roundTechnicians: { select: { technicianId: true } } },
@@ -319,7 +319,9 @@ class SetupService {
       step(7, serviceAreaCount > 0),
       step(8, activeRoundCount > 0),
       step(9, setupPropertyCount > 0),
-      step(10, allRoundsAssigned),
+      // Deferred: tenants can go live without technicians assigned to rounds.
+      // `complete` still reflects reality so the wizard can show progress.
+      step(10, allRoundsAssigned, true),
       step(11, visitCount > 0),
       // Step 12 (Review & Launch) is the final action — complete === setupCompleted
       step(12, settings?.setupCompleted ?? false),
