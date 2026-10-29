@@ -7,7 +7,8 @@ import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
 import { h, asObject, requireString, optString } from "../lib/http";
-import { sendInviteEmail, INVITE_TTL_DAYS } from "../lib/email";
+import { sendInviteEmail } from "../lib/email";
+import { assertNoActiveInvite, buildInviteUrl, newInviteExpiry } from "../lib/invites";
 import { isValidEmail } from "../lib/validation";
 
 export const invitesRouter = Router();
@@ -16,9 +17,38 @@ function assertInviteUsable(invite: {
   acceptedAt: Date | null;
   expiresAt: Date;
 }): void {
-  if (invite.acceptedAt) throw new AppError(410, "Invite has already been accepted");
-  if (invite.expiresAt < new Date()) throw new AppError(410, "Invite has expired");
+  if (invite.acceptedAt) throw new AppError(410, "Invite has already been accepted", "INVITE_ACCEPTED");
+  if (invite.expiresAt < new Date()) throw new AppError(410, "Invite has expired", "INVITE_EXPIRED");
 }
+
+// Tenant-scoped lookup for the admin cancel/resend endpoints. An accepted invite
+// can't be cancelled or resent — the person is already a member.
+async function findPendingInvite(id: string, tenantId: string) {
+  const invite = await prisma.tenantInvite.findFirst({ where: { id, tenantId } });
+  if (!invite) throw new AppError(404, "Invite not found");
+  if (invite.acceptedAt) {
+    throw new AppError(409, "Invite has already been accepted", "INVITE_ACCEPTED");
+  }
+  return invite;
+}
+
+// GET /invites — admin/manager lists invites not yet accepted (expired included,
+// flagged, so they can be resent). Tokens are left out: the list doesn't need them.
+invitesRouter.get(
+  "/",
+  requireAuth,
+  requireTenantAccess,
+  requireBusinessAccess(),
+  h(async (req, res) => {
+    const invites = await prisma.tenantInvite.findMany({
+      where: { tenantId: req.profile!.tenantId, acceptedAt: null },
+      select: { id: true, email: true, role: true, technicianId: true, expiresAt: true, createdAt: true },
+      orderBy: { createdAt: "desc" },
+    });
+    const now = new Date();
+    return res.json(invites.map((invite) => ({ ...invite, expired: invite.expiresAt < now })));
+  })
+);
 
 // POST /invites — admin/manager sends an email invite
 invitesRouter.post(
@@ -47,24 +77,18 @@ invitesRouter.post(
         throw new AppError(409, "Technician has already accepted an invite");
     }
 
-    const existing = await prisma.tenantInvite.findFirst({
-      where: { tenantId: profile.tenantId, email, acceptedAt: null },
-    });
-    if (existing) throw new AppError(409, "A pending invite for this email already exists");
-
-    const expiresAt = new Date();
-    expiresAt.setDate(expiresAt.getDate() + INVITE_TTL_DAYS);
+    await assertNoActiveInvite(
+      profile.tenantId,
+      email,
+      "A pending invite for this email already exists"
+    );
 
     const invite = await prisma.tenantInvite.create({
-      data: { tenantId: profile.tenantId, email, role, technicianId, expiresAt },
+      data: { tenantId: profile.tenantId, email, role, technicianId, expiresAt: newInviteExpiry() },
     });
 
-    const base = process.env.INVITE_BASE_URL!;
     try {
-      await sendInviteEmail({
-        to: email,
-        inviteUrl: `${base}/accept-invite?token=${invite.token}`,
-      });
+      await sendInviteEmail({ to: email, inviteUrl: buildInviteUrl(invite.token) });
     } catch {
       // Roll back the invite row so the admin can retry without hitting 409.
       await prisma.tenantInvite.delete({ where: { id: invite.id } }).catch((rollbackErr) => {
@@ -75,6 +99,44 @@ invitesRouter.post(
     }
 
     return res.status(201).json(invite);
+  })
+);
+
+// DELETE /invites/:id — admin/manager cancels a pending invite. The old email
+// link then 404s ("Invite not found").
+invitesRouter.delete(
+  "/:id",
+  requireAuth,
+  requireTenantAccess,
+  requireBusinessAccess(),
+  h(async (req, res) => {
+    const invite = await findPendingInvite(req.params.id, req.profile!.tenantId);
+    await prisma.tenantInvite.delete({ where: { id: invite.id } });
+    return res.status(204).send();
+  })
+);
+
+// POST /invites/:id/resend — admin/manager re-sends the email and resets the
+// 7-day expiry. The token is unchanged, so earlier emails' links keep working.
+// Email is sent first so a delivery failure leaves the invite untouched.
+invitesRouter.post(
+  "/:id/resend",
+  requireAuth,
+  requireTenantAccess,
+  requireBusinessAccess(),
+  h(async (req, res) => {
+    const invite = await findPendingInvite(req.params.id, req.profile!.tenantId);
+    try {
+      await sendInviteEmail({ to: invite.email, inviteUrl: buildInviteUrl(invite.token) });
+    } catch (err) {
+      console.error("[invites] Resend email failed:", err);
+      throw new AppError(503, "Invite email failed to send. Please try again.");
+    }
+    const updated = await prisma.tenantInvite.update({
+      where: { id: invite.id },
+      data: { expiresAt: newInviteExpiry() },
+    });
+    return res.json(updated);
   })
 );
 
@@ -147,8 +209,8 @@ invitesRouter.post(
     }
 
     const body = asObject(req.body);
+    // requireString already rejects blank/whitespace-only names.
     const name = requireString(body.name, "name").trim();
-    if (!name) throw new AppError(400, "name must not be blank");
 
     const profile = await prisma.$transaction(async (tx) => {
       const p = await tx.profile.create({

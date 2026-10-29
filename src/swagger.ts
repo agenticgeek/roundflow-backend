@@ -149,7 +149,13 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
   Error: {
     type: "object",
     required: ["error"],
-    properties: { error: { type: "string" } },
+    properties: {
+      error: { type: "string" },
+      code: {
+        type: "string",
+        description: "Machine-readable reason, present on some errors (e.g. INVITE_ACCEPTED, INVITE_EXPIRED).",
+      },
+    },
     example: { error: "Unauthorized" },
   },
 
@@ -2121,6 +2127,21 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     example: { email: "james@example.com", role: "TECHNICIAN", technicianId: "clx..." },
   },
 
+  PendingInvite: {
+    type: "object",
+    description: "An invite that hasn't been accepted yet (GET /invites). Token omitted.",
+    required: ["id", "email", "role", "expiresAt", "createdAt", "expired"],
+    properties: {
+      id: { type: "string" },
+      email: { type: "string", format: "email" },
+      role: ref("UserRole"),
+      technicianId: { type: "string", nullable: true },
+      expiresAt: dateTime,
+      createdAt: dateTime,
+      expired: { type: "boolean", description: "True once expiresAt has passed — resend to revive it." },
+    },
+  },
+
   InviteTokenInfo: {
     type: "object",
     required: ["email", "role", "tenantId", "expiresAt"],
@@ -2557,10 +2578,10 @@ const reusableResponses: Record<string, OpenAPIV3.ResponseObject> = {
     "POST /setup/complete when setup is already complete.",
     "Setup is already complete."
   ),
-  Gone: errorResponse(
-    "Invite has expired or has already been accepted.",
-    "Invite has expired"
-  ),
+  Gone: jsonResponse("Invite has expired or has already been accepted. `code` is INVITE_EXPIRED or INVITE_ACCEPTED.", {
+    allOf: [ref("Error")],
+    example: { error: "Invite has expired", code: "INVITE_EXPIRED" },
+  }),
   ServerError: errorResponse("Unexpected server error.", "Internal Server Error"),
 };
 
@@ -2662,12 +2683,29 @@ const paths: OpenAPIV3.PathsObject = {
 
   // ---- Invites ----
   "/invites": {
+    get: {
+      tags: ["Invites"],
+      summary: "List invites not yet accepted",
+      description:
+        "Newest first. Includes expired invites with `expired: true` so they can be resent. " +
+        "Requires ADMIN or MANAGER role.",
+      responses: {
+        "200": jsonResponse("Unaccepted invites for the caller's tenant.", {
+          type: "array",
+          items: ref("PendingInvite"),
+        }),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
     post: {
       tags: ["Invites"],
       summary: "Send an invite email",
       description:
         "Creates a `TenantInvite` (7-day TTL) and sends an email to the invitee via Supabase Auth. " +
-        "Only one pending invite per email+tenant is allowed — 409 if a pending invite already exists. " +
+        "Only one pending invite per email+tenant is allowed — 409 if an unexpired, unaccepted invite already exists " +
+        "(use POST /invites/{id}/resend instead). Expired unaccepted invites for the email are replaced. " +
+        "If the email already has a Supabase account, a magic link to the same accept-invite URL is sent instead. " +
         "Requires ADMIN or MANAGER role. " +
         "If `technicianId` is supplied, that Technician row's `profileId` is set when the invite is accepted.",
       requestBody: jsonBody(ref("InviteSendInput")),
@@ -2681,6 +2719,26 @@ const paths: OpenAPIV3.PathsObject = {
           "A pending invite for this email already exists, or the technician has already accepted an invite.",
           "A pending invite for this email already exists"
         ),
+        "503": errorResponse("Invite email failed to send; the invite was rolled back.", "Invite created but email delivery failed. Please try again."),
+      },
+    },
+  },
+
+  "/invites/{id}/resend": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    post: {
+      tags: ["Invites"],
+      summary: "Resend an invite email",
+      description:
+        "Re-sends the email for an unaccepted invite (expired or not) and resets `expiresAt` to 7 days from now. " +
+        "The token is unchanged, so links in earlier emails keep working. Requires ADMIN or MANAGER role.",
+      responses: {
+        "200": jsonResponse("The updated TenantInvite.", ref("TenantInvite")),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": errorResponse("No invite with this id in the caller's tenant.", "Invite not found"),
+        "409": errorResponse("Invite already accepted (`code: INVITE_ACCEPTED`).", "Invite has already been accepted"),
+        "503": errorResponse("Email failed to send; the invite is unchanged.", "Invite email failed to send. Please try again."),
       },
     },
   },
@@ -2699,6 +2757,20 @@ const paths: OpenAPIV3.PathsObject = {
         "200": jsonResponse("Token is valid.", ref("InviteTokenInfo")),
         "404": ERR[404],
         "410": ERR[410],
+      },
+    },
+    delete: {
+      tags: ["Invites"],
+      summary: "Cancel an invite",
+      description:
+        "**For this operation the path segment is the invite `id`** (from GET /invites), not the token. " +
+        "Deletes an unaccepted invite; its email link then returns 404. Requires ADMIN or MANAGER role.",
+      responses: {
+        "204": { description: "Deleted." },
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": errorResponse("No invite with this id in the caller's tenant.", "Invite not found"),
+        "409": errorResponse("Invite already accepted (`code: INVITE_ACCEPTED`).", "Invite has already been accepted"),
       },
     },
   },

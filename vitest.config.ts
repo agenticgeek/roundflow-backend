@@ -54,6 +54,17 @@ const GEOCODING_FILES = [
   "src/jobs/geocodeBackfill.ts",
 ];
 
+// Team invites (2026-10-30): send/list/cancel/resend/accept plus the Supabase
+// email helper. Whole files, gated at 100%. POST /technicians (sendInvite)
+// also uses src/lib/invites.ts but technicians.ts itself stays ungated — it is
+// a larger, previously-untested file, like the callers excluded above.
+const INVITE_FILES = [
+  "src/routes/invites.ts",
+  "src/lib/invites.ts",
+  "src/lib/email.ts",
+  "src/lib/app-error.ts",
+];
+
 export default defineConfig({
   test: {
     include: ["src/**/*.test.ts"],
@@ -62,7 +73,7 @@ export default defineConfig({
     coverage: {
       provider: "v8",
       reporter: ["text", "html", "lcov"],
-      include: [...PAYMENT_DOMAIN_FILES, ...AUDIT_REMEDIATION_FILES, ...GEOCODING_FILES],
+      include: [...PAYMENT_DOMAIN_FILES, ...AUDIT_REMEDIATION_FILES, ...GEOCODING_FILES, ...INVITE_FILES],
       thresholds: {
         100: true,
         perFile: true,

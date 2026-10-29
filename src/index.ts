@@ -149,7 +149,9 @@ app.use((_req: Request, res: Response) => {
 // Typed AppErrors carry their own status + message; anything else is a 500.
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   if (err instanceof AppError) {
-    return res.status(err.statusCode).json({ error: err.message });
+    return res
+      .status(err.statusCode)
+      .json(err.code ? { error: err.message, code: err.code } : { error: err.message });
   }
   // express.json() body-parser SyntaxError (invalid JSON, null bytes, non-object strict-mode
   // rejection). The middleware sets err.status=400 and err.body on the thrown SyntaxError.

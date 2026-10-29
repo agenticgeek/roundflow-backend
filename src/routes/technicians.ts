@@ -7,7 +7,8 @@ import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
 import { asObject, h, optBool, optReqString, optString, optStringArray } from "../lib/http";
 import { isValidEmail, optTechnicianRole, MAX_NAME_LENGTH, MAX_NOTES_LENGTH } from "../lib/validation";
-import { sendInviteEmail, INVITE_TTL_DAYS } from "../lib/email";
+import { sendInviteEmail } from "../lib/email";
+import { assertNoActiveInvite, buildInviteUrl, newInviteExpiry } from "../lib/invites";
 import {
   createTechnicianService,
   CreateTechnicianInput,
@@ -70,15 +71,11 @@ techniciansRouter.post(
     // Check for a duplicate pending invite BEFORE creating the technician so a
     // 409 doesn't leave an orphaned technician row in the DB.
     if (sendInvite && email) {
-      const existing = await prisma.tenantInvite.findFirst({
-        where: { tenantId: req.profile!.tenantId, email, acceptedAt: null },
-      });
-      if (existing) {
-        throw new AppError(
-          409,
-          "A pending invite for this email already exists. Use POST /invites to resend."
-        );
-      }
+      await assertNoActiveInvite(
+        req.profile!.tenantId,
+        email,
+        "A pending invite for this email already exists. Use POST /invites/:id/resend to resend."
+      );
     }
 
     const input: CreateTechnicianInput = { name, phone, role, email, notes, serviceAreaIds };
@@ -88,25 +85,18 @@ techniciansRouter.post(
     if (sendInvite && email) {
       const profile = req.profile!;
 
-      const expiresAt = new Date();
-      expiresAt.setDate(expiresAt.getDate() + INVITE_TTL_DAYS);
-
       const invite = await prisma.tenantInvite.create({
         data: {
           tenantId: profile.tenantId,
           email,
           role: UserRole.TECHNICIAN,
           technicianId: tech.id,
-          expiresAt,
+          expiresAt: newInviteExpiry(),
         },
       });
 
-      const base = process.env.INVITE_BASE_URL!;
       try {
-        await sendInviteEmail({
-          to: email,
-          inviteUrl: `${base}/accept-invite?token=${invite.token}`,
-        });
+        await sendInviteEmail({ to: email, inviteUrl: buildInviteUrl(invite.token) });
       } catch {
         await prisma.tenantInvite.delete({ where: { id: invite.id } }).catch((rollbackErr) => {
           console.error("[technicians] Failed to roll back invite after email failure:", rollbackErr);
