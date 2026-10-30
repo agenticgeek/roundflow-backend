@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import request from "supertest";
 import express from "express";
+import { Prisma } from "../../generated/tenant-client";
 
 const tenantFindUnique = vi.fn();
 const tenantUpdateMany = vi.fn().mockResolvedValue({});
@@ -134,15 +135,32 @@ describe("POST /webhooks/ghl — auth", () => {
 });
 
 describe("POST /webhooks/ghl — event processing", () => {
-  it("skips processing when the event id is a duplicate", async () => {
+  it("skips processing when the event id is a duplicate (unique-constraint violation)", async () => {
     const tp = setup();
-    tp.webhookEvent.create.mockRejectedValue(new Error("dup"));
+    tp.webhookEvent.create.mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError("dup", { code: "P2002", clientVersion: "x" })
+    );
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
 
-    await send("?tenantId=t1&secret=abc", { id: "ev1", type: "ContactCreate" });
+    await send("?tenantId=t1&secret=abc", { id: "ev1", contactId: "c1" });
 
     await vi.waitFor(() => expect(tp.webhookEvent.create).toHaveBeenCalled());
     await new Promise((r) => setTimeout(r, 10));
     expect(tp.customer.findFirst).not.toHaveBeenCalled();
+    expect(err).not.toHaveBeenCalled();
+    err.mockRestore();
+  });
+
+  it("D-8: any other dedup error is logged, not swallowed as 'already processed'", async () => {
+    const tp = setup();
+    tp.webhookEvent.create.mockRejectedValue(new Error("connection reset"));
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await send("?tenantId=t1&secret=abc", { id: "ev1", contactId: "c1" });
+
+    await vi.waitFor(() => expect(err).toHaveBeenCalledWith(expect.stringContaining("[ghlWebhook]"), expect.any(Error)));
+    expect(tp.customer.findFirst).not.toHaveBeenCalled();
+    err.mockRestore();
   });
 
   it("no-ops for ContactCreate / ContactUpdate (RoundFlow stays master)", async () => {

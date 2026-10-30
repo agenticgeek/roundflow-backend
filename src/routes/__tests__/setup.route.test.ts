@@ -82,6 +82,7 @@ function makeApp() {
 
 const validRow = {
   customerName: "Test Customer",
+  phone: "07700900201",
   fullAddress: "1 Test Lane",
   postcode: "T1 1TT",
   serviceAreaId: "area1",
@@ -170,7 +171,7 @@ it("POST /setup/step/9/bulk reports a real field name (not 'unknown') for a pars
     .send({ properties: [badRow] });
   expect(res.status).toBe(400);
   expect(res.body.errors).toEqual([
-    { row: 0, field: "roundId", message: expect.any(String) },
+    { row: 0, field: "roundId", error: expect.any(String), message: expect.any(String) },
   ]);
 });
 
@@ -181,7 +182,7 @@ it("POST /setup/step/9/bulk remaps a service-level row error back to the origina
     results: [],
     // The service only ever saw the one valid row, so it reports row 0 —
     // the route must remap that back to its real position (row 2).
-    errors: [{ row: 0, field: "serviceAreaId", message: "serviceAreaId not found: bad-area" }],
+    errors: [{ row: 0, field: "serviceAreaId", error: "serviceAreaId not found: bad-area", message: "serviceAreaId not found: bad-area" }],
   });
   const app = makeApp();
   const res = await request(app).post("/setup/step/9/bulk").send({
@@ -194,14 +195,15 @@ it("POST /setup/step/9/bulk remaps a service-level row error back to the origina
   expect(res.status).toBe(400);
   expect(res.body.errors).toEqual(
     expect.arrayContaining([
-      { row: 0, field: "roundId", message: expect.any(String) },
-      { row: 1, field: "customerName", message: expect.any(String) },
-      { row: 2, field: "serviceAreaId", message: "serviceAreaId not found: bad-area" },
+      { row: 0, field: "roundId", error: expect.any(String), message: expect.any(String) },
+      { row: 1, field: "customerName", error: expect.any(String), message: expect.any(String) },
+      { row: 2, field: "serviceAreaId", error: "serviceAreaId not found: bad-area", message: "serviceAreaId not found: bad-area" },
     ])
   );
   expect(mockSetupSvc.bulkAddSetupProperties).toHaveBeenCalledWith(
     [expect.objectContaining({ serviceAreaId: "bad-area" })],
-    undefined
+    undefined,
+    { allowFrequencyMismatch: false }
   );
 });
 
@@ -215,7 +217,8 @@ it("POST /setup/step/9/bulk passes landline, serviceIds and idempotencyKey throu
   expect(res.status).toBe(201);
   expect(mockSetupSvc.bulkAddSetupProperties).toHaveBeenCalledWith(
     [expect.objectContaining({ landline: "01234567890", serviceIds: ["svc-a", "svc-b"] })],
-    "import-123"
+    "import-123",
+    { allowFrequencyMismatch: false }
   );
 });
 
@@ -234,7 +237,7 @@ it("POST /setup/step/9/bulk returns 201 with idempotent:true and skips calling t
 it("POST /setup/step/9/bulk returns 400 (not 201) when every submitted row fails", async () => {
   mockSetupSvc.bulkAddSetupProperties.mockResolvedValueOnce({
     created: 0, failed: 1, results: [],
-    errors: [{ row: 0, field: "serviceAreaId", message: "serviceAreaId not found: bad" }],
+    errors: [{ row: 0, field: "serviceAreaId", error: "serviceAreaId not found: bad", message: "serviceAreaId not found: bad" }],
   });
   const app = makeApp();
   const res = await request(app)

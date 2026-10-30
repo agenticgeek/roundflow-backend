@@ -59,6 +59,7 @@ enum VisitStatus {
   IN_PROGRESS
   COMPLETED
   SKIPPED
+  CANCELLED
 }
 
 enum PaymentStatus {
@@ -82,6 +83,35 @@ enum PaymentTiming {
   COLLECT_AFTER_VISIT
   COLLECT_BEFORE_VISIT
   COLLECT_ON_DATE
+  COLLECT_DAILY_BATCH
+}
+
+enum ReminderMode {
+  EVENING_BEFORE
+  MORNING_OF
+  NONE
+}
+
+enum CleanMethod {
+  TRADITIONAL
+  WATER_FED_POLE
+  BOTH
+}
+
+enum NoDirectDebitAction {
+  SEND_INVOICE
+  SEND_PAYMENT_LINK
+}
+
+enum IncidentType {
+  STRIKE
+  DAMAGE
+  UPSELL
+}
+
+enum KpiOperator {
+  GT
+  LT
 }
 
 enum MessageChannel {
@@ -151,6 +181,7 @@ enum PhotoType {
   PROPERTY
   BEFORE
   AFTER
+  ACCESS_ISSUE // mobile: photo attached to an access-issue report (Photo.issueId)
 }
 
 enum NoteType {
@@ -223,6 +254,19 @@ model BusinessSettings {
   preCleanReminderTimings  String[]       @default([])
   termsUrl                 String?        // mobile: Terms & Policies link
   privacyUrl               String?        // mobile: Privacy link
+  addressLine1             String?
+  addressLine2             String?
+  town                     String?
+  postcode                 String?
+  vatRate                  Decimal        @default(20) @db.Decimal(5, 2)
+  reminderMode             ReminderMode   @default(EVENING_BEFORE)
+  reminderTime             String         @default("19:00") // HH:mm, tenant-local
+  defaultCleanMethod       CleanMethod?
+  autoCreateNextVisit      Boolean        @default(true)
+  defaultPaymentMethod     PaymentMethod?
+  invoiceDueDays           Int            @default(7)
+  noDirectDebitAction      NoDirectDebitAction @default(SEND_INVOICE)
+  completedSteps           Int[]          @default([]) // setup wizard steps saved at least once
   updatedAt                DateTime       @updatedAt
 }
 
@@ -256,6 +300,7 @@ model Customer {
   holdNextClean Boolean         @default(false)
   holdReason    String?
   holdSince     DateTime?
+  messagesOptOut Boolean        @default(false)
   properties    Property[]
   invoices      Invoice[]
   payments      Payment[]
@@ -287,6 +332,10 @@ model Property {
   status        LifecycleStatus @default(ACTIVE)
   roundId       String?
   round         Round?          @relation(fields: [roundId], references: [id])
+  // Per-property allocation within a multi-technician round (see
+  // src/services/visit-assignment.ts). Null = use the round's sole technician.
+  assignedTechnicianId String?
+  assignedTechnician   Technician? @relation("PropertyAssignedTechnician", fields: [assignedTechnicianId], references: [id], onDelete: SetNull)
   servicePlans  ServicePlan[]
   visits        Visit[]
   photos        Photo[]
@@ -299,6 +348,7 @@ model Property {
   @@index([customerId])
   @@index([serviceAreaId])
   @@index([roundId])
+  @@index([assignedTechnicianId])
 }
 
 // Notes & Risk tab (Screen 15). authorProfileId references public.Profile.id —
@@ -348,6 +398,8 @@ model Round {
   status        RoundStatus        @default(DRAFT)
   serviceAreaId String?
   serviceArea   ServiceArea?       @relation(fields: [serviceAreaId], references: [id])
+  defaultServiceId String?
+  defaultService   Service?          @relation("RoundDefaultService", fields: [defaultServiceId], references: [id], onDelete: SetNull)
   properties       Property[]
   visits           Visit[]
   roundTechnicians RoundTechnician[]
@@ -357,6 +409,7 @@ model Round {
   updatedAt        DateTime           @updatedAt
 
   @@index([serviceAreaId])
+  @@index([defaultServiceId])
 }
 
 // profileId references public.Profile.id — no DB-level FK (cross-schema).
@@ -379,6 +432,10 @@ model Technician {
   roundTechnicians RoundTechnician[]
   emergencies      TechnicianEmergency[]   @relation("EmergencyReporter")
   assignedEmergencies TechnicianEmergency[] @relation("EmergencyAssigned")
+  assignedProperties  Property[]            @relation("PropertyAssignedTechnician")
+  incidents           TechnicianIncident[]
+  availability        TechnicianAvailability[]
+  kpiAlerts           KpiAlert[]
   createdAt        DateTime                @default(now())
   updatedAt        DateTime                @updatedAt
 }
@@ -429,11 +486,19 @@ model Visit {
   servicePlan   ServicePlan?   @relation(fields: [servicePlanId], references: [id])
   technicianId  String?
   technician    Technician?    @relation(fields: [technicianId], references: [id])
+  // true = a manager set technicianId by hand for this visit; restamping
+  // (visit-assignment.restampFutureVisits) must leave it alone.
+  technicianOverride Boolean   @default(false)
+  cancelReason  String?        // set when status = CANCELLED, e.g. "PAUSED"
+  reminderSentAt DateTime?     @db.Timestamptz // pre-clean reminder idempotency
+  complaintId   String?        // revisit booked from a complaint
+  complaint     Complaint?     @relation(fields: [complaintId], references: [id], onDelete: SetNull)
   paymentMethod PaymentMethod?
   invoice       Invoice?
   payment       Payment?
   photos        Photo[]
   issues        Issue[]
+  incidents     TechnicianIncident[]
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
 
@@ -445,6 +510,7 @@ model Visit {
   @@index([date, status])
   @@index([roundId, date])
   @@index([technicianId, date])
+  @@index([complaintId])
 }
 
 model Complaint {
@@ -465,9 +531,11 @@ model Complaint {
   // References public.Profile.id (control-plane schema) — same cross-schema
   // pattern as ActivityLog.actorId; no Prisma relation possible here.
   resolvedBy   String?
+  upheld       Boolean?        // set on resolve; upheld + technicianId counts as a strike
   notes        String?
   messages     Message[]
   photos       Photo[]
+  revisits     Visit[]
   createdAt    DateTime        @default(now())
   updatedAt    DateTime        @updatedAt
 
@@ -485,6 +553,7 @@ model Issue {
   property   Property? @relation(fields: [propertyId], references: [id])
   type       IssueType @default(OTHER)
   note       String?
+  photos     Photo[]
   createdAt  DateTime  @default(now())
 
   @@index([visitId])
@@ -506,6 +575,7 @@ model Invoice {
   notes          String?
   sentToCustomer Boolean       @default(false)
   sentAt         DateTime?
+  paidAt         DateTime?
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
 
@@ -525,6 +595,7 @@ model Payment {
   gocardlessId     String?
   stripeId         String?   // Stripe PaymentIntent ID (pi_xxx)
   stripeReceiptUrl String?
+  reference        String?   // manual-payment reference (cheque number, bank ref)
   contactedAt      DateTime?
   paidAt       DateTime?
   createdAt    DateTime      @default(now())
@@ -550,6 +621,7 @@ model Message {
   scheduledFor DateTime?
   sentAt       DateTime?
   creditCost   Int?
+  externalId   String?          // provider message id (GHL messageId)
   createdAt    DateTime         @default(now())
 
   @@index([customerId])
@@ -578,6 +650,7 @@ model Service {
   active       Boolean         @default(true)
   servicePlans ServicePlan[]
   visits       Visit[]
+  defaultForRounds Round[]     @relation("RoundDefaultService")
   createdAt    DateTime        @default(now())
   updatedAt    DateTime        @updatedAt
 }
@@ -604,11 +677,14 @@ model Photo {
   visit       Visit?     @relation(fields: [visitId], references: [id])
   complaintId String?
   complaint   Complaint? @relation(fields: [complaintId], references: [id])
+  issueId     String?
+  issue       Issue?     @relation(fields: [issueId], references: [id], onDelete: SetNull)
   createdAt   DateTime   @default(now())
 
   @@index([propertyId])
   @@index([visitId])
   @@index([complaintId])
+  @@index([issueId])
 }
 
 model ActivityLog {
@@ -741,4 +817,79 @@ model BulkImportAttempt {
   idempotencyKey String   @unique
   createdCount   Int
   createdAt      DateTime @default(now()) @db.Timestamptz
+}
+
+// Technician KPI events recorded by admins (strikes, damage) or by the
+// technician on the job (upsells). createdById = public.Profile.id (cross-schema).
+model TechnicianIncident {
+  id           String       @id @default(cuid())
+  technicianId String
+  technician   Technician   @relation(fields: [technicianId], references: [id], onDelete: Cascade)
+  visitId      String?
+  visit        Visit?       @relation(fields: [visitId], references: [id], onDelete: SetNull)
+  type         IncidentType
+  amount       Decimal?     @db.Decimal(10, 2)
+  note         String?
+  createdById  String?
+  createdAt    DateTime     @default(now()) @db.Timestamptz
+
+  @@index([technicianId, type, createdAt])
+  @@index([visitId])
+}
+
+// Tenant-wide KPI alert thresholds, e.g. { metric: "revenuePerHour", LT, 30 }.
+model KpiThreshold {
+  id        String      @id @default(cuid())
+  metric    String
+  operator  KpiOperator
+  value     Decimal     @db.Decimal(10, 2)
+  createdAt DateTime    @default(now()) @db.Timestamptz
+  updatedAt DateTime    @updatedAt @db.Timestamptz
+
+  @@unique([metric, operator])
+}
+
+// A crossed KPI threshold for one technician in one period. The unique key
+// de-duplicates the nightly check so each crossing alerts once per period.
+model KpiAlert {
+  id           String      @id @default(cuid())
+  technicianId String
+  technician   Technician  @relation(fields: [technicianId], references: [id], onDelete: Cascade)
+  metric       String
+  value        Decimal     @db.Decimal(10, 2)
+  threshold    Decimal     @db.Decimal(10, 2)
+  operator     KpiOperator
+  periodKey    String      // e.g. "2026-10" or "2026-W44"
+  createdAt    DateTime    @default(now()) @db.Timestamptz
+
+  @@unique([technicianId, metric, periodKey])
+  @@index([createdAt])
+}
+
+// Leave / unavailability window; generation and restamping skip the
+// technician for visit dates inside [from, to].
+model TechnicianAvailability {
+  id           String     @id @default(cuid())
+  technicianId String
+  technician   Technician @relation(fields: [technicianId], references: [id], onDelete: Cascade)
+  from         DateTime
+  to           DateTime
+  reason       String?
+  createdAt    DateTime   @default(now()) @db.Timestamptz
+
+  @@index([technicianId, from, to])
+}
+
+// Stored responses for X-Idempotency-Key on /mobile/visits/:id/* writes, so
+// an offline replay returns the original result without re-executing.
+// Purged after 7 days by the nightly job.
+model IdempotencyRecord {
+  key            String   @id
+  technicianId   String
+  route          String
+  responseStatus Int
+  responseBody   Json
+  createdAt      DateTime @default(now()) @db.Timestamptz
+
+  @@index([createdAt])
 }

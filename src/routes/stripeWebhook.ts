@@ -6,6 +6,7 @@ import { getStripeClient } from "../integrations/stripe/client";
 import { Prisma, PaymentMethod, PaymentStatus, StripeSessionStatus } from "../generated/tenant-client";
 import { queueGhlEvent } from "../integrations/ghl/sync";
 import { createPaymentService } from "../services/payment.service";
+import { releaseHoldIfSettled } from "../services/payment-hold";
 
 export const stripeWebhookRouter = Router();
 
@@ -24,8 +25,10 @@ export const stripeWebhookRouter = Router();
 stripeWebhookRouter.post("/", async (req: Request, res: Response) => {
   const connectSecret = process.env.STRIPE_CONNECT_WEBHOOK_SECRET;
   if (!connectSecret) {
+    // A6: a config gap, not a crash — 503 tells Stripe (and whoever reads the
+    // dashboard's delivery log) the endpoint is unavailable, and it retries.
     console.error("[stripeWebhook] STRIPE_CONNECT_WEBHOOK_SECRET is not configured");
-    res.sendStatus(500);
+    res.status(503).json({ error: "Stripe webhook is not configured", code: "WEBHOOK_NOT_CONFIGURED" });
     return;
   }
 
@@ -145,6 +148,7 @@ async function handleSessionCompleted(
     ? session.payment_intent
     : (session.payment_intent as Stripe.PaymentIntent | null)?.id ?? null;
 
+  const paidAt = new Date();
   await tp.$transaction([
     tp.payment.create({
       data: {
@@ -154,15 +158,17 @@ async function handleSessionCompleted(
         method: PaymentMethod.STRIPE,
         status: PaymentStatus.PAID,
         stripeId: piId,
-        paidAt: new Date(),
+        paidAt,
       },
     }),
     tp.invoice.update({
       where: { id: invoice.id },
-      data: { status: "PAID" },
+      data: { status: "PAID", paidAt },
     }),
   ]);
   queueGhlEvent(tp, "payment.collected", invoice.customerId).catch(console.error);
+  // A3 auto-release: last unpaid invoice settled → lift the payment hold.
+  await releaseHoldIfSettled(tp, invoice.customerId);
 }
 
 async function handlePaymentFailed(

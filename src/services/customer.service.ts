@@ -1,4 +1,5 @@
 import {
+  InvoiceStatus,
   LifecycleStatus,
   VisitStatus,
   PaymentStatus,
@@ -6,7 +7,7 @@ import {
   PhotoType,
   NoteType,
   PropertyType,
-  RoundStatus,
+  CleaningFrequency,
   Prisma,
 } from "../generated/tenant-client";
 import type {
@@ -14,7 +15,7 @@ import type {
   Property,
   ServicePlan,
   PropertyNote,
-  CleaningFrequency,
+  DayOfWeek,
   PaymentTiming,
 } from "../generated/tenant-client";
 import { UserRole } from "@prisma/client";
@@ -22,6 +23,19 @@ import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 import { getCachedBusinessSettings } from "./settings.service";
 import { geocodePostcode } from "../integrations/geocoding/client";
+import { initialNextDueDate } from "../lib/schedule";
+import {
+  deriveCustomerPaymentStatus,
+  invoiceAmountDue,
+  type CustomerPaymentStatus,
+} from "./customer-payment-status";
+import {
+  pausePlan,
+  resumePlan,
+  updatePlan,
+  type PauseResult,
+  type PlanUpdateResult,
+} from "./service-plan-lifecycle";
 
 // Fire-and-forget: geocodes `postcode` and writes the result onto the
 // property. Never thrown by the caller — always chained with
@@ -47,15 +61,6 @@ async function triggerGeocode(tp: TenantPrismaClient, propertyId: string, postco
       : { geocodeAttempts: { increment: 1 }, geocodeError: error },
   });
 }
-
-// Human-readable labels for CleaningFrequency values — used when naming
-// auto-created rounds in the frequency-change reassignment flow (FR-FREQ-4).
-const FREQUENCY_LABELS: Record<CleaningFrequency, string> = {
-  FOUR_WEEKLY: "Four Weekly",
-  SIX_WEEKLY: "Six Weekly",
-  EIGHT_WEEKLY: "Eight Weekly",
-  TWELVE_WEEKLY: "Twelve Weekly",
-};
 
 // ---- input types ----------------------------------------------------------
 
@@ -85,6 +90,9 @@ export interface PropertyAddInput {
   cleanMethod?: string | null;
   paymentMethod?: PaymentMethod | null;
   nextDueDate?: Date | null;
+  // A2: when nextDueDate is omitted it is derived from this (last clean + one
+  // cycle, snapped to the round day) or, without it, the round's next day.
+  lastCleanedDate?: Date | null;
   accessNotes?: string | null;
   riskNotes?: string | null;
   roundId?: string | null;
@@ -105,6 +113,7 @@ export interface PropertyCreateInput {
   cleanMethod?: string | null;
   paymentMethod?: PaymentMethod | null;
   nextDueDate?: Date | null;
+  lastCleanedDate?: Date | null;
   accessNotes?: string | null;
   riskNotes?: string | null;
   roundId?: string | null;
@@ -120,7 +129,11 @@ export interface PropertyUpdateInput {
   riskNotes?: string | null;
   roundId?: string | null;
   cleaningFrequency?: CleaningFrequency | null;
+  // B3: with cleaningFrequency, create "<Area> <Day> <N>wk" when no matching round exists (else 409).
+  createRoundIfMissing?: boolean;
 }
+
+export type PropertyUpdateResult = Property & { movedToRound: PlanUpdateResult["movedToRound"] };
 
 export interface CustomerUpdateInput {
   // Customer
@@ -128,6 +141,7 @@ export interface CustomerUpdateInput {
   phone?: string | null;
   landline?: string | null;
   email?: string | null;
+  messagesOptOut?: boolean; // opt out of automated messages (reminders, visit-completed)
   // Property
   addressLine?: string;
   postcode?: string;
@@ -155,6 +169,8 @@ export interface ServicePlanUpdateInput {
   cleanMethod?: string | null;
   paymentMethod?: PaymentMethod | null;
   cleaningFrequency?: CleaningFrequency | null;
+  // B3: create "<Area> <Day> <N>wk" when no matching round exists (else 409).
+  createRoundIfMissing?: boolean;
 }
 
 export interface NoteCreateInput {
@@ -181,9 +197,12 @@ export interface CustomerListRow {
   technicianId: string | null;
   technicianName: string | null;
   nextDueDate: Date | null;
-  paymentStatus: string;
+  // GAP-021: plan nextDueDate, else the next open visit's date.
+  nextDue: Date | null;
+  paymentStatus: CustomerPaymentStatus;
   onHold: boolean;
-  amountDue?: number; // financial — omitted for TECHNICIAN viewers
+  badDebt: boolean;
+  amountDue?: number; // unpaid SENT invoice totals — omitted for TECHNICIAN viewers
 }
 
 export interface CustomerListResult {
@@ -244,6 +263,7 @@ export interface VisitHistoryRow {
   date: Date;
   roundName: string | null;
   status: VisitStatus;
+  cancelReason: string | null;
   paymentStatus: PaymentStatus | null;
   notes: string | null;
 }
@@ -256,6 +276,7 @@ export interface CustomerDetail {
     email: string | null;
     status: LifecycleStatus;
     ghlContactId: string | null;
+    badDebt: boolean;
   };
   property: {
     id: string;
@@ -276,8 +297,10 @@ export interface CustomerDetail {
     frequency: CleaningFrequency | null;
     assignedRound: string | null;
     technicianName: string | null;
-    paymentStatus: string;
-    outstandingBalance?: number; // financial — omitted for TECHNICIAN viewers
+    paymentStatus: CustomerPaymentStatus;
+    outstandingBalance?: number; // = amountDue (kept for existing clients) — omitted for TECHNICIAN viewers
+    amountDue?: number; // unpaid SENT invoice totals — omitted for TECHNICIAN viewers
+    nextDue: Date | null; // primary plan nextDueDate, else next open visit date
     lastPaymentDate: Date | null;
     issuesCount: number;
     nextVisitStatus: VisitStatus | null;
@@ -301,16 +324,37 @@ export interface CustomerDetail {
   };
 }
 
+// GAP-022: access/risk notes surfaced as pinned entries ahead of PropertyNotes.
+export interface PinnedNote {
+  pinned: true;
+  source: "ACCESS" | "RISK";
+  body: string;
+}
+
+export type NoteListEntry = PinnedNote | (PropertyNote & { pinned: false });
+
+// GAP-010: customer picker row.
+export interface CustomerSearchRow {
+  id: string;
+  name: string;
+  phone: string | null;
+  email: string | null;
+  propertyCount: number;
+  postcode: string | null;
+}
+
+export interface VisitHistoryPage {
+  rows: VisitHistoryRow[];
+  pagination: { page: number; pageSize: number; total: number; totalPages: number };
+}
+
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
 
+const SEARCH_LIMIT = 10;
+
 const OPEN_VISIT: VisitStatus[] = [VisitStatus.SCHEDULED, VisitStatus.IN_PROGRESS];
-const DUE_PAYMENT: PaymentStatus[] = [
-  PaymentStatus.PENDING,
-  PaymentStatus.OVERDUE,
-  PaymentStatus.FAILED,
-];
 
 class CustomerService {
   constructor(private readonly prisma: TenantPrismaClient) {}
@@ -320,26 +364,6 @@ class CustomerService {
     return d == null ? null : Number(d);
   }
 
-  /** Derive the badge string shown on the list/detail. */
-  private derivePaymentStatus(
-    onHold: boolean,
-    latest: PaymentStatus | null | undefined
-  ): string {
-    if (onHold) return "hold";
-    switch (latest) {
-      case PaymentStatus.PAID:
-        return "paid";
-      case PaymentStatus.PENDING:
-        return "pending";
-      case PaymentStatus.OVERDUE:
-        return "overdue";
-      case PaymentStatus.FAILED:
-        return "failed";
-      default:
-        return "none"; // NOT_DUE / no payment history → render blank/dash, not a Paid badge
-    }
-  }
-
   // ---- list ----
 
   async getCustomers(
@@ -347,6 +371,7 @@ class CustomerService {
     viewerRole: UserRole
   ): Promise<CustomerListResult> {
     const hideFinancials = viewerRole === UserRole.TECHNICIAN;
+    const now = new Date();
     const { search, roundId, status } = filters;
     if (status && !["ACTIVE", "PAUSED", "CANCELLED", "HOLD"].includes(status)) {
       throw new AppError(400, `Invalid status: ${status}. Use ACTIVE|PAUSED|CANCELLED|HOLD.`);
@@ -396,20 +421,18 @@ class CustomerService {
           properties: { some: { visits: { some: { paymentHold: true, status: { in: OPEN_VISIT } } } } },
         },
       }),
-      this.prisma.payment.aggregate({
+      this.prisma.invoice.aggregate({
         _sum: { amount: true },
-        where: { status: { in: DUE_PAYMENT }, customer: { status: LifecycleStatus.ACTIVE } },
+        where: { status: InvoiceStatus.SENT, customer: { status: LifecycleStatus.ACTIVE } },
       }),
     ]);
 
-    // Shared include for both list paths.
-    // `payments` is NOT take-limited: toRow() below reads payments[0] for the
-    // latest status but also sums every due-status payment for amountDue, so
-    // capping this would silently undercount a customer's outstanding balance.
-    // Per-customer payment counts are small — this isn't the over-fetch risk
-    // the visits/history caps elsewhere in this file were solving.
+    // Shared include for both list paths. Only the latest payment is needed
+    // (FAILED badge); amountDue and the rest of the badge come from invoices
+    // (GAP-021), which are not take-limited so amountDue can't undercount.
     const listInclude = {
-      payments: { orderBy: { createdAt: "desc" as const } },
+      payments: { orderBy: { createdAt: "desc" as const }, take: 1, select: { status: true } },
+      invoices: { select: { status: true, dueDate: true, amount: true } },
       properties: {
         orderBy: { createdAt: "asc" as const },
         include: {
@@ -442,11 +465,7 @@ class CustomerService {
       // via a secondary property while this field (and the paymentStatus badge
       // derived from it) stays false.
       const onHold = c.properties.some((p) => p.visits.some((v) => v.paymentHold));
-      const amountDue = Number(
-        c.payments
-          .filter((p) => DUE_PAYMENT.includes(p.status))
-          .reduce((sum, p) => sum.add(p.amount), new Prisma.Decimal(0))
-      );
+      const amountDue = invoiceAmountDue(c.invoices);
 
       return {
         customerId: c.id,
@@ -464,8 +483,15 @@ class CustomerService {
         technicianId: nextVisit?.technicianId ?? null,
         technicianName: nextVisit?.technician?.name ?? null,
         nextDueDate: plan?.nextDueDate ?? null,
-        paymentStatus: this.derivePaymentStatus(onHold, c.payments[0]?.status),
+        nextDue: plan?.nextDueDate ?? nextVisit?.date ?? null,
+        paymentStatus: deriveCustomerPaymentStatus({
+          onHold: onHold || c.holdNextClean,
+          latestPaymentStatus: c.payments[0]?.status,
+          invoices: c.invoices,
+          now,
+        }),
         onHold,
+        badDebt: c.badDebt,
         amountDue: hideFinancials ? undefined : amountDue,
       };
     };
@@ -514,6 +540,7 @@ class CustomerService {
         where: { id: customerId },
         include: {
           payments: { orderBy: { createdAt: "desc" } },
+          invoices: { select: { status: true, dueDate: true, amount: true } },
           properties: {
             orderBy: { createdAt: "asc" },
             include: {
@@ -589,11 +616,7 @@ class CustomerService {
     const nextScheduled = scheduled[0] ?? null;
     const onHold = visits.some((v) => v.paymentHold && OPEN_VISIT.includes(v.status));
 
-    const outstandingBalance = Number(
-      customer.payments
-        .filter((p) => DUE_PAYMENT.includes(p.status))
-        .reduce((sum, p) => sum.add(p.amount), new Prisma.Decimal(0))
-    );
+    const amountDue = invoiceAmountDue(customer.invoices);
     const lastPaymentDate =
       customer.payments
         .filter((p) => p.paidAt != null)
@@ -610,6 +633,7 @@ class CustomerService {
         email: customer.email,
         status: customer.status,
         ghlContactId: customer.ghlContactId,
+        badDebt: customer.badDebt,
       },
       property: property
         ? {
@@ -632,8 +656,15 @@ class CustomerService {
         frequency: plan?.cleaningFrequency ?? property?.round?.frequency ?? null,
         assignedRound: property?.round?.name ?? null,
         technicianName,
-        paymentStatus: this.derivePaymentStatus(onHold, customer.payments[0]?.status),
-        outstandingBalance: hideFinancials ? undefined : outstandingBalance,
+        paymentStatus: deriveCustomerPaymentStatus({
+          onHold: onHold || customer.holdNextClean,
+          latestPaymentStatus: customer.payments[0]?.status,
+          invoices: customer.invoices,
+          now: new Date(),
+        }),
+        outstandingBalance: hideFinancials ? undefined : amountDue,
+        amountDue: hideFinancials ? undefined : amountDue,
+        nextDue: plan?.nextDueDate ?? nextScheduled?.date ?? null,
         lastPaymentDate,
         issuesCount,
         nextVisitStatus: nextScheduled?.status ?? null,
@@ -657,13 +688,15 @@ class CustomerService {
           date: v.date,
           roundName: v.round?.name ?? null,
           status: v.status,
+          cancelReason: v.cancelReason,
           paymentStatus: v.payment?.status ?? null,
           notes: v.notes,
         })),
         payments: hideFinancials
           ? undefined
           : {
-              rows: visits.map((v) => ({
+              // Cancelled visits (pause / frequency change) never carry money.
+              rows: visits.filter((v) => v.status !== VisitStatus.CANCELLED).map((v) => ({
                 visitId: v.id,
                 visitDate: v.date,
                 technicianName: v.technician?.name ?? null,
@@ -749,6 +782,7 @@ class CustomerService {
       if (input.phone !== undefined) customerData.phone = input.phone;
       if (input.landline !== undefined) customerData.landline = input.landline;
       if (input.email !== undefined) customerData.email = input.email;
+      if (input.messagesOptOut !== undefined) customerData.messagesOptOut = input.messagesOptOut;
       if (Object.keys(customerData).length > 0) {
         await tx.customer.update({ where: { id: customer.id }, data: customerData });
       }
@@ -841,18 +875,38 @@ class CustomerService {
 
   // Private helper shared by createProperty and addPropertyToCustomer.
   // FR-FREQ-1 round frequency lookup is done by the caller before the transaction.
-  private async resolveRoundFrequency(roundId: string | null | undefined): Promise<CleaningFrequency | null> {
+  private async resolveRound(
+    roundId: string | null | undefined
+  ): Promise<{ frequency: CleaningFrequency | null; defaultDay: DayOfWeek | null } | null> {
     if (!roundId) return null;
     const round = await this.prisma.round.findUnique({ where: { id: roundId } });
     if (!round) throw new AppError(404, `Round not found: ${roundId}`);
-    return round.frequency;
+    return { frequency: round.frequency, defaultDay: round.defaultDay };
+  }
+
+  // A2: an explicit nextDueDate wins. Otherwise a plan on a round gets the
+  // round's next day on/after today, or last clean + one cycle when
+  // lastCleanedDate is given (and the round has a frequency). No round = no
+  // date (nothing generates visits for an unassigned property anyway).
+  private planNextDueDate(
+    input: PropertyAddInput,
+    round: { frequency: CleaningFrequency | null; defaultDay: DayOfWeek | null } | null
+  ): Date | null {
+    if (input.nextDueDate) return input.nextDueDate;
+    if (!round) return null;
+    return initialNextDueDate({
+      lastCleanedDate: round.frequency ? input.lastCleanedDate : null,
+      frequency: round.frequency ?? CleaningFrequency.FOUR_WEEKLY,
+      roundDefaultDay: round.defaultDay,
+      today: new Date(),
+    });
   }
 
   private async createPropertyAndPlan(
     tx: Parameters<Parameters<TenantPrismaClient["$transaction"]>[0]>[0],
     customerId: string,
     input: PropertyAddInput,
-    roundFrequency: CleaningFrequency | null
+    round: { frequency: CleaningFrequency | null; defaultDay: DayOfWeek | null } | null
   ): Promise<{ propertyId: string; servicePlanId: string }> {
     const property = await tx.property.create({
       data: {
@@ -875,8 +929,8 @@ class CustomerService {
         price: input.price,
         cleanMethod: input.cleanMethod ?? null,
         paymentMethod: input.paymentMethod ?? null,
-        nextDueDate: input.nextDueDate ?? null,
-        cleaningFrequency: roundFrequency,
+        nextDueDate: this.planNextDueDate(input, round),
+        cleaningFrequency: round?.frequency ?? null,
         status: LifecycleStatus.ACTIVE,
       },
     });
@@ -886,7 +940,7 @@ class CustomerService {
   async createProperty(
     input: PropertyCreateInput
   ): Promise<{ customerId: string; propertyId: string; servicePlanId: string; assigned: boolean }> {
-    const roundFrequency = await this.resolveRoundFrequency(input.roundId);
+    const round = await this.resolveRound(input.roundId);
     await this.assertServiceAreaExists(input.serviceAreaId);
 
     const result = await this.prisma.$transaction(async (tx) => {
@@ -901,7 +955,7 @@ class CustomerService {
         },
       });
       const { propertyId, servicePlanId } = await this.createPropertyAndPlan(
-        tx, customer.id, input, roundFrequency
+        tx, customer.id, input, round
       );
       return { customerId: customer.id, propertyId, servicePlanId, assigned: input.roundId != null };
     });
@@ -920,12 +974,12 @@ class CustomerService {
     if (customer.status === LifecycleStatus.CANCELLED) {
       throw new AppError(409, "Cannot add a property to a cancelled customer");
     }
-    const roundFrequency = await this.resolveRoundFrequency(input.roundId);
+    const round = await this.resolveRound(input.roundId);
     await this.assertServiceAreaExists(input.serviceAreaId);
 
     const result = await this.prisma.$transaction(async (tx) => {
       const { propertyId, servicePlanId } = await this.createPropertyAndPlan(
-        tx, customerId, input, roundFrequency
+        tx, customerId, input, round
       );
       return { propertyId, servicePlanId, assigned: input.roundId != null };
     });
@@ -956,11 +1010,10 @@ class CustomerService {
   async updateProperty(
     propertyId: string,
     input: PropertyUpdateInput
-  ): Promise<Property> {
+  ): Promise<PropertyUpdateResult> {
     const existing = await this.prisma.property.findUnique({
       where: { id: propertyId },
       include: {
-        round: { include: { roundTechnicians: true } },
         servicePlans: {
           where: { status: { not: LifecycleStatus.CANCELLED } },
           orderBy: { createdAt: "desc" as const },
@@ -981,10 +1034,9 @@ class CustomerService {
     // when the postcode itself actually changes.
     const postcodeChanged = input.postcode !== undefined && input.postcode !== existing.postcode;
 
-    // Determine the target round and whether the service plan frequency needs updating.
     let targetRoundId: string | null = existing.roundId;
     let newFrequency: CleaningFrequency | null | undefined = undefined; // undefined = no plan update
-    let caseB = false; // FR-FREQ-4: must create a new round inside the transaction
+    let movedToRound: PlanUpdateResult["movedToRound"] = null;
 
     if (input.roundId !== undefined) {
       // Explicit round assignment / unassignment (FR-FREQ-1)
@@ -996,64 +1048,22 @@ class CustomerService {
         targetRoundId = round.id;
         if (round.frequency) newFrequency = round.frequency;
       }
-    } else if (input.cleaningFrequency !== undefined) {
-      // Frequency change (FR-FREQ-2..6) — mutually exclusive with explicit roundId.
-      newFrequency = input.cleaningFrequency;
-      if (existing.roundId && !existing.serviceAreaId) {
-        throw new AppError(409, "Property has no service area; cannot auto-reassign round on frequency change");
-      } else if (!existing.roundId) {
-        // FR-FREQ-5: no round assigned — just update the plan field, no round change.
-      } else if (existing.round?.frequency === input.cleaningFrequency) {
-        // FR-FREQ-6: frequency matches current round — just update the plan field.
-      } else {
-        // FR-FREQ-2: frequency differs from current round → find or create a matching round.
-        const matchingRound = await this.prisma.round.findFirst({
-          where: {
-            frequency: input.cleaningFrequency,
-            serviceAreaId: existing.serviceAreaId,
-            status: RoundStatus.ACTIVE,
-            NOT: { id: existing.roundId },
-          },
-        });
-        if (matchingRound) {
-          targetRoundId = matchingRound.id; // FR-FREQ-3 (Case A): reuse existing round
-        } else {
-          caseB = true; // FR-FREQ-4 (Case B): create new round in the transaction below
-        }
-      }
+    } else if (input.cleaningFrequency !== undefined && plan) {
+      // Frequency change — same B3 move logic as PATCH /service-plans/:id
+      // (matching round in the area, else 409 NO_MATCHING_ROUND unless
+      // createRoundIfMissing; future visits on the old round cancelled).
+      // Runs before the property write so a 409 leaves the property untouched.
+      const result = await updatePlan(
+        this.prisma,
+        plan.id,
+        { cleaningFrequency: input.cleaningFrequency, createRoundIfMissing: input.createRoundIfMissing },
+        new Date()
+      );
+      movedToRound = result.movedToRound;
+      if (movedToRound) targetRoundId = movedToRound.id;
     }
 
     return this.prisma.$transaction(async (tx) => {
-      if (caseB && existing.round) {
-        // FR-FREQ-4: create a new round by copying the current one with the new frequency.
-        const label = FREQUENCY_LABELS[input.cleaningFrequency!];
-        const baseName = `${existing.round.name} (${label})`;
-        // Ensure the generated name is unique — a round with this name may already exist.
-        const nameConflict = await tx.round.findFirst({
-          where: { name: baseName, serviceAreaId: existing.round.serviceAreaId },
-          select: { id: true },
-        });
-        const roundName = nameConflict ? `${baseName} 2` : baseName;
-        const newRound = await tx.round.create({
-          data: {
-            name: roundName,
-            frequency: input.cleaningFrequency!,
-            serviceAreaId: existing.round.serviceAreaId,
-            defaultDay: existing.round.defaultDay,
-            status: RoundStatus.ACTIVE,
-          },
-        });
-        if (existing.round.roundTechnicians.length > 0) {
-          await tx.roundTechnician.createMany({
-            data: existing.round.roundTechnicians.map((rt) => ({
-              roundId: newRound.id,
-              technicianId: rt.technicianId,
-            })),
-          });
-        }
-        targetRoundId = newRound.id;
-      }
-
       if (plan && newFrequency !== undefined) {
         await tx.servicePlan.update({
           where: { id: plan.id },
@@ -1079,7 +1089,7 @@ class CustomerService {
       });
     }).then((updated) => {
       if (postcodeChanged) triggerGeocode(this.prisma, updated.id, updated.postcode).catch(console.error);
-      return updated;
+      return { ...updated, movedToRound };
     });
   }
 
@@ -1088,34 +1098,18 @@ class CustomerService {
   async pauseService(
     propertyId: string,
     input: PauseInput
-  ): Promise<ServicePlan> {
+  ): Promise<PauseResult> {
     const plan = await this.primaryPlan(propertyId);
     if (plan.status === LifecycleStatus.PAUSED) {
       throw new AppError(409, "Service plan is already paused");
     }
-    return this.prisma.servicePlan.update({
-      where: { id: plan.id },
-      data: {
-        status: LifecycleStatus.PAUSED,
-        pauseStartDate: input.pauseStartDate,
-        pauseEndDate: input.pauseEndDate ?? null,
-      },
-    });
+    return pausePlan(this.prisma, plan, input, new Date());
   }
 
   async resumeService(propertyId: string): Promise<ServicePlan> {
     const plan = await this.primaryPlan(propertyId);
-    if (plan.status !== LifecycleStatus.PAUSED) {
-      throw new AppError(409, "Service plan is not paused");
-    }
-    return this.prisma.servicePlan.update({
-      where: { id: plan.id },
-      data: {
-        status: LifecycleStatus.ACTIVE,
-        pauseStartDate: null,
-        pauseEndDate: null,
-      },
-    });
+    this.assertResumable(plan);
+    return resumePlan(this.prisma, plan, new Date());
   }
 
   // ---- per-plan writes (targets one ServicePlan directly, not the
@@ -1124,59 +1118,152 @@ class CustomerService {
   async updateServicePlan(
     servicePlanId: string,
     input: ServicePlanUpdateInput
-  ): Promise<ServicePlan> {
-    const existing = await this.prisma.servicePlan.findUnique({ where: { id: servicePlanId } });
-    if (!existing) throw new AppError(404, "Service plan not found");
-
-    const data: Partial<Prisma.ServicePlanUpdateInput> = {};
-    if (input.price !== undefined) data.price = input.price;
-    if (input.cleanMethod !== undefined) data.cleanMethod = input.cleanMethod;
-    if (input.paymentMethod !== undefined) data.paymentMethod = input.paymentMethod;
-    if (input.cleaningFrequency !== undefined) data.cleaningFrequency = input.cleaningFrequency;
-
-    return this.prisma.servicePlan.update({ where: { id: servicePlanId }, data });
+  ): Promise<PlanUpdateResult> {
+    return updatePlan(this.prisma, servicePlanId, input, new Date());
   }
 
-  async pauseServicePlan(servicePlanId: string, input: PauseInput): Promise<ServicePlan> {
+  async pauseServicePlan(servicePlanId: string, input: PauseInput): Promise<PauseResult> {
     const plan = await this.prisma.servicePlan.findUnique({ where: { id: servicePlanId } });
     if (!plan) throw new AppError(404, "Service plan not found");
     if (plan.status === LifecycleStatus.PAUSED) {
       throw new AppError(409, "Service plan is already paused");
     }
-    return this.prisma.servicePlan.update({
-      where: { id: servicePlanId },
-      data: {
-        status: LifecycleStatus.PAUSED,
-        pauseStartDate: input.pauseStartDate,
-        pauseEndDate: input.pauseEndDate ?? null,
-      },
-    });
+    return pausePlan(this.prisma, plan, input, new Date());
   }
 
   async resumeServicePlan(servicePlanId: string): Promise<ServicePlan> {
     const plan = await this.prisma.servicePlan.findUnique({ where: { id: servicePlanId } });
     if (!plan) throw new AppError(404, "Service plan not found");
-    if (plan.status !== LifecycleStatus.PAUSED) {
+    this.assertResumable(plan);
+    return resumePlan(this.prisma, plan, new Date());
+  }
+
+  // PAUSED, or ACTIVE with a scheduled (future) pause — resuming the latter
+  // cancels the scheduled pause.
+  private assertResumable(plan: ServicePlan): void {
+    if (plan.status !== LifecycleStatus.PAUSED && plan.pauseStartDate == null) {
       throw new AppError(409, "Service plan is not paused");
     }
-    return this.prisma.servicePlan.update({
-      where: { id: servicePlanId },
-      data: {
-        status: LifecycleStatus.ACTIVE,
-        pauseStartDate: null,
-        pauseEndDate: null,
+  }
+
+  // ---- GAP-022: bad debt flag ----
+
+  async setBadDebt(customerId: string, flag: boolean): Promise<{ id: string; badDebt: boolean }> {
+    const customer = await this.prisma.customer.findUnique({ where: { id: customerId }, select: { id: true } });
+    if (!customer) throw new AppError(404, "Customer not found");
+    return this.prisma.customer.update({
+      where: { id: customerId },
+      data: { badDebt: flag },
+      select: { id: true, badDebt: true },
+    });
+  }
+
+  // ---- GAP-010: customer picker search ----
+
+  // Matches name, email or postcode (case-insensitive substring), or the
+  // phone/landline by digits only, so "07700 900" finds numbers stored with
+  // spaces or a +44 prefix. Cancelled customers are excluded.
+  async searchCustomers(q: string): Promise<CustomerSearchRow[]> {
+    const term = q.trim();
+    if (term === "") return [];
+    const digits = term.replace(/\D/g, "");
+    const digitsLike = `%${digits}%`;
+    const phoneMatches =
+      digits.length >= 3
+        ? await this.prisma.$queryRaw<{ id: string }[]>`
+            SELECT "id" FROM "Customer"
+            WHERE regexp_replace(coalesce("phone", ''), '[^0-9]', '', 'g') LIKE ${digitsLike}
+               OR regexp_replace(coalesce("landline", ''), '[^0-9]', '', 'g') LIKE ${digitsLike}
+            LIMIT 50
+          `
+        : [];
+
+    const customers = await this.prisma.customer.findMany({
+      where: {
+        status: { not: LifecycleStatus.CANCELLED },
+        OR: [
+          { name: { contains: term, mode: "insensitive" } },
+          { email: { contains: term, mode: "insensitive" } },
+          { properties: { some: { postcode: { contains: term, mode: "insensitive" } } } },
+          ...(phoneMatches.length > 0 ? [{ id: { in: phoneMatches.map((r) => r.id) } }] : []),
+        ],
+      },
+      orderBy: { name: "asc" },
+      take: SEARCH_LIMIT,
+      select: {
+        id: true,
+        name: true,
+        phone: true,
+        email: true,
+        properties: {
+          where: { status: { not: LifecycleStatus.CANCELLED } },
+          orderBy: { createdAt: "asc" },
+          select: { postcode: true },
+        },
       },
     });
+    return customers.map((c) => ({
+      id: c.id,
+      name: c.name,
+      phone: c.phone,
+      email: c.email,
+      propertyCount: c.properties.length,
+      postcode: c.properties[0]?.postcode ?? null,
+    }));
+  }
+
+  // ---- visit history (all statuses, incl. CANCELLED with its reason) ----
+
+  async getVisitHistory(
+    customerId: string,
+    page: number,
+    pageSize: number
+  ): Promise<VisitHistoryPage> {
+    const customer = await this.prisma.customer.findUnique({ where: { id: customerId }, select: { id: true } });
+    if (!customer) throw new AppError(404, "Customer not found");
+    const where: Prisma.VisitWhereInput = { property: { customerId } };
+    const [total, visits] = await Promise.all([
+      this.prisma.visit.count({ where }),
+      this.prisma.visit.findMany({
+        where,
+        orderBy: { date: "desc" },
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+        include: { round: { select: { name: true } }, payment: { select: { status: true } } },
+      }),
+    ]);
+    return {
+      rows: visits.map((v) => ({
+        visitId: v.id,
+        date: v.date,
+        roundName: v.round?.name ?? null,
+        status: v.status,
+        cancelReason: v.cancelReason,
+        paymentStatus: v.payment?.status ?? null,
+        notes: v.notes,
+      })),
+      pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) },
+    };
   }
 
   // ---- M20: notes ----
 
-  async getNotes(propertyId: string): Promise<PropertyNote[]> {
-    await this.assertPropertyExists(propertyId);
-    return this.prisma.propertyNote.findMany({
+  // GAP-022: the property's access and risk notes come first as pinned
+  // entries, then PropertyNotes newest first.
+  async getNotes(propertyId: string): Promise<NoteListEntry[]> {
+    const property = await this.prisma.property.findUnique({
+      where: { id: propertyId },
+      select: { accessNotes: true, riskNotes: true },
+    });
+    if (!property) throw new AppError(404, "Property not found");
+    const notes = await this.prisma.propertyNote.findMany({
       where: { propertyId },
       orderBy: { createdAt: "desc" },
     });
+    const pinned: PinnedNote[] = [];
+    if (property.accessNotes?.trim()) pinned.push({ pinned: true, source: "ACCESS", body: property.accessNotes });
+    if (property.riskNotes?.trim()) pinned.push({ pinned: true, source: "RISK", body: property.riskNotes });
+    return [...pinned, ...notes.map((n) => ({ ...n, pinned: false as const }))];
   }
 
   async addNote(

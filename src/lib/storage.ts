@@ -17,7 +17,7 @@ const MIME_TO_EXT: Record<string, string> = {
 export function buildVisitPhotoPath(
   tenantId: string,
   visitId: string,
-  photoType: "BEFORE" | "AFTER",
+  photoType: "BEFORE" | "AFTER" | "ACCESS_ISSUE",
   mimeType: string
 ): string {
   const ext = MIME_TO_EXT[mimeType] ?? "jpg";

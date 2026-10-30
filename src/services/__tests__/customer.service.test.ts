@@ -19,12 +19,13 @@ function makePrisma() {
     servicePlan: { findMany: vi.fn(), findUnique: vi.fn(), create: vi.fn(), update: vi.fn() },
     round: { findMany: vi.fn(), findUnique: vi.fn(), update: vi.fn() },
     serviceArea: { findUnique: vi.fn() },
-    visit: { findMany: vi.fn(), updateMany: vi.fn(), createMany: vi.fn() },
+    visit: { findMany: vi.fn(), updateMany: vi.fn(), createMany: vi.fn(), count: vi.fn() },
     payment: { findMany: vi.fn(), aggregate: vi.fn() },
     propertyNote: { findMany: vi.fn(), create: vi.fn() },
     photo: { findMany: vi.fn() },
     issue: { findMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
-    invoice: { findMany: vi.fn() },
+    invoice: { findMany: vi.fn(), aggregate: vi.fn().mockResolvedValue({ _sum: { amount: 0 } }) },
+    $queryRaw: vi.fn().mockResolvedValue([]),
     businessSettings: { findFirst: vi.fn() },
     $transaction: vi.fn((cb: any) => cb(makePrisma())),
   } as unknown as Parameters<typeof createCustomerService>[0];
@@ -223,9 +224,63 @@ it("updateProperty resets coordinates and triggers a re-geocode when the postcod
       geocodeError: null,
     },
   });
-  expect(result).toEqual({ id: "p1", postcode: "NE1 9ZZ" });
+  expect(result).toEqual({ id: "p1", postcode: "NE1 9ZZ", movedToRound: null });
   await vi.waitFor(() => expect(prisma.property.update).toHaveBeenCalled());
   expect(geocodePostcode).toHaveBeenCalledWith("NE1 9ZZ");
+});
+
+it("updateProperty cleaningFrequency uses the B3 move logic (updatePlan) and keeps the new round", async () => {
+  const prisma = makePrisma();
+  (prisma.property.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: "p1", postcode: "NE66 1AA", roundId: "r1", serviceAreaId: "sa1",
+    servicePlans: [{ id: "sp-old", status: "CANCELLED" }, { id: "sp1", status: "ACTIVE" }],
+  });
+  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: "sp1", propertyId: "p1", lastCompleted: null,
+    property: {
+      serviceAreaId: "sa1", serviceArea: { name: "Alnwick" },
+      round: { id: "r1", name: "Alnwick Mon 4wk", frequency: "FOUR_WEEKLY", defaultDay: "MON", serviceAreaId: "sa1", roundTechnicians: [], serviceArea: { name: "Alnwick" } },
+    },
+  });
+  (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ id: "r2", name: "Alnwick Mon 6wk", defaultDay: "MON" }]);
+  const tx = {
+    ...makePrisma(),
+    property: { update: vi.fn().mockResolvedValue({ id: "p1", postcode: "NE66 1AA", roundId: "r2" }) },
+    servicePlan: { update: vi.fn().mockResolvedValue({ id: "sp1" }) },
+    visit: { updateMany: vi.fn().mockResolvedValue({ count: 2 }) },
+  };
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb: any) => cb(tx));
+
+  const result = await createCustomerService(prisma).updateProperty("p1", { cleaningFrequency: "SIX_WEEKLY", accessNotes: "gate" });
+
+  expect(prisma.servicePlan.findUnique).toHaveBeenCalledWith(expect.objectContaining({ where: { id: "sp1" } }));
+  expect(tx.visit.updateMany).toHaveBeenCalled();
+  expect(tx.property.update).toHaveBeenLastCalledWith({
+    where: { id: "p1" },
+    data: expect.objectContaining({ accessNotes: "gate", roundId: "r2" }),
+  });
+  expect(result.movedToRound).toEqual({ id: "r2", name: "Alnwick Mon 6wk", created: false });
+});
+
+it("updateProperty cleaningFrequency without a move leaves the round and ignores a property with no plan", async () => {
+  const prisma = makePrisma();
+  (prisma.property.findUnique as ReturnType<typeof vi.fn>)
+    .mockResolvedValueOnce({ id: "p1", postcode: "X", roundId: null, serviceAreaId: null, servicePlans: [{ id: "sp1", status: "PAUSED" }] })
+    .mockResolvedValueOnce({ id: "p2", postcode: "X", roundId: "r1", serviceAreaId: null, servicePlans: [] });
+  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1", property: { round: null } });
+  (prisma.servicePlan.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1" });
+  const tx = { ...makePrisma(), property: { update: vi.fn().mockResolvedValue({ id: "p1", postcode: "X" }) } };
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb: any) => cb(tx));
+
+  const svc = createCustomerService(prisma);
+  const first = await svc.updateProperty("p1", { cleaningFrequency: "SIX_WEEKLY" });
+  expect(prisma.servicePlan.update).toHaveBeenCalledWith({ where: { id: "sp1" }, data: { cleaningFrequency: "SIX_WEEKLY" } });
+  expect(tx.property.update.mock.calls[0][0].data.roundId).toBeNull();
+  expect(first.movedToRound).toBeNull();
+
+  await svc.updateProperty("p2", { cleaningFrequency: "SIX_WEEKLY" });
+  expect(prisma.servicePlan.findUnique).toHaveBeenCalledTimes(1);
+  expect(tx.property.update.mock.calls[1][0].data.roundId).toBe("r1");
 });
 
 it("updateProperty leaves coordinates untouched when the postcode is unchanged", async () => {
@@ -281,8 +336,10 @@ it("updateCustomer writes landline when provided", async () => {
   (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb: any) => cb(txPrisma));
   await createCustomerService(prisma).updateCustomer("c1", {
     landline: "+44 1665 000111",
+    messagesOptOut: true,
   });
   expect(capturedUpdate.data.landline).toBe("+44 1665 000111");
+  expect(capturedUpdate.data.messagesOptOut).toBe(true);
 });
 
 it("updateCustomer resets coordinates and triggers a re-geocode when the property's postcode changes", async () => {
@@ -366,6 +423,7 @@ function makeCustomerWithPlans(plans: object[]) {
     status: LifecycleStatus.ACTIVE,
     ghlContactId: null,
     payments: [],
+    invoices: [],
     properties: [
       {
         id: "p1",
@@ -473,7 +531,7 @@ it("getCustomerDetail returns empty servicePlans when customer has no properties
   const prisma = makePrisma();
   (prisma.customer.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
     id: "c1", name: "Bob", phone: null, landline: null, email: null,
-    status: LifecycleStatus.ACTIVE, ghlContactId: null, payments: [], properties: [],
+    status: LifecycleStatus.ACTIVE, ghlContactId: null, payments: [], invoices: [], properties: [],
   });
   (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(makeSettings());
 
@@ -496,9 +554,12 @@ function makeListedCustomer(opts: {
     id,
     name: `Customer ${id}`,
     status: LifecycleStatus.ACTIVE,
+    holdNextClean: false,
+    badDebt: false,
     payments: paymentStatus
       ? [{ status: paymentStatus, amount, createdAt: new Date("2026-01-01") }]
       : [],
+    invoices: [] as Array<{ status: string; dueDate: Date | null; amount: number }>,
     properties: [
       {
         id: `p-${id}`,
@@ -524,7 +585,7 @@ function mockSummaryCounts(
     .mockResolvedValueOnce(total)
     .mockResolvedValueOnce(active)
     .mockResolvedValueOnce(holds);
-  (prisma.payment.aggregate as ReturnType<typeof vi.fn>).mockResolvedValue({
+  (prisma.invoice.aggregate as ReturnType<typeof vi.fn>).mockResolvedValue({
     _sum: { amount: 0 },
   });
 }
@@ -594,6 +655,7 @@ it.each(["ACTIVE", "PAUSED", "CANCELLED", undefined] as const)(
       paymentStatus: PaymentStatus.PENDING,
       amount: 50,
     });
+    fixture.invoices = [{ status: "SENT", dueDate: null, amount: 50 }];
     (prisma.customer.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([fixture]);
 
     const result = await createCustomerService(prisma).getCustomers(
@@ -604,7 +666,7 @@ it.each(["ACTIVE", "PAUSED", "CANCELLED", undefined] as const)(
     expect(result.customers).toHaveLength(1);
     expect(result.customers[0].customerId).toBe("c1");
     expect(result.customers[0].amountDue).toBe(50);
-    expect(result.customers[0].paymentStatus).toBe("pending");
+    expect(result.customers[0].paymentStatus).toBe("UNPAID");
     expect(result.pagination.total).toBe(1);
 
     const findManyArgs = (prisma.customer.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
@@ -618,26 +680,48 @@ it.each(["ACTIVE", "PAUSED", "CANCELLED", undefined] as const)(
   }
 );
 
-it("getCustomers sums amountDue across ALL due-status payments, not just the latest", async () => {
-  // Regression test for: `payments` include was briefly capped to `take: 1`
-  // for an over-fetch "optimization", which silently undercounted amountDue
-  // since toRow() sums every due-status payment, not just payments[0].
+it("getCustomers sums amountDue across ALL unpaid SENT invoices and ignores paid/draft/void ones", async () => {
   const prisma = makePrisma();
   mockSummaryCounts(prisma, { total: 1, active: 1, holds: 0 });
   (prisma.customer.count as ReturnType<typeof vi.fn>).mockResolvedValueOnce(1);
   const fixture = makeListedCustomer({ id: "c1" });
-  fixture.payments = [
-    { status: PaymentStatus.PENDING, amount: 50, createdAt: new Date("2026-02-01") },
-    { status: PaymentStatus.OVERDUE, amount: 30, createdAt: new Date("2026-01-01") },
+  fixture.invoices = [
+    { status: "SENT", dueDate: new Date("2099-01-01"), amount: 50 },
+    { status: "SENT", dueDate: null, amount: 30 },
+    { status: "PAID", dueDate: null, amount: 99 },
+    { status: "DRAFT", dueDate: null, amount: 11 },
+    { status: "VOID", dueDate: null, amount: 7 },
   ];
   (prisma.customer.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([fixture]);
 
   const result = await createCustomerService(prisma).getCustomers({}, UserRole.ADMIN);
 
   expect(result.customers[0].amountDue).toBe(80);
-  // The include must not cap payments — toRow() needs the full due-payment set.
+  expect(result.customers[0].paymentStatus).toBe("UNPAID");
+  // Invoices are not take-limited (amountDue needs all of them).
   const findManyArgs = (prisma.customer.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
-  expect(findManyArgs.include.payments.take).toBeUndefined();
+  expect(findManyArgs.include.invoices.take).toBeUndefined();
+});
+
+it("getCustomers: ON_HOLD from holdNextClean, nextDue falls back to the next open visit, badDebt passes through", async () => {
+  const prisma = makePrisma();
+  mockSummaryCounts(prisma, { total: 1, active: 1, holds: 0 });
+  (prisma.customer.count as ReturnType<typeof vi.fn>).mockResolvedValueOnce(1);
+  const fixture = makeListedCustomer({ id: "c1" });
+  fixture.holdNextClean = true;
+  fixture.badDebt = true;
+  (fixture.properties[0] as any).visits = [
+    { paymentHold: false, technicianId: "t1", technician: { name: "Sam" }, date: new Date("2026-11-06") },
+  ];
+  (prisma.customer.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([fixture]);
+
+  const result = await createCustomerService(prisma).getCustomers({}, UserRole.ADMIN);
+
+  expect(result.customers[0].paymentStatus).toBe("ON_HOLD");
+  expect(result.customers[0].onHold).toBe(false);
+  expect(result.customers[0].badDebt).toBe(true);
+  expect(result.customers[0].nextDueDate).toBeNull();
+  expect(result.customers[0].nextDue).toEqual(new Date("2026-11-06"));
 });
 
 it("getCustomers({status:'HOLD'}) returns a multi-property customer whose onHold visit is on a non-primary property, with onHold=true", async () => {
@@ -653,6 +737,7 @@ it("getCustomers({status:'HOLD'}) returns a multi-property customer whose onHold
     name: "Customer c1",
     status: LifecycleStatus.ACTIVE,
     payments: [],
+    invoices: [],
     properties: [
       {
         // Primary (active, listed first): no on-hold visit.
@@ -716,7 +801,7 @@ it("getCustomers skips customers with no properties", async () => {
   mockSummaryCounts(prisma, { total: 1, active: 1, holds: 0 });
   (prisma.customer.count as ReturnType<typeof vi.fn>).mockResolvedValueOnce(1);
   (prisma.customer.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
-    { id: "c1", name: "No Property", status: LifecycleStatus.ACTIVE, payments: [], properties: [] },
+    { id: "c1", name: "No Property", status: LifecycleStatus.ACTIVE, payments: [], invoices: [], properties: [] },
   ]);
 
   const result = await createCustomerService(prisma).getCustomers({}, UserRole.ADMIN);
@@ -769,6 +854,7 @@ function makeCustomerWithVisitsAndPayments(opts: {
     status: LifecycleStatus.ACTIVE,
     ghlContactId: null,
     payments,
+    invoices: [] as Array<{ status: string; dueDate: Date | null; amount: number }>,
     properties: [
       {
         id: "p1",
@@ -814,9 +900,9 @@ it("getCustomerDetail caps visitHistory/payments tabs at 50, newest-first, indep
   expect(result.tabs.visitHistory[0].visitId).toBe("v50");
   expect(result.tabs.visitHistory[49].visitId).toBe("v1");
 
-  // outstandingBalance/lastPaymentDate are derived from the FULL payments array
-  // (not capped at 50, and unrelated to the visit cap): 40 + 60 = 100 outstanding.
-  expect(result.standingInfo.outstandingBalance).toBe(100);
+  // outstandingBalance/amountDue come from unpaid SENT invoices (GAP-021);
+  // lastPaymentDate from the FULL payments array (not capped at 50).
+  expect(result.standingInfo.outstandingBalance).toBe(0);
   expect(result.standingInfo.lastPaymentDate).toEqual(new Date("2026-03-01"));
 
   // The query itself must request the capped/ordered visits include.
@@ -836,6 +922,7 @@ it("getCustomerDetail includes the payment method on each payments.rows entry", 
     status: LifecycleStatus.ACTIVE,
     ghlContactId: null,
     payments: [],
+    invoices: [],
     properties: [
       {
         id: "p1",
@@ -972,6 +1059,7 @@ it("getCustomers applies the search filter and resolves 'failed'/plan fields fro
     name: "Searched Co",
     status: LifecycleStatus.ACTIVE,
     payments: [{ status: PaymentStatus.FAILED, amount: 10, createdAt: new Date("2026-01-01") }],
+    invoices: [],
     properties: [
       {
         id: "p1",
@@ -996,7 +1084,7 @@ it("getCustomers applies the search filter and resolves 'failed'/plan fields fro
   );
 
   expect(result.customers).toHaveLength(1);
-  expect(result.customers[0].paymentStatus).toBe("failed");
+  expect(result.customers[0].paymentStatus).toBe("FAILED");
   expect(result.customers[0].price).toBe(45);
   expect(result.customers[0].frequency).toBe("FOUR_WEEKLY");
 
@@ -1015,7 +1103,7 @@ it("getCustomers falls back to 0 when the due-payment aggregate sum is null", as
     .mockResolvedValueOnce(0)
     .mockResolvedValueOnce(0)
     .mockResolvedValueOnce(0);
-  (prisma.payment.aggregate as ReturnType<typeof vi.fn>).mockResolvedValue({
+  (prisma.invoice.aggregate as ReturnType<typeof vi.fn>).mockResolvedValue({
     _sum: { amount: null },
   });
   (prisma.customer.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
@@ -1035,6 +1123,7 @@ it("getCustomerDetail sorts multiple scheduled visits, evaluates the paymentHold
     status: LifecycleStatus.ACTIVE,
     ghlContactId: null,
     payments: [],
+    invoices: [],
     properties: [
       {
         id: "p1",
@@ -1069,69 +1158,41 @@ it("getCustomerDetail sorts multiple scheduled visits, evaluates the paymentHold
   // Scheduled visits sorted earliest-first for "next scheduled" selection.
   expect(result.standingInfo.nextVisitStatus).toBe(VisitStatus.IN_PROGRESS);
   // paymentHold is true on a COMPLETED visit only — not an open one — so onHold is false.
-  expect(result.standingInfo.paymentStatus).not.toBe("hold");
+  expect(result.standingInfo.paymentStatus).toBe("NONE");
   expect(result.tabs.notes).toEqual([{ ...customer.properties[0].notes[0], authorName: null }]);
 });
 
-// ── per-plan writes: updateServicePlan / pauseServicePlan / resumeServicePlan ──
+// ── per-plan writes: delegate to service-plan-lifecycle (tested in depth there) ──
+
+type Fn = ReturnType<typeof vi.fn>;
+
+function txReturning(prisma: ReturnType<typeof makePrisma>, tx: Record<string, unknown>) {
+  (prisma.$transaction as Fn).mockImplementation((cb: any) => cb(tx));
+}
 
 it("updateServicePlan throws 404 when the plan does not exist", async () => {
   const prisma = makePrisma();
-  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+  (prisma.servicePlan.findUnique as Fn).mockResolvedValue(null);
 
   await expect(
     createCustomerService(prisma).updateServicePlan("missing", { price: 50 })
   ).rejects.toMatchObject({ statusCode: 404 });
 });
 
-it("updateServicePlan only writes fields that were actually provided", async () => {
+it("updateServicePlan returns { servicePlan, movedToRound: null } for a plain field update", async () => {
   const prisma = makePrisma();
-  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1" });
-  (prisma.servicePlan.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1", price: 50 });
+  (prisma.servicePlan.findUnique as Fn).mockResolvedValue({ id: "sp1", property: { round: null } });
+  (prisma.servicePlan.update as Fn).mockResolvedValue({ id: "sp1", price: 50 });
 
-  await createCustomerService(prisma).updateServicePlan("sp1", { price: 50 });
+  const result = await createCustomerService(prisma).updateServicePlan("sp1", { price: 50 });
 
-  expect(prisma.servicePlan.update).toHaveBeenCalledWith({
-    where: { id: "sp1" },
-    data: { price: 50 },
-  });
-});
-
-it("updateServicePlan writes every provided field (cleanMethod, paymentMethod, cleaningFrequency)", async () => {
-  const prisma = makePrisma();
-  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1" });
-  (prisma.servicePlan.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1" });
-
-  await createCustomerService(prisma).updateServicePlan("sp1", {
-    cleanMethod: "Water Fed Pole",
-    paymentMethod: "GOCARDLESS" as never,
-    cleaningFrequency: "FOUR_WEEKLY" as never,
-  });
-
-  expect(prisma.servicePlan.update).toHaveBeenCalledWith({
-    where: { id: "sp1" },
-    data: {
-      cleanMethod: "Water Fed Pole",
-      paymentMethod: "GOCARDLESS",
-      cleaningFrequency: "FOUR_WEEKLY",
-    },
-  });
-});
-
-it("updateServicePlan sends an empty data object when nothing is provided", async () => {
-  const prisma = makePrisma();
-  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1" });
-  (prisma.servicePlan.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1" });
-
-  await createCustomerService(prisma).updateServicePlan("sp1", {});
-
-  expect(prisma.servicePlan.update).toHaveBeenCalledWith({ where: { id: "sp1" }, data: {} });
+  expect(result).toEqual({ servicePlan: { id: "sp1", price: 50 }, movedToRound: null });
+  expect(prisma.servicePlan.update).toHaveBeenCalledWith({ where: { id: "sp1" }, data: { price: 50 } });
 });
 
 it("pauseServicePlan throws 404 when the plan does not exist", async () => {
   const prisma = makePrisma();
-  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-
+  (prisma.servicePlan.findUnique as Fn).mockResolvedValue(null);
   await expect(
     createCustomerService(prisma).pauseServicePlan("missing", { pauseStartDate: new Date() })
   ).rejects.toMatchObject({ statusCode: 404 });
@@ -1139,66 +1200,299 @@ it("pauseServicePlan throws 404 when the plan does not exist", async () => {
 
 it("pauseServicePlan throws 409 when the plan is already paused", async () => {
   const prisma = makePrisma();
-  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1", status: LifecycleStatus.PAUSED });
-
+  (prisma.servicePlan.findUnique as Fn).mockResolvedValue({ id: "sp1", status: LifecycleStatus.PAUSED });
   await expect(
     createCustomerService(prisma).pauseServicePlan("sp1", { pauseStartDate: new Date() })
   ).rejects.toMatchObject({ statusCode: 409 });
 });
 
-it("pauseServicePlan sets PAUSED + pauseStartDate/pauseEndDate on that specific plan", async () => {
+it("pauseServicePlan pauses now, cancels visits and reports cancelledVisits", async () => {
   const prisma = makePrisma();
-  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1", status: LifecycleStatus.ACTIVE });
-  (prisma.servicePlan.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1", status: LifecycleStatus.PAUSED });
-  const start = new Date("2026-02-01");
-  const end = new Date("2026-03-01");
+  (prisma.servicePlan.findUnique as Fn).mockResolvedValue({ id: "sp1", status: LifecycleStatus.ACTIVE });
+  const tx = {
+    visit: { updateMany: vi.fn().mockResolvedValue({ count: 2 }) },
+    servicePlan: { update: vi.fn().mockResolvedValue({ id: "sp1", status: LifecycleStatus.PAUSED }) },
+  };
+  txReturning(prisma, tx);
 
-  await createCustomerService(prisma).pauseServicePlan("sp1", { pauseStartDate: start, pauseEndDate: end });
+  const result = await createCustomerService(prisma).pauseServicePlan("sp1", { pauseStartDate: new Date("2020-01-01") });
 
-  expect(prisma.servicePlan.update).toHaveBeenCalledWith({
-    where: { id: "sp1" },
-    data: { status: LifecycleStatus.PAUSED, pauseStartDate: start, pauseEndDate: end },
-  });
-});
-
-it("pauseServicePlan defaults pauseEndDate to null when omitted", async () => {
-  const prisma = makePrisma();
-  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1", status: LifecycleStatus.ACTIVE });
-  (prisma.servicePlan.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1" });
-
-  await createCustomerService(prisma).pauseServicePlan("sp1", { pauseStartDate: new Date("2026-02-01") });
-
-  const call = (prisma.servicePlan.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
-  expect(call.data.pauseEndDate).toBeNull();
+  expect(result).toMatchObject({ id: "sp1", cancelledVisits: 2, pauseScheduled: false });
+  expect(tx.servicePlan.update.mock.calls[0][0].data.status).toBe(LifecycleStatus.PAUSED);
 });
 
 it("resumeServicePlan throws 404 when the plan does not exist", async () => {
   const prisma = makePrisma();
-  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-
-  await expect(
-    createCustomerService(prisma).resumeServicePlan("missing")
-  ).rejects.toMatchObject({ statusCode: 404 });
+  (prisma.servicePlan.findUnique as Fn).mockResolvedValue(null);
+  await expect(createCustomerService(prisma).resumeServicePlan("missing")).rejects.toMatchObject({ statusCode: 404 });
 });
 
-it("resumeServicePlan throws 409 when the plan is not paused", async () => {
+it("resumeServicePlan throws 409 when the plan is ACTIVE with no scheduled pause", async () => {
   const prisma = makePrisma();
-  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1", status: LifecycleStatus.ACTIVE });
-
-  await expect(
-    createCustomerService(prisma).resumeServicePlan("sp1")
-  ).rejects.toMatchObject({ statusCode: 409 });
+  (prisma.servicePlan.findUnique as Fn).mockResolvedValue({ id: "sp1", status: LifecycleStatus.ACTIVE, pauseStartDate: null });
+  await expect(createCustomerService(prisma).resumeServicePlan("sp1")).rejects.toMatchObject({ statusCode: 409 });
 });
 
-it("resumeServicePlan sets ACTIVE and clears the pause window on that specific plan", async () => {
+it("resumeServicePlan resumes a PAUSED plan and recomputes nextDueDate", async () => {
   const prisma = makePrisma();
-  (prisma.servicePlan.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1", status: LifecycleStatus.PAUSED });
-  (prisma.servicePlan.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "sp1", status: LifecycleStatus.ACTIVE });
+  (prisma.servicePlan.findUnique as Fn).mockResolvedValue({ id: "sp1", propertyId: "p1", status: LifecycleStatus.PAUSED });
+  (prisma.property.findUnique as Fn).mockResolvedValue({ round: { defaultDay: "FRI" } });
+  (prisma.servicePlan.update as Fn).mockResolvedValue({ id: "sp1", status: LifecycleStatus.ACTIVE });
 
   await createCustomerService(prisma).resumeServicePlan("sp1");
 
-  expect(prisma.servicePlan.update).toHaveBeenCalledWith({
-    where: { id: "sp1" },
-    data: { status: LifecycleStatus.ACTIVE, pauseStartDate: null, pauseEndDate: null },
+  const data = (prisma.servicePlan.update as Fn).mock.calls[0][0].data;
+  expect(data).toMatchObject({ status: LifecycleStatus.ACTIVE, pauseStartDate: null, pauseEndDate: null });
+  expect((data.nextDueDate as Date).getUTCDay()).toBe(5);
+});
+
+it("resumeServicePlan cancels a scheduled (future) pause on an ACTIVE plan", async () => {
+  const prisma = makePrisma();
+  (prisma.servicePlan.findUnique as Fn).mockResolvedValue({
+    id: "sp1", propertyId: "p1", status: LifecycleStatus.ACTIVE, pauseStartDate: new Date("2099-01-01"),
   });
+  (prisma.property.findUnique as Fn).mockResolvedValue(null);
+  (prisma.servicePlan.update as Fn).mockResolvedValue({ id: "sp1" });
+
+  await createCustomerService(prisma).resumeServicePlan("sp1");
+  expect(prisma.servicePlan.update).toHaveBeenCalled();
+});
+
+it("pauseService (property-level) pauses the primary plan; 409 when already paused", async () => {
+  const prisma = makePrisma();
+  (prisma.property.findUnique as Fn).mockResolvedValueOnce({
+    id: "p1", servicePlans: [{ id: "sp1", status: LifecycleStatus.PAUSED }],
+  });
+  await expect(
+    createCustomerService(prisma).pauseService("p1", { pauseStartDate: new Date() })
+  ).rejects.toMatchObject({ statusCode: 409 });
+
+  (prisma.property.findUnique as Fn).mockResolvedValueOnce({
+    id: "p1", servicePlans: [{ id: "sp1", status: LifecycleStatus.ACTIVE }],
+  });
+  txReturning(prisma, {
+    visit: { updateMany: vi.fn().mockResolvedValue({ count: 0 }) },
+    servicePlan: { update: vi.fn().mockResolvedValue({ id: "sp1" }) },
+  });
+  const result = await createCustomerService(prisma).pauseService("p1", { pauseStartDate: new Date("2099-01-01") });
+  expect(result).toMatchObject({ cancelledVisits: 0, pauseScheduled: true });
+});
+
+it("resumeService (property-level) resumes the primary plan; 409 when not paused", async () => {
+  const prisma = makePrisma();
+  (prisma.property.findUnique as Fn).mockResolvedValueOnce({
+    id: "p1", servicePlans: [{ id: "sp1", status: LifecycleStatus.ACTIVE, pauseStartDate: null }],
+  });
+  await expect(createCustomerService(prisma).resumeService("p1")).rejects.toMatchObject({ statusCode: 409 });
+
+  (prisma.property.findUnique as Fn)
+    .mockResolvedValueOnce({ id: "p1", servicePlans: [{ id: "sp1", propertyId: "p1", status: LifecycleStatus.PAUSED }] })
+    .mockResolvedValueOnce({ round: null });
+  (prisma.servicePlan.update as Fn).mockResolvedValue({ id: "sp1", status: LifecycleStatus.ACTIVE });
+  expect(await createCustomerService(prisma).resumeService("p1")).toEqual({ id: "sp1", status: LifecycleStatus.ACTIVE });
+});
+
+// ── GAP-022: bad debt, pinned notes ─────────────────────────────────────────
+
+it("setBadDebt 404s for an unknown customer and updates the flag otherwise", async () => {
+  const prisma = makePrisma();
+  (prisma.customer.findUnique as Fn).mockResolvedValueOnce(null);
+  await expect(createCustomerService(prisma).setBadDebt("x", true)).rejects.toMatchObject({ statusCode: 404 });
+
+  (prisma.customer.findUnique as Fn).mockResolvedValueOnce({ id: "c1" });
+  (prisma.customer.update as Fn).mockResolvedValue({ id: "c1", badDebt: true });
+  expect(await createCustomerService(prisma).setBadDebt("c1", true)).toEqual({ id: "c1", badDebt: true });
+  expect((prisma.customer.update as Fn).mock.calls[0][0].data).toEqual({ badDebt: true });
+});
+
+it("getNotes 404s for an unknown property", async () => {
+  const prisma = makePrisma();
+  (prisma.property.findUnique as Fn).mockResolvedValue(null);
+  await expect(createCustomerService(prisma).getNotes("x")).rejects.toMatchObject({ statusCode: 404 });
+});
+
+it("getNotes prepends pinned ACCESS then RISK entries before the notes", async () => {
+  const prisma = makePrisma();
+  (prisma.property.findUnique as Fn).mockResolvedValue({ accessNotes: "Gate code 1234", riskNotes: "Dog" });
+  const note = { id: "n1", body: "hi" };
+  (prisma.propertyNote.findMany as Fn).mockResolvedValue([note]);
+
+  const result = await createCustomerService(prisma).getNotes("p1");
+
+  expect(result).toEqual([
+    { pinned: true, source: "ACCESS", body: "Gate code 1234" },
+    { pinned: true, source: "RISK", body: "Dog" },
+    { ...note, pinned: false },
+  ]);
+});
+
+it("getNotes skips blank or missing access/risk notes", async () => {
+  const prisma = makePrisma();
+  (prisma.property.findUnique as Fn).mockResolvedValue({ accessNotes: "  ", riskNotes: null });
+  (prisma.propertyNote.findMany as Fn).mockResolvedValue([]);
+  expect(await createCustomerService(prisma).getNotes("p1")).toEqual([]);
+});
+
+// ── GAP-010: search ─────────────────────────────────────────────────────────
+
+it("searchCustomers returns [] for a blank query without touching the DB", async () => {
+  const prisma = makePrisma();
+  expect(await createCustomerService(prisma).searchCustomers("   ")).toEqual([]);
+  expect(prisma.customer.findMany).not.toHaveBeenCalled();
+});
+
+it("searchCustomers matches phone digits via raw SQL and maps picker rows", async () => {
+  const prisma = makePrisma();
+  (prisma.$queryRaw as unknown as Fn).mockResolvedValue([{ id: "c9" }]);
+  (prisma.customer.findMany as Fn).mockResolvedValue([
+    { id: "c9", name: "Coates", phone: "+44 7700 900111", email: null, properties: [{ postcode: "NE66 1TD" }, { postcode: "NE66 2AA" }] },
+    { id: "c2", name: "No Props", phone: null, email: "a@b.c", properties: [] },
+  ]);
+
+  const result = await createCustomerService(prisma).searchCustomers(" 07700 900 ");
+
+  expect(prisma.$queryRaw).toHaveBeenCalled();
+  const args = (prisma.customer.findMany as Fn).mock.calls[0][0];
+  expect(args.take).toBe(10);
+  expect(args.where.status).toEqual({ not: LifecycleStatus.CANCELLED });
+  expect(args.where.OR).toContainEqual({ id: { in: ["c9"] } });
+  expect(args.where.OR[0]).toEqual({ name: { contains: "07700 900", mode: "insensitive" } });
+  expect(result).toEqual([
+    { id: "c9", name: "Coates", phone: "+44 7700 900111", email: null, propertyCount: 2, postcode: "NE66 1TD" },
+    { id: "c2", name: "No Props", phone: null, email: "a@b.c", propertyCount: 0, postcode: null },
+  ]);
+});
+
+it("searchCustomers skips the phone query for short/no-digit terms and when it finds nothing", async () => {
+  const prisma = makePrisma();
+  (prisma.customer.findMany as Fn).mockResolvedValue([]);
+  await createCustomerService(prisma).searchCustomers("coates");
+  expect(prisma.$queryRaw).not.toHaveBeenCalled();
+  expect((prisma.customer.findMany as Fn).mock.calls[0][0].where.OR).toHaveLength(3);
+
+  (prisma.$queryRaw as unknown as Fn).mockResolvedValue([]);
+  await createCustomerService(prisma).searchCustomers("12345");
+  expect((prisma.customer.findMany as Fn).mock.calls[1][0].where.OR).toHaveLength(3);
+});
+
+// ── visit history ───────────────────────────────────────────────────────────
+
+it("getVisitHistory 404s for an unknown customer", async () => {
+  const prisma = makePrisma();
+  (prisma.customer.findUnique as Fn).mockResolvedValue(null);
+  await expect(createCustomerService(prisma).getVisitHistory("x", 1, 50)).rejects.toMatchObject({ statusCode: 404 });
+});
+
+it("getVisitHistory pages every status, including CANCELLED with its reason", async () => {
+  const prisma = makePrisma();
+  (prisma.customer.findUnique as Fn).mockResolvedValue({ id: "c1" });
+  (prisma.visit.count as Fn).mockResolvedValue(3);
+  (prisma.visit.findMany as Fn).mockResolvedValue([
+    { id: "v1", date: new Date("2026-11-01"), status: VisitStatus.CANCELLED, cancelReason: "PAUSED", notes: null, round: { name: "Fri" }, payment: null },
+    { id: "v2", date: new Date("2026-10-01"), status: VisitStatus.COMPLETED, cancelReason: null, notes: "ok", round: null, payment: { status: PaymentStatus.PAID } },
+  ]);
+
+  const result = await createCustomerService(prisma).getVisitHistory("c1", 2, 2);
+
+  expect(result.pagination).toEqual({ page: 2, pageSize: 2, total: 3, totalPages: 2 });
+  expect(result.rows[0]).toEqual({
+    visitId: "v1", date: new Date("2026-11-01"), roundName: "Fri", status: VisitStatus.CANCELLED,
+    cancelReason: "PAUSED", paymentStatus: null, notes: null,
+  });
+  expect(result.rows[1].paymentStatus).toBe(PaymentStatus.PAID);
+  const args = (prisma.visit.findMany as Fn).mock.calls[0][0];
+  expect(args.skip).toBe(2);
+  expect(args.where).toEqual({ property: { customerId: "c1" } });
+});
+
+// ── detail: GAP-021/022 fields, CANCELLED handling ─────────────────────────
+
+it("getCustomerDetail returns badDebt, invoice-based amountDue, ON_HOLD, nextDue fallback and cancelled visits in history only", async () => {
+  const prisma = makePrisma();
+  const customer = makeCustomerWithVisitsAndPayments({ visitCount: 0, payments: [] });
+  (customer as any).badDebt = true;
+  (customer as any).holdNextClean = true;
+  customer.invoices = [{ status: "SENT", dueDate: new Date("2020-01-01"), amount: 25 }];
+  customer.properties[0].visits = [
+    { ...makeVisit({ id: "v-next", date: new Date("2026-12-04"), status: VisitStatus.SCHEDULED }), cancelReason: null },
+    { ...makeVisit({ id: "v-cancel", date: new Date("2026-11-20"), status: VisitStatus.CANCELLED }), cancelReason: "PAUSED" },
+  ] as any;
+  (prisma.customer.findUnique as Fn).mockResolvedValue(customer);
+  (prisma.businessSettings.findFirst as Fn).mockResolvedValue(makeSettings());
+
+  const result = await createCustomerService(prisma).getCustomerDetail("c1", UserRole.ADMIN);
+
+  expect(result.customer.badDebt).toBe(true);
+  expect(result.standingInfo.paymentStatus).toBe("ON_HOLD");
+  expect(result.standingInfo.amountDue).toBe(25);
+  expect(result.standingInfo.outstandingBalance).toBe(25);
+  expect(result.standingInfo.nextDue).toEqual(new Date("2026-12-04"));
+  expect(result.tabs.visitHistory.map((v) => [v.visitId, v.cancelReason])).toEqual([
+    ["v-next", null],
+    ["v-cancel", "PAUSED"],
+  ]);
+  expect(result.tabs.payments?.rows.map((r) => r.visitId)).toEqual(["v-next"]);
+});
+
+it("getCustomerDetail reports OVERDUE from a past-due SENT invoice and hides amountDue for technicians", async () => {
+  const prisma = makePrisma();
+  const customer = makeCustomerWithVisitsAndPayments({ visitCount: 0, payments: [] });
+  customer.invoices = [{ status: "SENT", dueDate: new Date("2020-01-01"), amount: 25 }];
+  (prisma.customer.findUnique as Fn).mockResolvedValue(customer);
+  (prisma.businessSettings.findFirst as Fn).mockResolvedValue(makeSettings());
+
+  const admin = await createCustomerService(prisma).getCustomerDetail("c1", UserRole.ADMIN);
+  expect(admin.standingInfo.paymentStatus).toBe("OVERDUE");
+  expect(admin.standingInfo.nextDue).toBeNull();
+
+  const tech = await createCustomerService(prisma).getCustomerDetail("c1", UserRole.TECHNICIAN);
+  expect(tech.standingInfo.amountDue).toBeUndefined();
+});
+
+// ── A2: nextDueDate on POST /customers/:id/properties ───────────────────────
+
+function addPropertySetup(round: unknown) {
+  const prisma = makePrisma();
+  (prisma.customer.findUnique as Fn).mockResolvedValue({ id: "c1", status: LifecycleStatus.ACTIVE });
+  (prisma.round.findUnique as Fn).mockResolvedValue(round);
+  (prisma.serviceArea.findUnique as Fn).mockResolvedValue({ id: "sa1" });
+  (prisma.property.update as Fn).mockResolvedValue({});
+  vi.mocked(geocodePostcode).mockResolvedValue(null);
+  const tx = {
+    property: { create: vi.fn().mockResolvedValue({ id: "p1" }) },
+    servicePlan: { create: vi.fn().mockResolvedValue({ id: "sp1" }) },
+  };
+  txReturning(prisma, tx);
+  return { prisma, tx };
+}
+
+const baseAdd = { addressLine: "1 St", postcode: "NE66 1TD", serviceAreaId: "sa1", price: 20 };
+
+it("addPropertyToCustomer keeps an explicit nextDueDate", async () => {
+  const { prisma, tx } = addPropertySetup({ id: "r1", frequency: "FOUR_WEEKLY", defaultDay: "FRI" });
+  const due = new Date("2026-12-01");
+  await createCustomerService(prisma).addPropertyToCustomer("c1", { ...baseAdd, roundId: "r1", nextDueDate: due });
+  expect(tx.servicePlan.create.mock.calls[0][0].data.nextDueDate).toBe(due);
+});
+
+it("addPropertyToCustomer derives nextDueDate from lastCleanedDate + frequency, snapped to the round day", async () => {
+  const { prisma, tx } = addPropertySetup({ id: "r1", frequency: "FOUR_WEEKLY", defaultDay: "FRI" });
+  const lastCleanedDate = new Date();
+  await createCustomerService(prisma).addPropertyToCustomer("c1", { ...baseAdd, roundId: "r1", lastCleanedDate });
+  const data = tx.servicePlan.create.mock.calls[0][0].data;
+  expect(data.cleaningFrequency).toBe("FOUR_WEEKLY");
+  expect((data.nextDueDate as Date).getUTCDay()).toBe(5);
+  expect((data.nextDueDate as Date).getTime()).toBeGreaterThan(Date.now() + 20 * 86_400_000);
+});
+
+it("addPropertyToCustomer ignores lastCleanedDate when the round has no frequency, and sets null with no round", async () => {
+  const { prisma, tx } = addPropertySetup({ id: "r1", frequency: null, defaultDay: "MON" });
+  await createCustomerService(prisma).addPropertyToCustomer("c1", { ...baseAdd, roundId: "r1", lastCleanedDate: new Date("2020-01-01") });
+  const due = tx.servicePlan.create.mock.calls[0][0].data.nextDueDate as Date;
+  expect(due.getUTCDay()).toBe(1);
+  expect(due.getTime()).toBeLessThan(Date.now() + 8 * 86_400_000);
+
+  const second = addPropertySetup(null);
+  await createCustomerService(second.prisma).addPropertyToCustomer("c1", baseAdd);
+  expect(second.tx.servicePlan.create.mock.calls[0][0].data.nextDueDate).toBeNull();
 });

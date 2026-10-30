@@ -487,3 +487,37 @@ it("updateTechnician replaces service areas via a nested deleteMany+create on a 
     create: [{ serviceAreaId: "sa1" }, { serviceAreaId: "sa2" }],
   });
 });
+
+// ---- Phase 1 audit: new BusinessSettings fields pass through (B1, B2, GAP-008) ----
+
+it("updateBusinessProfile writes the address fields and vatRate", async () => {
+  const prisma = makePrisma();
+  (prisma.businessSettings.upsert as ReturnType<typeof vi.fn>).mockResolvedValue({});
+  await createSettingsService(prisma, "schema_p1_a").updateBusinessProfile({
+    addressLine1: "1 Audit St", addressLine2: null, town: "Alnwick", postcode: "NE66 1TD", vatRate: 5,
+  });
+  const written = (prisma.businessSettings.upsert as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(written.update).toMatchObject({ addressLine1: "1 Audit St", addressLine2: null, town: "Alnwick", postcode: "NE66 1TD", vatRate: 5 });
+});
+
+it("updateRoundSettings writes reminderMode/reminderTime/defaultCleanMethod/autoCreateNextVisit", async () => {
+  const prisma = makePrisma();
+  (prisma.businessSettings.upsert as ReturnType<typeof vi.fn>).mockResolvedValue({});
+  await createSettingsService(prisma, "schema_p1_b").updateRoundSettings({
+    reminderMode: "MORNING_OF", reminderTime: "07:00", defaultCleanMethod: "BOTH", autoCreateNextVisit: false,
+  });
+  const written = (prisma.businessSettings.upsert as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(written.update).toMatchObject({ reminderMode: "MORNING_OF", reminderTime: "07:00", defaultCleanMethod: "BOTH", autoCreateNextVisit: false });
+});
+
+it("updatePaymentRules writes the payment defaults", async () => {
+  const prisma = makePrisma();
+  (prisma.businessSettings.upsert as ReturnType<typeof vi.fn>).mockResolvedValue({});
+  await createSettingsService(prisma, "schema_p1_c").updatePaymentRules({
+    paymentRule: "COLLECT_DAILY_BATCH", defaultPaymentMethod: "BACS", invoiceDueDays: 14, noDirectDebitAction: "SEND_PAYMENT_LINK",
+  });
+  const written = (prisma.businessSettings.upsert as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(written.update).toMatchObject({
+    paymentRule: "COLLECT_DAILY_BATCH", defaultPaymentMethod: "BACS", invoiceDueDays: 14, noDirectDebitAction: "SEND_PAYMENT_LINK",
+  });
+});

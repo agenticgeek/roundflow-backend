@@ -1,7 +1,13 @@
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
-import { MessageChannel, PaymentMethod, Prisma } from "../generated/tenant-client";
+import { MessageChannel, PaymentMethod, Prisma, VisitStatus } from "../generated/tenant-client";
 import { createMessageService } from "./message.service";
+import { getCachedBusinessSettings } from "./settings.service";
+import { holdNextVisits, releaseHeldVisits } from "./payment-hold";
+import { getInvoiceCheckoutLink } from "../integrations/stripe/checkout";
+import {
+  FALLBACK_BODIES, TEMPLATE_NAMES, invoiceTemplateVars, loadTemplate, renderTemplate,
+} from "./message-templates";
 
 // The 7 tabs the debt board UI shows: the 6 named buckets below, plus
 // whatever bucket string doesn't match one of them (the "default"/catch-all
@@ -31,7 +37,10 @@ async function computeBucketContext(prisma: TenantPrismaClient): Promise<BucketC
 
   const [failedPayments, upcomingVisits] = await Promise.all([
     prisma.payment.findMany({ where: { status: "FAILED", method: "GOCARDLESS" }, select: { visitId: true } }),
-    prisma.visit.findMany({ where: { date: { gte: now, lte: sevenDaysFromNow } }, select: { property: { select: { customerId: true } } } }),
+    prisma.visit.findMany({
+      where: { date: { gte: now, lte: sevenDaysFromNow }, status: { not: VisitStatus.CANCELLED } },
+      select: { property: { select: { customerId: true } } },
+    }),
   ]);
   const failedVisitIds = [...new Set(failedPayments.map((p) => p.visitId).filter(Boolean) as string[])];
   const upcomingCustomerIds = [...new Set(upcomingVisits.map((v) => v.property.customerId))];
@@ -56,10 +65,7 @@ function buildBucketWhere(
     case "BAD_DEBT":
       customerWhere.badDebt = true;
       break;
-    case "ON_HOLD":
-      customerWhere.badDebt = false;
-      customerWhere.holdNextClean = true;
-      break;
+    // ON_HOLD is customer-based (onHoldCustomerWhere), never an invoice filter.
     case "FAILED_GC":
       customerWhere.badDebt = false;
       where.visitId = { in: failedVisitIds };
@@ -108,7 +114,74 @@ function buildBucketWhere(
   return where;
 }
 
+// ON_HOLD counts customers on hold whatever their invoice status (A3), with
+// the board's round / payment-method / search filters applied at customer level.
+function onHoldCustomerWhere(filters: { roundId?: string; paymentMethod?: string; search?: string }): Prisma.CustomerWhereInput {
+  const where: Prisma.CustomerWhereInput = { holdNextClean: true, badDebt: false };
+  if (filters.paymentMethod) where.paymentMethod = filters.paymentMethod as PaymentMethod;
+  if (filters.roundId) where.properties = { some: { roundId: filters.roundId } };
+  if (filters.search) {
+    where.OR = [
+      { name: { contains: filters.search, mode: "insensitive" } },
+      { properties: { some: { addressLine: { contains: filters.search, mode: "insensitive" } } } },
+    ];
+  }
+  return where;
+}
+
+// One debt-board row. Invoice buckets give one row per SENT invoice; the
+// ON_HOLD bucket gives one row per held customer (A3) — invoice fields then
+// describe the customer's oldest SENT invoice (null when none) and `amount`
+// is the customer's total outstanding.
+type BoardRowBase = {
+  invoiceId: string | null;
+  invoiceNumber: string | null;
+  amount: number;
+  dueDate: Date | null;
+  customerId: string;
+  customerName: string;
+  addressLine: string;
+  postcode: string | null;
+  paymentMethod: string | null;
+  badDebt: boolean;
+  holdNextClean: boolean;
+};
+
+type InvoiceForSend = {
+  id: string;
+  invoiceNumber: string;
+  customerId: string;
+  amount: Prisma.Decimal;
+  dueDate: Date | null;
+  status: string;
+  customer: { name: string };
+};
+
 export function createDebtService(prisma: TenantPrismaClient) {
+  const messages = createMessageService(prisma);
+
+  const loadInvoice = async (invoiceId: string): Promise<InvoiceForSend> => {
+    const invoice = await prisma.invoice.findUnique({
+      where: { id: invoiceId },
+      include: { customer: { select: { name: true } } },
+    });
+    if (!invoice) throw new AppError(404, "Invoice not found");
+    return invoice;
+  };
+
+  const templateVars = async (invoice: InvoiceForSend, paymentLink?: string) => {
+    const settings = await getCachedBusinessSettings(prisma);
+    return invoiceTemplateVars({
+      customerName: invoice.customer.name,
+      invoiceNumber: invoice.invoiceNumber,
+      amount: invoice.amount.toNumber(),
+      dueDate: invoice.dueDate,
+      currency: settings?.currency,
+      businessName: settings?.businessName,
+      paymentLink,
+    });
+  };
+
   return {
     getBoard: async (
       bucket: string,
@@ -122,24 +195,80 @@ export function createDebtService(prisma: TenantPrismaClient) {
       const pageSizeNum = Math.min(100, Math.max(1, pageSize ?? 50));
       const skip = (pageNum - 1) * pageSizeNum;
 
-      const ctx = await computeBucketContext(prisma);
-      const where = buildBucketWhere(bucket, { roundId, paymentMethod, search }, ctx);
+      let total: number;
+      let baseRows: BoardRowBase[];
+      if (bucket === "ON_HOLD") {
+        // Listed per customer so it matches the ON_HOLD count, including held
+        // customers with no SENT invoice.
+        const customerWhere = onHoldCustomerWhere({ roundId, paymentMethod, search });
+        const [count, customers] = await Promise.all([
+          prisma.customer.count({ where: customerWhere }),
+          prisma.customer.findMany({
+            where: customerWhere,
+            select: {
+              id: true, name: true, paymentMethod: true, badDebt: true, holdNextClean: true,
+              properties: { select: { addressLine: true, postcode: true }, orderBy: { createdAt: "asc" }, take: 1 },
+              invoices: {
+                where: { status: "SENT" },
+                select: { id: true, invoiceNumber: true, amount: true, dueDate: true },
+                orderBy: { createdAt: "asc" },
+              },
+            },
+            orderBy: [{ holdSince: "asc" }, { createdAt: "asc" }],
+            take: pageSizeNum,
+            skip,
+          }),
+        ]);
+        total = count;
+        baseRows = customers.map((c) => {
+          const oldest = c.invoices[0];
+          return {
+            invoiceId: oldest?.id ?? null,
+            invoiceNumber: oldest?.invoiceNumber ?? null,
+            amount: c.invoices.reduce((sum, i) => sum + i.amount.toNumber(), 0),
+            dueDate: oldest?.dueDate ?? null,
+            customerId: c.id,
+            customerName: c.name,
+            addressLine: c.properties[0]?.addressLine ?? "",
+            postcode: c.properties[0]?.postcode ?? null,
+            paymentMethod: (c.paymentMethod as string | null) ?? null,
+            badDebt: c.badDebt,
+            holdNextClean: c.holdNextClean,
+          };
+        });
+      } else {
+        const ctx = await computeBucketContext(prisma);
+        const where = buildBucketWhere(bucket, { roundId, paymentMethod, search }, ctx);
+        const [count, invoices] = await Promise.all([
+          prisma.invoice.count({ where }),
+          prisma.invoice.findMany({
+            where,
+            include: {
+              customer: { select: { id: true, name: true, email: true, paymentMethod: true, badDebt: true, holdNextClean: true } },
+              visit: { select: { date: true, property: { select: { addressLine: true, postcode: true, roundId: true, customerId: true } } } },
+            },
+            orderBy: { createdAt: "asc" },
+            take: pageSizeNum,
+            skip,
+          }),
+        ]);
+        total = count;
+        baseRows = invoices.map((inv) => ({
+          invoiceId: inv.id,
+          invoiceNumber: inv.invoiceNumber,
+          amount: inv.amount.toNumber(),
+          dueDate: inv.dueDate,
+          customerId: inv.customerId,
+          customerName: inv.customer.name,
+          addressLine: inv.visit?.property.addressLine ?? "",
+          postcode: inv.visit?.property.postcode ?? null,
+          paymentMethod: (inv.customer.paymentMethod as string | null) ?? null,
+          badDebt: inv.customer.badDebt,
+          holdNextClean: inv.customer.holdNextClean,
+        }));
+      }
 
-      const [total, invoices] = await Promise.all([
-        prisma.invoice.count({ where }),
-        prisma.invoice.findMany({
-          where,
-          include: {
-            customer: { select: { id: true, name: true, email: true, paymentMethod: true, badDebt: true, holdNextClean: true } },
-            visit: { select: { date: true, property: { select: { addressLine: true, postcode: true, roundId: true, customerId: true } } } },
-          },
-          orderBy: { createdAt: "asc" },
-          take: pageSizeNum,
-          skip,
-        }),
-      ]);
-
-      const customerIds = [...new Set(invoices.map((i) => i.customerId))];
+      const customerIds = [...new Set(baseRows.map((r) => r.customerId))];
       const lastMessages = customerIds.length > 0
         ? await prisma.$queryRaw<{ customerId: string; createdAt: Date }[]>`
             SELECT DISTINCT ON ("customerId") "customerId", "createdAt"
@@ -153,19 +282,19 @@ export function createDebtService(prisma: TenantPrismaClient) {
         if (msg && msg.customerId) lastContactMap.set(msg.customerId, msg.createdAt);
       }
 
-      const rows = invoices.map((inv) => ({
-        invoiceId: inv.id,
-        invoiceNumber: inv.invoiceNumber,
-        amount: inv.amount.toNumber(),
-        dueDate: inv.dueDate,
-        customerId: inv.customerId,
-        customerName: inv.customer.name,
-        addressLine: inv.visit?.property.addressLine ?? "",
-        postcode: inv.visit?.property.postcode ?? null,
-        paymentMethod: (inv.customer.paymentMethod as string | null) ?? null,
-        lastContactedAt: lastContactMap.get(inv.customerId) ?? null,
-        badDebt: inv.customer.badDebt,
-        holdNextClean: inv.customer.holdNextClean,
+      const rows = baseRows.map((r) => ({
+        invoiceId: r.invoiceId,
+        invoiceNumber: r.invoiceNumber,
+        amount: r.amount,
+        dueDate: r.dueDate,
+        customerId: r.customerId,
+        customerName: r.customerName,
+        addressLine: r.addressLine,
+        postcode: r.postcode,
+        paymentMethod: r.paymentMethod,
+        lastContactedAt: lastContactMap.get(r.customerId) ?? null,
+        badDebt: r.badDebt,
+        holdNextClean: r.holdNextClean,
       }));
 
       return {
@@ -178,22 +307,41 @@ export function createDebtService(prisma: TenantPrismaClient) {
         },
       };
     },
+    // A5: payment link = a real Stripe Checkout Session on the tenant's
+    // connected account, delivered through GHL. Contact/channel and the GHL
+    // connection are checked BEFORE the session is created (D-6), so a
+    // request that can't be delivered never orphans a Stripe session.
     sendPaymentLink: async (
       invoiceId: string,
-      _message: string,
-      options?: { overrideUrl?: string; provider?: string; expiresAt?: Date | null }
+      options: { tenantId: string; channel?: MessageChannel; message?: string }
     ) => {
-      const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId }, include: { customer: { select: { id: true, name: true, email: true } } } });
-      if (!invoice) throw new AppError(404, "Invoice not found");
-      if (!invoice.customer.email) throw new AppError(400, "Customer has no email address");
-      const link = options?.overrideUrl ?? `https://pay.roundflow.app/i/${invoice.invoiceNumber}`;
-      const body = `${_message}\n\n${link}`;
-      const msg = await prisma.message.create({ data: { channel: "EMAIL", direction: "OUTBOUND", body, customerId: invoice.customerId, sentAt: new Date() } });
+      const invoice = await loadInvoice(invoiceId);
+      if (invoice.status === "PAID" || invoice.status === "VOID") {
+        throw new AppError(409, `Invoice is ${invoice.status.toLowerCase()}, so no payment link is needed`, "INVOICE_NOT_PAYABLE");
+      }
+      const prep = await messages.prepare(invoice.customerId, options.channel);
+      const link = await getInvoiceCheckoutLink(prisma, {
+        tenantId: options.tenantId,
+        invoiceId: invoice.id,
+        customerId: invoice.customerId,
+        invoiceNumber: invoice.invoiceNumber,
+        amount: invoice.amount,
+      });
+      const template = options.message
+        ? { id: null, body: options.message }
+        : await loadTemplate(prisma, TEMPLATE_NAMES.PAYMENT_LINK, FALLBACK_BODIES.PAYMENT_LINK);
+      const rendered = renderTemplate(template.body, await templateVars(invoice, link.url));
+      const body = rendered.includes(link.url) ? rendered : `${rendered}\n\n${link.url}`;
+      const sent = await messages.deliver(prep, body, { templateId: template.id });
       return {
-        id: msg.id,
-        paymentUrl: link,
-        provider: options?.provider ?? "static",
-        expiresAt: options?.expiresAt ?? null,
+        url: link.url,
+        messageId: sent.messageId,
+        channel: sent.channel,
+        // Pre-A5 response fields, kept for one release.
+        id: sent.messageId,
+        paymentUrl: link.url,
+        provider: "stripe" as const,
+        expiresAt: link.expiresAt,
       };
     },
     flagHold: async (
@@ -209,9 +357,11 @@ export function createDebtService(prisma: TenantPrismaClient) {
           ? { holdNextClean: true, holdReason: options?.reason ?? null, holdSince: options?.date ?? new Date() }
           : { holdNextClean: false, holdReason: null, holdSince: null },
       });
+      // A3: the hold is real. Flag (or clear) the customer's next visits.
+      const visitsUpdated = await (_flag ? holdNextVisits : releaseHeldVisits)(prisma, updated.id);
       if (_flag && options?.notify) {
         const body = options.message?.trim() || "Your next clean is on hold until this is resolved.";
-        await createMessageService(prisma).send({ customerId: updated.id, channel: "sms", body }).catch((err) => {
+        await messages.send({ customerId: updated.id, channel: "SMS", body }).catch((err) => {
           console.error(`[debt] hold notify failed for customer ${updated.id}:`, err);
         });
       }
@@ -220,6 +370,7 @@ export function createDebtService(prisma: TenantPrismaClient) {
         holdNextClean: updated.holdNextClean,
         holdReason: updated.holdReason,
         holdSince: updated.holdSince,
+        visitsUpdated,
       };
     },
     flagBadDebt: async (invoiceId: string, _flag: boolean) => {
@@ -228,12 +379,17 @@ export function createDebtService(prisma: TenantPrismaClient) {
       const updated = await prisma.customer.update({ where: { id: invoice.customerId }, data: { badDebt: _flag } });
       return { customerId: updated.id, badDebt: updated.badDebt };
     },
-    sendReminder: async (invoiceId: string, channel: string, _message: string) => {
-      const invoice = await prisma.invoice.findUnique({ where: { id: invoiceId }, include: { customer: { select: { id: true, name: true, email: true } } } });
-      if (!invoice) throw new AppError(404, "Invoice not found");
-      if (channel === "EMAIL" && !invoice.customer.email) throw new AppError(400, "Customer has no email address");
-      const msg = await prisma.message.create({ data: { channel: channel as MessageChannel, direction: "OUTBOUND", body: _message, customerId: invoice.customerId, sentAt: new Date() } });
-      return { id: msg.id };
+    // A5: reminder through GHL. channel omitted = SMS if mobile, else EMAIL;
+    // message omitted = the tenant's "Payment Overdue Reminder" template.
+    sendReminder: async (invoiceId: string, options: { channel?: MessageChannel; message?: string }) => {
+      const invoice = await loadInvoice(invoiceId);
+      const prep = await messages.prepare(invoice.customerId, options.channel);
+      const template = options.message
+        ? { id: null, body: options.message }
+        : await loadTemplate(prisma, TEMPLATE_NAMES.PAYMENT_REMINDER, FALLBACK_BODIES.PAYMENT_REMINDER);
+      const body = renderTemplate(template.body, await templateVars(invoice));
+      const sent = await messages.deliver(prep, body, { templateId: template.id });
+      return { id: sent.messageId, messageId: sent.messageId, channel: sent.channel, customerId: invoice.customerId };
     },
     getBucketCounts: async (
       roundId?: string,
@@ -243,8 +399,9 @@ export function createDebtService(prisma: TenantPrismaClient) {
       const ctx = await computeBucketContext(prisma);
       const entries = await Promise.all(
         DEBT_BUCKETS.map(async (bucket) => {
-          const where = buildBucketWhere(bucket, { roundId, paymentMethod, search }, ctx);
-          const count = await prisma.invoice.count({ where });
+          const count = bucket === "ON_HOLD"
+            ? await prisma.customer.count({ where: onHoldCustomerWhere({ roundId, paymentMethod, search }) })
+            : await prisma.invoice.count({ where: buildBucketWhere(bucket, { roundId, paymentMethod, search }, ctx) });
           return [bucket, count] as const;
         })
       );
@@ -253,22 +410,28 @@ export function createDebtService(prisma: TenantPrismaClient) {
     getKpis: async () => {
       const { failedVisitIds, upcomingCustomerIds } = await computeBucketContext(prisma);
 
-      const [totalOutstandingsAgg, badDebtAgg, failedGoCardless, dueBeforeClean, holdCustomers] = await Promise.all([
+      const [
+        totalOutstandingsAgg, badDebtAgg, failedGoCardless, dueBeforeClean, holdNextClean,
+        totalOutstandingsCount, badDebtCount,
+      ] = await Promise.all([
         prisma.invoice.aggregate({ _sum: { amount: true }, where: { status: "SENT", customer: { badDebt: false } } }),
         prisma.invoice.aggregate({ _sum: { amount: true }, where: { status: "SENT", customer: { badDebt: true } } }),
         prisma.invoice.count({ where: { status: "SENT", customer: { badDebt: false }, visitId: { in: failedVisitIds } } }),
         prisma.invoice.count({ where: { status: "SENT", customer: { badDebt: false }, customerId: { in: upcomingCustomerIds } } }),
-        prisma.invoice.findMany({
-          where: { status: "SENT", customer: { badDebt: false, holdNextClean: true } },
-          distinct: ["customerId"],
-          select: { customerId: true },
-        }),
+        // A3: customers on hold, whatever their invoice status.
+        prisma.customer.count({ where: { holdNextClean: true, badDebt: false } }),
+        // GAP-031: distinct customers behind each total.
+        prisma.customer.count({ where: { badDebt: false, invoices: { some: { status: "SENT" } } } }),
+        prisma.customer.count({ where: { badDebt: true, invoices: { some: { status: "SENT" } } } }),
       ]);
 
       const totalOutstandings = Number(totalOutstandingsAgg._sum.amount ?? 0);
       const badDebt = Number(badDebtAgg._sum.amount ?? 0);
 
-      return { totalOutstandings, badDebt, failedGoCardless, dueBeforeClean, holdNextClean: holdCustomers.length };
+      return {
+        totalOutstandings, totalOutstandingsCount, badDebt, badDebtCount,
+        failedGoCardless, dueBeforeClean, holdNextClean,
+      };
     },
     // Detail for one invoice — the fields the debt board's row doesn't carry
     // (phone/email/round/next visit/mandate/recent visits), so the debt
@@ -299,7 +462,7 @@ export function createDebtService(prisma: TenantPrismaClient) {
           select: { date: true },
         }),
         prisma.visit.findMany({
-          where: { property: { customerId: invoice.customerId } },
+          where: { property: { customerId: invoice.customerId }, status: { not: VisitStatus.CANCELLED } },
           orderBy: { date: "desc" },
           take: 5,
           select: { id: true, date: true, status: true, price: true },

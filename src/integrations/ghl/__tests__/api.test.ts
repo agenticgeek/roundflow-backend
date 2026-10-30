@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { __clearGhlCustomFieldCache, setGhlContactCustomFields } from "../api";
+import { __clearGhlCustomFieldCache, sendGhlMessage, setGhlContactCustomFields } from "../api";
 
 const fetchMock = vi.fn();
 vi.stubGlobal("fetch", fetchMock);
@@ -110,5 +110,28 @@ describe("setGhlContactCustomFields", () => {
     await expect(setGhlContactCustomFields(ctx, "contact-1", { balance_owed: 1 })).rejects.toThrow(
       /setCustomFields failed \(400\)/
     );
+  });
+});
+
+describe("sendGhlMessage", () => {
+  it("posts the message with the mapped channel type and returns GHL's message id", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ messageId: "ghl-m1" }));
+    await expect(sendGhlMessage(ctx, "contact-1", "hi", "WHATSAPP")).resolves.toBe("ghl-m1");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toContain("/conversations/messages");
+    expect(JSON.parse(init.body)).toEqual({ type: "WhatsApp", contactId: "contact-1", message: "hi" });
+  });
+
+  it("defaults an unknown channel to Email and returns null without a message id or JSON body", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({}));
+    await expect(sendGhlMessage(ctx, "c", "hi", "PIGEON")).resolves.toBeNull();
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).type).toBe("Email");
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 200, json: () => Promise.reject(new Error("no body")), text: () => Promise.resolve("") });
+    await expect(sendGhlMessage(ctx, "c", "hi", "SMS")).resolves.toBeNull();
+  });
+
+  it("throws on a non-2xx response", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ message: "nope" }, false, 422));
+    await expect(sendGhlMessage(ctx, "c", "hi", "SMS")).rejects.toThrow(/sendMessage failed \(422\)/);
   });
 });

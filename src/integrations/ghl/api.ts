@@ -125,12 +125,15 @@ const CHANNEL_TYPE_MAP: Record<string, string> = {
   WHATSAPP: "WhatsApp",
 };
 
+// Resolves to GHL's message id once GHL has accepted the message (null if the
+// response body carries none). Throws on any non-2xx so callers only record a
+// Message row after a real acceptance.
 export async function sendGhlMessage(
   ctx: GhlTokenContext,
   contactId: string,
   messageBody: string,
   channel: string
-): Promise<void> {
+): Promise<string | null> {
   const type = CHANNEL_TYPE_MAP[channel] ?? "Email";
   const res = await fetch(`${GHL_API}/conversations/messages`, {
     method: "POST",
@@ -138,6 +141,8 @@ export async function sendGhlMessage(
     body: JSON.stringify({ type, contactId, message: messageBody }),
   });
   await assertGhlOk(res, "sendMessage");
+  const data = (await res.json().catch(() => null)) as { messageId?: string } | null;
+  return data?.messageId ?? null;
 }
 
 // ---------------------------------------------------------------------------

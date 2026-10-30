@@ -11,7 +11,7 @@ const visitDetailInclude = {
       id: true, addressLine: true, postcode: true, latitude: true, longitude: true,
       customer: {
         select: {
-          id: true, name: true, badDebt: true,
+          id: true, name: true, badDebt: true, paymentMethod: true,
           invoices: {
             where: { status: { in: [InvoiceStatus.DRAFT, InvoiceStatus.SENT] } },
             select: { id: true, invoiceNumber: true, amount: true, dueDate: true },
@@ -24,10 +24,20 @@ const visitDetailInclude = {
   round: { select: { id: true, name: true } },
   service: { select: { id: true, name: true } },
   technician: { select: { name: true, role: true } },
+  servicePlan: { select: { paymentMethod: true } },
+  // Stored paths; GET /mobile/visits/:id adds a signed read url per photo.
+  photos: { select: { id: true, type: true, url: true, issueId: true, createdAt: true }, orderBy: { createdAt: "asc" } },
   _count: { select: { issues: true } },
 } satisfies Prisma.VisitInclude;
 
 type VisitDetailBase = Prisma.VisitGetPayload<{ include: typeof visitDetailInclude }>;
+
+export interface DebtPaymentResult {
+  cleared: boolean;
+  amountPaid: number;
+  amountPending: number;
+  method: "CASH" | "CHEQUE";
+}
 
 export interface VisitDetail extends VisitDetailBase {
   lastClean: Date | null;
@@ -59,7 +69,7 @@ class JobDetailService {
     if (visit.roundId) {
       const { start, end } = todayRange();
       const roundVisits = await this.prisma.visit.findMany({
-        where: { roundId: visit.roundId, date: { gte: start, lt: end } },
+        where: { roundId: visit.roundId, date: { gte: start, lt: end }, status: { not: VisitStatus.CANCELLED } },
         orderBy: { createdAt: "asc" },
         select: { id: true },
       });
@@ -83,13 +93,22 @@ class JobDetailService {
     const debtAmount = outstandingInvoices.reduce((s, i) => s + i.amount, 0);
     const gate = await evaluateDebtGate(this.prisma, visit.property.customer.id);
 
-    return { ...visit, lastClean: lastVisit?.completedAt ?? null, roundPosition, activityLog, outstandingInvoices, debtAmount, canStart: gate.canStart, blockReason: gate.blockReason };
+    // Effective method (visit → plan → customer) drives the app's payment sheet.
+    const paymentMethod = visit.paymentMethod ?? visit.servicePlan?.paymentMethod ?? visit.property.customer.paymentMethod ?? null;
+
+    return { ...visit, paymentMethod, lastClean: lastVisit?.completedAt ?? null, roundPosition, activityLog, outstandingInvoices, debtAmount, canStart: gate.canStart, blockReason: gate.blockReason };
   }
 
-  async collectDebtPayment(visitId: string): Promise<{ cleared: boolean; amountPaid: number }> {
+  // On-site debt collection. CASH clears the outstanding invoices immediately.
+  // CHEQUE records a PENDING cheque payment for the total and leaves the
+  // invoices open until the office clears them (POST /invoices/:id/mark-paid).
+  async collectDebtPayment(
+    visitId: string,
+    opts: { method: "CASH" | "CHEQUE"; chequeNumber?: string; actorProfileId?: string },
+  ): Promise<DebtPaymentResult> {
     const visit = await this.prisma.visit.findUnique({
       where: { id: visitId },
-      select: { property: { select: { customer: { select: { id: true } } } } },
+      select: { property: { select: { customer: { select: { id: true, name: true } } } } },
     });
     if (!visit) throw new AppError(404, "Visit not found");
 
@@ -103,7 +122,30 @@ class JobDetailService {
 
     if (invoices.length === 0) {
       await this.prisma.customer.update({ where: { id: customerId }, data: { badDebt: false } });
-      return { cleared: true, amountPaid: 0 };
+      return { cleared: true, amountPaid: 0, amountPending: 0, method: opts.method };
+    }
+
+    if (opts.method === "CHEQUE") {
+      await this.prisma.$transaction([
+        this.prisma.payment.create({
+          data: {
+            customerId,
+            amount: totalAmount,
+            method: PaymentMethod.CHEQUE,
+            status: PaymentStatus.PENDING,
+            reference: opts.chequeNumber,
+          },
+        }),
+        this.prisma.activityLog.create({
+          data: {
+            type: "CHEQUE_RECEIVED",
+            message: `Cheque ${opts.chequeNumber} received on site for ${invoices.length} outstanding invoice(s) (£${totalAmount.toFixed(2)}) — ${visit.property.customer.name}`,
+            actorId: opts.actorProfileId ?? null,
+            actorRole: "TECHNICIAN",
+          },
+        }),
+      ]);
+      return { cleared: false, amountPaid: 0, amountPending: totalAmount, method: "CHEQUE" };
     }
 
     await this.prisma.$transaction([
@@ -120,7 +162,7 @@ class JobDetailService {
       }),
     ]);
 
-    return { cleared: true, amountPaid: totalAmount };
+    return { cleared: true, amountPaid: totalAmount, amountPending: 0, method: "CASH" };
   }
 }
 

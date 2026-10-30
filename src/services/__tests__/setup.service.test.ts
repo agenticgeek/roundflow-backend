@@ -246,7 +246,7 @@ it("bulkAddSetupProperties: unknown serviceAreaId is reported as a row error, no
   expect(result.created).toBe(0);
   expect(result.failed).toBe(1);
   expect(result.errors).toEqual([
-    { row: 0, field: "serviceAreaId", message: expect.stringContaining("area1") },
+    { row: 0, field: "serviceAreaId", error: expect.stringContaining("area1"), message: expect.stringContaining("area1") },
   ]);
   expect(prisma.$transaction).not.toHaveBeenCalled();
 });
@@ -259,7 +259,7 @@ it("bulkAddSetupProperties: unknown roundId is reported as a row error, not an a
   const result = await createSetupService(prisma).bulkAddSetupProperties([makeInput()]);
 
   expect(result.errors).toEqual([
-    { row: 0, field: "roundId", message: expect.stringContaining("round1") },
+    { row: 0, field: "roundId", error: expect.stringContaining("round1"), message: expect.stringContaining("round1") },
   ]);
   expect(prisma.$transaction).not.toHaveBeenCalled();
 });
@@ -272,7 +272,7 @@ it("bulkAddSetupProperties: inactive round is reported as a row error, not an ab
   const result = await createSetupService(prisma).bulkAddSetupProperties([makeInput()]);
 
   expect(result.errors).toEqual([
-    { row: 0, field: "roundId", message: expect.stringContaining("ACTIVE") },
+    { row: 0, field: "roundId", error: expect.stringContaining("ACTIVE"), message: expect.stringContaining("ACTIVE") },
   ]);
   expect(prisma.$transaction).not.toHaveBeenCalled();
 });
@@ -291,7 +291,7 @@ it("bulkAddSetupProperties: a bad row doesn't block other valid rows in the same
   expect(result.created).toBe(2);
   expect(result.failed).toBe(1);
   expect(result.errors).toEqual([
-    { row: 1, field: "serviceAreaId", message: expect.stringContaining("missing-area") },
+    { row: 1, field: "serviceAreaId", error: expect.stringContaining("missing-area"), message: expect.stringContaining("missing-area") },
   ]);
 });
 
@@ -314,7 +314,7 @@ it("bulkAddSetupProperties: invalid propertyType is a row error and skips FK che
   const result = await createSetupService(prisma).bulkAddSetupProperties([input]);
 
   expect(result.errors).toEqual([
-    { row: 0, field: "propertyType", message: expect.stringContaining("propertyType") },
+    { row: 0, field: "propertyType", error: expect.stringContaining("propertyType"), message: expect.stringContaining("propertyType") },
   ]);
   expect(prisma.serviceArea.findMany).not.toHaveBeenCalled();
 });
@@ -324,7 +324,7 @@ it("bulkAddSetupProperties: invalid cleaningFrequency is reported as a row error
   const input = { ...makeInput(), cleaningFrequency: "DAILY" };
   const result = await createSetupService(prisma).bulkAddSetupProperties([input]);
   expect(result.errors).toEqual([
-    { row: 0, field: "cleaningFrequency", message: expect.stringContaining("cleaningFrequency") },
+    { row: 0, field: "cleaningFrequency", error: expect.stringContaining("cleaningFrequency"), message: expect.stringContaining("cleaningFrequency") },
   ]);
 });
 
@@ -333,7 +333,7 @@ it("bulkAddSetupProperties: invalid paymentMethod is reported as a row error", a
   const input = { ...makeInput(), paymentMethod: "CRYPTO" };
   const result = await createSetupService(prisma).bulkAddSetupProperties([input]);
   expect(result.errors).toEqual([
-    { row: 0, field: "paymentMethod", message: expect.stringContaining("paymentMethod") },
+    { row: 0, field: "paymentMethod", error: expect.stringContaining("paymentMethod"), message: expect.stringContaining("paymentMethod") },
   ]);
 });
 
@@ -342,7 +342,7 @@ it("bulkAddSetupProperties: a negative price is reported as a row error", async 
   const input = { ...makeInput(), price: -5 };
   const result = await createSetupService(prisma).bulkAddSetupProperties([input]);
   expect(result.errors).toEqual([
-    { row: 0, field: "price", message: expect.stringContaining("price") },
+    { row: 0, field: "price", error: expect.stringContaining("price"), message: expect.stringContaining("price") },
   ]);
 });
 
@@ -359,8 +359,8 @@ it("bulkAddSetupProperties: a batch DB failure is reported per-row and does not 
   expect(result.created).toBe(0);
   expect(result.failed).toBe(2);
   expect(result.errors).toEqual([
-    { row: 0, field: "batch", message: "db exploded" },
-    { row: 1, field: "batch", message: "db exploded" },
+    { row: 0, field: "batch", error: "db exploded", message: "db exploded" },
+    { row: 1, field: "batch", error: "db exploded", message: "db exploded" },
   ]);
 });
 
@@ -679,44 +679,38 @@ it("getPaymentSetup returns null before setup has started", async () => {
   expect(result).toBeNull();
 });
 
-it("savePaymentSetup persists paymentRule/debtHoldEnabled/vatInInvoices and the connect flags", async () => {
+it("savePaymentSetup persists the rules and payment defaults, never the connect flags, and marks step 2", async () => {
   const prisma = makePrisma();
-  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ completedSteps: [1] });
   (prisma.businessSettings.upsert as ReturnType<typeof vi.fn>).mockResolvedValue({
     uniqueId: "singleton",
-    paymentRule: "COLLECT_BEFORE_VISIT",
-    debtHoldEnabled: true,
-    vatInInvoices: true,
-    gocardlessConnected: true,
-    stripeConnected: true,
+    paymentRule: "COLLECT_DAILY_BATCH",
   });
 
   const result = await createSetupService(prisma).savePaymentSetup({
-    paymentRule: "COLLECT_BEFORE_VISIT",
+    paymentRule: "COLLECT_DAILY_BATCH",
     debtHoldEnabled: true,
     vatInInvoices: true,
-    gocardlessConnected: true,
-    stripeConnected: true,
+    defaultPaymentMethod: "BACS",
+    invoiceDueDays: 14,
+    noDirectDebitAction: "SEND_PAYMENT_LINK",
   });
 
+  const expected = {
+    paymentRule: "COLLECT_DAILY_BATCH",
+    debtHoldEnabled: true,
+    vatInInvoices: true,
+    defaultPaymentMethod: "BACS",
+    invoiceDueDays: 14,
+    noDirectDebitAction: "SEND_PAYMENT_LINK",
+    completedSteps: [1, 2],
+  };
   expect(prisma.businessSettings.upsert).toHaveBeenCalledWith({
     where: { uniqueId: "singleton" },
-    update: {
-      paymentRule: "COLLECT_BEFORE_VISIT",
-      debtHoldEnabled: true,
-      vatInInvoices: true,
-      gocardlessConnected: true,
-      stripeConnected: true,
-    },
-    create: {
-      paymentRule: "COLLECT_BEFORE_VISIT",
-      debtHoldEnabled: true,
-      vatInInvoices: true,
-      gocardlessConnected: true,
-      stripeConnected: true,
-    },
+    update: expected,
+    create: expected,
   });
-  expect(result.gocardlessConnected).toBe(true);
+  expect(result.paymentRule).toBe("COLLECT_DAILY_BATCH");
 });
 
 it("savePaymentSetup passes through undefined fields untouched (partial update)", async () => {
@@ -724,16 +718,18 @@ it("savePaymentSetup passes through undefined fields untouched (partial update)"
   (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
   (prisma.businessSettings.upsert as ReturnType<typeof vi.fn>).mockResolvedValue({ uniqueId: "singleton" });
 
-  await createSetupService(prisma).savePaymentSetup({ stripeConnected: true });
+  await createSetupService(prisma).savePaymentSetup({ vatInInvoices: true });
 
   expect(prisma.businessSettings.upsert).toHaveBeenCalledWith(
     expect.objectContaining({
       update: {
         paymentRule: undefined,
         debtHoldEnabled: undefined,
-        vatInInvoices: undefined,
-        gocardlessConnected: undefined,
-        stripeConnected: true,
+        vatInInvoices: true,
+        defaultPaymentMethod: undefined,
+        invoiceDueDays: undefined,
+        noDirectDebitAction: undefined,
+        completedSteps: [2],
       },
     })
   );

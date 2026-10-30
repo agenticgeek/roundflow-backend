@@ -3,7 +3,7 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { h, asObject, requireString, optId, optBool } from "../lib/http";
-import { createMessageService } from "../services/message.service";
+import { createMessageService, optOutboundChannel } from "../services/message.service";
 
 export const messagesRouter = Router();
 messagesRouter.use(requireAuth);
@@ -13,6 +13,8 @@ messagesRouter.use(requireBusinessAccess());
 const svc = (req: Request) => createMessageService(req.tenantPrisma!);
 
 // POST /messages/send — send one SMS/email/WhatsApp to a single customer.
+// channel omitted (or "AUTO") = SMS when the customer has a mobile, else EMAIL.
+// 400 NO_CONTACT_FOR_CHANNEL · 409 GHL_NOT_CONNECTED · 502 GHL_SEND_FAILED.
 messagesRouter.post(
   "/send",
   h(async (req, res) => {
@@ -20,7 +22,7 @@ messagesRouter.post(
     const result = await svc(req).send({
       propertyId: optId(b.propertyId, "propertyId") ?? undefined,
       customerId: optId(b.customerId, "customerId") ?? undefined,
-      channel: requireString(b.channel, "channel"),
+      channel: optOutboundChannel(b.channel),
       body: requireString(b.body, "body"),
     });
     res.status(201).json(result);

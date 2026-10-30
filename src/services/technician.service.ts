@@ -3,6 +3,7 @@ import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 import type { AppStatus } from "./settings.service";
 import { todayRange } from "../lib/dates";
+import { computeTechnicianKpis, emptyKpis, periodRange, type KpiPeriod } from "./technician-kpi.service";
 
 // ---------------------------------------------------------------------------
 // M9 — Technicians CRUD (BE-M9-02).
@@ -67,6 +68,23 @@ export interface TodayStats {
 export interface TechnicianListRow extends TechnicianListItem {
   roundNames: string[];
   todayStats: TodayStats;
+}
+
+// GET /technicians/:id/performance (GAP-030).
+export interface TechnicianPerformance {
+  technicianId: string;
+  period: KpiPeriod;
+  from: Date;
+  to: Date; // exclusive
+  visitsCompleted: number;
+  revenue: number;
+  timeOnJobMinutes: number | null;
+  revenuePerHour: number | null;
+  strikes: number;
+  damages: number;
+  upsells: number;
+  upsellValue: number;
+  complaints: number;
 }
 
 // Alias: create/update operations return the same shape as list items.
@@ -226,6 +244,28 @@ class TechnicianService {
       ...toRecord(tech),
       roundNames: tech.roundTechnicians.map((rt) => rt.round.name),
       todayWorkload,
+    };
+  }
+
+  async getPerformance(id: string, period: KpiPeriod, now: Date): Promise<TechnicianPerformance> {
+    const tech = await this.prisma.technician.findUnique({ where: { id }, select: { id: true } });
+    if (!tech) throw new AppError(404, "Technician not found");
+    const range = periodRange(period, now);
+    const k = (await computeTechnicianKpis(this.prisma, range, [id])).get(id) ?? emptyKpis();
+    return {
+      technicianId: id,
+      period,
+      from: range.start,
+      to: range.end,
+      visitsCompleted: k.jobsCompleted,
+      revenue: k.valueCompleted,
+      timeOnJobMinutes: k.timeOnJobMinutes,
+      revenuePerHour: k.revenuePerHour,
+      strikes: k.strikes,
+      damages: k.damages,
+      upsells: k.upsells,
+      upsellValue: k.upsellValue,
+      complaints: k.complaints,
     };
   }
 

@@ -12,27 +12,42 @@ const pushMissedJobs = vi.fn();
 const listDayStopsForRounds = vi.fn();
 const generateVisitsNow = vi.fn();
 const getOccurrence = vi.fn();
+const setTechnicians = vi.fn();
+const getAllocation = vi.fn();
+const reassignTechnician = vi.fn();
+const logActivity = vi.fn();
 
-vi.mock("../../services/round.service", () => ({
+vi.mock("../../services/round.service", async () => {
+  // Real-shaped AllocationError without loading the real service module.
+  const { AppError } = (await vi.importActual("../../lib/app-error")) as { AppError: typeof import("../../lib/app-error").AppError };
+  class AllocationError extends AppError {
+    constructor(public readonly fields: Record<string, string>) {
+      super(400, "Invalid technician allocation", "INVALID_ALLOCATION");
+    }
+  }
+  return {
+  AllocationError,
   createRoundService: vi.fn(() => ({
     listOccurrencesForRounds,
     listRounds: vi.fn(),
     createRound: vi.fn(),
     getRound: vi.fn(),
     updateRound: vi.fn(),
-    setTechnicians: vi.fn(),
+    setTechnicians,
+    getAllocation,
     listOccurrences: vi.fn(),
     getOccurrence,
     getTodayPanel: vi.fn(),
-    reassignTechnician: vi.fn(),
+    reassignTechnician,
     pushMissedJobs,
     listDayStopsForRounds,
     generateVisitsNow,
   })),
-}));
+  };
+});
 
 vi.mock("../../services/reports.service", () => ({
-  createReportsService: vi.fn(() => ({ logActivity: vi.fn() })),
+  createReportsService: vi.fn(() => ({ logActivity })),
 }));
 
 vi.mock("../../middleware/requireAuth", () => ({
@@ -48,6 +63,18 @@ vi.mock("../../middleware/requireRole", () => ({
 
 import { roundsRouter } from "../../routes/rounds";
 import { AppError } from "../../lib/app-error";
+import { errorHandler } from "../../lib/error-handler";
+import { AllocationError } from "../../services/round.service";
+
+// Uses the real centralised error handler (extra AppError fields forwarded).
+function makeRealApp() {
+  const app = express();
+  app.use(express.json());
+  app.use((req: any, _res: any, next: any) => { req.tenantPrisma = {}; next(); });
+  app.use("/rounds", roundsRouter);
+  app.use(errorHandler);
+  return app;
+}
 
 function makeApp() {
   const app = express();
@@ -328,5 +355,158 @@ describe("POST /rounds/:id/generate-visits", () => {
     const app = makeApp();
     const res = await request(app).post("/rounds/r1/generate-visits");
     expect(res.status).toBe(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PUT /rounds/:id/technicians — split (A1 / GAP-012)
+// ---------------------------------------------------------------------------
+
+describe("PUT /rounds/:id/technicians", () => {
+  const allocationResult = {
+    roundId: "r1",
+    allocation: [{ technicianId: "t1", name: "Sam", propertyIds: ["p1"], stops: 1, value: "37.00" }],
+    visitsUpdated: 6,
+  };
+
+  it("passes technicianIds with no split (service picks SINGLE/AUTO) and logs the change", async () => {
+    setTechnicians.mockResolvedValueOnce(allocationResult);
+    logActivity.mockClear();
+    const res = await request(makeApp()).put("/rounds/r1/technicians").send({ technicianIds: ["t1"] });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(allocationResult);
+    expect(setTechnicians).toHaveBeenCalledWith("r1", ["t1"], undefined, { dryRun: false });
+    expect(logActivity).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats split: null as omitted", async () => {
+    setTechnicians.mockResolvedValueOnce(allocationResult);
+    await request(makeApp()).put("/rounds/r1/technicians").send({ technicianIds: ["t1"], split: null });
+    expect(setTechnicians).toHaveBeenLastCalledWith("r1", ["t1"], undefined, { dryRun: false });
+  });
+
+  it("passes SINGLE/AUTO without allocations", async () => {
+    for (const mode of ["SINGLE", "AUTO"]) {
+      setTechnicians.mockResolvedValueOnce(allocationResult);
+      const res = await request(makeApp())
+        .put("/rounds/r1/technicians")
+        .send({ technicianIds: ["t1"], split: { mode, allocations: [{ propertyId: "p1", technicianId: "t1" }] } });
+      expect(res.status).toBe(200);
+      expect(setTechnicians).toHaveBeenLastCalledWith("r1", ["t1"], { mode }, { dryRun: false });
+    }
+  });
+
+  it("passes MANUAL allocations", async () => {
+    setTechnicians.mockResolvedValueOnce(allocationResult);
+    const allocations = [{ propertyId: "p1", technicianId: "t1" }];
+    await request(makeApp()).put("/rounds/r1/technicians").send({ technicianIds: ["t1"], split: { mode: "MANUAL", allocations } });
+    expect(setTechnicians).toHaveBeenLastCalledWith("r1", ["t1"], { mode: "MANUAL", allocations }, { dryRun: false });
+  });
+
+  it("?dryRun=true previews without logging activity", async () => {
+    setTechnicians.mockResolvedValueOnce(allocationResult);
+    logActivity.mockClear();
+    const res = await request(makeApp()).put("/rounds/r1/technicians?dryRun=true").send({ technicianIds: ["t1", "t2"] });
+    expect(res.status).toBe(200);
+    expect(setTechnicians).toHaveBeenLastCalledWith("r1", ["t1", "t2"], undefined, { dryRun: true });
+    expect(logActivity).not.toHaveBeenCalled();
+  });
+
+  it("400s for a bad technicianIds / split shape", async () => {
+    const bodies = [
+      { technicianIds: "t1" },
+      { technicianIds: [1] },
+      { technicianIds: ["t1"], split: "AUTO" },
+      { technicianIds: ["t1"], split: { mode: "HALF" } },
+      { technicianIds: ["t1"], split: { mode: "MANUAL" } },
+      { technicianIds: ["t1"], split: { mode: "MANUAL", allocations: [null] } },
+      { technicianIds: ["t1"], split: { mode: "MANUAL", allocations: [{ propertyId: "p1" }] } },
+      { technicianIds: ["t1"], split: { mode: "MANUAL", allocations: [{ propertyId: 1, technicianId: "t1" }] } },
+    ];
+    setTechnicians.mockClear();
+    for (const body of bodies) {
+      const res = await request(makeApp()).put("/rounds/r1/technicians").send(body);
+      expect(res.status).toBe(400);
+    }
+    expect(setTechnicians).not.toHaveBeenCalled();
+  });
+
+  it("400s with code INVALID_ALLOCATION and the fields map", async () => {
+    setTechnicians.mockRejectedValueOnce(new AllocationError({ p9: "Property not in round" }));
+    const res = await request(makeRealApp())
+      .put("/rounds/r1/technicians")
+      .send({ technicianIds: ["t1"], split: { mode: "MANUAL", allocations: [{ propertyId: "p9", technicianId: "t1" }] } });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({
+      error: "Invalid technician allocation",
+      code: "INVALID_ALLOCATION",
+      fields: { p9: "Property not in round" },
+    });
+  });
+
+  it("forwards other service errors (pending invite 400)", async () => {
+    setTechnicians.mockRejectedValueOnce(new AppError(400, "Cannot assign technician(s) with a pending invite: Sam"));
+    const res = await request(makeApp()).put("/rounds/r1/technicians").send({ technicianIds: ["t1"] });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: "Cannot assign technician(s) with a pending invite: Sam" });
+  });
+});
+
+describe("GET /rounds/:id/allocation", () => {
+  it("returns the service's { mode, allocation }", async () => {
+    getAllocation.mockResolvedValueOnce({ mode: "AUTO", allocation: [] });
+    const res = await request(makeApp()).get("/rounds/r1/allocation");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ mode: "AUTO", allocation: [] });
+    expect(getAllocation).toHaveBeenCalledWith("r1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /rounds/:id/reassign (GAP-013)
+// ---------------------------------------------------------------------------
+
+describe("POST /rounds/:id/reassign", () => {
+  it("accepts fromTechnicianId null, a date, scope and permanent", async () => {
+    reassignTechnician.mockResolvedValueOnce({ updated: 4 });
+    const res = await request(makeApp()).post("/rounds/r1/reassign").send({
+      date: "2099-11-06", fromTechnicianId: null, toTechnicianId: "t2", scope: "REMAINING", permanent: true, notify: true,
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ updated: 4 });
+    expect(reassignTechnician).toHaveBeenLastCalledWith("r1", {
+      date: new Date("2099-11-06T00:00:00.000Z"),
+      fromTechnicianId: null,
+      toTechnicianId: "t2",
+      scope: "REMAINING",
+      permanent: true,
+      note: undefined,
+      notify: true,
+    });
+  });
+
+  it("defaults date (today), fromTechnicianId (null), permanent and notify; accepts lowercase scope", async () => {
+    reassignTechnician.mockResolvedValueOnce({ updated: 1 });
+    const res = await request(makeApp()).post("/rounds/r1/reassign").send({ toTechnicianId: "t2", scope: "all", date: null });
+    expect(res.status).toBe(200);
+    expect(reassignTechnician).toHaveBeenLastCalledWith("r1", expect.objectContaining({
+      date: undefined, fromTechnicianId: null, scope: "ALL", permanent: false, notify: false,
+    }));
+  });
+
+  it("passes an explicit fromTechnicianId", async () => {
+    reassignTechnician.mockResolvedValueOnce({ updated: 1 });
+    await request(makeApp()).post("/rounds/r1/reassign").send({ fromTechnicianId: "t1", toTechnicianId: "t2", scope: "ALL" });
+    expect(reassignTechnician).toHaveBeenLastCalledWith("r1", expect.objectContaining({ fromTechnicianId: "t1" }));
+  });
+
+  it("400s for a bad scope or date", async () => {
+    for (const body of [
+      { toTechnicianId: "t2", scope: "SOME" },
+      { toTechnicianId: "t2", scope: "ALL", date: "06/11/2099" },
+    ]) {
+      const res = await request(makeApp()).post("/rounds/r1/reassign").send(body);
+      expect(res.status).toBe(400);
+    }
   });
 });

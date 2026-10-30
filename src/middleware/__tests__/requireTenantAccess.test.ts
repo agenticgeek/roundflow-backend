@@ -69,6 +69,7 @@ it("negative-cache guard: a 403 (no profile) is never cached — a profile creat
   const res1 = makeRes();
   await requireTenantAccess(makeReq("user1"), res1, vi.fn() as unknown as NextFunction);
   expect(res1.status).toHaveBeenCalledWith(403);
+  expect(res1.json).toHaveBeenCalledWith({ error: "No profile found for this user", code: "NO_PROFILE" });
 
   // Profile now exists (e.g. signup completed on another ECS task).
   findUnique.mockResolvedValueOnce(PROFILE);

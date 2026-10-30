@@ -1,16 +1,38 @@
 import { randomBytes } from "crypto";
 import { Request, Router } from "express";
 import { ServiceCategory, PaymentTiming } from "../generated/tenant-client";
-import { encrypt } from "../lib/crypto";
+import { encrypt, decrypt } from "../lib/crypto";
 import { prisma } from "../lib/prisma";
+import { getTenantPrismaForSchema, type TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { buildGhlAuthUrl, exchangeGhlCode } from "../integrations/ghl/oauth";
+import { getGhlToken } from "../integrations/ghl/api";
+import {
+  fetchGhlLocation,
+  ghlApiRedirectUri,
+  ghlWebhookUrl,
+  frontendBaseUrl,
+  isAllowedWebRedirect,
+} from "../integrations/ghl/connection";
 import { buildStripeAuthUrl, exchangeStripeCode } from "../integrations/stripe/oauth";
+import { signOAuthState, verifyOAuthState } from "../lib/oauth-state";
+import { toBusinessSettingsDto } from "../lib/settings-dto";
+import {
+  optReminderMode,
+  optReminderTime,
+  optCleanMethod,
+  optPaymentMethod,
+  optNoDirectDebitAction,
+  optVatRate,
+  optInvoiceDueDays,
+  reminderModeFromLegacy,
+  foldServiceAreaIds,
+} from "../lib/settings-validators";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
 import { invalidateCachedBusinessSettings } from "../services/settings.service";
-import { validateWorkingDays, assertPositiveInt, assertNonNegative, requireMessageChannel, optMessageChannel, optTechnicianRole, isValidEmail, MAX_NAME_LENGTH } from "../lib/validation";
+import { validateWorkingDays, assertPositiveInt, assertNonNegative, requireMessageChannel, optMessageChannel, optTechnicianRole, isValidEmail, MAX_NAME_LENGTH, MAX_ADDRESS_LENGTH } from "../lib/validation";
 import {
   asObject,
   h,
@@ -38,6 +60,86 @@ import {
 } from "../services/settings.service";
 
 export const settingsRouter = Router();
+
+// ---- content negotiation for the connect flows ----------------------------
+// The web calls authorize/callback with fetch + bearer and Accept: application/json.
+// A top-level browser navigation (Accept: text/html) keeps the old redirect
+// behaviour for one release.
+const wantsJson = (req: Request) => (req.get("accept") ?? "").includes("application/json");
+const isBrowserNavigation = (req: Request) =>
+  !wantsJson(req) && (req.get("accept") ?? "").includes("text/html");
+
+// GET /settings/ghl/callback — PUBLIC (registered before requireAuth). GHL
+// redirects the admin's browser here with no bearer token, so the tenant and
+// the redirect URI the code was issued for come from the signed, 10-minute
+// `state` minted by GET /settings/ghl/authorize. With Accept: application/json
+// (a web callback page relaying ?code&state) it answers 200 JSON / 4xx JSON;
+// otherwise it redirects to /settings/integrations?ghl=connected|error.
+settingsRouter.get(
+  "/ghl/callback",
+  h(async (req, res) => {
+    const fail = (status: number, message: string, code?: string) => {
+      if (wantsJson(req)) throw new AppError(status, message, code);
+      const qs = new URLSearchParams({ ghl: "error", message });
+      res.redirect(`${frontendBaseUrl()}/settings/integrations?${qs}`);
+    };
+
+    const { code, state, error } = req.query as Record<string, string | undefined>;
+    if (error) return fail(400, `GHL authorisation denied: ${error}`);
+    if (!code || !state) return fail(400, "Missing code or state from GHL");
+
+    const verified = verifyOAuthState(state);
+    if (!verified.ok) {
+      return fail(
+        400,
+        verified.reason === "expired"
+          ? "This GHL connection link has expired. Start again from Settings."
+          : "Invalid GHL connection state. Start again from Settings.",
+        "INVALID_STATE"
+      );
+    }
+    const { tenantId, redirectUri } = verified.payload;
+
+    const tenant = await prisma.tenant.findUnique({ where: { id: tenantId }, select: { schemaName: true } });
+    if (!tenant) return fail(404, "Tenant not found");
+    const tp = getTenantPrismaForSchema(tenant.schemaName);
+
+    let tokens;
+    try {
+      tokens = await exchangeGhlCode(code, redirectUri);
+    } catch (err) {
+      console.error("[settings/ghl/callback] token exchange failed:", err);
+      return fail(502, "GoHighLevel rejected the authorisation code. Try connecting again.", "GHL_SEND_FAILED");
+    }
+
+    const expiresAt = new Date(Date.now() + tokens.expires_in * 1000);
+    const webhookSecret = randomBytes(32).toString("hex");
+    await tp.businessSettings.updateMany({
+      data: {
+        ghlConnected:                true,
+        ghlLocationId:               tokens.locationId,
+        ghlAccessTokenEncrypted:     encrypt(tokens.access_token),
+        ghlRefreshTokenEncrypted:    encrypt(tokens.refresh_token),
+        ghlTokenExpiresAt:           expiresAt,
+        ghlWebhookSecretEncrypted:   encrypt(webhookSecret),
+      },
+    });
+    invalidateCachedBusinessSettings(tp);
+
+    // Stamp on global Tenant for fast webhook lookup by locationId
+    await prisma.tenant.update({
+      where: { id: tenantId },
+      data: { ghlLocationId: tokens.locationId },
+    });
+
+    const webhookUrl = ghlWebhookUrl(tenantId, webhookSecret);
+    if (wantsJson(req)) {
+      return res.json({ status: "connected", method: "oauth", locationId: tokens.locationId, webhookUrl });
+    }
+    res.redirect(`${frontendBaseUrl()}/settings/integrations?ghl=connected&webhookUrl=${encodeURIComponent(webhookUrl)}`);
+  })
+);
+
 settingsRouter.use(requireAuth);
 settingsRouter.use(requireTenantAccess);
 // Authorization: reads allowed for any known role; mutations require ADMIN/MANAGER.
@@ -50,7 +152,9 @@ const svc = (req: Request) => createSettingsService(req.tenantPrisma!, req.tenan
 // here. GET endpoints are always open (so the Setup Wizard can read back saved
 // values); every mutating handler (PATCH, POST, DELETE) first calls
 // `assertSetupComplete`, which 403s until setup is complete. (This is the
-// inverse of the wizard's `assertSetupIncomplete`.)
+// inverse of the wizard's `assertSetupIncomplete`.) Exception: the GHL /
+// Stripe / GoCardless connect, disconnect, status and webhook-secret routes,
+// which the wizard uses before setup completes (A5/A6).
 //
 // Generic request helpers (asObject, h, requireString, requireNumber, and the
 // opt* validators) are shared via ../lib/http. Only route-local helpers — the
@@ -111,7 +215,7 @@ function optPaymentTiming(v: unknown): PaymentTiming | null | undefined {
 settingsRouter.get(
   "/business-profile",
   h(async (req, res) => {
-    res.json(await svc(req).getSettings());
+    res.json(toBusinessSettingsDto(await svc(req).getSettings()));
   })
 );
 settingsRouter.patch(
@@ -130,8 +234,13 @@ settingsRouter.patch(
       currency: optString(body.currency, "currency"),
       defaultWorkingDays: optWorkingDays(body.defaultWorkingDays, "defaultWorkingDays"),
       bankDetails: parseBankDetails(body.bankDetails),
+      addressLine1: optString(body.addressLine1, "addressLine1", { maxLength: MAX_ADDRESS_LENGTH }),
+      addressLine2: optString(body.addressLine2, "addressLine2", { maxLength: MAX_ADDRESS_LENGTH }),
+      town: optString(body.town, "town", { maxLength: MAX_ADDRESS_LENGTH }),
+      postcode: optString(body.postcode, "postcode", { maxLength: MAX_ADDRESS_LENGTH }),
+      vatRate: optVatRate(body.vatRate),
     };
-    res.json(await svc(req).updateBusinessProfile(input));
+    res.json(toBusinessSettingsDto(await svc(req).updateBusinessProfile(input)));
   })
 );
 
@@ -142,7 +251,7 @@ settingsRouter.patch(
 settingsRouter.get(
   "/round-settings",
   h(async (req, res) => {
-    res.json(await svc(req).getSettings());
+    res.json(toBusinessSettingsDto(await svc(req).getSettings()));
   })
 );
 settingsRouter.patch(
@@ -153,6 +262,12 @@ settingsRouter.patch(
     const input: RoundSettingsUpdateInput = {
       defaultCycleLength: optCycleLength(body.defaultCycleLength),
       defaultWorkingDays: optWorkingDays(body.defaultWorkingDays, "defaultWorkingDays"),
+      reminderMode: optReminderMode(body.reminderMode),
+      reminderTime: optReminderTime(body.reminderTime),
+      defaultCleanMethod: optCleanMethod(body.defaultCleanMethod),
+      autoCreateNextVisit: optBool(body.autoCreateNextVisit, "autoCreateNextVisit"),
+      // Deprecated (B2): still accepted from old clients and mapped onto
+      // reminderMode when reminderMode itself wasn't sent.
       preCleanReminderTimings: (() => {
         const arr = optStringArray(body.preCleanReminderTimings, "preCleanReminderTimings");
         if (!arr) return arr;
@@ -163,7 +278,10 @@ settingsRouter.patch(
         return arr;
       })(),
     };
-    res.json(await svc(req).updateRoundSettings(input));
+    if (input.preCleanReminderTimings && input.reminderMode === undefined) {
+      input.reminderMode = reminderModeFromLegacy(input.preCleanReminderTimings);
+    }
+    res.json(toBusinessSettingsDto(await svc(req).updateRoundSettings(input)));
   })
 );
 
@@ -283,7 +401,7 @@ settingsRouter.post(
       phone: optString(body.phone, "phone"),
       role: optTechnicianRole(body.role),
       active: optBool(body.active, "active"),
-      serviceAreaIds: optStringArray(body.serviceAreaIds, "serviceAreaIds"),
+      serviceAreaIds: foldServiceAreaIds(body),
     };
     const emailRaw = optString(body.email, "email");
     if (emailRaw !== undefined && emailRaw !== null) {
@@ -306,7 +424,7 @@ settingsRouter.patch(
       phone: optString(body.phone, "phone"),
       role: optTechnicianRole(body.role),
       active: optBool(body.active, "active"),
-      serviceAreaIds: optStringArray(body.serviceAreaIds, "serviceAreaIds"),
+      serviceAreaIds: foldServiceAreaIds(body),
     };
     // Email validated separately to normalise case (mirrors PATCH /technicians/:id)
     const emailRaw = optString(body.email, "email");
@@ -336,7 +454,7 @@ settingsRouter.delete(
 settingsRouter.get(
   "/payment",
   h(async (req, res) => {
-    res.json(await svc(req).getSettings());
+    res.json(toBusinessSettingsDto(await svc(req).getSettings()));
   })
 );
 settingsRouter.patch(
@@ -350,14 +468,17 @@ settingsRouter.patch(
       debtHoldEnabled: optBool(body.debtHoldEnabled, "debtHoldEnabled"),
       debtHoldMaxInvoices: body.debtHoldMaxInvoices !== undefined ? (body.debtHoldMaxInvoices === null ? null : Number(body.debtHoldMaxInvoices)) : undefined,
       debtHoldMaxAmount: body.debtHoldMaxAmount !== undefined ? (body.debtHoldMaxAmount === null ? null : Number(body.debtHoldMaxAmount)) : undefined,
+      defaultPaymentMethod: optPaymentMethod(body.defaultPaymentMethod, "defaultPaymentMethod"),
+      invoiceDueDays: optInvoiceDueDays(body.invoiceDueDays),
+      noDirectDebitAction: optNoDirectDebitAction(body.noDirectDebitAction),
     };
-    res.json(await svc(req).updatePaymentRules(input));
+    res.json(toBusinessSettingsDto(await svc(req).updatePaymentRules(input)));
   })
 );
 settingsRouter.post(
   "/payment/gocardless/connect",
+  // No assertSetupComplete: the wizard connects providers before setup completes (A5/A6).
   h(async (req, res) => {
-    await svc(req).assertSetupComplete();
     const body = asObject(req.body);
     const accessToken = requireString(body.accessToken, "accessToken");
     const environment = requireString(body.environment, "environment");
@@ -394,8 +515,8 @@ settingsRouter.post(
 
 settingsRouter.post(
   "/payment/gocardless/disconnect",
+  // No assertSetupComplete: the wizard connects providers before setup completes (A5/A6).
   h(async (req, res) => {
-    await svc(req).assertSetupComplete();
     await req.tenantPrisma!.businessSettings.updateMany({
       data: {
         gocardlessConnected: false,
@@ -417,8 +538,8 @@ settingsRouter.post(
 // RoundFlow invents — is what verifies incoming webhook signatures.
 settingsRouter.patch(
   "/payment/gocardless/webhook-secret",
+  // No assertSetupComplete: the wizard connects providers before setup completes (A5/A6).
   h(async (req, res) => {
-    await svc(req).assertSetupComplete();
     const body = asObject(req.body);
     const secret = requireString(body.secret, "secret");
 
@@ -437,13 +558,16 @@ settingsRouter.patch(
   })
 );
 
-// GET /settings/stripe/authorize — redirect the admin to Stripe Connect consent page
+// GET /settings/stripe/authorize — the Stripe Connect consent URL as JSON
+// { url } (the web now builds this URL itself; kept for API clients). A
+// top-level browser navigation still gets the old 302 for one release.
 settingsRouter.get(
   "/stripe/authorize",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete();
     const state = `${req.profile!.tenantId}:${randomBytes(8).toString("hex")}`;
-    res.redirect(buildStripeAuthUrl(state));
+    const url = buildStripeAuthUrl(state);
+    if (isBrowserNavigation(req)) return res.redirect(url);
+    res.json({ url });
   })
 );
 
@@ -479,15 +603,18 @@ settingsRouter.get(
     });
     invalidateCachedBusinessSettings(req.tenantPrisma!);
 
-    const frontendUrl = process.env.FRONTEND_URL!.split(",")[0].trim();
-    res.redirect(`${frontendUrl}/settings/integrations?stripe=connected`);
+    // The web's callback page calls this with fetch + bearer + Accept: application/json.
+    if (wantsJson(req)) {
+      return res.json({ status: "connected", stripeConnectAccountId: tokens.stripe_user_id });
+    }
+    res.redirect(`${frontendBaseUrl()}/settings/integrations?stripe=connected`);
   })
 );
 
 settingsRouter.post(
   "/stripe/disconnect",
+  // No assertSetupComplete: the wizard connects providers before setup completes (A5/A6).
   h(async (req, res) => {
-    await svc(req).assertSetupComplete();
     const tenantId = req.profile!.tenantId;
     await req.tenantPrisma!.businessSettings.updateMany({
       data: {
@@ -560,52 +687,75 @@ settingsRouter.delete(
 // Section 8 — GHL OAuth
 // ---------------------------------------------------------------------------
 
-// GET /settings/ghl/authorize — redirect the admin to GHL's OAuth consent page
+// GET /settings/ghl/authorize → 200 { url }. The url carries a signed,
+// 10-minute `state` naming this tenant and the redirect URI, which the public
+// callback verifies. Optional ?redirectUri= lets the web use its own callback
+// page instead of the API one; it must be on a FRONTEND_URL origin. A
+// top-level browser navigation still gets the old 302 for one release.
 settingsRouter.get(
   "/ghl/authorize",
   h(async (req, res) => {
-    await svc(req).assertSetupComplete();
-    const state = `${req.profile!.tenantId}:${randomBytes(8).toString("hex")}`;
-    const redirectUri = `${process.env.PUBLIC_API_URL}/settings/ghl/callback`;
-    res.redirect(buildGhlAuthUrl(redirectUri, state));
+    const requested = typeof req.query.redirectUri === "string" ? req.query.redirectUri : undefined;
+    if (requested !== undefined && !isAllowedWebRedirect(requested)) {
+      throw new AppError(400, "redirectUri must be on the web app's origin");
+    }
+    const redirectUri = requested ?? ghlApiRedirectUri();
+    const state = signOAuthState({ tenantId: req.profile!.tenantId, redirectUri });
+    const url = buildGhlAuthUrl(redirectUri, state);
+    if (isBrowserNavigation(req)) return res.redirect(url);
+    res.json({ url });
   })
 );
 
-// GET /settings/ghl/callback — GHL redirects here after the admin authorises
+// GET /settings/ghl/status — connection card for Settings and the wizard.
 settingsRouter.get(
-  "/ghl/callback",
+  "/ghl/status",
   h(async (req, res) => {
-    const { code, state, error } = req.query as Record<string, string>;
-    if (error) throw new AppError(400, `GHL authorisation denied: ${error}`);
-    if (!code || !state) throw new AppError(400, "Missing code or state from GHL");
-
-    const redirectUri = `${process.env.PUBLIC_API_URL}/settings/ghl/callback`;
-    const tokens = await exchangeGhlCode(code, redirectUri);
-
-    const expiresAt = new Date(Date.now() + tokens.expires_in * 1000);
-    const webhookSecret = randomBytes(32).toString("hex");
-    await req.tenantPrisma!.businessSettings.updateMany({
-      data: {
-        ghlConnected:                true,
-        ghlLocationId:               tokens.locationId,
-        ghlAccessTokenEncrypted:     encrypt(tokens.access_token),
-        ghlRefreshTokenEncrypted:    encrypt(tokens.refresh_token),
-        ghlTokenExpiresAt:           expiresAt,
-        ghlWebhookSecretEncrypted:   encrypt(webhookSecret),
+    const tp = req.tenantPrisma!;
+    const bs = await tp.businessSettings.findFirst({
+      select: {
+        ghlConnected: true,
+        ghlLocationId: true,
+        ghlRefreshTokenEncrypted: true,
+        ghlWebhookSecretEncrypted: true,
       },
     });
-    invalidateCachedBusinessSettings(req.tenantPrisma!);
-
-    // Stamp on global Tenant for fast webhook lookup by locationId
-    await prisma.tenant.update({
-      where: { id: req.profile!.tenantId },
-      data: { ghlLocationId: tokens.locationId },
+    if (!bs?.ghlConnected) {
+      return res.json({ connected: false, method: null, locationId: null, locationName: null, webhookUrl: null, connectedAt: null });
+    }
+    res.json({
+      connected: true,
+      // Private integrations store no refresh token (location API keys don't expire).
+      method: bs.ghlRefreshTokenEncrypted ? "oauth" : "private",
+      locationId: bs.ghlLocationId,
+      locationName: await ghlLocationName(tp),
+      webhookUrl: bs.ghlWebhookSecretEncrypted
+        ? ghlWebhookUrl(req.profile!.tenantId, decrypt(bs.ghlWebhookSecretEncrypted))
+        : null,
+      // Not stored yet (needs a BusinessSettings.ghlConnectedAt column).
+      connectedAt: null,
     });
+  })
+);
 
-    const tenantId = req.profile!.tenantId;
-    const webhookUrl = `${process.env.PUBLIC_API_URL}/webhooks/ghl?tenantId=${tenantId}&secret=${webhookSecret}`;
-    const frontendUrl = process.env.FRONTEND_URL!.split(",")[0].trim();
-    res.redirect(`${frontendUrl}/settings/integrations?ghl=connected&webhookUrl=${encodeURIComponent(webhookUrl)}`);
+// Best-effort location name for the status card: null when GHL can't be reached.
+async function ghlLocationName(tp: TenantPrismaClient): Promise<string | null> {
+  const ctx = await getGhlToken(tp);
+  if (!ctx) return null;
+  const result = await fetchGhlLocation(ctx.accessToken, ctx.locationId);
+  return result.ok ? result.locationName : null;
+}
+
+// POST /settings/ghl/test — calls GHL /locations/:id with the stored token.
+// 200 { ok: true, locationName } · 409 GHL_NOT_CONNECTED · 502 GHL_SEND_FAILED
+settingsRouter.post(
+  "/ghl/test",
+  h(async (req, res) => {
+    const ctx = await getGhlToken(req.tenantPrisma!);
+    if (!ctx) throw new AppError(409, "GoHighLevel is not connected", "GHL_NOT_CONNECTED");
+    const result = await fetchGhlLocation(ctx.accessToken, ctx.locationId);
+    if (!result.ok) throw new AppError(502, `GoHighLevel test failed: ${result.message}`, "GHL_SEND_FAILED");
+    res.json({ ok: true, locationName: result.locationName });
   })
 );
 
@@ -616,23 +766,15 @@ settingsRouter.get(
 // GHL locations API before being saved.
 settingsRouter.post(
   "/ghl/connect-private",
+  // No assertSetupComplete: the wizard connects providers before setup completes (A5/A6).
   h(async (req, res) => {
-    await svc(req).assertSetupComplete();
     const body       = asObject(req.body);
     const apiKey     = requireString(body.apiKey,     "apiKey");
     const locationId = requireString(body.locationId, "locationId");
 
     // Validate key + locationId by fetching the location from GHL
-    const verifyRes = await fetch(
-      `https://services.leadconnectorhq.com/locations/${locationId}`,
-      {
-        headers: {
-          "Authorization": `Bearer ${apiKey}`,
-          "Version":       "2021-07-28",
-        },
-      }
-    );
-    if (!verifyRes.ok) {
+    const verify = await fetchGhlLocation(apiKey, locationId);
+    if (!verify.ok) {
       throw new AppError(400, "GHL API key or location ID is invalid");
     }
 
@@ -655,8 +797,7 @@ settingsRouter.post(
       data:  { ghlLocationId: locationId },
     });
 
-    const tenantId = req.profile!.tenantId;
-    const webhookUrl = `${process.env.PUBLIC_API_URL}/webhooks/ghl?tenantId=${tenantId}&secret=${webhookSecret}`;
+    const webhookUrl = ghlWebhookUrl(req.profile!.tenantId, webhookSecret);
     res.json({ status: "connected", method: "private", webhookUrl });
   })
 );
@@ -664,8 +805,8 @@ settingsRouter.post(
 // POST /settings/ghl/disconnect
 settingsRouter.post(
   "/ghl/disconnect",
+  // No assertSetupComplete: the wizard connects providers before setup completes (A5/A6).
   h(async (req, res) => {
-    await svc(req).assertSetupComplete();
     await req.tenantPrisma!.businessSettings.updateMany({
       data: {
         ghlConnected:              false,
@@ -677,6 +818,11 @@ settingsRouter.post(
       },
     });
     invalidateCachedBusinessSettings(req.tenantPrisma!);
+    // D-8: the webhook resolves tenants by Tenant.ghlLocationId — clear it too.
+    await prisma.tenant.update({
+      where: { id: req.profile!.tenantId },
+      data: { ghlLocationId: null },
+    });
     res.json({ status: "disconnected" });
   })
 );

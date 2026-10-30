@@ -10,7 +10,7 @@ import express from "express";
 
 const profileFindUnique = vi.fn();
 const profileUpdate = vi.fn().mockResolvedValue({});
-const technicianFindUnique = vi.fn().mockResolvedValue({ avatarUrl: null, serviceAreas: [] });
+const technicianFindUnique = vi.fn().mockResolvedValue({ id: "tech-1", avatarUrl: null, serviceAreas: [] });
 const technicianUpdateMany = vi.fn().mockResolvedValue({});
 
 vi.mock("../../lib/prisma", () => ({
@@ -31,7 +31,7 @@ vi.mock("../../middleware/requireAuth", () => ({
 
 vi.mock("../../middleware/requireTenantAccess", () => ({
   requireTenantAccess: (req: any, _res: any, next: any) => {
-    req.profile = { id: "profile-1", tenantId: "tenant-1", name: "James Carter" };
+    req.profile = { id: "profile-1", tenantId: "tenant-1", name: "James Carter", role: "TECHNICIAN" };
     req.tenantPrisma = {
       technician: {
         findUnique: (...args: unknown[]) => technicianFindUnique(...args),
@@ -40,6 +40,10 @@ vi.mock("../../middleware/requireTenantAccess", () => ({
     };
     next();
   },
+}));
+
+vi.mock("../media-urls", () => ({
+  signAvatar: async (_tenantId: string, url: string | null) => (url ? `${url}?signed` : null),
 }));
 
 import { mobileRouter } from "../routes";
@@ -60,7 +64,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   profileFindUnique.mockResolvedValue({ name: "James Carter", dateOfBirth: null });
   profileUpdate.mockResolvedValue({});
-  technicianFindUnique.mockResolvedValue({ avatarUrl: null, serviceAreas: [] });
+  technicianFindUnique.mockResolvedValue({ id: "tech-1", avatarUrl: null, serviceAreas: [] });
   technicianUpdateMany.mockResolvedValue({});
 });
 
@@ -145,4 +149,21 @@ it("PATCH /mobile/me without a dateOfBirth skips the date validation", async () 
   expect(profileUpdate).toHaveBeenCalledWith(
     expect.objectContaining({ data: { name: "Valid Name" } })
   );
+});
+
+// ---------------------------------------------------------------------------
+// signed avatar read url
+// ---------------------------------------------------------------------------
+
+it("GET /mobile/me returns the stored avatarUrl plus a signed avatarSignedUrl", async () => {
+  technicianFindUnique.mockResolvedValue({ id: "tech-1", avatarUrl: "tenant-1/avatars/p.jpg", serviceAreas: [] });
+  const res = await request(makeApp()).get("/mobile/me");
+  expect(res.status).toBe(200);
+  expect(res.body.avatarUrl).toBe("tenant-1/avatars/p.jpg");
+  expect(res.body.avatarSignedUrl).toBe("tenant-1/avatars/p.jpg?signed");
+});
+
+it("GET /mobile/me returns avatarSignedUrl null when no avatar is stored", async () => {
+  const res = await request(makeApp()).get("/mobile/me");
+  expect(res.body.avatarSignedUrl).toBeNull();
 });

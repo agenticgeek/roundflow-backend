@@ -3,7 +3,7 @@ import { Router, Request, Response } from "express";
 import { prisma } from "../lib/prisma";
 import { getTenantPrismaForSchema } from "../lib/tenant-prisma-manager";
 import { decrypt } from "../lib/crypto";
-import { MessageChannel, MessageDirection } from "../generated/tenant-client";
+import { MessageChannel, MessageDirection, Prisma } from "../generated/tenant-client";
 import { invalidateCachedBusinessSettings } from "../services/settings.service";
 
 export const ghlWebhookRouter = Router();
@@ -67,10 +67,14 @@ async function processEvent(schemaName: string, event: GhlEvent, eventId?: strin
 
   // Idempotency for events that carry an id
   if (eventId) {
+    // D-8: only a unique-constraint violation means "already processed".
+    // Anything else (e.g. a transient DB error) is rethrown and logged by the
+    // caller instead of being silently treated as a replay.
     try {
       await tp.webhookEvent.create({ data: { source: "ghl", externalId: eventId } });
-    } catch {
-      return; // already processed
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") return;
+      throw err;
     }
   }
 

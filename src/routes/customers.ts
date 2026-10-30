@@ -13,6 +13,7 @@ import {
   optReqString,
   optReqNumber,
   optId,
+  optBool,
   parsePageParams,
 } from "../lib/http";
 import {
@@ -25,6 +26,7 @@ import {
   MAX_NOTES_LENGTH,
 } from "../lib/validation";
 import { createInvoiceService } from "../services/invoice.service";
+import { createReportsService } from "../services/reports.service";
 import {
   createCustomerService,
   CustomerCreateInput,
@@ -105,6 +107,23 @@ customersRouter.get(
 );
 
 // ==========================================================================
+// GET /customers/search?q= — customer picker (GAP-010), top 10
+// Registered before /:id so "search" isn't read as a customer id.
+// ==========================================================================
+customersRouter.get(
+  "/search",
+  h(async (req, res) => {
+    const q = req.query.q;
+    if (typeof q !== "string" || q.trim() === "") {
+      throw new AppError(400, '"q" is required and must be a non-empty string.');
+    }
+    if (q.includes("\0")) throw new AppError(400, "q must not contain null bytes");
+    if (q.length > MAX_NAME_LENGTH) throw new AppError(400, `"q" must not exceed ${MAX_NAME_LENGTH} characters.`);
+    res.json(await svc(req).searchCustomers(q));
+  })
+);
+
+// ==========================================================================
 // GET /customers/:id — full Customer Detail aggregate (Screen 15, all 6 tabs)
 // ==========================================================================
 customersRouter.get(
@@ -130,6 +149,7 @@ customersRouter.patch(
       phone: optString(body.phone, "phone"),
       landline: optString(body.landline, "landline"),
       email: optString(body.email, "email"),
+      messagesOptOut: optBool(body.messagesOptOut, "messagesOptOut"),
       // Property
       addressLine: optReqString(body.addressLine, "addressLine", { maxLength: MAX_ADDRESS_LENGTH }),
       postcode: optReqString(body.postcode, "postcode", { maxLength: MAX_ADDRESS_LENGTH }),
@@ -144,6 +164,45 @@ customersRouter.patch(
     };
     const result = await svc(req).updateCustomer(req.params.id, input);
     queueGhlEvent(req.tenantPrisma!, "customer.synced", req.params.id).catch(console.error);
+    res.json(result);
+  })
+);
+
+// ==========================================================================
+// GET /customers/:id/visits — paginated visit history, every status
+// (CANCELLED included, with cancelReason)
+// ==========================================================================
+customersRouter.get(
+  "/:id/visits",
+  h(async (req, res) => {
+    const { page, pageSize } = parsePageParams(req.query as Record<string, unknown>, {
+      defaultPageSize: 50,
+      maxPageSize: 100,
+    });
+    res.json(await svc(req).getVisitHistory(req.params.id, page, pageSize));
+  })
+);
+
+// ==========================================================================
+// PATCH /customers/:id/bad-debt — { flag, reason? } (GAP-022)
+// There is no reason column; the reason goes to the activity log.
+// ==========================================================================
+customersRouter.patch(
+  "/:id/bad-debt",
+  h(async (req, res) => {
+    const body = asObject(req.body);
+    const flag = optBool(body.flag, "flag");
+    if (flag === undefined) throw new AppError(400, '"flag" is required and must be a boolean.');
+    const reason = optString(body.reason, "reason", { maxLength: MAX_NOTES_LENGTH });
+    const result = await svc(req).setBadDebt(req.params.id, flag);
+    void createReportsService(req.tenantPrisma!)
+      .logActivity(
+        flag ? "CUSTOMER_BAD_DEBT_FLAGGED" : "CUSTOMER_BAD_DEBT_CLEARED",
+        `Customer ${req.params.id} ${flag ? "flagged as" : "cleared of"} bad debt${reason ? `: ${reason}` : ""}`,
+        req.profile?.id,
+        req.profile?.role ?? undefined
+      )
+      .catch(console.error);
     res.json(result);
   })
 );
@@ -179,6 +238,7 @@ customersRouter.post(
       cleanMethod: optString(body.cleanMethod, "cleanMethod"),
       paymentMethod: optPaymentMethod(body.paymentMethod),
       nextDueDate: optIsoDate(body.nextDueDate, "nextDueDate"),
+      lastCleanedDate: optIsoDate(body.lastCleanedDate, "lastCleanedDate"),
       accessNotes: optString(body.accessNotes, "accessNotes", { maxLength: MAX_NOTES_LENGTH }),
       riskNotes: optString(body.riskNotes, "riskNotes", { maxLength: MAX_NOTES_LENGTH }),
       roundId: optId(body.roundId, "roundId"),

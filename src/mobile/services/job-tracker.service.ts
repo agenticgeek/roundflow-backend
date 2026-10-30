@@ -1,4 +1,4 @@
-import { IssueType, VisitStatus } from "../../generated/tenant-client";
+import { IssueType, PhotoType, VisitStatus } from "../../generated/tenant-client";
 import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
 import { AppError } from "../../lib/app-error";
 import { evaluateDebtGate } from "./debt-gate";
@@ -43,15 +43,23 @@ class JobTrackerService {
     const visit = await this.prisma.visit.findUnique({ where: { id: visitId } });
     if (!visit) throw new AppError(404, "Visit not found");
     if (visit.status === VisitStatus.COMPLETED) throw new AppError(409, "Cannot skip a completed visit");
+    if (visit.status === VisitStatus.CANCELLED) throw new AppError(409, "Cannot skip a cancelled visit");
     if (visit.status === VisitStatus.SKIPPED) return;
     const skipReason = description ? `${reason}: ${description}` : reason;
     await this.prisma.visit.update({ where: { id: visitId }, data: { status: VisitStatus.SKIPPED, skipReason } });
   }
 
-  async reportAccessIssue(visitId: string, issueType: IssueType, description: string): Promise<void> {
+  // photoPaths: storage paths from POST /photos/upload-url (type ACCESS_ISSUE),
+  // stored as ACCESS_ISSUE Photo rows linked to the issue in the same insert.
+  async reportAccessIssue(visitId: string, issueType: IssueType, description: string, photoPaths: string[] = []): Promise<{ id: string }> {
     const visit = await this.prisma.visit.findUnique({ where: { id: visitId } });
     if (!visit) throw new AppError(404, "Visit not found");
-    await this.prisma.issue.create({ data: { visitId, type: issueType, note: description } });
+    const photos = photoPaths.map((url) => ({ url, type: PhotoType.ACCESS_ISSUE, visitId, propertyId: visit.propertyId }));
+    const issue = await this.prisma.issue.create({
+      data: { visitId, type: issueType, note: description, ...(photos.length ? { photos: { create: photos } } : {}) },
+      select: { id: true },
+    });
+    return { id: issue.id };
   }
 
   async adjustPrice(visitId: string, price: number, reason?: string | null): Promise<void> {

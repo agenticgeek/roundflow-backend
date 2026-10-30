@@ -3,8 +3,20 @@ import { it, expect, vi, beforeEach } from "vitest";
 vi.mock("../../lib/email", () => ({}));
 
 const sendMessage = vi.fn();
+const prepareMessage = vi.fn();
+const deliverMessage = vi.fn();
 vi.mock("../message.service", () => ({
-  createMessageService: vi.fn(() => ({ send: sendMessage })),
+  createMessageService: vi.fn(() => ({ send: sendMessage, prepare: prepareMessage, deliver: deliverMessage })),
+}));
+const holdNextVisits = vi.fn();
+const releaseHeldVisits = vi.fn();
+vi.mock("../payment-hold", () => ({
+  holdNextVisits: (...a: unknown[]) => holdNextVisits(...a),
+  releaseHeldVisits: (...a: unknown[]) => releaseHeldVisits(...a),
+}));
+const getInvoiceCheckoutLink = vi.fn();
+vi.mock("../../integrations/stripe/checkout", () => ({
+  getInvoiceCheckoutLink: (...a: unknown[]) => getInvoiceCheckoutLink(...a),
 }));
 
 import { createDebtService } from "../debt.service";
@@ -12,10 +24,11 @@ import { createDebtService } from "../debt.service";
 function makePrisma() {
   return {
     invoice: { findMany: vi.fn(), findUnique: vi.fn(), update: vi.fn(), count: vi.fn(), aggregate: vi.fn() },
-    customer: { findUnique: vi.fn(), update: vi.fn() },
+    customer: { findUnique: vi.fn(), findMany: vi.fn().mockResolvedValue([]), update: vi.fn(), count: vi.fn().mockResolvedValue(0) },
     visit: { findMany: vi.fn(), findFirst: vi.fn() },
     payment: { findMany: vi.fn() },
     message: { create: vi.fn(), findFirst: vi.fn() },
+    messageTemplate: { findFirst: vi.fn().mockResolvedValue(null) },
     businessSettings: { findFirst: vi.fn() },
     $queryRaw: vi.fn(),
   } as unknown as Parameters<typeof createDebtService>[0];
@@ -23,6 +36,11 @@ function makePrisma() {
 
 beforeEach(() => {
   sendMessage.mockReset();
+  prepareMessage.mockReset();
+  deliverMessage.mockReset();
+  holdNextVisits.mockReset().mockResolvedValue(1);
+  releaseHeldVisits.mockReset().mockResolvedValue(2);
+  getInvoiceCheckoutLink.mockReset();
 });
 
 // ---- helpers for getBoard tests -------------------------------------------
@@ -68,7 +86,9 @@ function setupKpis(
     badDebt?: number | null;
     failedGoCardless?: number;
     dueBeforeClean?: number;
-    holdCustomers?: string[];
+    holdNextClean?: number;
+    totalOutstandingsCount?: number;
+    badDebtCount?: number;
     failedPayments?: unknown[];
     upcomingVisits?: unknown[];
   } = {}
@@ -81,16 +101,20 @@ function setupKpis(
   (prisma.invoice.count as ReturnType<typeof vi.fn>)
     .mockResolvedValueOnce(opts.failedGoCardless ?? 0)
     .mockResolvedValueOnce(opts.dueBeforeClean ?? 0);
-  (prisma.invoice.findMany as ReturnType<typeof vi.fn>).mockResolvedValue(
-    (opts.holdCustomers ?? []).map((customerId) => ({ customerId }))
-  );
+  (prisma.customer.count as ReturnType<typeof vi.fn>)
+    .mockResolvedValueOnce(opts.holdNextClean ?? 0)
+    .mockResolvedValueOnce(opts.totalOutstandingsCount ?? 0)
+    .mockResolvedValueOnce(opts.badDebtCount ?? 0);
 }
 
-it("getKpis result has totalOutstandings", async () => {
+it("getKpis returns every KPI field", async () => {
   const prisma = makePrisma();
   setupKpis(prisma, {});
   const result = await createDebtService(prisma).getKpis();
-  expect("totalOutstandings" in result).toBe(true);
+  expect(Object.keys(result).sort()).toEqual([
+    "badDebt", "badDebtCount", "dueBeforeClean", "failedGoCardless", "holdNextClean",
+    "totalOutstandings", "totalOutstandingsCount",
+  ]);
 });
 
 it("getKpis totalOutstandings uses the aggregate _sum.amount with customer.badDebt:false", async () => {
@@ -104,18 +128,12 @@ it("getKpis totalOutstandings uses the aggregate _sum.amount with customer.badDe
   });
 });
 
-it("getKpis totalOutstandings defaults to 0 when aggregate sum is null", async () => {
+it("getKpis totalOutstandings and badDebt default to 0 when aggregate sums are null", async () => {
   const prisma = makePrisma();
-  setupKpis(prisma, { totalOutstandings: null });
+  setupKpis(prisma, { totalOutstandings: null, badDebt: null });
   const result = await createDebtService(prisma).getKpis();
   expect(result.totalOutstandings).toBe(0);
-});
-
-it("getKpis result has badDebt field", async () => {
-  const prisma = makePrisma();
-  setupKpis(prisma, {});
-  const result = await createDebtService(prisma).getKpis();
-  expect("badDebt" in result).toBe(true);
+  expect(result.badDebt).toBe(0);
 });
 
 it("getKpis badDebt uses the aggregate _sum.amount with customer.badDebt:true", async () => {
@@ -129,16 +147,9 @@ it("getKpis badDebt uses the aggregate _sum.amount with customer.badDebt:true", 
   });
 });
 
-it("getKpis result has failedGoCardless field", async () => {
-  const prisma = makePrisma();
-  setupKpis(prisma, {});
-  const result = await createDebtService(prisma).getKpis();
-  expect("failedGoCardless" in result).toBe(true);
-});
-
 it("getKpis failedGoCardless counts invoices via visitId:{in:[...failedVisitIds]}", async () => {
   const prisma = makePrisma();
-  setupKpis(prisma, { failedGoCardless: 1, failedPayments: [{ visitId: "v1" }] });
+  setupKpis(prisma, { failedGoCardless: 1, failedPayments: [{ visitId: "v1" }, { visitId: null }] });
   const result = await createDebtService(prisma).getKpis();
   expect(result.failedGoCardless).toBe(1);
   expect(prisma.invoice.count).toHaveBeenNthCalledWith(1, {
@@ -146,14 +157,7 @@ it("getKpis failedGoCardless counts invoices via visitId:{in:[...failedVisitIds]
   });
 });
 
-it("getKpis result has dueBeforeClean field", async () => {
-  const prisma = makePrisma();
-  setupKpis(prisma, {});
-  const result = await createDebtService(prisma).getKpis();
-  expect("dueBeforeClean" in result).toBe(true);
-});
-
-it("getKpis dueBeforeClean counts invoices via customerId:{in:[...upcomingCustomerIds]}", async () => {
+it("getKpis dueBeforeClean counts invoices via customerId:{in:[...upcomingCustomerIds]}, ignoring CANCELLED visits", async () => {
   const prisma = makePrisma();
   setupKpis(prisma, { dueBeforeClean: 1, upcomingVisits: [{ property: { customerId: "c1" } }] });
   const result = await createDebtService(prisma).getKpis();
@@ -161,34 +165,27 @@ it("getKpis dueBeforeClean counts invoices via customerId:{in:[...upcomingCustom
   expect(prisma.invoice.count).toHaveBeenNthCalledWith(2, {
     where: { status: "SENT", customer: { badDebt: false }, customerId: { in: ["c1"] } },
   });
+  expect(prisma.visit.findMany).toHaveBeenCalledWith(expect.objectContaining({
+    where: expect.objectContaining({ status: { not: "CANCELLED" } }),
+  }));
 });
 
-it("getKpis result has holdNextClean field", async () => {
+it("getKpis holdNextClean counts customers on hold whatever their invoice status (A3)", async () => {
   const prisma = makePrisma();
-  setupKpis(prisma, {});
+  setupKpis(prisma, { holdNextClean: 4 });
   const result = await createDebtService(prisma).getKpis();
-  expect("holdNextClean" in result).toBe(true);
+  expect(result.holdNextClean).toBe(4);
+  expect(prisma.customer.count).toHaveBeenNthCalledWith(1, { where: { holdNextClean: true, badDebt: false } });
 });
 
-it("getKpis holdNextClean counts distinct customers via findMany distinct:['customerId']", async () => {
+it("getKpis totalOutstandingsCount / badDebtCount count distinct customers (GAP-031)", async () => {
   const prisma = makePrisma();
-  setupKpis(prisma, { holdCustomers: ["c1"] });
+  setupKpis(prisma, { totalOutstandingsCount: 7, badDebtCount: 2 });
   const result = await createDebtService(prisma).getKpis();
-  expect(result.holdNextClean).toBe(1);
-  expect(prisma.invoice.findMany).toHaveBeenCalledWith({
-    where: { status: "SENT", customer: { badDebt: false, holdNextClean: true } },
-    distinct: ["customerId"],
-    select: { customerId: true },
-  });
-});
-
-it("getKpis holdNextClean dedupes multiple invoices for the same customer", async () => {
-  const prisma = makePrisma();
-  // Even though distinct is pushed to the DB query, the mock's "distinct" result
-  // is what the (mocked) DB would have returned already deduped.
-  setupKpis(prisma, { holdCustomers: ["c1"] });
-  const result = await createDebtService(prisma).getKpis();
-  expect(result.holdNextClean).toBe(1);
+  expect(result.totalOutstandingsCount).toBe(7);
+  expect(result.badDebtCount).toBe(2);
+  expect(prisma.customer.count).toHaveBeenNthCalledWith(2, { where: { badDebt: false, invoices: { some: { status: "SENT" } } } });
+  expect(prisma.customer.count).toHaveBeenNthCalledWith(3, { where: { badDebt: true, invoices: { some: { status: "SENT" } } } });
 });
 
 // ---- getBoard: basic ----------------------------------------------------------
@@ -218,12 +215,49 @@ it("getBoard BAD_DEBT builds where.customer.badDebt:true", async () => {
   expect(countArgs.where).toMatchObject({ status: "SENT", customer: { badDebt: true } });
 });
 
-it("getBoard ON_HOLD builds where.customer.badDebt:false,holdNextClean:true", async () => {
+const fnOf = (f: unknown) => f as ReturnType<typeof vi.fn>;
+
+function heldCustomer(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "c1", name: "Held Co", paymentMethod: "BACS", badDebt: false, holdNextClean: true,
+    properties: [{ addressLine: "1 High St", postcode: "NE1 1AA" }],
+    invoices: [
+      { id: "inv-a", invoiceNumber: "INV-A", amount: { toNumber: () => 20 }, dueDate: new Date("2026-10-01") },
+      { id: "inv-b", invoiceNumber: "INV-B", amount: { toNumber: () => 15 }, dueDate: new Date("2026-10-08") },
+    ],
+    ...overrides,
+  };
+}
+
+it("getBoard ON_HOLD lists held customers (one row each, oldest SENT invoice + total outstanding), matching the count", async () => {
   const prisma = makePrisma();
-  setupBoard(prisma, [inv({ customer: { ...inv().customer, holdNextClean: true } })]);
-  await createDebtService(prisma).getBoard("ON_HOLD");
-  const callArgs = (prisma.invoice.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
-  expect(callArgs.where).toMatchObject({ status: "SENT", customer: { badDebt: false, holdNextClean: true } });
+  fnOf(prisma.customer.count).mockResolvedValue(2);
+  fnOf(prisma.customer.findMany).mockResolvedValue([
+    heldCustomer(),
+    heldCustomer({ id: "c2", name: "No Invoice", paymentMethod: null, properties: [], invoices: [] }),
+  ]);
+  fnOf(prisma.$queryRaw).mockResolvedValue([{ customerId: "c1", createdAt: new Date("2026-10-20") }]);
+
+  const result = await createDebtService(prisma).getBoard("ON_HOLD", undefined, undefined, 1, 10);
+
+  expect(prisma.invoice.findMany).not.toHaveBeenCalled();
+  const args = fnOf(prisma.customer.findMany).mock.calls[0][0];
+  expect(args.where).toEqual({ holdNextClean: true, badDebt: false });
+  expect(args).toMatchObject({ take: 10, skip: 0 });
+  expect(fnOf(prisma.customer.count).mock.calls[0][0].where).toEqual(args.where);
+  expect(result.pagination.total).toBe(2);
+  expect(result.rows).toEqual([
+    {
+      invoiceId: "inv-a", invoiceNumber: "INV-A", amount: 35, dueDate: new Date("2026-10-01"),
+      customerId: "c1", customerName: "Held Co", addressLine: "1 High St", postcode: "NE1 1AA",
+      paymentMethod: "BACS", lastContactedAt: new Date("2026-10-20"), badDebt: false, holdNextClean: true,
+    },
+    {
+      invoiceId: null, invoiceNumber: null, amount: 0, dueDate: null,
+      customerId: "c2", customerName: "No Invoice", addressLine: "", postcode: null,
+      paymentMethod: null, lastContactedAt: null, badDebt: false, holdNextClean: true,
+    },
+  ]);
 });
 
 it("getBoard FAILED_GC builds where.visitId:{in:[...failedVisitIds]}", async () => {
@@ -358,11 +392,11 @@ it("getBoard: a bad-debt customer who would otherwise match ON_HOLD is excluded 
   const prisma = makePrisma();
   // Customer has badDebt:true AND holdNextClean:true, but the ON_HOLD where clause
   // forces badDebt:false, so the DB would never return this row for that bucket.
-  setupBoard(prisma, []);
   const result = await createDebtService(prisma).getBoard("ON_HOLD");
-  const callArgs = (prisma.invoice.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
-  expect(callArgs.where.customer.badDebt).toBe(false);
+  const callArgs = fnOf(prisma.customer.findMany).mock.calls[0][0];
+  expect(callArgs.where.badDebt).toBe(false);
   expect(result.rows).toHaveLength(0);
+  expect(prisma.$queryRaw).not.toHaveBeenCalled();
 });
 
 it("getBoard: a bad-debt customer appears under BAD_DEBT regardless of holdNextClean/failedGC/etc (precedence)", async () => {
@@ -442,10 +476,21 @@ it("getBoard applies paymentMethod filter via where.customer.paymentMethod", asy
 it("getBoard combines roundId and paymentMethod with a bucket filter", async () => {
   const prisma = makePrisma();
   setupBoard(prisma, [inv()]);
-  await createDebtService(prisma).getBoard("ON_HOLD", "round-1", "CARD");
+  await createDebtService(prisma).getBoard("BAD_DEBT", "round-1", "CARD");
   const callArgs = (prisma.invoice.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
   expect(callArgs.where.visit).toEqual({ property: { roundId: "round-1" } });
-  expect(callArgs.where.customer).toMatchObject({ paymentMethod: "CARD", badDebt: false, holdNextClean: true });
+  expect(callArgs.where.customer).toMatchObject({ paymentMethod: "CARD", badDebt: true });
+});
+
+it("getBoard ON_HOLD applies round / payment-method / search filters at customer level", async () => {
+  const prisma = makePrisma();
+  await createDebtService(prisma).getBoard("ON_HOLD", "round-1", "CARD", 2, 5, "smith");
+  const args = fnOf(prisma.customer.findMany).mock.calls[0][0];
+  expect(args.where).toMatchObject({
+    holdNextClean: true, badDebt: false, paymentMethod: "CARD", properties: { some: { roundId: "round-1" } },
+  });
+  expect(args.where.OR).toHaveLength(2);
+  expect(args).toMatchObject({ take: 5, skip: 5 });
 });
 
 // ---- getBoard: search param ------------------------------------------------------
@@ -493,22 +538,24 @@ it("getBucketCounts is a function", () => {
   expect(typeof createDebtService(makePrisma()).getBucketCounts).toBe("function");
 });
 
-it("getBucketCounts returns a count for all 7 bucket tabs in one call", async () => {
+it("getBucketCounts returns a count for all 7 bucket tabs in one call (ON_HOLD counts customers)", async () => {
   const prisma = makePrisma();
   (prisma.payment.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
   (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
   (prisma.invoice.count as ReturnType<typeof vi.fn>).mockResolvedValue(3);
+  (prisma.customer.count as ReturnType<typeof vi.fn>).mockResolvedValue(9);
   const result = await createDebtService(prisma).getBucketCounts();
   expect(result).toEqual({
     BAD_DEBT: 3,
-    ON_HOLD: 3,
+    ON_HOLD: 9,
     FAILED_GC: 3,
     DUE_BEFORE_CLEAN: 3,
     SEVEN_DAYS_OVER: 3,
     FOURTEEN_DAYS_OVER: 3,
     ALL: 3,
   });
-  expect(prisma.invoice.count).toHaveBeenCalledTimes(7);
+  expect(prisma.invoice.count).toHaveBeenCalledTimes(6);
+  expect(prisma.customer.count).toHaveBeenCalledWith({ where: { holdNextClean: true, badDebt: false } });
 });
 
 it("getBucketCounts only computes the failed/upcoming context once, not once per bucket", async () => {
@@ -528,12 +575,24 @@ it("getBucketCounts threads roundId/paymentMethod/search into every bucket's whe
   (prisma.invoice.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
   await createDebtService(prisma).getBucketCounts("round-1", "CARD", "smith");
   const calls = (prisma.invoice.count as ReturnType<typeof vi.fn>).mock.calls;
-  expect(calls).toHaveLength(7);
+  expect(calls).toHaveLength(6);
   for (const [{ where }] of calls) {
     expect(where.visit).toMatchObject({ property: { roundId: "round-1" } });
     expect(where.customer).toMatchObject({ paymentMethod: "CARD" });
     expect(where.AND).toBeDefined();
   }
+  expect(prisma.customer.count).toHaveBeenCalledWith({
+    where: {
+      holdNextClean: true,
+      badDebt: false,
+      paymentMethod: "CARD",
+      properties: { some: { roundId: "round-1" } },
+      OR: [
+        { name: { contains: "smith", mode: "insensitive" } },
+        { properties: { some: { addressLine: { contains: "smith", mode: "insensitive" } } } },
+      ],
+    },
+  });
 });
 
 it("getBucketCounts distinguishes BAD_DEBT (true) from every other bucket (false) in the where clause", async () => {
@@ -543,7 +602,7 @@ it("getBucketCounts distinguishes BAD_DEBT (true) from every other bucket (false
   (prisma.invoice.count as ReturnType<typeof vi.fn>).mockResolvedValue(0);
   await createDebtService(prisma).getBucketCounts();
   const calls = (prisma.invoice.count as ReturnType<typeof vi.fn>).mock.calls as Array<[{ where: { customer: { badDebt?: boolean } } }]>;
-  // DEBT_BUCKETS order: BAD_DEBT, ON_HOLD, FAILED_GC, DUE_BEFORE_CLEAN, SEVEN_DAYS_OVER, FOURTEEN_DAYS_OVER, ALL
+  // DEBT_BUCKETS order minus ON_HOLD: BAD_DEBT, FAILED_GC, DUE_BEFORE_CLEAN, SEVEN_DAYS_OVER, FOURTEEN_DAYS_OVER, ALL
   expect(calls[0][0].where.customer.badDebt).toBe(true);
   for (const [{ where }] of calls.slice(1)) {
     expect(where.customer.badDebt).toBe(false);
@@ -589,26 +648,52 @@ it("sendReminder is a function", () => {
   expect(typeof svc.sendReminder).toBe("function");
 });
 
+const sendable = (overrides: Record<string, unknown> = {}) => ({
+  id: "inv-1",
+  invoiceNumber: "INV-2026-001",
+  customerId: "c1",
+  amount: { toNumber: () => 33 },
+  dueDate: new Date("2026-11-06T00:00:00Z"),
+  status: "SENT",
+  customer: { name: "Jo Bloggs" },
+  ...overrides,
+});
+
 it("sendReminder throws 404 when invoice does not exist", async () => {
   const prisma = makePrisma();
   (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-  await expect(createDebtService(prisma).sendReminder("bad-id", "EMAIL", "Hi")).rejects.toMatchObject({ statusCode: 404 });
+  await expect(createDebtService(prisma).sendReminder("bad-id", {})).rejects.toMatchObject({ statusCode: 404 });
 });
 
-it("sendReminder throws 400 when channel is EMAIL and customer has no email", async () => {
+it("sendReminder propagates a contact/channel error from prepare (nothing delivered)", async () => {
   const prisma = makePrisma();
-  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", invoiceNumber: "INV-2026-001", customerId: "c1", customer: { id: "c1", name: "John", email: null } });
-  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-  await expect(createDebtService(prisma).sendReminder("inv-1", "EMAIL", "Hi")).rejects.toMatchObject({ statusCode: 400 });
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(sendable());
+  prepareMessage.mockRejectedValue(Object.assign(new Error("no email"), { statusCode: 400, code: "NO_CONTACT_FOR_CHANNEL" }));
+  await expect(createDebtService(prisma).sendReminder("inv-1", { channel: "EMAIL" })).rejects.toMatchObject({ code: "NO_CONTACT_FOR_CHANNEL" });
+  expect(prepareMessage).toHaveBeenCalledWith("c1", "EMAIL");
+  expect(deliverMessage).not.toHaveBeenCalled();
 });
 
-it("sendReminder records a Message and returns its id", async () => {
+it("sendReminder renders the tenant reminder template and returns the message id", async () => {
   const prisma = makePrisma();
-  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", invoiceNumber: "INV-2026-001", customerId: "c1", customer: { id: "c1", name: "John", email: "j@example.com" } });
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(sendable());
+  (prisma.messageTemplate.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "tpl-1", body: "Hi {{firstName}}, {{invoiceNumber}} {{amount}} {{mystery}}!" });
   (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-  (prisma.message.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "msg-1" });
-  const result = await createDebtService(prisma).sendReminder("inv-1", "EMAIL", "Hi");
-  expect(result.id).toBe("msg-1");
+  prepareMessage.mockResolvedValue({ prep: true });
+  deliverMessage.mockResolvedValue({ messageId: "m1", channel: "SMS" });
+  const result = await createDebtService(prisma).sendReminder("inv-1", {});
+  expect(result).toEqual({ id: "m1", messageId: "m1", channel: "SMS", customerId: "c1" });
+  expect(deliverMessage).toHaveBeenCalledWith({ prep: true }, "Hi Jo, INV-2026-001 £33.00 !", { templateId: "tpl-1" });
+});
+
+it("sendReminder uses a custom message instead of the template", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(sendable());
+  prepareMessage.mockResolvedValue({});
+  deliverMessage.mockResolvedValue({ messageId: "m1", channel: "EMAIL" });
+  await createDebtService(prisma).sendReminder("inv-1", { message: "Pay {{amount}} please" });
+  expect(prisma.messageTemplate.findFirst).not.toHaveBeenCalled();
+  expect(deliverMessage).toHaveBeenCalledWith({}, "Pay £33.00 please", { templateId: null });
 });
 
 it("flagBadDebt is a function", () => {
@@ -639,12 +724,14 @@ it("flagHold throws 404 when invoice does not exist", async () => {
   await expect(createDebtService(prisma).flagHold("bad-id", true)).rejects.toMatchObject({ statusCode: 404 });
 });
 
-it("flagHold sets holdNextClean on the customer and returns it", async () => {
+it("flagHold sets holdNextClean on the customer, holds the next visits and returns it", async () => {
   const prisma = makePrisma();
   (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", customerId: "c1" });
-  (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1", holdNextClean: true });
+  (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1", holdNextClean: true, holdReason: null, holdSince: null });
   const result = await createDebtService(prisma).flagHold("inv-1", true);
-  expect(result.holdNextClean).toBe(true);
+  expect(result).toMatchObject({ customerId: "c1", holdNextClean: true, visitsUpdated: 1 });
+  expect(holdNextVisits).toHaveBeenCalledWith(prisma, "c1");
+  expect(releaseHeldVisits).not.toHaveBeenCalled();
 });
 
 it("flagHold defaults reason to null and date to now when setting the hold with no options", async () => {
@@ -653,68 +740,56 @@ it("flagHold defaults reason to null and date to now when setting the hold with 
   (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1", holdNextClean: true, holdReason: null, holdSince: new Date() });
   await createDebtService(prisma).flagHold("inv-1", true);
   const call = (prisma.customer.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
-  expect(call.data.holdNextClean).toBe(true);
   expect(call.data.holdReason).toBeNull();
   expect(call.data.holdSince).toBeInstanceOf(Date);
 });
 
 it("flagHold persists a given reason and date", async () => {
   const prisma = makePrisma();
+  const date = new Date("2026-10-01T00:00:00Z");
   (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", customerId: "c1" });
-  (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1", holdNextClean: true });
-  const date = new Date("2026-02-01");
-  await createDebtService(prisma).flagHold("inv-1", true, { reason: "Non-payment", date });
-  expect(prisma.customer.update).toHaveBeenCalledWith({
-    where: { id: "c1" },
-    data: { holdNextClean: true, holdReason: "Non-payment", holdSince: date },
-  });
+  (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1", holdNextClean: true, holdReason: "Owes", holdSince: date });
+  const result = await createDebtService(prisma).flagHold("inv-1", true, { reason: "Owes", date });
+  expect(prisma.customer.update).toHaveBeenCalledWith({ where: { id: "c1" }, data: { holdNextClean: true, holdReason: "Owes", holdSince: date } });
+  expect(result.holdReason).toBe("Owes");
 });
 
-it("flagHold clears holdReason/holdSince when flag is false, ignoring any reason/date given", async () => {
+it("flagHold clears holdReason/holdSince and releases held visits when flag is false", async () => {
   const prisma = makePrisma();
   (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", customerId: "c1" });
   (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1", holdNextClean: false, holdReason: null, holdSince: null });
-  await createDebtService(prisma).flagHold("inv-1", false, { reason: "ignored", date: new Date() });
-  expect(prisma.customer.update).toHaveBeenCalledWith({
-    where: { id: "c1" },
-    data: { holdNextClean: false, holdReason: null, holdSince: null },
-  });
+  const result = await createDebtService(prisma).flagHold("inv-1", false, { reason: "x", date: new Date() });
+  expect(prisma.customer.update).toHaveBeenCalledWith({ where: { id: "c1" }, data: { holdNextClean: false, holdReason: null, holdSince: null } });
+  expect(releaseHeldVisits).toHaveBeenCalledWith(prisma, "c1");
+  expect(holdNextVisits).not.toHaveBeenCalled();
+  expect(result.visitsUpdated).toBe(2);
 });
 
-it("flagHold does not notify when notify is false/omitted", async () => {
+it("flagHold does not notify when notify is false/omitted, or when flag is false", async () => {
   const prisma = makePrisma();
   (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", customerId: "c1" });
-  (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1", holdNextClean: true });
+  (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1" });
   await createDebtService(prisma).flagHold("inv-1", true);
-  expect(sendMessage).not.toHaveBeenCalled();
-});
-
-it("flagHold does not notify when flag is false even if notify is true", async () => {
-  const prisma = makePrisma();
-  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", customerId: "c1" });
-  (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1", holdNextClean: false });
   await createDebtService(prisma).flagHold("inv-1", false, { notify: true });
   expect(sendMessage).not.toHaveBeenCalled();
 });
 
-it("flagHold sends the given message when notify is true", async () => {
+it("flagHold sends the given message by SMS when notify is true", async () => {
   const prisma = makePrisma();
   (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", customerId: "c1" });
-  (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1", holdNextClean: true });
+  (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1" });
   sendMessage.mockResolvedValue({ status: "sent" });
-  await createDebtService(prisma).flagHold("inv-1", true, { notify: true, message: "You're on hold" });
-  expect(sendMessage).toHaveBeenCalledWith({ customerId: "c1", channel: "sms", body: "You're on hold" });
+  await createDebtService(prisma).flagHold("inv-1", true, { notify: true, message: "On hold" });
+  expect(sendMessage).toHaveBeenCalledWith({ customerId: "c1", channel: "SMS", body: "On hold" });
 });
 
 it("flagHold falls back to a default message when notify is true but message is blank", async () => {
   const prisma = makePrisma();
   (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", customerId: "c1" });
-  (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1", holdNextClean: true });
+  (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1" });
   sendMessage.mockResolvedValue({ status: "sent" });
-  await createDebtService(prisma).flagHold("inv-1", true, { notify: true, message: "   " });
-  expect(sendMessage).toHaveBeenCalledWith({
-    customerId: "c1", channel: "sms", body: "Your next clean is on hold until this is resolved.",
-  });
+  await createDebtService(prisma).flagHold("inv-1", true, { notify: true, message: "  " });
+  expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringContaining("on hold") }));
 });
 
 it("flagHold swallows a notify send failure (best-effort)", async () => {
@@ -722,11 +797,11 @@ it("flagHold swallows a notify send failure (best-effort)", async () => {
   (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", customerId: "c1" });
   (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1", holdNextClean: true });
   sendMessage.mockRejectedValue(new Error("GHL down"));
-  const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+  const err = vi.spyOn(console, "error").mockImplementation(() => {});
   const result = await createDebtService(prisma).flagHold("inv-1", true, { notify: true });
   expect(result.holdNextClean).toBe(true);
-  expect(consoleErrorSpy).toHaveBeenCalled();
-  consoleErrorSpy.mockRestore();
+  expect(err).toHaveBeenCalled();
+  err.mockRestore();
 });
 
 it("sendPaymentLink is a function", () => {
@@ -736,47 +811,69 @@ it("sendPaymentLink is a function", () => {
 it("sendPaymentLink throws 404 when invoice does not exist", async () => {
   const prisma = makePrisma();
   (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-  await expect(createDebtService(prisma).sendPaymentLink("bad-id", "Pay now")).rejects.toMatchObject({ statusCode: 404 });
+  await expect(createDebtService(prisma).sendPaymentLink("bad", { tenantId: "t1" })).rejects.toMatchObject({ statusCode: 404 });
 });
 
-it("sendPaymentLink throws 400 when customer has no email", async () => {
+it("sendPaymentLink 409s INVOICE_NOT_PAYABLE for PAID and VOID invoices", async () => {
   const prisma = makePrisma();
-  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", invoiceNumber: "INV-2026-001", customerId: "c1", customer: { id: "c1", name: "John", email: null } });
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>)
+    .mockResolvedValueOnce(sendable({ status: "PAID" }))
+    .mockResolvedValueOnce(sendable({ status: "VOID" }));
+  const svc = createDebtService(prisma);
+  await expect(svc.sendPaymentLink("inv-1", { tenantId: "t1" })).rejects.toMatchObject({ statusCode: 409, code: "INVOICE_NOT_PAYABLE" });
+  await expect(svc.sendPaymentLink("inv-1", { tenantId: "t1" })).rejects.toMatchObject({ statusCode: 409, code: "INVOICE_NOT_PAYABLE" });
+  expect(getInvoiceCheckoutLink).not.toHaveBeenCalled();
+});
+
+it("sendPaymentLink (D-6) checks contact/channel BEFORE creating the Stripe session", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(sendable());
+  prepareMessage.mockRejectedValue(Object.assign(new Error("no email"), { statusCode: 400, code: "NO_CONTACT_FOR_CHANNEL" }));
+  await expect(createDebtService(prisma).sendPaymentLink("inv-1", { tenantId: "t1", channel: "EMAIL" }))
+    .rejects.toMatchObject({ code: "NO_CONTACT_FOR_CHANNEL" });
+  expect(getInvoiceCheckoutLink).not.toHaveBeenCalled();
+});
+
+it("sendPaymentLink propagates STRIPE_NOT_CONNECTED and sends nothing", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(sendable());
+  prepareMessage.mockResolvedValue({});
+  getInvoiceCheckoutLink.mockRejectedValue(Object.assign(new Error("no stripe"), { statusCode: 409, code: "STRIPE_NOT_CONNECTED" }));
+  await expect(createDebtService(prisma).sendPaymentLink("inv-1", { tenantId: "t1" })).rejects.toMatchObject({ code: "STRIPE_NOT_CONNECTED" });
+  expect(deliverMessage).not.toHaveBeenCalled();
+});
+
+it("sendPaymentLink sends the template with the Stripe link and returns url/messageId/channel", async () => {
+  const prisma = makePrisma();
+  const expiresAt = new Date("2026-10-31T00:00:00Z");
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(sendable());
   (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-  await expect(createDebtService(prisma).sendPaymentLink("inv-1", "Pay now")).rejects.toMatchObject({ statusCode: 400 });
-});
-
-it("sendPaymentLink records a Message and returns its id", async () => {
-  const prisma = makePrisma();
-  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", invoiceNumber: "INV-2026-001", customerId: "c1", customer: { id: "c1", name: "John", email: "j@example.com" } });
-  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-  (prisma.message.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "msg-2" });
-  const result = await createDebtService(prisma).sendPaymentLink("inv-1", "Pay now");
-  expect(result.id).toBe("msg-2");
-});
-
-it("sendPaymentLink defaults provider to 'static' and expiresAt to null with no options", async () => {
-  const prisma = makePrisma();
-  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", invoiceNumber: "INV-2026-001", customerId: "c1", customer: { id: "c1", name: "John", email: "j@example.com" } });
-  (prisma.message.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "msg-2" });
-  const result = await createDebtService(prisma).sendPaymentLink("inv-1", "Pay now");
-  expect(result.provider).toBe("static");
-  expect(result.expiresAt).toBeNull();
-  expect(result.paymentUrl).toBe("https://pay.roundflow.app/i/INV-2026-001");
-});
-
-it("sendPaymentLink surfaces the given provider, overrideUrl and expiresAt", async () => {
-  const prisma = makePrisma();
-  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", invoiceNumber: "INV-2026-001", customerId: "c1", customer: { id: "c1", name: "John", email: "j@example.com" } });
-  (prisma.message.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "msg-3" });
-  const expiresAt = new Date("2026-03-01");
-  const result = await createDebtService(prisma).sendPaymentLink("inv-1", "Pay now", {
-    overrideUrl: "https://checkout.stripe.com/pay/cs_1", provider: "stripe", expiresAt,
+  prepareMessage.mockResolvedValue({ p: 1 });
+  getInvoiceCheckoutLink.mockResolvedValue({ url: "https://checkout.stripe.com/c/1", expiresAt });
+  deliverMessage.mockResolvedValue({ messageId: "m9", channel: "SMS" });
+  const result = await createDebtService(prisma).sendPaymentLink("inv-1", { tenantId: "t1" });
+  expect(getInvoiceCheckoutLink).toHaveBeenCalledWith(prisma, {
+    tenantId: "t1", invoiceId: "inv-1", customerId: "c1", invoiceNumber: "INV-2026-001", amount: expect.anything(),
   });
-  expect(result).toEqual({ id: "msg-3", paymentUrl: "https://checkout.stripe.com/pay/cs_1", provider: "stripe", expiresAt });
+  // Built-in fallback template already contains {{paymentLink}} → not appended twice.
+  const body = deliverMessage.mock.calls[0][1] as string;
+  expect(body.match(/checkout\.stripe\.com/g)).toHaveLength(1);
+  expect(deliverMessage.mock.calls[0][2]).toEqual({ templateId: null });
+  expect(result).toEqual({
+    url: "https://checkout.stripe.com/c/1", messageId: "m9", channel: "SMS",
+    id: "m9", paymentUrl: "https://checkout.stripe.com/c/1", provider: "stripe", expiresAt,
+  });
 });
 
-// ---- getInvoiceDetail --------------------------------------------------------
+it("sendPaymentLink appends the link when a custom message doesn't include it", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(sendable());
+  prepareMessage.mockResolvedValue({});
+  getInvoiceCheckoutLink.mockResolvedValue({ url: "https://pay/x", expiresAt: null });
+  deliverMessage.mockResolvedValue({ messageId: "m1", channel: "EMAIL" });
+  await createDebtService(prisma).sendPaymentLink("inv-1", { tenantId: "t1", message: "Please pay" });
+  expect(deliverMessage).toHaveBeenCalledWith({}, "Please pay\n\nhttps://pay/x", { templateId: null });
+});
 
 it("getInvoiceDetail is a function", () => {
   expect(typeof createDebtService(makePrisma()).getInvoiceDetail).toBe("function");
@@ -862,4 +959,13 @@ it("getInvoiceDetail caps recent visits at 5, newest first", async () => {
   const call = (prisma.visit.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
   expect(call.take).toBe(5);
   expect(call.orderBy).toEqual({ date: "desc" });
+});
+
+it("flagHold uses the default notify message when none is given", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", customerId: "c1" });
+  (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1" });
+  sendMessage.mockResolvedValue({ status: "sent" });
+  await createDebtService(prisma).flagHold("inv-1", true, { notify: true });
+  expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringContaining("on hold") }));
 });

@@ -3,7 +3,8 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
-import { asObject, h, requireString, requireNumber, optString, optReqString, optId } from "../lib/http";
+import { asObject, h, requireString, requireNumber, optString, optReqString, optId, optBool, parsePageParams } from "../lib/http";
+import { PhotoType } from "../generated/tenant-client";
 import {
   assertPositive,
   optPaymentMethod,
@@ -22,6 +23,7 @@ import {
   PropertyUpdateInput,
 } from "../services/customer.service";
 import { createReportsService } from "../services/reports.service";
+import { createPhotoGalleryService } from "../services/photo-gallery.service";
 
 export const propertiesRouter = Router();
 propertiesRouter.use(requireAuth);
@@ -61,6 +63,7 @@ propertiesRouter.post(
       paymentMethod: optPaymentMethod(body.paymentMethod),
       // Schedule (step 3)
       nextDueDate: optIsoDate(body.nextDueDate, "nextDueDate"),
+      lastCleanedDate: optIsoDate(body.lastCleanedDate, "lastCleanedDate"),
       // Notes (step 4)
       accessNotes: optString(body.accessNotes, "accessNotes", { maxLength: MAX_NOTES_LENGTH }),
       riskNotes: optString(body.riskNotes, "riskNotes", { maxLength: MAX_NOTES_LENGTH }),
@@ -79,7 +82,10 @@ propertiesRouter.post(
 );
 
 // ==========================================================================
-// PATCH /properties/:id — property edit + Move Round (assign/unassign)
+// PATCH /properties/:id — property edit + Move Round (assign/unassign).
+// cleaningFrequency (without roundId) uses the B3 move logic shared with
+// PATCH /service-plans/:id: 409 NO_MATCHING_ROUND (+ suggestions/proposedName)
+// unless createRoundIfMissing; response adds movedToRound.
 // ==========================================================================
 propertiesRouter.patch(
   "/:id",
@@ -95,6 +101,7 @@ propertiesRouter.patch(
       riskNotes: optString(body.riskNotes, "riskNotes", { maxLength: MAX_NOTES_LENGTH }),
       roundId: optId(body.roundId, "roundId"), // null = unassign; id = assign/reassign
       cleaningFrequency: optCleaningFrequency(body.cleaningFrequency),
+      createRoundIfMissing: optBool(body.createRoundIfMissing, "createRoundIfMissing"),
     };
     res.json(await svc(req).updateProperty(req.params.id, input));
   })
@@ -135,12 +142,38 @@ propertiesRouter.post(
 );
 
 // ==========================================================================
-// GET /properties/:id/notes — Notes & Risk (newest first)
+// GET /properties/:id/notes — Notes & Risk: pinned access/risk notes first,
+// then notes newest first
 // ==========================================================================
 propertiesRouter.get(
   "/:id/notes",
   h(async (req, res) => {
     res.json(await svc(req).getNotes(req.params.id));
+  })
+);
+
+// ==========================================================================
+// GET /properties/:id/photos?type=BEFORE|AFTER|PROPERTY&page&pageSize (B4)
+// ==========================================================================
+const PHOTO_TYPES = Object.values(PhotoType) as string[];
+propertiesRouter.get(
+  "/:id/photos",
+  h(async (req, res) => {
+    const rawType = req.query.type;
+    if (rawType !== undefined && (typeof rawType !== "string" || !PHOTO_TYPES.includes(rawType))) {
+      throw new AppError(400, `type must be one of: ${PHOTO_TYPES.join(", ")}`);
+    }
+    const { page, pageSize } = parsePageParams(req.query as Record<string, unknown>, {
+      defaultPageSize: 24,
+      maxPageSize: 100,
+    });
+    res.json(
+      await createPhotoGalleryService(req.tenantPrisma!).listPropertyPhotos(req.params.id, {
+        page,
+        pageSize,
+        type: rawType as PhotoType | undefined,
+      })
+    );
   })
 );
 

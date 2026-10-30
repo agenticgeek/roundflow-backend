@@ -1,6 +1,9 @@
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { createTodayService, type TodayRoundRow } from "./today.service";
 import { todayRange } from "../lib/dates";
+import type { KpiOperator } from "../generated/tenant-client";
+import { computeTechnicianKpis, emptyKpis, periodRange } from "./technician-kpi.service";
+import { monthPeriodKey } from "./kpi-threshold.service";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -39,16 +42,34 @@ export interface TechnicianKpi {
   valueCompleted: number;
   openComplaints: number;
   issueCount: number;
-  timeOnJobMinutes: null;
-  strikes: null;
-  damages: null;
-  upsells: null;
+  // B6: computed; null only when the period has no timed visits.
+  timeOnJobMinutes: number | null;
+  revenuePerHour: number | null;
+  strikes: number;
+  damages: number;
+  upsells: number;
+  upsellValue: number;
+}
+
+// One crossed KPI threshold this month (src/jobs/kpiThresholds.ts).
+export interface KpiThresholdAlert {
+  type: "KPI_THRESHOLD";
+  id: string;
+  technicianId: string;
+  technicianName: string | null;
+  metric: string;
+  value: number;
+  threshold: number;
+  operator: KpiOperator;
+  periodKey: string;
+  createdAt: Date;
 }
 
 export interface DashboardAlerts {
   skippedNeedingReview: number;
   failedPayments: number;
   complaintRevisitsDue: number;
+  kpiAlerts: KpiThresholdAlert[];
 }
 
 export interface DashboardKpis {
@@ -77,7 +98,7 @@ export function createDashboardService(prisma: TenantPrismaClient) {
       ] = await Promise.all([
         // Jobs scheduled for today (any non-cancelled status)
         prisma.visit.count({
-          where: { date: { gte: dayStart, lt: dayEnd } },
+          where: { date: { gte: dayStart, lt: dayEnd }, status: { not: "CANCELLED" } },
         }),
 
         // All open complaints (not resolved), bucketed by severity in SQL
@@ -149,7 +170,7 @@ export function createDashboardService(prisma: TenantPrismaClient) {
       const { start: dayStart, end: dayEnd } = todayRange();
       const weekEnd = endOfWeek();
 
-      const [skippedNeedingReview, failedPayments, complaintRevisitsDue] =
+      const [skippedNeedingReview, failedPayments, complaintRevisitsDue, kpiAlertRows] =
         await Promise.all([
           prisma.visit.count({
             where: { date: { gte: dayStart, lt: dayEnd }, status: "SKIPPED" },
@@ -165,9 +186,28 @@ export function createDashboardService(prisma: TenantPrismaClient) {
               revisitDate: { not: null, lte: weekEnd },
             },
           }),
+
+          prisma.kpiAlert.findMany({
+            where: { periodKey: monthPeriodKey(new Date()) },
+            orderBy: { createdAt: "desc" },
+            include: { technician: { select: { name: true } } },
+          }),
         ]);
 
-      return { skippedNeedingReview, failedPayments, complaintRevisitsDue };
+      const kpiAlerts: KpiThresholdAlert[] = kpiAlertRows.map((a) => ({
+        type: "KPI_THRESHOLD",
+        id: a.id,
+        technicianId: a.technicianId,
+        technicianName: a.technician.name,
+        metric: a.metric,
+        value: Number(a.value),
+        threshold: Number(a.threshold),
+        operator: a.operator,
+        periodKey: a.periodKey,
+        createdAt: a.createdAt,
+      }));
+
+      return { skippedNeedingReview, failedPayments, complaintRevisitsDue, kpiAlerts };
     },
 
     getTodaysRounds: async (): Promise<TodayRoundRow[]> => {
@@ -238,91 +278,31 @@ export function createDashboardService(prisma: TenantPrismaClient) {
     },
 
     getTechnicianKpis: async (period: "monthly" | "yearly"): Promise<TechnicianKpi[]> => {
-      const now = new Date();
-      const start =
-        period === "yearly"
-          ? new Date(Date.UTC(now.getUTCFullYear(), 0, 1))
-          : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
-      const end =
-        period === "yearly"
-          ? new Date(Date.UTC(now.getUTCFullYear() + 1, 0, 1))
-          : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
-
-      const [technicians, visitGroups, issueRows, complaintGroups] = await Promise.all([
+      const [technicians, kpis] = await Promise.all([
         prisma.technician.findMany({
           where: { active: true },
           select: { id: true, name: true },
         }),
-        // jobsCompleted / valueCompleted per technician, summed in SQL
-        prisma.visit.groupBy({
-          by: ["technicianId"],
-          where: {
-            date: { gte: start, lt: end },
-            status: "COMPLETED",
-            technicianId: { not: null },
-          },
-          _count: true,
-          _sum: { price: true },
-        }),
-        // issueCount per technician — kept as a scoped findMany (already bounded to
-        // one period's completed visits per technician, a small row count), but
-        // trimmed to drop `price` now that it's covered by the groupBy above.
-        prisma.visit.findMany({
-          where: {
-            date: { gte: start, lt: end },
-            status: "COMPLETED",
-            technicianId: { not: null },
-          },
-          select: {
-            technicianId: true,
-            issues: { select: { id: true } },
-          },
-        }),
-        prisma.complaint.groupBy({
-          by: ["technicianId"],
-          where: { status: { not: "RESOLVED" }, technicianId: { not: null } },
-          _count: true,
-        }),
+        computeTechnicianKpis(prisma, periodRange(period, new Date())),
       ]);
 
-      const statsMap = new Map<string, { jobsCompleted: number; valueCompleted: number }>();
-      for (const g of visitGroups as Array<{
-        technicianId: string | null;
-        _count: number;
-        _sum: { price: { toNumber(): number } | null };
-      }>) {
-        const tid = g.technicianId!;
-        statsMap.set(tid, {
-          jobsCompleted: g._count,
-          valueCompleted: g._sum.price?.toNumber() ?? 0,
-        });
-      }
-
-      type IssueRow = { technicianId: string | null; issues: { id: string }[] };
-      const issueMap = new Map<string, number>();
-      for (const v of issueRows as IssueRow[]) {
-        const tid = v.technicianId!;
-        issueMap.set(tid, (issueMap.get(tid) ?? 0) + v.issues.length);
-      }
-
-      const complaintMap = new Map<string, number>();
-      for (const c of complaintGroups as Array<{ technicianId: string | null; _count: number }>) {
-        const tid = c.technicianId!;
-        complaintMap.set(tid, (complaintMap.get(tid) ?? 0) + c._count);
-      }
-
-      return technicians.map((t) => ({
-        technicianId: t.id,
-        technicianName: t.name,
-        jobsCompleted: statsMap.get(t.id)?.jobsCompleted ?? 0,
-        valueCompleted: statsMap.get(t.id)?.valueCompleted ?? 0,
-        issueCount: issueMap.get(t.id) ?? 0,
-        openComplaints: complaintMap.get(t.id) ?? 0,
-        timeOnJobMinutes: null,
-        strikes: null,
-        damages: null,
-        upsells: null,
-      }));
+      return technicians.map((t) => {
+        const k = kpis.get(t.id) ?? emptyKpis();
+        return {
+          technicianId: t.id,
+          technicianName: t.name,
+          jobsCompleted: k.jobsCompleted,
+          valueCompleted: k.valueCompleted,
+          issueCount: k.issueCount,
+          openComplaints: k.openComplaints,
+          timeOnJobMinutes: k.timeOnJobMinutes,
+          revenuePerHour: k.revenuePerHour,
+          strikes: k.strikes,
+          damages: k.damages,
+          upsells: k.upsells,
+          upsellValue: k.upsellValue,
+        };
+      });
     },
   };
 }

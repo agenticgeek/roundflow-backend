@@ -137,4 +137,16 @@ describe("POST /complaints/:id/resolve", () => {
     expect(res.status).toBe(200);
     expect(resolve).toHaveBeenCalledWith("cmp1", { notes: undefined, resolvedBy: "profile-1" });
   });
+
+  it("passes upheld through", async () => {
+    resolve.mockResolvedValue({ id: "cmp1", status: "RESOLVED", customerId: "cust-2" });
+    const res = await request(makeApp()).post("/complaints/cmp1/resolve").send({ upheld: true });
+    expect(res.status).toBe(200);
+    expect(resolve).toHaveBeenCalledWith("cmp1", { notes: undefined, resolvedBy: "profile-1", upheld: true });
+  });
+
+  it("400s when upheld is not a boolean", async () => {
+    const res = await request(makeApp()).post("/complaints/cmp1/resolve").send({ upheld: "yes" });
+    expect(res.status).toBe(400);
+  });
 });

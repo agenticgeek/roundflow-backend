@@ -1,4 +1,5 @@
 import { ServiceCategory, PaymentTiming, MessageChannel, RoundStatus } from "../generated/tenant-client";
+import type { ReminderMode, CleanMethod, PaymentMethod, NoDirectDebitAction } from "../generated/tenant-client";
 import type {
   BusinessSettings,
   Service,
@@ -35,12 +36,22 @@ export interface BusinessProfileUpdateInput {
   currency?: string | null;
   defaultWorkingDays?: string[];
   bankDetails?: BankDetails | null;
+  addressLine1?: string | null;
+  addressLine2?: string | null;
+  town?: string | null;
+  postcode?: string | null;
+  vatRate?: number;
 }
 
 export interface RoundSettingsUpdateInput {
   defaultCycleLength?: number | null;
   defaultWorkingDays?: string[];
+  /** @deprecated use reminderMode/reminderTime (B2). Still stored for old clients. */
   preCleanReminderTimings?: string[];
+  reminderMode?: ReminderMode;
+  reminderTime?: string;
+  defaultCleanMethod?: CleanMethod | null;
+  autoCreateNextVisit?: boolean;
 }
 
 export interface ServiceCreateInput {
@@ -96,6 +107,9 @@ export interface PaymentRulesUpdateInput {
   debtHoldEnabled?: boolean;
   debtHoldMaxInvoices?: number | null;
   debtHoldMaxAmount?: number | null;
+  defaultPaymentMethod?: PaymentMethod | null;
+  invoiceDueDays?: number;
+  noDirectDebitAction?: NoDirectDebitAction;
 }
 
 /** ServiceArea + a derived, read-only summary of Rounds that reference it. */
@@ -183,6 +197,18 @@ type SettingsWritable = {
   stripeConnected?: boolean;
   preCleanReminderTimings?: string[];
   bankDetails?: TenantPrisma.InputJsonValue | typeof TenantPrisma.JsonNull;
+  addressLine1?: string | null;
+  addressLine2?: string | null;
+  town?: string | null;
+  postcode?: string | null;
+  vatRate?: number;
+  reminderMode?: ReminderMode;
+  reminderTime?: string;
+  defaultCleanMethod?: CleanMethod | null;
+  autoCreateNextVisit?: boolean;
+  defaultPaymentMethod?: PaymentMethod | null;
+  invoiceDueDays?: number;
+  noDirectDebitAction?: NoDirectDebitAction;
 };
 
 // ---------------------------------------------------------------------------
@@ -314,6 +340,11 @@ class SettingsService {
           : input.bankDetails === null
           ? TenantPrisma.JsonNull
           : (input.bankDetails as unknown as TenantPrisma.InputJsonValue),
+      addressLine1: input.addressLine1,
+      addressLine2: input.addressLine2,
+      town: input.town,
+      postcode: input.postcode,
+      vatRate: input.vatRate,
     });
   }
 
@@ -326,6 +357,10 @@ class SettingsService {
       defaultCycleLength: input.defaultCycleLength,
       defaultWorkingDays: input.defaultWorkingDays,
       preCleanReminderTimings: input.preCleanReminderTimings,
+      reminderMode: input.reminderMode,
+      reminderTime: input.reminderTime,
+      defaultCleanMethod: input.defaultCleanMethod,
+      autoCreateNextVisit: input.autoCreateNextVisit,
     });
   }
 
@@ -613,6 +648,9 @@ class SettingsService {
       debtHoldEnabled: input.debtHoldEnabled,
       debtHoldMaxInvoices: input.debtHoldMaxInvoices,
       debtHoldMaxAmount: input.debtHoldMaxAmount,
+      defaultPaymentMethod: input.defaultPaymentMethod,
+      invoiceDueDays: input.invoiceDueDays,
+      noDirectDebitAction: input.noDirectDebitAction,
     });
   }
 

@@ -61,7 +61,7 @@ export async function requireTenantAccess(
         include: { tenant: true },
       });
       if (!found) {
-        res.status(403).json({ error: "No profile found for this user" });
+        res.status(403).json({ error: "No profile found for this user", code: "NO_PROFILE" });
         return;
       }
       profile = found;

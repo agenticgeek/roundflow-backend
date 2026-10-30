@@ -2,13 +2,10 @@ import { Request, Router } from "express";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
-import { h, parsePageParams } from "../lib/http";
+import { h, optString, parsePageParams } from "../lib/http";
 import { optIsoDate } from "../lib/validation";
 import { createDebtService } from "../services/debt.service";
-import { decrypt } from "../lib/crypto";
-import { getStripeClient } from "../integrations/stripe/client";
-import { createOneTimeSession } from "../integrations/stripe/checkout";
-import { StripeSessionType } from "../generated/tenant-client";
+import { optOutboundChannel } from "../services/message.service";
 import { queueGhlEvent } from "../integrations/ghl/sync";
 
 export const debtRouter = Router();
@@ -17,6 +14,12 @@ debtRouter.use(requireTenantAccess);
 debtRouter.use(requireBusinessAccess());
 
 const svc = (req: Request) => createDebtService(req.tenantPrisma!);
+
+// Optional free-text override of the template body ("" = use the template).
+function optMessage(v: unknown): string | undefined {
+  const message = optString(v, "message");
+  return message?.trim() ? message : undefined;
+}
 
 // GET /debt/kpis
 debtRouter.get("/kpis", h(async (req, res) => {
@@ -52,77 +55,28 @@ debtRouter.get("/:id", h(async (req, res) => {
   return res.json(result);
 }));
 
-// POST /debt/:id/remind
+// POST /debt/:id/remind { channel?, message? }
+// 400 NO_CONTACT_FOR_CHANNEL · 409 GHL_NOT_CONNECTED · 502 GHL_SEND_FAILED
 debtRouter.post("/:id/remind", h(async (req, res) => {
-  const { channel, message } = req.body ?? {};
-  if (!channel || !message) return res.status(400).json({ error: "channel and message are required" });
-  const result = await svc(req).sendReminder(req.params.id, channel, message);
-  const invoice = await req.tenantPrisma!.invoice.findUnique({ where: { id: req.params.id }, select: { customerId: true } });
-  if (invoice?.customerId) {
-    queueGhlEvent(req.tenantPrisma!, "debt.overdue", invoice.customerId).catch(console.error);
-  }
+  const body = req.body ?? {};
+  const { customerId, ...result } = await svc(req).sendReminder(req.params.id, {
+    channel: optOutboundChannel(body.channel),
+    message: optMessage(body.message),
+  });
+  queueGhlEvent(req.tenantPrisma!, "debt.overdue", customerId).catch(console.error);
   return res.json(result);
 }));
 
-// POST /debt/:id/payment-link
-// If Stripe is connected, creates a real Stripe Checkout Session and returns
-// the hosted URL. Falls back to the static pay.roundflow.app link otherwise.
+// POST /debt/:id/payment-link { channel?, message? } → { url, messageId, channel, ... }
+// 409 STRIPE_NOT_CONNECTED · 409 GHL_NOT_CONNECTED · 409 INVOICE_NOT_PAYABLE
+// 400 NO_CONTACT_FOR_CHANNEL · 502 GHL_SEND_FAILED
 debtRouter.post("/:id/payment-link", h(async (req, res) => {
-  const { message } = req.body ?? {};
-  if (!message) return res.status(400).json({ error: "message is required" });
-
-  // Try Stripe checkout first
-  const bs = await req.tenantPrisma!.businessSettings.findFirst({
-    select: { stripeConnected: true, stripeSecretKeyEncrypted: true },
+  const body = req.body ?? {};
+  const result = await svc(req).sendPaymentLink(req.params.id, {
+    tenantId: req.profile!.tenantId,
+    channel: optOutboundChannel(body.channel),
+    message: optMessage(body.message),
   });
-  if (bs?.stripeConnected && bs.stripeSecretKeyEncrypted) {
-    const invoice = await req.tenantPrisma!.invoice.findUnique({ where: { id: req.params.id } });
-    if (invoice && invoice.status !== "PAID" && invoice.status !== "VOID") {
-      const existing = await req.tenantPrisma!.stripeSession.findFirst({
-        where: { invoiceId: invoice.id, status: "PENDING" },
-      });
-      let checkoutUrl: string;
-      let checkoutExpiresAt: Date | null;
-      if (existing) {
-        checkoutUrl = existing.url;
-        checkoutExpiresAt = existing.expiresAt;
-      } else {
-        const stripe = getStripeClient(decrypt(bs.stripeSecretKeyEncrypted!));
-        const FRONTEND = process.env.FRONTEND_URL?.split(",")[0].trim() ?? "";
-        const result = await createOneTimeSession(stripe, req.tenantPrisma!, {
-          tenantId: req.profile!.tenantId,
-          customerId: invoice.customerId,
-          invoiceId: invoice.id,
-          invoiceNumber: invoice.invoiceNumber,
-          amountPence: Math.round(Number(invoice.amount) * 100),
-          successUrl: `${FRONTEND}/invoices/${invoice.id}?payment=success`,
-          cancelUrl:  `${FRONTEND}/invoices/${invoice.id}?payment=cancelled`,
-        });
-        await req.tenantPrisma!.stripeSession.create({
-          data: {
-            stripeSessionId: result.stripeSessionId,
-            type: StripeSessionType.ONE_TIME,
-            customerId: invoice.customerId,
-            invoiceId: invoice.id,
-            amountTotal: invoice.amount,
-            currency: "gbp",
-            url: result.url,
-            expiresAt: result.expiresAt,
-          },
-        });
-        checkoutUrl = result.url;
-        checkoutExpiresAt = result.expiresAt;
-      }
-      const result = await svc(req).sendPaymentLink(req.params.id, message, {
-        overrideUrl: checkoutUrl,
-        provider: "stripe",
-        expiresAt: checkoutExpiresAt,
-      });
-      return res.json(result);
-    }
-  }
-
-  const result = await svc(req).sendPaymentLink(req.params.id, message, { provider: "static" });
   return res.json(result);
 }));
 

@@ -20,8 +20,21 @@ import {
   requireNumber,
   optString,
   optId,
+  optBool,
   optStringArray,
 } from "../lib/http";
+import { toBusinessSettingsDto } from "../lib/settings-dto";
+import { rowError } from "../lib/row-error";
+import {
+  optReminderMode,
+  optReminderTime,
+  optCleanMethod,
+  optPaymentMethod,
+  optNoDirectDebitAction,
+  optVatRate,
+  optInvoiceDueDays,
+  rejectRemovedFields,
+} from "../lib/settings-validators";
 import {
   createSetupService,
   BusinessProfileInput,
@@ -33,6 +46,7 @@ import {
   FirstRoundInput,
   SetupPropertyInput,
   BulkSetupPropertyResult,
+  SetupPropertyRowError,
   RoundTechnicianAssignment,
   ActivationInput,
 } from "../services/setup.service";
@@ -71,7 +85,7 @@ setupRouter.get(
 setupRouter.get(
   "/step/1",
   h(async (req, res) => {
-    res.json(await svc(req).getBusinessSettings());
+    res.json(toBusinessSettingsDto(await svc(req).getBusinessSettings()));
   })
 );
 setupRouter.post(
@@ -112,20 +126,26 @@ setupRouter.post(
       timezone: body.timezone as string | undefined,
       currency: body.currency as string | undefined,
       bankDetails,
+      addressLine1: optString(body.addressLine1, "addressLine1", { maxLength: MAX_ADDRESS_LENGTH }),
+      addressLine2: optString(body.addressLine2, "addressLine2", { maxLength: MAX_ADDRESS_LENGTH }),
+      town: optString(body.town, "town", { maxLength: MAX_ADDRESS_LENGTH }),
+      postcode: optString(body.postcode, "postcode", { maxLength: MAX_ADDRESS_LENGTH }),
+      vatRate: optVatRate(body.vatRate),
     };
-    res.json(await svc(req).saveBusinessProfile(input));
+    res.json(toBusinessSettingsDto(await svc(req).saveBusinessProfile(input)));
   })
 );
 
 // ---- Step 2: Payment Setup -----------------------------------------------
-// Real step (not a stub). Persists payment rules + VAT/debt-hold toggles to the
-// BusinessSettings singleton. Connect toggles (gocardless/stripe) are Phase-1
-// booleans — no real OAuth yet.
+// Persists payment rules, VAT/debt-hold toggles and payment defaults to the
+// BusinessSettings singleton. Provider connection happens through the real
+// connect flows under /settings (A6), so the old gocardlessConnected /
+// stripeConnected booleans are rejected with 400 FIELD_REMOVED.
 
 setupRouter.get(
   "/step/2",
   h(async (req, res) => {
-    res.json(await svc(req).getPaymentSetup());
+    res.json(toBusinessSettingsDto(await svc(req).getPaymentSetup()));
   })
 );
 setupRouter.post(
@@ -133,6 +153,7 @@ setupRouter.post(
   h(async (req, res) => {
     await svc(req).assertSetupIncomplete();
     const body = asObject(req.body);
+    rejectRemovedFields(body, ["gocardlessConnected", "stripeConnected"]);
 
     let paymentRule: PaymentTiming | undefined;
     if (body.paymentRule != null) {
@@ -148,12 +169,11 @@ setupRouter.post(
         typeof body.debtHoldEnabled === "boolean" ? body.debtHoldEnabled : undefined,
       vatInInvoices:
         typeof body.vatInInvoices === "boolean" ? body.vatInInvoices : undefined,
-      gocardlessConnected:
-        typeof body.gocardlessConnected === "boolean" ? body.gocardlessConnected : undefined,
-      stripeConnected:
-        typeof body.stripeConnected === "boolean" ? body.stripeConnected : undefined,
+      defaultPaymentMethod: optPaymentMethod(body.defaultPaymentMethod, "defaultPaymentMethod"),
+      invoiceDueDays: optInvoiceDueDays(body.invoiceDueDays),
+      noDirectDebitAction: optNoDirectDebitAction(body.noDirectDebitAction),
     };
-    res.json(await svc(req).savePaymentSetup(input));
+    res.json(toBusinessSettingsDto(await svc(req).savePaymentSetup(input)));
   })
 );
 
@@ -191,8 +211,9 @@ setupRouter.get(
   "/step/4",
   h(async (req, res) => {
     // Same BusinessSettings singleton as step 1; the frontend reads the
-    // round-settings fields (defaultCycleLength / defaultWorkingDays) from it.
-    res.json(await svc(req).getBusinessSettings());
+    // round-settings fields (defaultCycleLength / defaultWorkingDays /
+    // reminderMode / reminderTime / defaultCleanMethod / autoCreateNextVisit) from it.
+    res.json(toBusinessSettingsDto(await svc(req).getBusinessSettings()));
   })
 );
 setupRouter.post(
@@ -208,8 +229,12 @@ setupRouter.post(
       defaultWorkingDays: Array.isArray(body.defaultWorkingDays)
         ? validateWorkingDays(body.defaultWorkingDays)
         : undefined,
+      reminderMode: optReminderMode(body.reminderMode),
+      reminderTime: optReminderTime(body.reminderTime),
+      defaultCleanMethod: optCleanMethod(body.defaultCleanMethod),
+      autoCreateNextVisit: optBool(body.autoCreateNextVisit, "autoCreateNextVisit"),
     };
-    res.json(await svc(req).saveRoundSettings(input));
+    res.json(toBusinessSettingsDto(await svc(req).saveRoundSettings(input)));
   })
 );
 
@@ -232,7 +257,9 @@ setupRouter.post(
       body: requireString(t.body, "body"),
       subject: optString(t.subject, "subject"),
     }));
-    res.json(await settingsSvc(req).replaceTemplates(templates));
+    const saved = await settingsSvc(req).replaceTemplates(templates);
+    await svc(req).markStepComplete(5);
+    res.json(saved);
   })
 );
 
@@ -344,6 +371,8 @@ setupRouter.post(
       // L-1: roundId is required so the property counts toward step 9 completion.
       // A property with no round cannot be scheduled and would leave step 9 stuck.
       roundId: requireString(body.roundId, "roundId"),
+      customerId: optId(body.customerId, "customerId") ?? null,
+      lastCleanedDate: optString(body.lastCleanedDate, "lastCleanedDate") ?? null,
     };
 
     res.status(201).json(await svc(req).addSetupProperty(input));
@@ -379,7 +408,8 @@ function parseBulkRow(body: Record<string, unknown>): SetupPropertyInput {
   return {
     customerName: need("customerName", () => requireString(body.customerName, "customerName", { maxLength: MAX_NAME_LENGTH })),
     propertyName: need("propertyName", () => optString(body.propertyName, "propertyName", { maxLength: MAX_NAME_LENGTH }) ?? null),
-    phone: need("phone", () => optString(body.phone, "phone") ?? null),
+    // GAP-009: imported rows must carry a phone (the reminder/message channel).
+    phone: need("phone", () => requireString(body.phone, "phone")),
     landline: need("landline", () => optString(body.landline, "landline") ?? null),
     email: need("email", () => optString(body.email, "email") ?? null),
     fullAddress: need("fullAddress", () => requireString(body.fullAddress, "fullAddress", { maxLength: MAX_ADDRESS_LENGTH })),
@@ -394,6 +424,8 @@ function parseBulkRow(body: Record<string, unknown>): SetupPropertyInput {
     accessNotes: need("accessNotes", () => optString(body.accessNotes, "accessNotes", { maxLength: MAX_NOTES_LENGTH }) ?? null),
     riskNotes: need("riskNotes", () => optString(body.riskNotes, "riskNotes", { maxLength: MAX_NOTES_LENGTH }) ?? null),
     roundId: need("roundId", () => requireString(body.roundId, "roundId")),
+    customerId: need("customerId", () => optId(body.customerId, "customerId") ?? null),
+    lastCleanedDate: need("lastCleanedDate", () => optString(body.lastCleanedDate, "lastCleanedDate") ?? null),
   };
 }
 
@@ -405,9 +437,10 @@ setupRouter.post(
     const body = asObject(req.body);
     const rows = asArray<Record<string, unknown>>(body.properties, "properties");
     const idempotencyKey = optString(body.idempotencyKey, "idempotencyKey") ?? undefined;
+    const allowFrequencyMismatch = optBool(body.allowFrequencyMismatch, "allowFrequencyMismatch") ?? false;
 
     // originalIndexes[i] = the row's position in `rows`, for inputs[i].
-    const errors: { row: number; field: string; message: string }[] = [];
+    const errors: SetupPropertyRowError[] = [];
     const inputs: SetupPropertyInput[] = [];
     const originalIndexes: number[] = [];
     rows.forEach((row, i) => {
@@ -418,13 +451,13 @@ setupRouter.post(
         // parseBulkRow() wraps every field parser through need(), which only
         // ever throws RowFieldError — this always has a real field name.
         const e = err as RowFieldError;
-        errors.push({ row: i, field: e.field, message: e.message });
+        errors.push(rowError(i, e.field, e.message));
       }
     });
 
     const serviceResult: BulkSetupPropertyResult =
       inputs.length > 0
-        ? await svc(req).bulkAddSetupProperties(inputs, idempotencyKey)
+        ? await svc(req).bulkAddSetupProperties(inputs, idempotencyKey, { allowFrequencyMismatch })
         : { created: 0, failed: 0, results: [], errors: [] };
 
     // Remap service-level errors (indexed into `inputs`) back to the
@@ -484,6 +517,21 @@ setupRouter.get(
   "/step/11",
   h(async (req, res) => {
     res.json(await svc(req).getActivationStatus());
+  })
+);
+
+// GET /setup/step/11/preview?startDate=YYYY-MM-DD&cycleWeeks=4 — what POST
+// /setup/step/11 would generate (same function), per ACTIVE round.
+setupRouter.get(
+  "/step/11/preview",
+  h(async (req, res) => {
+    const startDate = requireString(req.query.startDate, "startDate");
+    const cycleWeeksRaw = requireString(req.query.cycleWeeks, "cycleWeeks");
+    const cycleWeeks = Number(cycleWeeksRaw);
+    if (!Number.isInteger(cycleWeeks)) {
+      throw new AppError(400, "cycleWeeks must be an integer between 1 and 52");
+    }
+    res.json(await svc(req).previewActivation({ startDate, cycleWeeks }));
   })
 );
 setupRouter.post(

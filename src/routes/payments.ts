@@ -3,12 +3,14 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
-import { h, asObject, requireString } from "../lib/http";
+import { h, asObject, requireString, parsePageParams } from "../lib/http";
+import { parseOptionalDateOnly } from "../lib/validation";
+import { toCsv } from "../lib/csv";
 import { decrypt } from "../lib/crypto";
 import { getStripeClient } from "../integrations/stripe/client";
 import { createOneTimeSession, createSetupSession } from "../integrations/stripe/checkout";
 import { StripeSessionType, PaymentMethod, PaymentStatus } from "../generated/tenant-client";
-import { createPaymentService } from "../services/payment.service";
+import { createPaymentService, PaymentListFilters } from "../services/payment.service";
 export const paymentsRouter = Router();
 paymentsRouter.use(requireAuth);
 paymentsRouter.use(requireTenantAccess);
@@ -84,6 +86,48 @@ paymentsRouter.post(
     });
 
     return res.status(201).json({ url: session.url, sessionId: session.id });
+  })
+);
+
+function parsePaymentFilters(query: Record<string, unknown>): PaymentListFilters {
+  const { status, method } = query;
+  if (status !== undefined && !(Object.values(PaymentStatus) as unknown[]).includes(status)) {
+    throw new AppError(400, `status must be one of: ${Object.values(PaymentStatus).join(", ")}`);
+  }
+  if (method !== undefined && !(Object.values(PaymentMethod) as unknown[]).includes(method)) {
+    throw new AppError(400, `method must be one of: ${Object.values(PaymentMethod).join(", ")}`);
+  }
+  return {
+    status: status as PaymentStatus | undefined,
+    method: method as PaymentMethod | undefined,
+    from: parseOptionalDateOnly(query.from, "from"),
+    to: parseOptionalDateOnly(query.to, "to"),
+  };
+}
+
+// GET /payments?status&method&from&to&page&pageSize (GAP-028)
+// → { rows: [{ id, customer: { id, name }, amount, method, status, paidAt,
+//      createdAt, visitId, visitDate, invoiceId, invoiceNumber }], pagination }
+paymentsRouter.get(
+  "/",
+  h(async (req, res) => {
+    const query = req.query as Record<string, unknown>;
+    const filters = parsePaymentFilters(query);
+    const { page, pageSize } = parsePageParams(query, { defaultPageSize: 50, maxPageSize: 100 });
+    const result = await createPaymentService(req.tenantPrisma!).listPayments(filters, page, pageSize);
+    return res.json(result);
+  })
+);
+
+// GET /payments/export.csv?status&method&from&to — every matching row, text/csv.
+paymentsRouter.get(
+  "/export.csv",
+  h(async (req, res) => {
+    const filters = parsePaymentFilters(req.query as Record<string, unknown>);
+    const rows = await createPaymentService(req.tenantPrisma!).exportPayments(filters);
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="payments.csv"`);
+    return res.send(toCsv(rows));
   })
 );
 

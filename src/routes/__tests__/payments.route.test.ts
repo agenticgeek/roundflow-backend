@@ -35,6 +35,10 @@ vi.mock("../../integrations/stripe/checkout", () => ({
   createSetupSession: (...args: unknown[]) => createSetupSession(...args),
 }));
 
+vi.mock("../../services/payment-hold", () => ({
+  releaseHoldIfSettled: vi.fn().mockResolvedValue(false),
+}));
+
 import { paymentsRouter } from "../payments";
 
 function makeTenantPrisma() {
@@ -43,7 +47,12 @@ function makeTenantPrisma() {
     invoice: { findUnique: vi.fn(), updateMany: vi.fn().mockResolvedValue({}) },
     stripeSession: { findFirst: vi.fn(), create: vi.fn() },
     customer: { findUniqueOrThrow: vi.fn(), findUnique: vi.fn() },
-    payment: { findUnique: vi.fn(), update: vi.fn().mockResolvedValue({}) },
+    payment: {
+      findUnique: vi.fn(),
+      update: vi.fn().mockResolvedValue({}),
+      count: vi.fn().mockResolvedValue(0),
+      findMany: vi.fn().mockResolvedValue([]),
+    },
   };
 }
 
@@ -295,7 +304,7 @@ describe("PATCH /payments/:id/status", () => {
     });
     expect(tp.invoice.updateMany).toHaveBeenCalledWith({
       where: { visitId: "visit-1", status: { not: "PAID" } },
-      data: { status: "PAID" },
+      data: { status: "PAID", paidAt: expect.any(Date) },
     });
     expect(queueGhlEvent).toHaveBeenCalledWith(tp, "payment.collected", "cust-1");
   });
@@ -314,5 +323,71 @@ describe("PATCH /payments/:id/status", () => {
     });
     expect(tp.invoice.updateMany).not.toHaveBeenCalled();
     expect(queueGhlEvent).toHaveBeenCalledWith(tp, "payment.failed", "cust-2");
+  });
+});
+
+describe("GET /payments and /payments/export.csv (GAP-028)", () => {
+  const paymentRow = {
+    id: "pay-1",
+    customer: { id: "c1", name: "Jo" },
+    amount: { toNumber: () => 33 },
+    method: "BACS",
+    status: "PAID",
+    paidAt: new Date("2026-10-30T00:00:00Z"),
+    createdAt: new Date("2026-10-29T00:00:00Z"),
+    visitId: "v1",
+    visit: { date: new Date("2026-10-28T00:00:00Z"), invoice: { id: "inv-1", invoiceNumber: "INV-1" } },
+  };
+
+  it("lists payments with filters and pagination", async () => {
+    const tp = makeTenantPrisma();
+    tp.payment.count.mockResolvedValue(1);
+    tp.payment.findMany.mockResolvedValue([paymentRow, { ...paymentRow, id: "pay-2", visitId: null, visit: null }]);
+    const res = await request(makeApp(tp)).get("/payments?status=PAID&method=BACS&from=2026-10-01&to=2026-10-31&page=1&pageSize=20");
+    expect(res.status).toBe(200);
+    expect(tp.payment.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: {
+        status: "PAID",
+        method: "BACS",
+        createdAt: { gte: new Date("2026-10-01T00:00:00Z"), lt: new Date("2026-11-01T00:00:00Z") },
+      },
+      take: 20,
+      skip: 0,
+      orderBy: { createdAt: "desc" },
+    }));
+    expect(res.body.pagination).toEqual({ page: 1, pageSize: 20, total: 1, totalPages: 1 });
+    expect(res.body.rows[0]).toMatchObject({
+      id: "pay-1", customer: { id: "c1", name: "Jo" }, amount: 33, method: "BACS", status: "PAID",
+      visitId: "v1", invoiceId: "inv-1", invoiceNumber: "INV-1",
+    });
+    expect(res.body.rows[1]).toMatchObject({ visitDate: null, invoiceId: null, invoiceNumber: null });
+  });
+
+  it("supports one-sided date ranges and no filters", async () => {
+    const tp = makeTenantPrisma();
+    await request(makeApp(tp)).get("/payments?from=2026-10-01");
+    expect(tp.payment.findMany.mock.calls[0][0].where).toEqual({ createdAt: { gte: new Date("2026-10-01T00:00:00Z") } });
+    await request(makeApp(tp)).get("/payments?to=2026-10-01");
+    expect(tp.payment.findMany.mock.calls[1][0].where).toEqual({ createdAt: { lt: new Date("2026-10-02T00:00:00Z") } });
+    await request(makeApp(tp)).get("/payments");
+    expect(tp.payment.findMany.mock.calls[2][0].where).toEqual({});
+  });
+
+  it("400s on an unknown status or method", async () => {
+    const tp = makeTenantPrisma();
+    expect((await request(makeApp(tp)).get("/payments?status=LOST")).status).toBe(400);
+    expect((await request(makeApp(tp)).get("/payments?method=PAYPAL")).status).toBe(400);
+    expect(tp.payment.findMany).not.toHaveBeenCalled();
+  });
+
+  it("exports CSV with every matching row", async () => {
+    const tp = makeTenantPrisma();
+    tp.payment.findMany.mockResolvedValue([paymentRow]);
+    const res = await request(makeApp(tp)).get("/payments/export.csv?method=BACS");
+    expect(res.status).toBe(200);
+    expect(res.headers["content-type"]).toContain("text/csv");
+    expect(res.headers["content-disposition"]).toContain("payments.csv");
+    expect(res.text.split("\n")[0]).toBe("id,customerId,customerName,amount,method,status,paidAt,createdAt,visitDate,invoiceNumber");
+    expect(res.text).toContain("pay-1,c1,Jo,33.00,BACS,PAID");
   });
 });

@@ -24,6 +24,11 @@ vi.mock("../../services/payment.service", () => ({
   computeBalanceOwed: (...args: unknown[]) => computeBalanceOwed(...args),
 }));
 
+const messageSend = vi.fn().mockResolvedValue({ status: "sent", messageId: "m1", channel: "SMS" });
+vi.mock("../../services/message.service", () => ({
+  createMessageService: () => ({ send: (...args: unknown[]) => messageSend(...args) }),
+}));
+
 import { runOutboxWorker } from "../outboxWorker";
 
 type Row = { id: string; eventType: string; payload: unknown; attempts: number };
@@ -34,9 +39,15 @@ function makeTp(rows: Row[]) {
       findMany: vi.fn().mockResolvedValue(rows),
       update: vi.fn().mockResolvedValue({}),
     },
-    visit: { findUnique: vi.fn().mockResolvedValue(null) },
+    visit: { findUnique: vi.fn().mockResolvedValue(null) as ReturnType<typeof vi.fn> },
+    customer: { findUnique: vi.fn().mockResolvedValue({ messagesOptOut: false }) },
+    businessSettings: { findFirst: vi.fn().mockResolvedValue({ businessName: "Shine Ltd" }) },
+    messageTemplate: { findFirst: vi.fn().mockResolvedValue(null) },
   };
 }
+
+type Tp = ReturnType<typeof makeTp>;
+const SENT = { status: "sent", processedAt: expect.any(Date) };
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -261,6 +272,137 @@ describe("runOutboxWorker", () => {
       expect.any(Error)
     );
     errorSpy.mockRestore();
+  });
+
+  describe("message.send (pre-clean reminders)", () => {
+    const payload = {
+      customerId: "cust-1", visitId: "visit-1", channel: "SMS", body: "Hi Jo", templateId: "tpl-1", reason: "PRE_CLEAN_REMINDER",
+    };
+    const run = async (p: Record<string, unknown>, setup?: (tp: Tp) => void) => {
+      tenantFindMany.mockResolvedValue([{ schemaName: "t_1" }]);
+      const tp = makeTp([{ id: "row-1", eventType: "message.send", payload: p, attempts: 0 }]);
+      tp.visit.findUnique.mockResolvedValue({ status: "SCHEDULED" });
+      setup?.(tp);
+      getTenantPrismaForSchema.mockReturnValue(tp);
+      await runOutboxWorker();
+      return tp;
+    };
+
+    it("sends the pre-rendered body via the message service and marks the row sent", async () => {
+      const tp = await run(payload);
+      expect(tp.customer.findUnique).toHaveBeenCalledWith({ where: { id: "cust-1" }, select: { messagesOptOut: true } });
+      expect(tp.visit.findUnique).toHaveBeenCalledWith({ where: { id: "visit-1" }, select: { status: true } });
+      expect(messageSend).toHaveBeenCalledWith({ customerId: "cust-1", channel: "SMS", body: "Hi Jo", templateId: "tpl-1" });
+      expect(tp.integrationOutbox.update).toHaveBeenCalledWith({ where: { id: "row-1" }, data: SENT });
+    });
+
+    it("sends without a visit check or template when the payload has neither", async () => {
+      const tp = await run({ customerId: "cust-1", body: "Hi" });
+      expect(tp.visit.findUnique).not.toHaveBeenCalled();
+      expect(messageSend).toHaveBeenCalledWith({ customerId: "cust-1", channel: undefined, body: "Hi", templateId: null });
+    });
+
+    it.each([
+      ["the customer opted out", (tp: Tp) => tp.customer.findUnique.mockResolvedValue({ messagesOptOut: true })],
+      ["the customer no longer exists", (tp: Tp) => tp.customer.findUnique.mockResolvedValue(null)],
+      ["the visit is no longer scheduled", (tp: Tp) => tp.visit.findUnique.mockResolvedValue({ status: "CANCELLED" })],
+      ["the visit was deleted", (tp: Tp) => tp.visit.findUnique.mockResolvedValue(null)],
+    ])("skips (marks sent, no send) when %s", async (_label, setup) => {
+      const tp = await run(payload, setup);
+      expect(messageSend).not.toHaveBeenCalled();
+      expect(tp.integrationOutbox.update).toHaveBeenCalledWith({ where: { id: "row-1" }, data: SENT });
+    });
+
+    it("retries when the body is missing or the send fails", async () => {
+      let tp = await run({ customerId: "cust-1" });
+      expect(tp.integrationOutbox.update).toHaveBeenCalledWith({
+        where: { id: "row-1" },
+        data: { attempts: 1, lastError: expect.stringContaining("payload missing body"), status: "pending" },
+      });
+      messageSend.mockRejectedValueOnce(new Error("GHL down"));
+      tp = await run(payload);
+      expect(tp.integrationOutbox.update).toHaveBeenCalledWith({
+        where: { id: "row-1" },
+        data: { attempts: 1, lastError: expect.stringContaining("GHL down"), status: "pending" },
+      });
+    });
+  });
+
+  describe("message.visit_completed", () => {
+    const visit = {
+      completedAt: new Date("2026-10-30T10:00:00Z") as Date | null,
+      date: new Date("2026-10-29T00:00:00Z"),
+      property: { addressLine: "1 High St", customer: { name: "Jo Bloggs" } },
+      round: { name: "Monday" } as { name: string } | null,
+      technician: { name: "Alex" } as { name: string } | null,
+    };
+    const run = async (p: Record<string, unknown>, setup?: (tp: Tp) => void) => {
+      tenantFindMany.mockResolvedValue([{ schemaName: "t_1" }]);
+      const tp = makeTp([{ id: "row-1", eventType: "message.visit_completed", payload: p, attempts: 0 }]);
+      tp.visit.findUnique.mockResolvedValue(visit);
+      setup?.(tp);
+      getTenantPrismaForSchema.mockReturnValue(tp);
+      await runOutboxWorker();
+      return tp;
+    };
+
+    it("renders the tenant template and sends it", async () => {
+      const tp = await run({ customerId: "cust-1", visitId: "visit-1", template: "Visit completed" }, (t) =>
+        t.messageTemplate.findFirst.mockResolvedValue({
+          id: "tpl-9",
+          body: "Hi [Customer Name] ({{firstName}}), {{address}} done {{date}} by {{technicianName}} on {{roundName}} - {{businessName}}",
+        })
+      );
+      expect(tp.messageTemplate.findFirst).toHaveBeenCalledWith({
+        where: { name: { equals: "Visit completed", mode: "insensitive" } },
+        select: { id: true, body: true },
+      });
+      expect(messageSend).toHaveBeenCalledWith({
+        customerId: "cust-1",
+        body: "Hi Jo Bloggs (Jo), 1 High St done 2026-10-30 by Alex on Monday - Shine Ltd",
+        templateId: "tpl-9",
+      });
+      expect(tp.integrationOutbox.update).toHaveBeenCalledWith({ where: { id: "row-1" }, data: SENT });
+    });
+
+    it("falls back to the built-in body, visit date and blanks when template/round/technician/settings are missing", async () => {
+      await run({ customerId: "cust-1", visitId: "visit-1" }, (t) => {
+        t.visit.findUnique.mockResolvedValue({ ...visit, completedAt: null, round: null, technician: null });
+        t.businessSettings.findFirst.mockResolvedValue(null);
+        t.messageTemplate.findFirst.mockResolvedValue({ id: "tpl-2", body: "{{date}}|{{roundName}}|{{technicianName}}|{{businessName}}" });
+      });
+      expect(messageSend).toHaveBeenCalledWith({ customerId: "cust-1", body: "2026-10-29|||", templateId: "tpl-2" });
+    });
+
+    it("uses the built-in fallback body when the tenant has no template", async () => {
+      await run({ customerId: "cust-1", visitId: "visit-1" });
+      expect(messageSend).toHaveBeenCalledWith({
+        customerId: "cust-1",
+        body: "Hi Jo, your window clean at 1 High St was completed today. Thank you, Shine Ltd.",
+        templateId: null,
+      });
+    });
+
+    it("skips an opted-out customer", async () => {
+      const tp = await run({ customerId: "cust-1", visitId: "visit-1" }, (t) =>
+        t.customer.findUnique.mockResolvedValue({ messagesOptOut: true })
+      );
+      expect(tp.visit.findUnique).not.toHaveBeenCalled();
+      expect(messageSend).not.toHaveBeenCalled();
+      expect(tp.integrationOutbox.update).toHaveBeenCalledWith({ where: { id: "row-1" }, data: SENT });
+    });
+
+    it.each([
+      [{ customerId: "cust-1" }, undefined],
+      [{ customerId: "cust-1", visitId: "gone" }, (t: Tp) => t.visit.findUnique.mockResolvedValue(null)],
+    ])("retries when the visit is missing (%j)", async (p, setup) => {
+      const tp = await run(p, setup);
+      expect(messageSend).not.toHaveBeenCalled();
+      expect(tp.integrationOutbox.update).toHaveBeenCalledWith({
+        where: { id: "row-1" },
+        data: { attempts: 1, lastError: expect.stringContaining("payload visit not found"), status: "pending" },
+      });
+    });
   });
 
   it("processes multiple GHL-connected tenants independently", async () => {

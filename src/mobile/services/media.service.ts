@@ -17,12 +17,13 @@ class MediaService {
   }
 
   async addVisitPhoto(visitId: string, url: string, photoType: "BEFORE" | "AFTER"): Promise<void> {
-    const visit = await this.prisma.visit.findUnique({ where: { id: visitId }, select: { id: true } });
+    const visit = await this.prisma.visit.findUnique({ where: { id: visitId }, select: { id: true, propertyId: true } });
     if (!visit) throw new AppError(404, "Visit not found");
-    await this.prisma.photo.create({ data: { visitId, url, type: photoType } });
+    // propertyId lets the admin property gallery find the photo (B4).
+    await this.prisma.photo.create({ data: { visitId, propertyId: visit.propertyId, url, type: photoType } });
   }
 
-  async getPhotoUploadUrl(visitId: string, photoType: "BEFORE" | "AFTER", mimeType: string, tenantId: string): Promise<{ signedUrl: string; path: string }> {
+  async getPhotoUploadUrl(visitId: string, photoType: "BEFORE" | "AFTER" | "ACCESS_ISSUE", mimeType: string, tenantId: string): Promise<{ signedUrl: string; path: string }> {
     const visit = await this.prisma.visit.findUnique({ where: { id: visitId }, select: { id: true } });
     if (!visit) throw new AppError(404, "Visit not found");
     const path = buildVisitPhotoPath(tenantId, visitId, photoType, mimeType);

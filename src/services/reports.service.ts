@@ -1,7 +1,8 @@
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { prisma as publicPrisma } from "../lib/prisma";
 
-type Period = "today" | "last7" | "last30";
+// Unknown values fall back to last30 (the frontend handoff documents this).
+type Period = "today" | "last7" | "last30" | "last90" | "thisMonth" | "lastMonth" | "thisYear";
 
 export interface Pagination {
   page: number;
@@ -15,14 +16,37 @@ export interface PaginatedResult<T> {
   pagination: Pagination;
 }
 
-function periodRange(period: Period): { gte: Date; lte: Date } {
-  const now = new Date();
-  const lte = now;
+export function periodRange(period: Period, now: Date = new Date()): { gte: Date; lte: Date } {
   const gte = new Date(now);
-  if (period === "today") gte.setHours(0, 0, 0, 0);
-  else if (period === "last7") gte.setDate(gte.getDate() - 7);
-  else gte.setDate(gte.getDate() - 30);
-  return { gte, lte };
+  switch (period) {
+    case "today":
+      gte.setHours(0, 0, 0, 0);
+      return { gte, lte: now };
+    case "last7":
+      gte.setDate(gte.getDate() - 7);
+      return { gte, lte: now };
+    case "last90":
+      gte.setDate(gte.getDate() - 90);
+      return { gte, lte: now };
+    case "thisMonth":
+      return { gte: new Date(now.getFullYear(), now.getMonth(), 1), lte: now };
+    case "lastMonth":
+      return {
+        gte: new Date(now.getFullYear(), now.getMonth() - 1, 1),
+        lte: new Date(new Date(now.getFullYear(), now.getMonth(), 1).getTime() - 1),
+      };
+    case "thisYear":
+      return { gte: new Date(now.getFullYear(), 0, 1), lte: now };
+    default:
+      gte.setDate(gte.getDate() - 30);
+      return { gte, lte: now };
+  }
+}
+
+// A4: CANCELLED visits (paused plans etc.) never count in reports unless the
+// caller explicitly filters for them.
+function visitStatusWhere(status?: string) {
+  return status ? status : { not: "CANCELLED" };
 }
 
 function paginate(page: number | undefined, pageSize: number | undefined): { pageNum: number; pageSizeNum: number; skip: number } {
@@ -54,7 +78,7 @@ async function buildTechnicianRows(prisma: TenantPrismaClient, period: Period): 
   // with counts/sum computed in SQL instead of a full-row findMany + JS reduce.
   const groups = await prisma.visit.groupBy({
     by: ["technicianId", "status"],
-    where: { date: range, technicianId: { not: null } },
+    where: { date: range, technicianId: { not: null }, status: { not: "CANCELLED" } },
     _count: true,
     _sum: { price: true },
   });
@@ -169,8 +193,7 @@ export function createReportsService(prisma: TenantPrismaClient) {
     ): Promise<PaginatedResult<{ visitId: string; date: Date; property: string; postcode: string | null; round: string | null; technician: string | null; status: string; amount: number }>> => {
       const { pageNum, pageSizeNum, skip } = paginate(page, pageSize);
       const range = periodRange(period as Period);
-      const where: Record<string, unknown> = { date: range };
-      if (status) where.status = status;
+      const where: Record<string, unknown> = { date: range, status: visitStatusWhere(status) };
       const [total, visits] = await Promise.all([
         prisma.visit.count({ where }),
         prisma.visit.findMany({
@@ -204,8 +227,7 @@ export function createReportsService(prisma: TenantPrismaClient) {
     // which must export everything, not just the UI's current page.
     getVisitsExport: async (period: string, status?: string) => {
       const range = periodRange(period as Period);
-      const where: Record<string, unknown> = { date: range };
-      if (status) where.status = status;
+      const where: Record<string, unknown> = { date: range, status: visitStatusWhere(status) };
       const visits = await prisma.visit.findMany({
         where,
         select: {

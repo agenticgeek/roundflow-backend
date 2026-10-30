@@ -1,14 +1,19 @@
 import { it, expect, vi } from "vitest";
 
 vi.mock("../../lib/email", () => ({}));
+vi.mock("../message.service", () => ({ createMessageService: vi.fn() }));
 import { createInvoiceService } from "../invoice.service";
 
 function makePrisma() {
-  return {
+  const prisma = {
     invoice: { findMany: vi.fn(), findUnique: vi.fn(), create: vi.fn(), update: vi.fn() },
     visit: { findUnique: vi.fn() },
     businessSettings: { findFirst: vi.fn() },
+    $executeRaw: vi.fn(),
+    $transaction: vi.fn(),
   } as unknown as Parameters<typeof createInvoiceService>[0];
+  (prisma.$transaction as unknown as ReturnType<typeof vi.fn>).mockImplementation((fn: (tx: unknown) => unknown) => fn(prisma));
+  return prisma;
 }
 
 it("createInvoiceService returns an object", () => {
@@ -39,6 +44,7 @@ it("previewInvoice returns the customer name", async () => {
   const prisma = makePrisma();
   (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
     id: "visit-1",
+    status: "COMPLETED",
     date: new Date("2026-08-12T00:00:00Z"),
     price: { toNumber: () => 35 },
     paymentMethod: null,
@@ -63,6 +69,7 @@ it("previewInvoice returns the visit price as amount", async () => {
   const prisma = makePrisma();
   (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
     id: "visit-1",
+    status: "COMPLETED",
     date: new Date("2026-08-12T00:00:00Z"),
     price: { toNumber: () => 35 },
     paymentMethod: null,
@@ -87,6 +94,7 @@ it("previewInvoice returns invoiceNumber in INV-YYYY-NNN format", async () => {
   const prisma = makePrisma();
   (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
     id: "visit-1",
+    status: "COMPLETED",
     date: new Date("2026-08-12T00:00:00Z"),
     price: { toNumber: () => 35 },
     paymentMethod: null,
@@ -111,6 +119,7 @@ it("previewInvoice sets vatAmount to 0 when vatInInvoices is false", async () =>
   const prisma = makePrisma();
   (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
     id: "visit-1",
+    status: "COMPLETED",
     date: new Date("2026-08-12T00:00:00Z"),
     price: { toNumber: () => 35 },
     paymentMethod: null,
@@ -135,6 +144,7 @@ it("previewInvoice applies VAT when vatInInvoices is true", async () => {
   const prisma = makePrisma();
   (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
     id: "visit-1",
+    status: "COMPLETED",
     date: new Date("2026-08-12T00:00:00Z"),
     price: { toNumber: () => 100 },
     paymentMethod: null,
@@ -179,6 +189,7 @@ it("createInvoice returns an id", async () => {
   const prisma = makePrisma();
   (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
     id: "visit-1",
+    status: "COMPLETED",
     date: new Date("2026-08-12T00:00:00Z"),
     price: { toNumber: () => 35 },
     paymentMethod: null,
@@ -210,6 +221,7 @@ it("createInvoice sets status to DRAFT when sendEmail is false", async () => {
   const prisma = makePrisma();
   (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
     id: "visit-1",
+    status: "COMPLETED",
     date: new Date("2026-08-12T00:00:00Z"),
     price: { toNumber: () => 35 },
     paymentMethod: null,
@@ -241,6 +253,7 @@ it("createInvoice applies VAT and the given dueDate when vatInInvoices is true",
   const prisma = makePrisma();
   (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
     id: "visit-1",
+    status: "COMPLETED",
     date: new Date("2026-08-12T00:00:00Z"),
     price: { toNumber: () => 100 },
     paymentMethod: null,
@@ -297,23 +310,6 @@ it("sendInvoice throws 409 when invoice is already SENT", async () => {
   });
   const svc = createInvoiceService(prisma);
   await expect(svc.sendInvoice("inv-1")).rejects.toMatchObject({ statusCode: 409 });
-});
-
-it("sendInvoice throws 400 when customer has no email", async () => {
-  const prisma = makePrisma();
-  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-    id: "inv-1",
-    status: "DRAFT",
-    customer: { name: "John Smith", email: null },
-    visit: null,
-    createdAt: new Date(),
-    dueDate: null,
-    invoiceNumber: "INV-2026-001",
-    amount: { toNumber: () => 35 },
-  });
-  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-  const svc = createInvoiceService(prisma);
-  await expect(svc.sendInvoice("inv-1")).rejects.toMatchObject({ statusCode: 400 });
 });
 
 it("getInvoice is a function", () => {
@@ -478,34 +474,8 @@ it("getInvoice prefers the visit's own paymentMethod over the customer's when a 
   const result = await svc.getInvoice("inv-1");
   expect(result.paymentMethod).toBe("CASH");
   expect(result.roundName).toBeNull();
-  expect(result.lineItems[0].description).toContain("Window Cleaning Service");
+  expect(result.lineItems[0].description).toContain("Window cleaning");
   expect(result.lineItems[0].technicianName).toBeNull();
-});
-
-it("sendInvoice returns status SENT after sending", async () => {
-  const prisma = makePrisma();
-  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-    id: "inv-1",
-    status: "DRAFT",
-    customer: { name: "John Smith", email: "j@example.com" },
-    visit: null,
-    createdAt: new Date(),
-    dueDate: null,
-    invoiceNumber: "INV-2026-001",
-    amount: { toNumber: () => 35 },
-  });
-  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-  (prisma.invoice.update as ReturnType<typeof vi.fn>).mockResolvedValue({
-    id: "inv-1",
-    invoiceNumber: "INV-2026-001",
-    status: "SENT",
-    sentToCustomer: true,
-    sentAt: new Date(),
-  });
-  const svc = createInvoiceService(prisma);
-  const result = await svc.sendInvoice("inv-1");
-  expect(result.status).toBe("SENT");
-  expect(result.sentToCustomer).toBe(true);
 });
 
 // ---- getRenderData -----------------------------------------------------------
@@ -611,7 +581,7 @@ it("getRenderData falls back to visit.property.customer.paymentMethod when visit
   expect(result.customer.postcode).toBeNull();
 });
 
-it("getRenderData falls back to 'Window Cleaning Service' and omits the round when both are absent", async () => {
+it("getRenderData falls back to 'Window cleaning' and omits the round when both are absent", async () => {
   const prisma = makePrisma();
   (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(
     renderInvoice({ visit: renderVisit({ round: null, technician: null, service: null }) })
@@ -620,7 +590,7 @@ it("getRenderData falls back to 'Window Cleaning Service' and omits the round wh
 
   const result = await createInvoiceService(prisma).getRenderData("inv-1");
 
-  expect(result.lineItems[0].description).toContain("Window Cleaning Service");
+  expect(result.lineItems[0].description).toContain("Window cleaning");
   expect(result.lineItems[0].description).not.toContain("—  —");
   expect(result.lineItems[0].technicianName).toBeNull();
 });

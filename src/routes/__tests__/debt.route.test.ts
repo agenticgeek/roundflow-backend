@@ -28,16 +28,6 @@ vi.mock("../../services/debt.service", () => ({
   createDebtService: vi.fn(() => ({ getKpis, getBoard, getBucketCounts, sendReminder, sendPaymentLink, flagBadDebt, flagHold, getInvoiceDetail })),
 }));
 
-vi.mock("../../lib/crypto", () => ({
-  decrypt: vi.fn(() => "sk_test_decrypted"),
-}));
-vi.mock("../../integrations/stripe/client", () => ({
-  getStripeClient: vi.fn(() => ({ fake: "stripe-client" })),
-}));
-const createOneTimeSession = vi.fn();
-vi.mock("../../integrations/stripe/checkout", () => ({
-  createOneTimeSession: (...args: unknown[]) => createOneTimeSession(...args),
-}));
 const queueGhlEvent = vi.fn().mockResolvedValue(undefined);
 vi.mock("../../integrations/ghl/sync", () => ({
   queueGhlEvent: (...args: unknown[]) => queueGhlEvent(...args),
@@ -137,168 +127,80 @@ describe("GET /debt/board/counts", () => {
 });
 
 describe("POST /debt/:id/remind", () => {
-  it("400s when channel or message is missing", async () => {
-    const res = await request(makeApp()).post("/debt/inv-1/remind").send({ channel: "EMAIL" });
-    expect(res.status).toBe(400);
+  it("sends with the auto channel and the template when the body is empty, and queues debt.overdue", async () => {
+    sendReminder.mockResolvedValue({ id: "m1", messageId: "m1", channel: "SMS", customerId: "c1" });
+    const tp = makeTenantPrisma();
+    const res = await request(makeApp(tp)).post("/debt/inv-1/remind").send({});
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ id: "m1", messageId: "m1", channel: "SMS" });
+    expect(sendReminder).toHaveBeenCalledWith("inv-1", { channel: undefined, message: undefined });
+    expect(queueGhlEvent).toHaveBeenCalledWith(tp, "debt.overdue", "c1");
   });
 
-  it("400s when req.body is undefined", async () => {
+  it("tolerates an undefined body", async () => {
+    sendReminder.mockResolvedValue({ id: "m1", messageId: "m1", channel: "SMS", customerId: "c1" });
     const res = await request(makeAppWithUndefinedBody()).post("/debt/inv-1/remind");
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(200);
   });
 
-  it("queues a GHL debt.overdue event when the invoice has a customer", async () => {
-    sendReminder.mockResolvedValue({ id: "msg-1" });
-    const tp = makeTenantPrisma();
-    tp.invoice.findUnique.mockResolvedValue({ customerId: "cust-1" });
-
-    const res = await request(makeApp(tp)).post("/debt/inv-1/remind").send({ channel: "EMAIL", message: "Please pay" });
-
-    expect(res.status).toBe(200);
-    expect(queueGhlEvent).toHaveBeenCalledWith(tp, "debt.overdue", "cust-1");
+  it("passes an explicit channel (normalised) and a custom message; blank message = template", async () => {
+    sendReminder.mockResolvedValue({ id: "m1", messageId: "m1", channel: "EMAIL", customerId: "c1" });
+    await request(makeApp()).post("/debt/inv-1/remind").send({ channel: "email", message: "Pay up" });
+    expect(sendReminder).toHaveBeenLastCalledWith("inv-1", { channel: "EMAIL", message: "Pay up" });
+    await request(makeApp()).post("/debt/inv-1/remind").send({ channel: "AUTO", message: "  " });
+    expect(sendReminder).toHaveBeenLastCalledWith("inv-1", { channel: undefined, message: undefined });
   });
 
-  it("skips queuing when the invoice has no customerId", async () => {
-    sendReminder.mockResolvedValue({ id: "msg-1" });
-    const tp = makeTenantPrisma();
-    tp.invoice.findUnique.mockResolvedValue(null);
+  it("400s on an unknown channel or a non-string message", async () => {
+    expect((await request(makeApp()).post("/debt/inv-1/remind").send({ channel: "FAX" })).status).toBe(400);
+    expect((await request(makeApp()).post("/debt/inv-1/remind").send({ message: 5 })).status).toBe(400);
+    expect(sendReminder).not.toHaveBeenCalled();
+  });
 
-    const res = await request(makeApp(tp)).post("/debt/inv-1/remind").send({ channel: "EMAIL", message: "Please pay" });
-
-    expect(res.status).toBe(200);
+  it("propagates service errors (e.g. 502 GHL_SEND_FAILED) and queues nothing", async () => {
+    sendReminder.mockRejectedValue(new AppError(502, "GHL down", "GHL_SEND_FAILED"));
+    const res = await request(makeApp()).post("/debt/inv-1/remind").send({});
+    expect(res.status).toBe(502);
     expect(queueGhlEvent).not.toHaveBeenCalled();
+  });
+
+  it("logs (does not fail) when queuing the GHL event rejects", async () => {
+    sendReminder.mockResolvedValue({ id: "m1", messageId: "m1", channel: "SMS", customerId: "c1" });
+    queueGhlEvent.mockRejectedValueOnce(new Error("outbox down"));
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const res = await request(makeApp()).post("/debt/inv-1/remind").send({});
+    expect(res.status).toBe(200);
+    await new Promise((r) => setImmediate(r));
+    expect(err).toHaveBeenCalled();
+    err.mockRestore();
   });
 });
 
 describe("POST /debt/:id/payment-link", () => {
-  it("400s when message is missing", async () => {
-    const res = await request(makeApp()).post("/debt/inv-1/payment-link").send({});
-    expect(res.status).toBe(400);
+  it("passes the tenant, channel and message to the service and returns its result", async () => {
+    sendPaymentLink.mockResolvedValue({ url: "https://checkout.stripe.com/x", messageId: "m1", channel: "SMS" });
+    const res = await request(makeApp()).post("/debt/inv-1/payment-link").send({ channel: "sms", message: "Pay here" });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ url: "https://checkout.stripe.com/x", messageId: "m1", channel: "SMS" });
+    expect(sendPaymentLink).toHaveBeenCalledWith("inv-1", { tenantId: "tenant-1", channel: "SMS", message: "Pay here" });
   });
 
-  it("400s when req.body is undefined", async () => {
+  it("works with no body at all (auto channel, template body)", async () => {
+    sendPaymentLink.mockResolvedValue({ url: "u" });
     const res = await request(makeAppWithUndefinedBody()).post("/debt/inv-1/payment-link");
+    expect(res.status).toBe(200);
+    expect(sendPaymentLink).toHaveBeenCalledWith("inv-1", { tenantId: "tenant-1", channel: undefined, message: undefined });
+  });
+
+  it("400s on an unknown channel", async () => {
+    const res = await request(makeApp()).post("/debt/inv-1/payment-link").send({ channel: "PIGEON" });
     expect(res.status).toBe(400);
   });
 
-  it("falls back to the static link when Stripe is not connected", async () => {
-    const tp = makeTenantPrisma();
-    tp.businessSettings.findFirst.mockResolvedValue({ stripeConnected: false, stripeSecretKeyEncrypted: null });
-    sendPaymentLink.mockResolvedValue({ id: "msg-1", paymentUrl: "https://pay.roundflow.app/i/INV-1" });
-
-    const res = await request(makeApp(tp)).post("/debt/inv-1/payment-link").send({ message: "Please pay" });
-
-    expect(res.status).toBe(200);
-    expect(sendPaymentLink).toHaveBeenCalledWith("inv-1", "Please pay", { provider: "static" });
-    expect(createOneTimeSession).not.toHaveBeenCalled();
-  });
-
-  it("falls back to the static link when the invoice no longer exists", async () => {
-    const tp = makeTenantPrisma();
-    tp.businessSettings.findFirst.mockResolvedValue({ stripeConnected: true, stripeSecretKeyEncrypted: "enc" });
-    tp.invoice.findUnique.mockResolvedValue(null);
-    sendPaymentLink.mockResolvedValue({ id: "msg-1", paymentUrl: "https://pay.roundflow.app/i/INV-1" });
-
-    const res = await request(makeApp(tp)).post("/debt/inv-1/payment-link").send({ message: "Please pay" });
-
-    expect(res.status).toBe(200);
-    expect(sendPaymentLink).toHaveBeenCalledWith("inv-1", "Please pay", { provider: "static" });
-  });
-
-  it("falls back to the static link when the invoice is already PAID", async () => {
-    const tp = makeTenantPrisma();
-    tp.businessSettings.findFirst.mockResolvedValue({ stripeConnected: true, stripeSecretKeyEncrypted: "enc" });
-    tp.invoice.findUnique.mockResolvedValue({ id: "inv-1", status: "PAID" });
-    sendPaymentLink.mockResolvedValue({ id: "msg-1" });
-
-    const res = await request(makeApp(tp)).post("/debt/inv-1/payment-link").send({ message: "Please pay" });
-
-    expect(res.status).toBe(200);
-    expect(sendPaymentLink).toHaveBeenCalledWith("inv-1", "Please pay", { provider: "static" });
-  });
-
-  it("falls back to the static link when the invoice is VOID", async () => {
-    const tp = makeTenantPrisma();
-    tp.businessSettings.findFirst.mockResolvedValue({ stripeConnected: true, stripeSecretKeyEncrypted: "enc" });
-    tp.invoice.findUnique.mockResolvedValue({ id: "inv-1", status: "VOID" });
-    sendPaymentLink.mockResolvedValue({ id: "msg-1" });
-
-    const res = await request(makeApp(tp)).post("/debt/inv-1/payment-link").send({ message: "Please pay" });
-
-    expect(res.status).toBe(200);
-    expect(sendPaymentLink).toHaveBeenCalledWith("inv-1", "Please pay", { provider: "static" });
-  });
-
-  it("reuses an existing PENDING checkout session's url and surfaces its provider/expiresAt", async () => {
-    const tp = makeTenantPrisma();
-    const expiresAt = new Date("2026-03-01T00:00:00.000Z");
-    tp.businessSettings.findFirst.mockResolvedValue({ stripeConnected: true, stripeSecretKeyEncrypted: "enc" });
-    tp.invoice.findUnique.mockResolvedValue({ id: "inv-1", status: "DRAFT", customerId: "cust-1", invoiceNumber: "INV-1", amount: 35 });
-    tp.stripeSession.findFirst.mockResolvedValue({ url: "https://checkout.stripe.com/pay/cs_existing", expiresAt });
-    sendPaymentLink.mockResolvedValue({ id: "msg-1", paymentUrl: "https://checkout.stripe.com/pay/cs_existing", provider: "stripe", expiresAt });
-
-    const res = await request(makeApp(tp)).post("/debt/inv-1/payment-link").send({ message: "Please pay" });
-
-    expect(res.status).toBe(200);
-    expect(sendPaymentLink).toHaveBeenCalledWith("inv-1", "Please pay", {
-      overrideUrl: "https://checkout.stripe.com/pay/cs_existing",
-      provider: "stripe",
-      expiresAt,
-    });
-    expect(createOneTimeSession).not.toHaveBeenCalled();
-  });
-
-  it("creates a new one-time checkout session when none is pending", async () => {
-    const tp = makeTenantPrisma();
-    tp.businessSettings.findFirst.mockResolvedValue({ stripeConnected: true, stripeSecretKeyEncrypted: "enc" });
-    tp.invoice.findUnique.mockResolvedValue({ id: "inv-1", status: "DRAFT", customerId: "cust-1", invoiceNumber: "INV-1", amount: 35 });
-    tp.stripeSession.findFirst.mockResolvedValue(null);
-    createOneTimeSession.mockResolvedValue({
-      stripeSessionId: "cs_new_123",
-      url: "https://checkout.stripe.com/pay/cs_new_123",
-      expiresAt: null,
-    });
-    sendPaymentLink.mockResolvedValue({ id: "msg-1", paymentUrl: "https://checkout.stripe.com/pay/cs_new_123" });
-
-    const res = await request(makeApp(tp)).post("/debt/inv-1/payment-link").send({ message: "Please pay" });
-
-    expect(res.status).toBe(200);
-    expect(createOneTimeSession).toHaveBeenCalledWith(
-      { fake: "stripe-client" },
-      tp,
-      expect.objectContaining({ tenantId: "tenant-1", customerId: "cust-1", invoiceId: "inv-1" })
-    );
-    expect(tp.stripeSession.create).toHaveBeenCalled();
-    expect(sendPaymentLink).toHaveBeenCalledWith("inv-1", "Please pay", {
-      overrideUrl: "https://checkout.stripe.com/pay/cs_new_123",
-      provider: "stripe",
-      expiresAt: null,
-    });
-  });
-
-  it("falls back to an empty-string frontend URL when FRONTEND_URL is unset", async () => {
-    const original = process.env.FRONTEND_URL;
-    delete process.env.FRONTEND_URL;
-    try {
-      const tp = makeTenantPrisma();
-      tp.businessSettings.findFirst.mockResolvedValue({ stripeConnected: true, stripeSecretKeyEncrypted: "enc" });
-      tp.invoice.findUnique.mockResolvedValue({ id: "inv-1", status: "DRAFT", customerId: "cust-1", invoiceNumber: "INV-1", amount: 35 });
-      tp.stripeSession.findFirst.mockResolvedValue(null);
-      createOneTimeSession.mockResolvedValue({
-        stripeSessionId: "cs_new_123", url: "https://checkout.stripe.com/pay/cs_new_123", expiresAt: null,
-      });
-      sendPaymentLink.mockResolvedValue({ id: "msg-1" });
-
-      const res = await request(makeApp(tp)).post("/debt/inv-1/payment-link").send({ message: "Please pay" });
-
-      expect(res.status).toBe(200);
-      expect(createOneTimeSession).toHaveBeenCalledWith(
-        expect.anything(), expect.anything(),
-        expect.objectContaining({ successUrl: "/invoices/inv-1?payment=success" })
-      );
-    } finally {
-      process.env.FRONTEND_URL = original;
-    }
+  it("surfaces 409 STRIPE_NOT_CONNECTED from the service", async () => {
+    sendPaymentLink.mockRejectedValue(new AppError(409, "Stripe is not connected", "STRIPE_NOT_CONNECTED"));
+    const res = await request(makeApp()).post("/debt/inv-1/payment-link").send({});
+    expect(res.status).toBe(409);
   });
 });
 

@@ -52,8 +52,11 @@ export interface TodayRoundRow {
   skipped: number;
   issueCount: number;
   paymentHolds: number;
+  scheduledValue: number; // every (non-cancelled) stop today
+  completedValue: number; // COMPLETED stops only
+  /** @deprecated same as completedValue; kept for one release (GAP-035). */
   value: number;
-  etaMinutes: number | null;
+  etaMinutes: null;       // no real estimate yet
 }
 
 export interface TodayTechnicianCard {
@@ -68,6 +71,7 @@ export interface TodayTechnicianCard {
 
 export interface TodaysWorkAggregate {
   date: string;
+  generatedAt: string; // ISO timestamp, for "Updated HH:mm"
   dayClosed: boolean;
   kpi: TodayKpi;
   rounds: TodayRoundRow[];
@@ -109,7 +113,7 @@ class TodayService {
     const [settings, visits] = await Promise.all([
       getCachedBusinessSettings(this.prisma),
       this.prisma.visit.findMany({
-        where: { date: { gte: start, lt: end } },
+        where: { date: { gte: start, lt: end }, status: { not: VisitStatus.CANCELLED } },
         include: visitTodayInclude,
         orderBy: { property: { addressLine: "asc" } },
       }),
@@ -117,6 +121,7 @@ class TodayService {
 
     return {
       date: today,
+      generatedAt: new Date().toISOString(),
       dayClosed: settings?.lastClosedDate === today,
       kpi: this.computeKpi(visits),
       rounds: this.buildRoundRows(visits),
@@ -145,7 +150,7 @@ class TodayService {
       }
 
       const visits = await tx.visit.findMany({
-        where: { date: { gte: start, lt: end } },
+        where: { date: { gte: start, lt: end }, status: { not: VisitStatus.CANCELLED } },
         select: {
           id: true,
           status: true,
@@ -243,10 +248,9 @@ class TodayService {
       const completed = vs.filter((v) => v.status === VisitStatus.COMPLETED).length;
       const skipped = vs.filter((v) => v.status === VisitStatus.SKIPPED).length;
       const inProgress = vs.filter((v) => v.status === VisitStatus.IN_PROGRESS).length;
-      const remaining = vs.filter(
-        (v) =>
-          v.status === VisitStatus.SCHEDULED || v.status === VisitStatus.IN_PROGRESS
-      ).length;
+      const completedValue = vs
+        .filter((v) => v.status === VisitStatus.COMPLETED)
+        .reduce((acc, v) => acc + v.price.toNumber(), 0);
 
       return {
         roundId,
@@ -259,12 +263,10 @@ class TodayService {
         skipped,
         issueCount: vs.reduce((acc, v) => acc + v._count.issues, 0),
         paymentHolds: vs.filter((v) => v.paymentHold).length,
-        value: completed > 0
-          ? vs
-              .filter((v) => v.status === VisitStatus.COMPLETED)
-              .reduce((acc, v) => acc + v.price.toNumber(), 0)
-          : 0,
-        etaMinutes: remaining > 0 ? remaining * 20 : null,
+        scheduledValue: vs.reduce((acc, v) => acc + v.price.toNumber(), 0),
+        completedValue,
+        value: completedValue,
+        etaMinutes: null,
       };
     });
   }
