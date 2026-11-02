@@ -1,6 +1,6 @@
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { createTodayService, type TodayRoundRow } from "./today.service";
-import { todayRange } from "../lib/dates";
+import { tenantTodayRange } from "./business-time";
 import type { KpiOperator } from "../generated/tenant-client";
 import { computeTechnicianKpis, emptyKpis, periodRange } from "./technician-kpi.service";
 import { monthPeriodKey } from "./kpi-threshold.service";
@@ -86,7 +86,7 @@ export interface DashboardKpis {
 export function createDashboardService(prisma: TenantPrismaClient) {
   return {
     getKpis: async (): Promise<DashboardKpis> => {
-      const { start: dayStart, end: dayEnd } = todayRange();
+      const { start: dayStart, end: dayEnd } = await tenantTodayRange(prisma);
       const { start: monthStart, end: monthEnd } = monthRange();
 
       const [
@@ -167,7 +167,7 @@ export function createDashboardService(prisma: TenantPrismaClient) {
     },
 
     getAlerts: async (): Promise<DashboardAlerts> => {
-      const { start: dayStart, end: dayEnd } = todayRange();
+      const { start: dayStart, end: dayEnd } = await tenantTodayRange(prisma);
       const weekEnd = endOfWeek();
 
       const [skippedNeedingReview, failedPayments, complaintRevisitsDue, kpiAlertRows] =

@@ -9,8 +9,10 @@ vi.mock("../../services/technician.service", () => ({
   createTechnicianService: vi.fn(() => ({ createTechnician, updateTechnician, getPerformance })),
 }));
 const listTechnicianPhotos = vi.fn();
+const approveTechnicianPhotos = vi.fn();
+const reviewTechnicianPhoto = vi.fn();
 vi.mock("../../services/photo-gallery.service", () => ({
-  createPhotoGalleryService: vi.fn(() => ({ listTechnicianPhotos })),
+  createPhotoGalleryService: vi.fn(() => ({ listTechnicianPhotos, approveTechnicianPhotos, reviewTechnicianPhoto })),
 }));
 const incidentCreate = vi.fn();
 const incidentList = vi.fn();
@@ -109,8 +111,56 @@ it("GET /technicians/:id/performance defaults to thisMonth and validates period"
 it("GET /technicians/:id/photos paginates (default 24)", async () => {
   listTechnicianPhotos.mockResolvedValue({ rows: [], pagination: {} });
   expect((await request(makeApp()).get("/technicians/t1/photos?page=2")).status).toBe(200);
-  expect(listTechnicianPhotos).toHaveBeenCalledWith("t1", { page: 2, pageSize: 24 });
+  expect(listTechnicianPhotos).toHaveBeenCalledWith("t1", {
+    page: 2,
+    pageSize: 24,
+    search: undefined,
+    reviewStatus: undefined,
+  });
   expect((await request(makeApp()).get("/technicians/t1/photos?page=0")).status).toBe(400);
+});
+
+it("GET /technicians/:id/photos passes search and reviewStatus, rejecting bad values", async () => {
+  listTechnicianPhotos.mockResolvedValue({ rows: [], pagination: {} });
+  const ok = await request(makeApp()).get("/technicians/t1/photos?search=smith&reviewStatus=PENDING");
+  expect(ok.status).toBe(200);
+  expect(listTechnicianPhotos).toHaveBeenCalledWith("t1", {
+    page: 1,
+    pageSize: 24,
+    search: "smith",
+    reviewStatus: "PENDING",
+  });
+  expect((await request(makeApp()).get("/technicians/t1/photos?reviewStatus=MAYBE")).status).toBe(400);
+  expect((await request(makeApp()).get("/technicians/t1/photos?reviewStatus=A&reviewStatus=B")).status).toBe(400);
+  expect((await request(makeApp()).get("/technicians/t1/photos?search=a&search=b")).status).toBe(400);
+  expect((await request(makeApp()).get(`/technicians/t1/photos?search=${"x".repeat(101)}`)).status).toBe(400);
+});
+
+it("POST /technicians/:id/photos/approve approves as the acting profile", async () => {
+  approveTechnicianPhotos.mockResolvedValue({ updated: 2 });
+  const res = await request(makeApp()).post("/technicians/t1/photos/approve").send({ photoIds: ["a", "b"] });
+  expect(res.status).toBe(200);
+  expect(res.body).toEqual({ updated: 2 });
+  expect(approveTechnicianPhotos).toHaveBeenCalledWith("t1", ["a", "b"], { reviewedById: "prof1" });
+
+  await request(makeApp({ tenantId: "ten1", role: "ADMIN" })).post("/technicians/t1/photos/approve").send({});
+  expect(approveTechnicianPhotos).toHaveBeenLastCalledWith("t1", undefined, { reviewedById: null });
+
+  expect((await request(makeApp()).post("/technicians/t1/photos/approve").send({ photoIds: "a" })).status).toBe(400);
+  const tooMany = Array.from({ length: 501 }, (_, i) => `p${i}`);
+  expect((await request(makeApp()).post("/technicians/t1/photos/approve").send({ photoIds: tooMany })).status).toBe(400);
+});
+
+it("PATCH /technicians/:id/photos/:photoId/review approves or rejects one photo", async () => {
+  reviewTechnicianPhoto.mockResolvedValue({ id: "ph1", reviewStatus: "REJECTED" });
+  const res = await request(makeApp()).patch("/technicians/t1/photos/ph1/review").send({ status: "REJECTED" });
+  expect(res.status).toBe(200);
+  expect(reviewTechnicianPhoto).toHaveBeenCalledWith("t1", "ph1", "REJECTED", { reviewedById: "prof1" });
+
+  expect((await request(makeApp()).patch("/technicians/t1/photos/ph1/review").send({ status: "PENDING" })).status).toBe(400);
+
+  reviewTechnicianPhoto.mockRejectedValue(new AppError(404, "Photo not found"));
+  expect((await request(makeApp()).patch("/technicians/t1/photos/zz/review").send({ status: "APPROVED" })).status).toBe(404);
 });
 
 // ── incidents ───────────────────────────────────────────────────────────────

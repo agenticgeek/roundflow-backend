@@ -1,9 +1,9 @@
 import { PaymentMethod, Prisma, VisitStatus } from "../../generated/tenant-client";
 import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
 import type { CompletionsSummary, MobileVisitRow, RoundSummary } from "../types";
-import { todayRange } from "../../lib/dates";
+import { tenantTodayRange } from "../../services/business-time";
 
-const visitMobileInclude = {
+export const visitMobileInclude = {
   property: {
     select: {
       id: true, addressLine: true, postcode: true, latitude: true, longitude: true,
@@ -27,7 +27,7 @@ function effectiveMethod(v: VisitMobile): PaymentMethod | null {
   return v.paymentMethod ?? v.servicePlan?.paymentMethod ?? v.property.customer.paymentMethod ?? null;
 }
 
-function toRow(v: VisitMobile, position: number | null = null): MobileVisitRow {
+export function toRow(v: VisitMobile, position: number | null = null): MobileVisitRow {
   return {
     visitId: v.id,
     status: v.status,
@@ -62,11 +62,11 @@ class HomeService {
     });
     if (!tech) return [];
 
-    const { start, end } = todayRange();
+    const { start, end } = await tenantTodayRange(this.prisma);
     const visits = await this.prisma.visit.findMany({
       where: { technicianId: tech.id, date: { gte: start, lt: end }, status: NOT_CANCELLED },
       include: visitMobileInclude,
-      orderBy: [{ date: "asc" }, { createdAt: "asc" }],
+      orderBy: [{ date: "asc" }, { createdAt: "asc" }, { id: "asc" }],
     });
     const roundCounters = new Map<string, number>();
     return visits.map(v => {
@@ -87,7 +87,7 @@ class HomeService {
     });
     if (!tech) return { revenueToday: 0, revenueByMethod: { cash: 0, directDebit: 0, other: 0 }, revenueChangePercent: null, completedCount: 0, skippedCount: 0, totalCount: 0, roundName: null, visits: [] };
 
-    const { start, end } = todayRange();
+    const { start, end } = await tenantTodayRange(this.prisma);
     const visits = await this.prisma.visit.findMany({
       where: { technicianId: tech.id, date: { gte: start, lt: end }, status: NOT_CANCELLED },
       include: visitMobileInclude,
@@ -138,7 +138,7 @@ class HomeService {
     });
     if (!tech) return [];
 
-    const { start, end } = todayRange();
+    const { start, end } = await tenantTodayRange(this.prisma);
     const visits = await this.prisma.visit.findMany({
       where: { technicianId: tech.id, date: { gte: start, lt: end }, status: NOT_CANCELLED },
       select: { roundId: true, date: true, status: true, price: true, round: { select: { name: true } } },

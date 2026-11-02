@@ -37,13 +37,15 @@ const media = {
   getAvatarUploadUrl: vi.fn(), getChatAttachmentUploadUrl: vi.fn().mockResolvedValue({ signedUrl: "https://c", path: "c" }),
 };
 vi.mock("../services/media.service", () => ({ createMediaService: () => media }));
-const detail = { getVisitDetail: vi.fn().mockResolvedValue({ id: "v1", photos: [] }), collectDebtPayment: vi.fn() };
+const detail = { getVisitDetail: vi.fn().mockResolvedValue({ id: "v1", property: { id: "pr1", photos: [] }, photos: [] }), collectDebtPayment: vi.fn() };
 vi.mock("../services/job-detail.service", () => ({ createJobDetailService: () => detail }));
+const schedule = { getSchedule: vi.fn().mockResolvedValue({ rows: [] }) };
+vi.mock("../services/schedule.service", async (orig) => ({ ...(await orig<typeof import("../services/schedule.service")>()), createScheduleService: () => schedule }));
 const chat = {
   getChatMessages: vi.fn().mockResolvedValue([]),
-  sendChatMessage: vi.fn().mockResolvedValue({ id: "m1" }),
-  sendWorkPhotosMessage: vi.fn().mockResolvedValue({ id: "m2" }),
-  sendPhotosMessage: vi.fn().mockResolvedValue({ id: "m3" }),
+  send: vi.fn().mockResolvedValue({ row: { id: "m1" }, duplicate: false }),
+  unread: vi.fn().mockResolvedValue({ total: 0, rounds: [] }),
+  markRead: vi.fn().mockResolvedValue({ roundId: "r1", lastReadAt: "2026-11-03T00:00:00.000Z" }),
 };
 vi.mock("../services/chat.service", () => ({ createChatService: () => chat }));
 // Fake signer: stored value → "<value>?signed" (media-urls has its own tests).
@@ -64,7 +66,7 @@ import { AppError } from "../../lib/app-error";
 
 function makeTp() {
   return {
-    technician: { findUnique: vi.fn().mockResolvedValue({ id: "tech-1" }) },
+    technician: { findUnique: vi.fn().mockResolvedValue({ id: "tech-1", active: true }) },
     visit: { findUnique: vi.fn().mockResolvedValue({ technicianId: "tech-1" }), findFirst: vi.fn().mockResolvedValue(null) },
     roundTechnician: { findFirst: vi.fn().mockResolvedValue({ roundId: "r1" }) },
     idempotencyRecord: { findUnique: vi.fn().mockResolvedValue(null), create: vi.fn().mockResolvedValue({}) },
@@ -242,13 +244,13 @@ describe("access-issue photos", () => {
     const res = await request(makeApp()).post("/mobile/visits/v1/access-issues").send({ type: "DOG_LOOSE", description: "Dog", photoPaths: [PATH] });
     expect(res.status).toBe(201);
     expect(res.body).toEqual({ recorded: true, id: "iss-1", photoCount: 1 });
-    expect(tracker.reportAccessIssue).toHaveBeenCalledWith("v1", "DOG_LOOSE", "Dog", [PATH]);
+    expect(tracker.reportAccessIssue).toHaveBeenCalledWith("v1", "DOG_LOOSE", "Dog", [PATH], { technicianName: expect.anything(), profileId: expect.anything() });
   });
 
   it("access-issues without photos passes []", async () => {
     const res = await request(makeApp()).post("/mobile/visits/v1/access-issues").send({ type: "OTHER", description: "x" });
     expect(res.body.photoCount).toBe(0);
-    expect(tracker.reportAccessIssue).toHaveBeenCalledWith("v1", "OTHER", "x", []);
+    expect(tracker.reportAccessIssue).toHaveBeenCalledWith("v1", "OTHER", "x", [], expect.objectContaining({ profileId: expect.anything() }));
   });
 
   it.each([
@@ -270,19 +272,25 @@ describe("access-issue photos", () => {
 
 describe("signed read urls", () => {
   it("GET /mobile/visits/:id adds signedUrl to each photo, keeping the stored url", async () => {
-    detail.getVisitDetail.mockResolvedValueOnce({ id: "v1", photos: [{ id: "p1", type: "BEFORE", url: "tenant-1/visits/v1/b.jpg" }] });
+    detail.getVisitDetail.mockResolvedValueOnce({
+      id: "v1",
+      property: { id: "pr1", photos: [{ id: "pp1", url: "tenant-1/properties/pr1/h.jpg" }] },
+      photos: [{ id: "p1", type: "BEFORE", url: "tenant-1/visits/v1/b.jpg" }],
+    });
     const res = await request(makeApp()).get("/mobile/visits/v1");
     expect(res.body.photos).toEqual([{ id: "p1", type: "BEFORE", url: "tenant-1/visits/v1/b.jpg", signedUrl: "tenant-1/visits/v1/b.jpg?signed" }]);
+    expect(res.body.property.photos).toEqual([{ id: "pp1", url: "tenant-1/properties/pr1/h.jpg", signedUrl: "tenant-1/properties/pr1/h.jpg?signed" }]);
   });
 
   it("chat GET and POST responses carry photoSignedUrls", async () => {
-    chat.getChatMessages.mockResolvedValueOnce([{ id: "m1", photoUrls: ["tenant-1/chat/a.jpg"] }]);
+    chat.getChatMessages.mockResolvedValueOnce([{ id: "m1", photoUrls: ["tenant-1/chat/r1/a.jpg"] }]);
     const list = await request(makeApp()).get("/mobile/chat/messages?roundId=r1");
-    expect(list.body[0].photoSignedUrls).toEqual(["tenant-1/chat/a.jpg?signed"]);
+    expect(list.body[0].photoSignedUrls).toEqual(["tenant-1/chat/r1/a.jpg?signed"]);
 
-    chat.sendPhotosMessage.mockResolvedValueOnce({ id: "m3", photoUrls: ["tenant-1/chat/b.jpg"] });
-    const sent = await request(makeApp()).post("/mobile/chat/messages").send({ roundId: "r1", type: "PHOTOS", photoUrls: ["tenant-1/chat/b.jpg"] });
-    expect(sent.body.photoSignedUrls).toEqual(["tenant-1/chat/b.jpg?signed"]);
+    chat.send.mockResolvedValueOnce({ row: { id: "m3", photoUrls: ["tenant-1/chat/r1/b.jpg"] }, duplicate: false });
+    const sent = await request(makeApp()).post("/mobile/chat/messages").send({ roundId: "r1", type: "PHOTOS", photoUrls: ["tenant-1/chat/r1/b.jpg"] });
+    expect(sent.status).toBe(201);
+    expect(sent.body.photoSignedUrls).toEqual(["tenant-1/chat/r1/b.jpg?signed"]);
 
     const text = await request(makeApp()).post("/mobile/chat/messages").send({ roundId: "r1", text: "hi" });
     expect(text.body.photoSignedUrls).toEqual([]);
@@ -339,22 +347,22 @@ describe("chat scoping (A8) and sender id (D-4)", () => {
   it("GET passes the viewer ids", async () => {
     const res = await request(makeApp()).get("/mobile/chat/messages?roundId=r1");
     expect(res.status).toBe(200);
-    expect(chat.getChatMessages).toHaveBeenCalledWith("r1", { profileId: "profile-1", supabaseUserId: "sb-user-1" }, undefined);
+    expect(chat.getChatMessages).toHaveBeenCalledWith("r1", { profileId: "profile-1", supabaseUserId: "sb-user-1" }, undefined, { before: undefined, limit: 100 });
   });
 
   it("POST TEXT stores the Profile id as sender", async () => {
     await request(makeApp()).post("/mobile/chat/messages").send({ roundId: "r1", text: "hi" });
-    expect(chat.sendChatMessage).toHaveBeenCalledWith("r1", "profile-1", "hi");
+    expect(chat.send).toHaveBeenCalledWith("r1", "profile-1", { type: "TEXT", text: "hi", clientMsgId: null });
   });
 
   it("POST PHOTOS stores the Profile id as sender", async () => {
-    await request(makeApp()).post("/mobile/chat/messages").send({ roundId: "r1", type: "PHOTOS", photoUrls: ["a"] });
-    expect(chat.sendPhotosMessage).toHaveBeenCalledWith("r1", "profile-1", ["a"], undefined);
+    await request(makeApp()).post("/mobile/chat/messages").send({ roundId: "r1", type: "PHOTOS", photoUrls: ["tenant-1/chat/r1/a.jpg"] });
+    expect(chat.send).toHaveBeenCalledWith("r1", "profile-1", { type: "PHOTOS", photoUrls: ["tenant-1/chat/r1/a.jpg"], text: null, clientMsgId: null });
   });
 
   it("POST WORK_PHOTOS requires owning the visit", async () => {
     await request(makeApp()).post("/mobile/chat/messages").send({ roundId: "r1", type: "WORK_PHOTOS", visitId: "v1" });
-    expect(chat.sendWorkPhotosMessage).toHaveBeenCalledWith("r1", "profile-1", "v1");
+    expect(chat.send).toHaveBeenCalledWith("r1", "profile-1", { type: "WORK_PHOTOS", visitId: "v1", clientMsgId: null });
 
     tp.visit.findUnique.mockResolvedValue({ technicianId: "tech-2" });
     const res = await request(makeApp()).post("/mobile/chat/messages").send({ roundId: "r1", type: "WORK_PHOTOS", visitId: "v1" });
@@ -365,7 +373,7 @@ describe("chat scoping (A8) and sender id (D-4)", () => {
     tp.roundTechnician.findFirst.mockResolvedValue(null);
     const res = await request(makeApp()).post("/mobile/chat/messages").send({ roundId: "r9", text: "hi" });
     expect(res.status).toBe(403);
-    expect(chat.sendChatMessage).not.toHaveBeenCalled();
+    expect(chat.send).not.toHaveBeenCalled();
   });
 
   it("attachment upload-url is scoped to the technician's rounds", async () => {
@@ -374,5 +382,77 @@ describe("chat scoping (A8) and sender id (D-4)", () => {
     tp.roundTechnician.findFirst.mockResolvedValue(null);
     const res = await request(makeApp()).post("/mobile/messages/attachments/upload-url").send({ roundId: "r9" });
     expect(res.status).toBe(403);
+  });
+});
+
+describe("chat additions (limit/before, clientMsgId, caps, unread, read)", () => {
+  it("GET parses limit and before, rejects bad values and since+before together", async () => {
+    const before = "2026-11-03T10:00:00.000Z";
+    await request(makeApp()).get(`/mobile/chat/messages?roundId=r1&limit=20&before=${before}`);
+    expect(chat.getChatMessages).toHaveBeenLastCalledWith("r1", expect.anything(), undefined, { before: new Date(before), limit: 20 });
+    for (const qs of ["limit=0", "before=nope", "since=nope", "since=2026-01-01T00:00:00Z&before=2026-01-02T00:00:00Z"]) {
+      expect((await request(makeApp()).get(`/mobile/chat/messages?roundId=r1&${qs}`)).status).toBe(400);
+    }
+  });
+
+  it("POST passes clientMsgId; a duplicate answers 200 with the existing message", async () => {
+    chat.send.mockResolvedValueOnce({ row: { id: "m1" }, duplicate: true });
+    const res = await request(makeApp()).post("/mobile/chat/messages").send({ roundId: "r1", text: "hi", clientMsgId: "c1" });
+    expect(res.status).toBe(200);
+    expect(chat.send).toHaveBeenLastCalledWith("r1", "profile-1", { type: "TEXT", text: "hi", clientMsgId: "c1" });
+  });
+
+  it("POST rejects text over 2000 chars, empty text, bad photo paths, unknown types", async () => {
+    const post = (b: Record<string, unknown>) => request(makeApp()).post("/mobile/chat/messages").send({ roundId: "r1", ...b });
+    const long = await post({ text: "x".repeat(2001) });
+    expect(long.status).toBe(400);
+    expect(long.body.code).toBe("CHAT_TEXT_TOO_LONG");
+    expect((await post({ text: "x".repeat(2000) })).status).toBe(201);
+    expect((await post({ text: " " })).status).toBe(400);
+    expect((await post({ type: "PHOTOS", photoUrls: [] })).status).toBe(400);
+    expect((await post({ type: "PHOTOS", photoUrls: ["tenant-2/chat/r1/a.jpg"] })).status).toBe(400);
+    expect((await post({ type: "PHOTOS", photoUrls: ["tenant-1/chat/r2/a.jpg"] })).status).toBe(400);
+    const withText = await post({ type: "PHOTOS", photoUrls: ["tenant-1/chat/r1/a.jpg"], text: " look " });
+    expect(withText.status).toBe(201);
+    expect(chat.send).toHaveBeenLastCalledWith("r1", "profile-1", { type: "PHOTOS", photoUrls: ["tenant-1/chat/r1/a.jpg"], text: "look", clientMsgId: null });
+    expect((await post({ type: "VIDEO" })).status).toBe(400);
+  });
+
+  it("GET /chat/unread works with and without roundId and enforces round membership", async () => {
+    chat.unread.mockResolvedValueOnce({ total: 2, rounds: [{ roundId: "r1", unread: 2 }] });
+    const all = await request(makeApp()).get("/mobile/chat/unread");
+    expect(all.body.total).toBe(2);
+    expect(chat.unread).toHaveBeenLastCalledWith("tech-1", { profileId: "profile-1", supabaseUserId: "sb-user-1" }, undefined);
+    await request(makeApp()).get("/mobile/chat/unread?roundId=r1");
+    expect(chat.unread).toHaveBeenLastCalledWith("tech-1", expect.anything(), "r1");
+    tp.roundTechnician.findFirst.mockResolvedValue(null);
+    const res = await request(makeApp()).get("/mobile/chat/unread?roundId=r9");
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("NOT_YOUR_ROUND");
+  });
+
+  it("POST /chat/read marks the thread read and enforces round membership", async () => {
+    const ok = await request(makeApp()).post("/mobile/chat/read").send({ roundId: "r1" });
+    expect(ok.status).toBe(200);
+    expect(chat.markRead).toHaveBeenCalledWith("r1", { profileId: "profile-1", supabaseUserId: "sb-user-1" });
+    expect((await request(makeApp()).post("/mobile/chat/read").send({})).status).toBe(400);
+    tp.roundTechnician.findFirst.mockResolvedValue(null);
+    expect((await request(makeApp()).post("/mobile/chat/read").send({ roundId: "r9" })).status).toBe(403);
+  });
+});
+
+describe("GET /mobile/schedule", () => {
+  it("is scoped to the caller's technician id and parses range + paging", async () => {
+    const res = await request(makeApp()).get("/mobile/schedule?from=2026-11-04&to=2026-11-10&page=2&pageSize=500");
+    expect(res.status).toBe(200);
+    expect(schedule.getSchedule).toHaveBeenLastCalledWith("tech-1", { from: "2026-11-04", to: "2026-11-10", page: 2, pageSize: 200 });
+    await request(makeApp()).get("/mobile/schedule");
+    expect(schedule.getSchedule).toHaveBeenLastCalledWith("tech-1", { from: undefined, to: undefined, page: 1, pageSize: 100 });
+    expect((await request(makeApp()).get("/mobile/schedule?page=0")).status).toBe(400);
+  });
+
+  it("is refused for non-technicians", async () => {
+    role = "ADMIN";
+    expect((await request(makeApp()).get("/mobile/schedule")).status).toBe(403);
   });
 });

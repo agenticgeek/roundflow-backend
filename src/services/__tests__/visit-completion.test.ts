@@ -8,6 +8,11 @@ vi.mock("../../integrations/gocardless/client", () => ({ getGcClient: (...args: 
 const createGcPayment = vi.fn();
 vi.mock("../../integrations/gocardless/payment", () => ({ createGcPayment: (...args: unknown[]) => createGcPayment(...args) }));
 
+const autoCreateForCompletedVisit = vi.fn();
+vi.mock("../invoice.service", () => ({
+  createInvoiceService: () => ({ autoCreateForCompletedVisit: (...a: unknown[]) => autoCreateForCompletedVisit(...a) }),
+}));
+
 import {
   createVisitCompletionService,
   parseCompletionPayment,
@@ -55,7 +60,10 @@ function baseVisit(overrides: Record<string, unknown> = {}) {
 
 const ops = (tp: ReturnType<typeof makeTp>) => tp.$transaction.mock.calls[0][0].map((o: any) => o.op);
 
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => {
+  vi.clearAllMocks();
+  autoCreateForCompletedVisit.mockResolvedValue(null);
+});
 
 describe("parseCompletionPayment", () => {
   it("returns undefined when nothing is sent", () => {
@@ -112,7 +120,7 @@ describe("completeVisit", () => {
   it("is idempotent for an already COMPLETED visit (no writes)", async () => {
     const tp = makeTp();
     tp.visit.findUnique.mockResolvedValue(baseVisit({ status: VisitStatus.COMPLETED }));
-    expect(await createVisitCompletionService(tp as any).completeVisit("v1")).toEqual({ id: "visit-12345678", status: "COMPLETED", payment: null });
+    expect(await createVisitCompletionService(tp as any).completeVisit("v1")).toEqual({ id: "visit-12345678", status: "COMPLETED", payment: null, invoice: null });
     expect(tp.$transaction).not.toHaveBeenCalled();
   });
 
@@ -289,9 +297,80 @@ describe("completeVisit", () => {
     it.each([{ gocardlessMandateStatus: "cancelled" }, { gocardlessMandateId: null }])("skips charging for %j", async (c) => {
       const tp = makeTp();
       tp.visit.findUnique.mockResolvedValue(gcVisit(c));
-      await createVisitCompletionService(tp as any).completeVisit("v1");
+      expect(getGcClient).not.toHaveBeenCalled();
       expect(tp.businessSettings.findFirst).not.toHaveBeenCalled();
       expect(tp.payment.create).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe("QA batch 2026-11-03 (A1, A3, A6)", () => {
+  const vatTp = () => {
+    const tp = makeTp();
+    tp.businessSettings.findFirst.mockResolvedValue({ vatInInvoices: true, vatRate: new Prisma.Decimal(20) });
+    return tp;
+  };
+
+  it("A3: cash defaults to the VAT-inclusive total, an explicit amount still wins", async () => {
+    const tp = vatTp();
+    tp.visit.findUnique.mockResolvedValue(baseVisit({ price: new Prisma.Decimal(20) }));
+    await createVisitCompletionService(tp as any).completeVisit("v1", { payment: { method: "CASH" } });
+    expect(tp.payment.create.mock.calls[0][0].data.amount).toBe(24);
+
+    const tp2 = vatTp();
+    tp2.visit.findUnique.mockResolvedValue(baseVisit({ price: new Prisma.Decimal(20) }));
+    await createVisitCompletionService(tp2 as any).completeVisit("v1", { payment: { method: "CASH", amount: 22 } });
+    expect(tp2.payment.create.mock.calls[0][0].data.amount).toBe(22);
+  });
+
+  it("A3: cheque, BACS and GoCardless charge the gross total too", async () => {
+    const cheque = vatTp();
+    cheque.visit.findUnique.mockResolvedValue(baseVisit({ price: new Prisma.Decimal(20) }));
+    await createVisitCompletionService(cheque as any).completeVisit("v1", { payment: { method: "CHEQUE", chequeNumber: "001" } });
+    expect(cheque.payment.create.mock.calls[0][0].data.amount).toBe(24);
+
+    const bacs = vatTp();
+    bacs.visit.findUnique.mockResolvedValue(baseVisit({ price: new Prisma.Decimal(20), paymentMethod: PaymentMethod.BACS }));
+    await createVisitCompletionService(bacs as any).completeVisit("v1");
+    expect(bacs.payment.create.mock.calls[0][0].data.amount).toBe(24);
+
+    const gc = vatTp();
+    gc.businessSettings.findFirst.mockResolvedValue({ vatInInvoices: true, vatRate: new Prisma.Decimal(20), gocardlessAccessTokenEncrypted: "enc", gocardlessEnvironment: "sandbox" });
+    gc.visit.findUnique.mockResolvedValue(
+      baseVisit({
+        price: new Prisma.Decimal(20),
+        paymentMethod: PaymentMethod.GOCARDLESS,
+        property: { customer: { id: "c", name: "T", paymentMethod: null, gocardlessMandateId: "MD1", gocardlessMandateStatus: "active" } },
+      })
+    );
+    createGcPayment.mockResolvedValue({ id: "PM1" });
+    await createVisitCompletionService(gc as any).completeVisit("v1");
+    expect(createGcPayment.mock.calls[0][1].amountPence).toBe(2400);
+  });
+
+  it("A6: stamps ServicePlan.lastCompleted in the completion transaction", async () => {
+    const tp: any = makeTp();
+    tp.servicePlan = { update: vi.fn((args: any) => ({ op: "servicePlan.update", args })) };
+    tp.visit.findUnique.mockResolvedValue(baseVisit({ servicePlanId: "sp1" }));
+    await createVisitCompletionService(tp).completeVisit("v1", { payment: { method: "NONE" } });
+    expect(ops(tp)).toContain("servicePlan.update");
+    expect(tp.servicePlan.update.mock.calls[0][0]).toMatchObject({ where: { id: "sp1" }, data: { lastCompleted: expect.any(Date) } });
+  });
+
+  it("A1: creates the invoice after completion and returns it; failures never undo the completion", async () => {
+    const tp = makeTp();
+    tp.visit.findUnique.mockResolvedValue(baseVisit());
+    autoCreateForCompletedVisit.mockResolvedValueOnce({ invoiceId: "inv1", status: "PAID" });
+    const res = await createVisitCompletionService(tp as any).completeVisit("v1", { payment: { method: "CASH" } });
+    expect(autoCreateForCompletedVisit).toHaveBeenCalledWith("visit-12345678");
+    expect(res.invoice).toEqual({ id: "inv1", status: "PAID" });
+
+    const err = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    autoCreateForCompletedVisit.mockRejectedValueOnce(new Error("db down"));
+    const res2 = await createVisitCompletionService(tp as any).completeVisit("v1", { payment: { method: "CASH" } });
+    expect(res2.status).toBe("COMPLETED");
+    expect(res2.invoice).toBeNull();
+    expect(err).toHaveBeenCalled();
+    err.mockRestore();
   });
 });

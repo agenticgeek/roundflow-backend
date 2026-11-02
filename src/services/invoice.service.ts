@@ -3,6 +3,7 @@ import type { BusinessSettings } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 import { startOfUtcDay } from "../lib/schedule";
+import { round2, vatOn, vatRateOf } from "../lib/vat";
 import { queueGhlEvent } from "../integrations/ghl/sync";
 import { getCachedBusinessSettings } from "./settings.service";
 import { createMessageService } from "./message.service";
@@ -75,6 +76,7 @@ const visitInvoiceInclude = {
   service: { select: { name: true } },
   servicePlan: { select: { service: { select: { name: true } } } },
   invoice: { select: { id: true } },
+  payment: { select: { status: true, paidAt: true } },
 } satisfies Prisma.VisitInclude;
 
 type InvoiceVisit = Prisma.VisitGetPayload<{ include: typeof visitInvoiceInclude }>;
@@ -95,19 +97,8 @@ function toDateStr(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
 
-function round2(n: number): number {
-  return +n.toFixed(2);
-}
-
-// B1: VAT comes from BusinessSettings.vatRate (default 20%).
-function vatRateOf(settings: BusinessSettings | null): number {
-  return settings?.vatRate != null ? Number(settings.vatRate) : 20;
-}
-
-// VAT added on top of a net amount (creating an invoice from a visit price).
-function vatOn(subtotal: number, settings: BusinessSettings | null): number {
-  return settings?.vatInInvoices ? round2((subtotal * vatRateOf(settings)) / 100) : 0;
-}
+// VAT added on top of a net amount (creating an invoice from a visit price)
+// lives in ../lib/vat.ts (shared with visit completion, A3).
 
 // VAT contained in a saved gross total (rendering an existing invoice).
 function vatWithin(total: number, settings: BusinessSettings | null): number {
@@ -522,6 +513,10 @@ class InvoiceService {
     const total = new Prisma.Decimal(round2(subtotal + vatOn(subtotal, settings)));
     const dueDate = input.dueDate ? new Date(input.dueDate) : defaultDueDate(settings);
 
+    // A2: a visit whose payment is already PAID (e.g. cash taken at the door)
+    // gets a PAID invoice, so it never counts as debt or blocks the next visit.
+    const alreadyPaid = visit.payment?.status === PaymentStatus.PAID;
+
     const invoice = await this.prisma.$transaction(async (tx) => {
       await lockInvoiceNumbering(tx);
       const invoiceNumber = await nextInvoiceNumber(tx);
@@ -533,11 +528,13 @@ class InvoiceService {
           amount: total,
           dueDate,
           notes: input.notes ?? null,
-          status: InvoiceStatus.DRAFT,
+          status: alreadyPaid ? InvoiceStatus.PAID : InvoiceStatus.DRAFT,
+          paidAt: alreadyPaid ? visit.payment?.paidAt ?? new Date() : null,
           sentToCustomer: false,
         },
       });
     });
+    if (alreadyPaid) await releaseHoldIfSettled(this.prisma, visit.property.customer.id);
 
     return {
       id: invoice.id,
@@ -548,6 +545,24 @@ class InvoiceService {
       dueDate: invoice.dueDate,
       total: total.toNumber(),
     };
+  }
+
+  // A1: invoice created automatically when a visit is completed. Idempotent
+  // (a visit that already has an invoice — e.g. from "Create invoices for
+  // today" — returns null) and it follows the bulk skip rules: a visit or
+  // customer on payment hold is left for the office. Never throws for those
+  // expected cases; a real failure propagates to the caller.
+  async autoCreateForCompletedVisit(visitId: string): Promise<{ invoiceId: string; status: InvoiceStatus } | null> {
+    try {
+      const visit = await this.loadInvoiceableVisit(visitId);
+      if (visit.paymentHold || visit.property.customer.holdNextClean) return null;
+      const invoice = await this.createInvoice({ visitId, sendEmail: false });
+      return { invoiceId: invoice.id, status: invoice.status };
+    } catch (err) {
+      if (err instanceof AppError && err.code === "ALREADY_INVOICED") return null;
+      if ((err as { code?: string }).code === "P2002") return null; // lost a race to another creator
+      throw err;
+    }
   }
 
   async previewInvoice(visitId: string): Promise<InvoicePreview> {

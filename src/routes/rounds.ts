@@ -3,7 +3,7 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
-import { asObject, h, requireString, optReqString, optString, optId, optBool } from "../lib/http";
+import { asObject, h, requireString, optReqString, optString, optId, optBool, parsePageParams } from "../lib/http";
 import {
   requireCleaningFrequency,
   optCleaningFrequency,
@@ -18,8 +18,17 @@ import {
   PushMissedInput,
   SplitInput,
 } from "../services/round.service";
+import { optPostcodeSectors } from "../lib/postcode-sectors";
 import { createReportsService } from "../services/reports.service";
 import { parseIsoDate, parseOptionalDateOnly } from "../lib/validation";
+import {
+  createWeatherHoldService,
+  WEATHER_CONDITIONS,
+  WEATHER_RESCHEDULING,
+  type WeatherCondition,
+  type WeatherHoldInput,
+  type WeatherRescheduling,
+} from "../services/weather-hold.service";
 
 export const roundsRouter = Router();
 roundsRouter.use(requireAuth);
@@ -79,6 +88,7 @@ roundsRouter.post(
       serviceAreaId: requireString(body.serviceAreaId, "serviceAreaId"),
       defaultDay: optDayOfWeek(body.defaultDay),
       description: optString(body.description, "description"),
+      postcodeSectors: optPostcodeSectors(body.postcodeSectors),
     };
     res.status(201).json(await svc(req).createRound(input));
   })
@@ -156,6 +166,19 @@ roundsRouter.get(
 );
 
 // ==========================================================================
+// GET /rounds/:id/properties?page&pageSize — the round's non-cancelled
+// properties, paged (pageSize max 100, any page): { rows, pagination: { page,
+// pageSize, total, totalPages } }
+// ==========================================================================
+roundsRouter.get(
+  "/:id/properties",
+  h(async (req, res) => {
+    const { page, pageSize } = parsePageParams(req.query as Record<string, unknown>, { defaultPageSize: 50, maxPageSize: 100 });
+    res.json(await svc(req).listProperties(req.params.id, page, pageSize));
+  })
+);
+
+// ==========================================================================
 // PATCH /rounds/:id — partial update (name, frequency, serviceAreaId, defaultDay, description, status)
 // ==========================================================================
 roundsRouter.patch(
@@ -169,6 +192,7 @@ roundsRouter.patch(
       defaultDay: optDayOfWeek(body.defaultDay),
       description: optString(body.description, "description"),
       status: optRoundStatus(body.status),
+      postcodeSectors: optPostcodeSectors(body.postcodeSectors),
     };
     const result = await svc(req).updateRound(req.params.id, input);
     void createReportsService(req.tenantPrisma!).logActivity(
@@ -323,6 +347,58 @@ roundsRouter.post(
       req.profile?.id,
       req.profile?.role ?? undefined,
     );
+    res.json(result);
+  })
+);
+
+// Weather hold inputs, from a JSON body or the preview's query string.
+function parseWeatherHold(src: Record<string, unknown>): WeatherHoldInput {
+  const condition = requireString(src.condition, "condition");
+  if (!Object.prototype.hasOwnProperty.call(WEATHER_CONDITIONS, condition)) {
+    throw new AppError(400, `"condition" must be one of: ${Object.keys(WEATHER_CONDITIONS).join(", ")}`);
+  }
+  const rescheduling = requireString(src.rescheduling, "rescheduling");
+  if (!(WEATHER_RESCHEDULING as readonly string[]).includes(rescheduling)) {
+    throw new AppError(400, `"rescheduling" must be one of: ${WEATHER_RESCHEDULING.join(", ")}`);
+  }
+  const date = parseOptionalDateOnly(src.date, "date");
+  if (!date) throw new AppError(400, '"date" is required (YYYY-MM-DD)');
+  return { date, condition: condition as WeatherCondition, rescheduling: rescheduling as WeatherRescheduling };
+}
+
+const weatherHoldSvc = (req: Request) => {
+  if (!req.tenantPrisma) throw new AppError(500, "Tenant client not initialised");
+  return createWeatherHoldService(req.tenantPrisma);
+};
+
+// ==========================================================================
+// GET /rounds/:id/weather-hold/preview?date=YYYY-MM-DD&condition=&rescheduling=
+//   Read-only: affected visit/customer counts, the new date and the customer
+//   message rendered for the first affected customer.
+// ==========================================================================
+roundsRouter.get(
+  "/:id/weather-hold/preview",
+  h(async (req, res) => {
+    res.json(await weatherHoldSvc(req).preview(req.params.id, parseWeatherHold(req.query as Record<string, unknown>)));
+  })
+);
+
+// ==========================================================================
+// POST /rounds/:id/weather-hold — hold one round-day for the weather.
+//   Body: { date: YYYY-MM-DD, condition: heavy-rain|high-winds|snow-ice|technician-safety,
+//           rescheduling: next-available|next-cycle|manual, notifyCustomers? }
+//   Moves (or, for "manual", skips) the round's SCHEDULED visits on that date,
+//   logs WEATHER_HOLD, then messages the affected customers when asked.
+// ==========================================================================
+roundsRouter.post(
+  "/:id/weather-hold",
+  h(async (req, res) => {
+    const body = asObject(req.body);
+    const result = await weatherHoldSvc(req).apply(req.params.id, {
+      ...parseWeatherHold(body),
+      notifyCustomers: optBool(body.notifyCustomers, "notifyCustomers") ?? false,
+      actor: { id: req.profile?.id, role: req.profile?.role ?? undefined },
+    });
     res.json(result);
   })
 );

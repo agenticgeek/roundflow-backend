@@ -9,10 +9,13 @@ function uniqueConstraintError() {
   });
 }
 
+const CATALOGUE_PRICE: Record<string, number> = { "svc-a": 20, "svc-b": 30, "svc-c": 40 };
+
 function makePrisma() {
   return {
     businessSettings: { findFirst: vi.fn(), findMany: vi.fn(), upsert: vi.fn() },
-    service: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
+    // Echoes a catalogue row (price 10 x index, active) per id of an `id: { in }` lookup (BUG-06).
+    service: { findMany: vi.fn((args: any) => Promise.resolve(args?.where?.id?.in ? (args.where.id.in as string[]).map((id) => ({ id, defaultPrice: CATALOGUE_PRICE[id] ?? 10, active: true })) : [])), deleteMany: vi.fn(), createMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
     messageTemplate: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
     technician: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
     technicianServiceArea: { createMany: vi.fn().mockResolvedValue({ count: 0 }) },
@@ -176,7 +179,7 @@ it("addSetupProperty creates one plan at the full price when serviceIds is not g
   expect(result.servicePlan).toBe(result.servicePlans[0]);
 });
 
-it("addSetupProperty creates one plan per serviceIds entry, splitting price evenly", async () => {
+it("addSetupProperty (BUG-06) creates each serviceIds plan at its own catalogue price and ignores the client price", async () => {
   const prisma = makePrisma();
   (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((fn: (tx: typeof prisma) => Promise<unknown>) => fn(prisma));
   (prisma.serviceArea.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(makeServiceArea("area1"));
@@ -184,16 +187,16 @@ it("addSetupProperty creates one plan per serviceIds entry, splitting price even
   (prisma.customer.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1" });
   (prisma.property.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "p1" });
   (prisma.servicePlan.create as ReturnType<typeof vi.fn>)
-    .mockResolvedValueOnce({ id: "sp1", serviceId: "svc-a", price: 25 })
-    .mockResolvedValueOnce({ id: "sp2", serviceId: "svc-b", price: 25 });
+    .mockResolvedValueOnce({ id: "sp1", serviceId: "svc-a", price: 20 })
+    .mockResolvedValueOnce({ id: "sp2", serviceId: "svc-b", price: 30 });
 
   const result = await createSetupService(prisma).addSetupProperty({
     ...makeInput(), price: 50, serviceIds: ["svc-a", "svc-b"],
   });
 
   expect(prisma.servicePlan.create).toHaveBeenCalledTimes(2);
-  expect(prisma.servicePlan.create).toHaveBeenNthCalledWith(1, { data: expect.objectContaining({ serviceId: "svc-a", price: 25 }) });
-  expect(prisma.servicePlan.create).toHaveBeenNthCalledWith(2, { data: expect.objectContaining({ serviceId: "svc-b", price: 25 }) });
+  expect(prisma.servicePlan.create).toHaveBeenNthCalledWith(1, { data: expect.objectContaining({ serviceId: "svc-a", price: 20 }) });
+  expect(prisma.servicePlan.create).toHaveBeenNthCalledWith(2, { data: expect.objectContaining({ serviceId: "svc-b", price: 30 }) });
   expect(result.servicePlans).toHaveLength(2);
 });
 
@@ -392,7 +395,7 @@ it("bulkAddSetupProperties: landline is written through to the created customer"
   expect(call.data[0].landline).toBe("01234567890");
 });
 
-it("bulkAddSetupProperties: serviceIds creates one ServicePlan per id, splitting price evenly", async () => {
+it("bulkAddSetupProperties (BUG-06): serviceIds creates one ServicePlan per id at catalogue prices", async () => {
   const prisma = makePrisma();
   (prisma.serviceArea.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeServiceArea("area1")]);
   (prisma.round.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeRound("round1")]);
@@ -404,11 +407,8 @@ it("bulkAddSetupProperties: serviceIds creates one ServicePlan per id, splitting
   const call = (prisma.servicePlan.createMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
   expect(call.data).toHaveLength(3);
   expect(call.data.map((p: { serviceId: string }) => p.serviceId)).toEqual(["svc-a", "svc-b", "svc-c"]);
-  // 100 / 3 = 33.33.., floored to 33.33 for the first two, remainder on the last.
-  expect(call.data[0].price).toBe(33.33);
-  expect(call.data[1].price).toBe(33.33);
-  expect(call.data[2].price).toBe(33.34);
-  expect(call.data[0].price + call.data[1].price + call.data[2].price).toBe(100);
+  // client price (100) ignored; total = 20 + 30 + 40
+  expect(call.data.map((p: { price: number }) => p.price)).toEqual([20, 30, 40]);
   expect(result.results[0].servicePlans).toHaveLength(3);
   expect(result.results[0].servicePlan).toBe(result.results[0].servicePlans[0]);
 });
@@ -701,6 +701,7 @@ it("savePaymentSetup persists the rules and payment defaults, never the connect 
     debtHoldEnabled: true,
     vatInInvoices: true,
     defaultPaymentMethod: "BACS",
+    acceptedPaymentMethods: ["BACS"],
     invoiceDueDays: 14,
     noDirectDebitAction: "SEND_PAYMENT_LINK",
     completedSteps: [1, 2],

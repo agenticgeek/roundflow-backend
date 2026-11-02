@@ -670,11 +670,14 @@ it.each(["ACTIVE", "PAUSED", "CANCELLED", undefined] as const)(
     expect(result.pagination.total).toBe(1);
 
     const findManyArgs = (prisma.customer.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
-    if (status) {
+    // Deleted customers are only listed when CANCELLED is asked for explicitly;
+    // PAUSED is derived from service plans (E2E-028), so it filters on plans.
+    if (status === "ACTIVE" || status === "CANCELLED") {
       expect(findManyArgs.where.status).toBe(status);
     } else {
-      expect(findManyArgs.where.status).toBeUndefined();
+      expect(findManyArgs.where.status).toEqual({ not: "CANCELLED" });
     }
+    if (status === "PAUSED") expect(findManyArgs.where.AND[0].properties.some.servicePlans.some.status).toBe("PAUSED");
     // Regression guard: non-HOLD statuses never get the paymentHold semi-join.
     expect(findManyArgs.where.properties).toBeUndefined();
   }
@@ -796,7 +799,7 @@ it("getCustomers rejects an invalid status filter", async () => {
   ).rejects.toMatchObject({ statusCode: 400 });
 });
 
-it("getCustomers skips customers with no properties", async () => {
+it("getCustomers lists customers with no properties as hasNoProperty rows", async () => {
   const prisma = makePrisma();
   mockSummaryCounts(prisma, { total: 1, active: 1, holds: 0 });
   (prisma.customer.count as ReturnType<typeof vi.fn>).mockResolvedValueOnce(1);
@@ -806,7 +809,8 @@ it("getCustomers skips customers with no properties", async () => {
 
   const result = await createCustomerService(prisma).getCustomers({}, UserRole.ADMIN);
 
-  expect(result.customers).toEqual([]);
+  expect(result.customers).toHaveLength(1);
+  expect(result.customers[0]).toMatchObject({ customerId: "c1", hasNoProperty: true, propertyId: null, addressLine: null, postcode: null, roundId: null, price: null });
 });
 
 // ── getCustomerDetail: visit/payment caps ──────────────────────────────────
@@ -1215,7 +1219,7 @@ it("pauseServicePlan pauses now, cancels visits and reports cancelledVisits", as
   };
   txReturning(prisma, tx);
 
-  const result = await createCustomerService(prisma).pauseServicePlan("sp1", { pauseStartDate: new Date("2020-01-01") });
+  const result = await createCustomerService(prisma).pauseServicePlan("sp1", { pauseStartDate: new Date() });
 
   expect(result).toMatchObject({ id: "sp1", cancelledVisits: 2, pauseScheduled: false });
   expect(tx.servicePlan.update.mock.calls[0][0].data.status).toBe(LifecycleStatus.PAUSED);

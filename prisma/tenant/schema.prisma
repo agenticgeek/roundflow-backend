@@ -184,10 +184,23 @@ enum PhotoType {
   ACCESS_ISSUE // mobile: photo attached to an access-issue report (Photo.issueId)
 }
 
+// Admin review of technician photos (technician Photo Archive). New uploads
+// start PENDING; rows that existed before the column are backfilled APPROVED.
+enum PhotoReviewStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
 enum NoteType {
   INTERNAL
   RISK_WARNING
   CUSTOMER
+}
+
+enum ChatSenderRole {
+  TECHNICIAN
+  OFFICE
 }
 
 enum StripeSessionType {
@@ -261,6 +274,13 @@ model BusinessSettings {
   vatRate                  Decimal        @default(20) @db.Decimal(5, 2)
   reminderMode             ReminderMode   @default(EVENING_BEFORE)
   reminderTime             String         @default("19:00") // HH:mm, tenant-local
+  // BUG-01: [{ type: "EVENING_BEFORE"|"MORNING_OF", time: "HH:mm" }]; [] = no
+  // reminders. reminderMode/reminderTime above are kept in sync with the first
+  // entry for old clients.
+  preCleanReminders        Json           @default("[{\"type\":\"EVENING_BEFORE\",\"time\":\"19:00\"}]")
+  // BUG-05: methods the business accepts; defaultPaymentMethod must be one of
+  // them (enforced in the settings validators). Empty = not configured yet.
+  acceptedPaymentMethods   PaymentMethod[] @default([])
   defaultCleanMethod       CleanMethod?
   autoCreateNextVisit      Boolean        @default(true)
   defaultPaymentMethod     PaymentMethod?
@@ -398,6 +418,8 @@ model Round {
   status        RoundStatus        @default(DRAFT)
   serviceAreaId String?
   serviceArea   ServiceArea?       @relation(fields: [serviceAreaId], references: [id])
+  // BUG-04: postcode sectors (e.g. "CH41") this round covers.
+  postcodeSectors  String[]          @default([])
   defaultServiceId String?
   defaultService   Service?          @relation("RoundDefaultService", fields: [defaultServiceId], references: [id], onDelete: SetNull)
   properties       Property[]
@@ -436,6 +458,7 @@ model Technician {
   incidents           TechnicianIncident[]
   availability        TechnicianAvailability[]
   kpiAlerts           KpiAlert[]
+  dayCloses           TechnicianDayClose[]
   createdAt        DateTime                @default(now())
   updatedAt        DateTime                @updatedAt
 }
@@ -464,6 +487,8 @@ model RoundTechnician {
 
 model Visit {
   id            String         @id @default(cuid())
+  // Human-readable job ref ("JOB-000123"): per-tenant-schema sequence, set by the DB on every create.
+  jobNumber     Int            @unique @default(autoincrement())
   date          DateTime
   status        VisitStatus    @default(SCHEDULED)
   paymentHold   Boolean        @default(false)
@@ -490,7 +515,8 @@ model Visit {
   // (visit-assignment.restampFutureVisits) must leave it alone.
   technicianOverride Boolean   @default(false)
   cancelReason  String?        // set when status = CANCELLED, e.g. "PAUSED"
-  reminderSentAt DateTime?     @db.Timestamptz // pre-clean reminder idempotency
+  reminderSentAt DateTime?     @db.Timestamptz // pre-clean reminder idempotency (last send)
+  reminderSentTypes String[]   @default([])     // BUG-01: reminder types already sent for this visit ("EVENING_BEFORE" | "MORNING_OF")
   complaintId   String?        // revisit booked from a complaint
   complaint     Complaint?     @relation(fields: [complaintId], references: [id], onDelete: SetNull)
   paymentMethod PaymentMethod?
@@ -622,6 +648,7 @@ model Message {
   sentAt       DateTime?
   creditCost   Int?
   externalId   String?          // provider message id (GHL messageId)
+  readAt       DateTime?        @db.Timestamptz // INBOUND only: when the office marked it read (null = unread)
   createdAt    DateTime         @default(now())
 
   @@index([customerId])
@@ -679,12 +706,16 @@ model Photo {
   complaint   Complaint? @relation(fields: [complaintId], references: [id])
   issueId     String?
   issue       Issue?     @relation(fields: [issueId], references: [id], onDelete: SetNull)
+  reviewStatus  PhotoReviewStatus @default(PENDING)
+  reviewedAt    DateTime?
+  reviewedById  String? // public.Profile.id of the reviewer (cross-schema, no FK)
   createdAt   DateTime   @default(now())
 
   @@index([propertyId])
   @@index([visitId])
   @@index([complaintId])
   @@index([issueId])
+  @@index([reviewStatus])
 }
 
 model ActivityLog {
@@ -693,7 +724,13 @@ model ActivityLog {
   message   String
   actorId   String?
   actorRole String?
+  // BUG-08: the record the entry is about (e.g. a property id for
+  // PROPERTY_SERVICES_CHANGED) so per-record history can be listed.
+  entityId  String?
+  details   Json?    // structured payload for entries that need one (old/new services)
   createdAt DateTime @default(now())
+
+  @@index([entityId, createdAt])
 }
 
 // Technician self-reports they cannot complete a round mid-day.
@@ -754,10 +791,26 @@ model ChatMessage {
   type            String   @default("TEXT") // TEXT | WORK_PHOTOS | PHOTOS
   visitId         String?
   photoUrls       String[] @default([]) // image URLs for type = PHOTOS
+  senderRole      ChatSenderRole @default(TECHNICIAN)
+  // Client-generated id: a retried send (offline replay, double tap) returns
+  // the existing row instead of posting twice.
+  clientMsgId     String?
   createdAt       DateTime @default(now()) @db.Timestamptz
 
+  @@unique([roundId, senderProfileId, clientMsgId])
   @@index([roundId, createdAt])
   @@index([senderProfileId])
+}
+
+// Per-reader chat read marker (profileId = public.Profile.id, cross-schema) —
+// unread = messages from other senders newer than lastReadAt.
+model ChatRead {
+  profileId  String
+  roundId    String
+  lastReadAt DateTime @default(now()) @db.Timestamptz
+
+  @@id([profileId, roundId])
+  @@index([roundId])
 }
 
 // Push device registrations (mobile). pushToken is the provider token
@@ -796,6 +849,8 @@ model IntegrationOutbox {
   lastError   String?
   createdAt   DateTime @default(now())
   processedAt DateTime?
+  // Delayed sends (scheduled round messages): the worker skips pending rows until this time. null = due now.
+  runAfter    DateTime?
 
   @@index([status, createdAt])
 }
@@ -892,4 +947,20 @@ model IdempotencyRecord {
   createdAt      DateTime @default(now()) @db.Timestamptz
 
   @@index([createdAt])
+}
+
+// A technician's own end-of-day sign-off (POST /mobile/day/close): every visit they
+// had that day is COMPLETED or SKIPPED. Distinct from BusinessSettings.lastClosedDate,
+// which is the office closing the whole business day. One row per technician per day.
+model TechnicianDayClose {
+  id             String     @id @default(cuid())
+  technicianId   String
+  technician     Technician @relation(fields: [technicianId], references: [id])
+  date           String     // YYYY-MM-DD, tenant-local
+  closedAt       DateTime   @default(now()) @db.Timestamptz
+  completedCount Int
+  skippedCount   Int
+
+  @@unique([technicianId, date])
+  @@index([date])
 }

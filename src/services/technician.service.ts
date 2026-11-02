@@ -2,7 +2,8 @@ import { VisitStatus, Prisma } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 import type { AppStatus } from "./settings.service";
-import { todayRange } from "../lib/dates";
+import { tenantTodayRange, tenantToday } from "./business-time";
+import { releaseTechnicianWork } from "./visit-assignment";
 import { computeTechnicianKpis, emptyKpis, periodRange, type KpiPeriod } from "./technician-kpi.service";
 
 // ---------------------------------------------------------------------------
@@ -160,7 +161,7 @@ class TechnicianService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
   async listTechnicians(): Promise<TechnicianListRow[]> {
-    const { start, end } = todayRange();
+    const { start, end } = await tenantTodayRange(this.prisma);
 
     const [technicians, todayGroups] = await Promise.all([
       this.prisma.technician.findMany({
@@ -196,7 +197,7 @@ class TechnicianService {
   }
 
   async getTechnicianDetail(id: string): Promise<TechnicianDetail> {
-    const { start, end } = todayRange();
+    const { start, end } = await tenantTodayRange(this.prisma);
 
     const [tech, todayVisits] = await Promise.all([
       this.prisma.technician.findUnique({
@@ -328,6 +329,10 @@ class TechnicianService {
 
       let tech;
       try {
+        // C1: deactivating releases the technician's upcoming visits.
+        if (input.active === false && existing.active) {
+          await releaseTechnicianWork(tx, id, await tenantToday(this.prisma));
+        }
         tech = await tx.technician.update({
           where: { id },
           data: {

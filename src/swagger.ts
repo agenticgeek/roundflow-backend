@@ -149,6 +149,7 @@ const enumSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     "WRONG_ADDRESS",
     "OTHER",
   ]),
+  PhotoReviewStatus: stringEnum(["PENDING", "APPROVED", "REJECTED"], "Admin review state of a photo. New uploads start PENDING; photos that existed before review was added are APPROVED."),
   PhotoType: stringEnum(["PROPERTY", "BEFORE", "AFTER", "ACCESS_ISSUE"], "ACCESS_ISSUE: photo attached to a technician's access-issue report (POST /mobile/visits/{id}/access-issues `photoPaths`)."),
   PaymentTiming: stringEnum(["COLLECT_AFTER_VISIT", "COLLECT_BEFORE_VISIT", "COLLECT_ON_DATE", "COLLECT_DAILY_BATCH"]),
   NoteType: stringEnum(["INTERNAL", "RISK_WARNING", "CUSTOMER"]),
@@ -272,9 +273,11 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       vatRate: { type: "number", description: "VAT percentage (0–100) as a JSON number.", example: 20 },
       reminderMode: ref("ReminderMode"),
       reminderTime: { type: "string", example: "19:00", description: "HH:mm, tenant-local (timezone)." },
+      preCleanReminders: { type: "array", description: "BUG-01: pre-clean reminders, one message per entry per visit. [] = no reminders. Defaults 19:00 (EVENING_BEFORE) / 07:00 (MORNING_OF). Wins over the legacy reminderMode/reminderTime, which stay in sync with the first entry.", items: { type: "object", required: ["type"], properties: { type: { type: "string", enum: ["EVENING_BEFORE", "MORNING_OF"] }, time: { type: "string", example: "19:00", description: "HH:mm, tenant-local." } } } },
       defaultCleanMethod: nullableRef("CleanMethod"),
       autoCreateNextVisit: { type: "boolean" },
       defaultPaymentMethod: nullableRef("PaymentMethod"),
+      acceptedPaymentMethods: { type: "array", items: ref("PaymentMethod"), description: "BUG-05: methods the business accepts (no provider connection needed). defaultPaymentMethod must be one of them; new customers/properties/imports default to it." },
       invoiceDueDays: { type: "integer", minimum: 1, maximum: 90, example: 7 },
       noDirectDebitAction: ref("NoDirectDebitAction"),
       completedSteps: { type: "array", items: { type: "integer" }, description: "Setup wizard steps saved at least once (drives GET /setup/status)." },
@@ -356,6 +359,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       description: { type: "string", nullable: true },
       status: ref("RoundStatus"),
       serviceAreaId: { type: "string", nullable: true },
+      postcodeSectors: { type: "array", items: { type: "string", example: "CH41 2" }, description: "BUG-04: postcode sectors the round covers (upper-cased). Must sit inside the service area's postcodeSector(s) when the area records any (400 otherwise)." },
       defaultServiceId: { type: "string", nullable: true, description: "Fallback service for invoice line text (visit service → plan service → round default service → \"Window cleaning\"). No endpoint sets it yet." },
       createdAt: dateTime,
       updatedAt: dateTime,
@@ -946,6 +950,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       status: ref("RoundStatus"),
       serviceAreaId: { type: "string", nullable: true },
       serviceAreaName: { type: "string", nullable: true },
+      postcodeSectors: { type: "array", items: { type: "string", example: "CH41 2" }, description: "BUG-04: postcode sectors the round covers (upper-cased). Must sit inside the service area's postcodeSector(s) when the area records any (400 otherwise)." },
       technicianCount: { type: "integer" },
       propertyCount: { type: "integer" },
     },
@@ -1347,14 +1352,115 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     },
   },
 
+  BroadcastRecipient: {
+    type: "object",
+    required: ["customerId", "customerName", "status"],
+    properties: {
+      customerId: { type: "string" },
+      customerName: { type: "string" },
+      status: { type: "string", enum: ["sent", "scheduled", "skipped_opted_out", "skipped_no_contact", "failed"] },
+      channel: { type: "string", enum: ["SMS", "EMAIL", "WHATSAPP"], description: "The channel used / queued (absent when skipped for opt-out)." },
+      error: { type: "string", description: "Why the recipient was skipped (no contact detail) or failed." },
+    },
+  },
+
   MessageBulkResult: {
     type: "object",
-    required: ["queued"],
+    description: "Per-recipient outcome of a round broadcast (POST /messages/bulk) or of the customer notification in a weather hold.",
+    required: ["queued", "sent", "scheduled", "skippedOptedOut", "skippedNoContact", "failed", "scheduledFor", "recipients"],
     properties: {
-      queued: {
-        type: "integer",
-        description: "Number of recipients the message was actually sent to. Best-effort: a per-recipient failure is logged and skipped, not surfaced as an error.",
+      queued: { type: "integer", description: "sent + scheduled (older clients read only this)." },
+      sent: { type: "integer", description: "Delivered to GoHighLevel now; a Message row was recorded for each." },
+      scheduled: { type: "integer", description: "Queued on the outbox for `scheduledFor`; the Message row is recorded when it is actually sent." },
+      skippedOptedOut: { type: "integer", description: "Customers with messagesOptOut — never contacted." },
+      skippedNoContact: { type: "integer", description: "No mobile / email on file for the channel." },
+      failed: { type: "integer", description: "GHL rejected the send or it could not be queued." },
+      scheduledFor: { type: "string", format: "date-time", nullable: true },
+      recipients: { type: "array", items: ref("BroadcastRecipient") },
+    },
+  },
+
+  BulkRecipient: {
+    type: "object",
+    required: ["customerId", "customerName", "address", "status"],
+    properties: {
+      customerId: { type: "string" },
+      customerName: { type: "string" },
+      address: { type: "string", description: "The first property of the customer in the round." },
+      status: { type: "string", enum: ["ok", "opted_out", "no_contact"], description: "ok = would be messaged on the channel; opted_out = messagesOptOut; no_contact = no mobile / email for the channel." },
+    },
+  },
+
+  BulkRecipientsResult: {
+    type: "object",
+    required: ["total", "reachable", "recipients"],
+    properties: {
+      total: { type: "integer" },
+      reachable: { type: "integer", description: "Recipients with status ok." },
+      recipients: { type: "array", items: ref("BulkRecipient") },
+    },
+  },
+
+  VisitRescheduleInput: {
+    type: "object",
+    required: ["date"],
+    properties: { date: { type: "string", format: "date", description: "Today or later." } },
+    example: { date: "2026-11-10" },
+  },
+
+  VisitRescheduleResult: {
+    type: "object",
+    required: ["id", "status", "date"],
+    properties: {
+      id: { type: "string" },
+      status: { type: "string", enum: ["SCHEDULED"] },
+      date: { type: "string", format: "date" },
+    },
+  },
+
+  WeatherHoldInput: {
+    type: "object",
+    required: ["date", "condition", "rescheduling"],
+    properties: {
+      date: { type: "string", format: "date", description: "The round-day to hold. Today or later." },
+      condition: { type: "string", enum: ["heavy-rain", "high-winds", "snow-ice", "technician-safety"] },
+      rescheduling: {
+        type: "string",
+        enum: ["next-available", "next-cycle", "manual"],
+        description: "next-available: SCHEDULED visits move to the next working day. next-cycle: each visit moves to its next regular cycle date (and its plan's nextDueDate moves a cycle on). manual: visits are marked SKIPPED (\"Weather hold: ...\") with no new date.",
       },
+      notifyCustomers: { type: "boolean", default: false },
+    },
+    example: { date: "2026-11-05", condition: "heavy-rain", rescheduling: "next-available", notifyCustomers: true },
+  },
+
+  WeatherHoldPreview: {
+    type: "object",
+    required: ["date", "affectedVisits", "affectedCustomers", "optedOutCustomers", "newDate", "message", "characterCount", "templateName"],
+    properties: {
+      date: { type: "string", format: "date" },
+      affectedVisits: { type: "integer", description: "The round's SCHEDULED visits on `date`." },
+      affectedCustomers: { type: "integer" },
+      optedOutCustomers: { type: "integer", description: "Affected customers who will not be messaged (messagesOptOut)." },
+      newDate: { type: "string", format: "date", nullable: true, description: "Earliest new visit date; null for manual." },
+      message: { type: "string", description: "The customer message rendered for the first affected customer; empty when nothing is affected." },
+      characterCount: { type: "integer" },
+      templateName: { type: "string", nullable: true, description: "The tenant message template used (\"Weather Hold\"), or null for the built-in wording." },
+    },
+  },
+
+  WeatherHoldResult: {
+    type: "object",
+    required: ["roundId", "date", "condition", "rescheduling", "held", "newDate", "notification"],
+    properties: {
+      roundId: { type: "string" },
+      date: { type: "string", format: "date" },
+      condition: { type: "string", enum: ["heavy-rain", "high-winds", "snow-ice", "technician-safety"] },
+      rescheduling: { type: "string", enum: ["next-available", "next-cycle", "manual"] },
+      held: { type: "integer", description: "Visits actually moved (or skipped for manual)." },
+      newDate: { type: "string", format: "date", nullable: true },
+      notification: { allOf: [ref("MessageBulkResult")], nullable: true, description: "null when notifyCustomers was false, or the notification step failed (see notificationError)." },
+      notificationError: { type: "string", description: "The hold was applied but notifying customers failed as a whole." },
     },
   },
 
@@ -2225,6 +2331,33 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     },
   },
 
+  MobileDayStatus: {
+    type: "object",
+    required: ["date", "closed", "closedAt", "completedCount", "skippedCount", "remaining"],
+    description: "The caller's own end-of-day state (POST /mobile/day/close). Not the office's business-day close.",
+    properties: {
+      date: { type: "string", format: "date", description: "Tenant-local day." },
+      closed: { type: "boolean" },
+      closedAt: { ...dateTime, nullable: true },
+      completedCount: { type: "integer", description: "Stored at close time once closed; live count otherwise." },
+      skippedCount: { type: "integer" },
+      remaining: {
+        type: "array",
+        description: "The caller's visits still SCHEDULED or IN_PROGRESS that day (must be completed or skipped before closing).",
+        items: {
+          type: "object",
+          required: ["visitId", "status", "customerName", "addressLine", "roundName"],
+          properties: {
+            visitId: { type: "string" },
+            status: { type: "string", enum: ["SCHEDULED", "IN_PROGRESS"] },
+            customerName: { type: "string" },
+            addressLine: { type: "string" },
+            roundName: { type: "string", nullable: true },
+          },
+        },
+      },
+    },
+  },
   MobileUpsell: {
     type: "object",
     required: ["id", "type", "amount", "note", "visitId", "createdAt"],
@@ -2312,6 +2445,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       defaultWorkingDays: { type: "array", items: { type: "string", enum: ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"] } },
       reminderMode: ref("ReminderMode"),
       reminderTime: { type: "string", example: "19:00", description: "24-hour HH:mm (400 otherwise)." },
+      preCleanReminders: { type: "array", description: "BUG-01: pre-clean reminders, one message per entry per visit. [] = no reminders. Defaults 19:00 (EVENING_BEFORE) / 07:00 (MORNING_OF). Wins over the legacy reminderMode/reminderTime, which stay in sync with the first entry.", items: { type: "object", required: ["type"], properties: { type: { type: "string", enum: ["EVENING_BEFORE", "MORNING_OF"] }, time: { type: "string", example: "19:00", description: "HH:mm, tenant-local." } } } },
       defaultCleanMethod: nullableRef("CleanMethod"),
       autoCreateNextVisit: { type: "boolean" },
     },
@@ -2327,6 +2461,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       debtHoldEnabled: { type: "boolean", description: "Block service if payment is overdue." },
       vatInInvoices: { type: "boolean", description: "Include VAT in invoices by default." },
       defaultPaymentMethod: nullableRef("PaymentMethod"),
+      acceptedPaymentMethods: { type: "array", items: ref("PaymentMethod"), description: "BUG-05: accepted methods; defaultPaymentMethod must be one of them (400)." },
       invoiceDueDays: { type: "integer", minimum: 1, maximum: 90 },
       noDirectDebitAction: ref("NoDirectDebitAction"),
     },
@@ -2427,6 +2562,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       defaultWorkingDays: { type: "array", items: { type: "string", enum: ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"] } },
       reminderMode: ref("ReminderMode"),
       reminderTime: { type: "string", example: "19:00", description: "24-hour HH:mm, tenant-local (400 otherwise)." },
+      preCleanReminders: { type: "array", description: "BUG-01: pre-clean reminders, one message per entry per visit. [] = no reminders. Defaults 19:00 (EVENING_BEFORE) / 07:00 (MORNING_OF). Wins over the legacy reminderMode/reminderTime, which stay in sync with the first entry.", items: { type: "object", required: ["type"], properties: { type: { type: "string", enum: ["EVENING_BEFORE", "MORNING_OF"] }, time: { type: "string", example: "19:00", description: "HH:mm, tenant-local." } } } },
       defaultCleanMethod: nullableRef("CleanMethod"),
       autoCreateNextVisit: { type: "boolean" },
       preCleanReminderTimings: {
@@ -2523,6 +2659,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       debtHoldMaxInvoices: { type: "integer", nullable: true, description: "Mobile debt gate: max unpaid (DRAFT/SENT) invoices before Start is blocked. null = any unpaid invoice blocks (when debtHoldEnabled)." },
       debtHoldMaxAmount: { type: "number", nullable: true, description: "Mobile debt gate: max unpaid total before Start is blocked. null = any unpaid amount blocks (when debtHoldEnabled)." },
       defaultPaymentMethod: nullableRef("PaymentMethod"),
+      acceptedPaymentMethods: { type: "array", items: ref("PaymentMethod"), description: "BUG-05: accepted methods; defaultPaymentMethod must be one of them (400). Setting only a default seeds an empty list with it." },
       invoiceDueDays: { type: "integer", minimum: 1, maximum: 90 },
       noDirectDebitAction: ref("NoDirectDebitAction"),
     },
@@ -2585,10 +2722,11 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     properties: {
       customerId: { type: "string" },
       customerName: { type: "string" },
-      status: ref("LifecycleStatus"),
-      propertyId: { type: "string" },
-      addressLine: { type: "string" },
-      postcode: { type: "string" },
+      status: { ...ref("LifecycleStatus"), description: "PAUSED when the customer is ACTIVE but the displayed plan is PAUSED." },
+      hasNoProperty: { type: "boolean", description: "true for a customer with no property yet: propertyId/addressLine/postcode (and round/price/technician fields) are null." },
+      propertyId: { type: "string", nullable: true },
+      addressLine: { type: "string", nullable: true },
+      postcode: { type: "string", nullable: true },
       latitude: { type: "number", nullable: true, description: "Null until the next geocoding backfill tick picks up the new postcode." },
       longitude: { type: "number", nullable: true },
       roundId: { type: "string", nullable: true },
@@ -2985,6 +3123,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       serviceAreaId: { type: "string", description: "Must exist (404 if not)." },
       defaultDay: nullableRef("DayOfWeek"),
       description: { type: "string", nullable: true },
+      postcodeSectors: { type: "array", items: { type: "string", example: "CH41 2" }, description: "BUG-04: postcode sectors the round covers (upper-cased). Must sit inside the service area's postcodeSector(s) when the area records any (400 otherwise)." },
     },
     example: { name: "Alnwick Monday", frequency: "FOUR_WEEKLY", serviceAreaId: "csa_example", defaultDay: "MON" },
   },
@@ -2999,6 +3138,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       defaultDay: nullableRef("DayOfWeek"),
       description: { type: "string", nullable: true },
       status: ref("RoundStatus"),
+      postcodeSectors: { type: "array", items: { type: "string", example: "CH41 2" }, description: "BUG-04: postcode sectors the round covers (upper-cased). Must sit inside the service area's postcodeSector(s) when the area records any (400 otherwise)." },
     },
   },
 
@@ -3109,8 +3249,11 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       channel: { type: "string", enum: ["sms", "email", "whatsapp"], description: "Case-insensitive." },
       body: { type: "string", minLength: 1 },
       excludePaymentHold: { type: "boolean", default: false, description: "Drop any customer whose round properties all have a payment-hold visit." },
+      customerIds: { type: "array", items: { type: "string" }, description: "Message only these customers. Each must be one of the round's recipients (400 UNKNOWN_RECIPIENT otherwise); from GET /messages/bulk/recipients. Omit for everyone." },
+      templateId: { type: "string", nullable: true, description: "Message template the body came from — recorded on each Message row." },
+      scheduledFor: { type: "string", format: "date-time", nullable: true, description: "Send later: a future time within 90 days. Omit to send now." },
     },
-    example: { roundId: "r1", channel: "sms", body: "Your clean has been rescheduled due to weather.", excludePaymentHold: true },
+    example: { roundId: "r1", channel: "sms", body: "Hi {{firstName}}, your clean at {{address}} is on {{date}}.", excludePaymentHold: true },
   },
 
   // ---- Setup steps 9–12 ----
@@ -3536,11 +3679,15 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       id: { type: "string" },
       type: ref("PhotoType"),
       url: { type: "string", nullable: true, description: "1-hour signed read URL (null if signing failed)." },
-      thumbnailUrl: { type: "string", nullable: true, description: "Same signed URL — no server-side thumbnails yet." },
+      thumbnailUrl: { type: "string", nullable: true, description: "1-hour signed URL of a resized (480px wide) copy via Storage image transformation. Falls back to the full `url` when Storage cannot transform it (plan tier / error)." },
       takenAt: dateTime,
       visitId: { type: "string", nullable: true },
       visitDate: { ...dateTime, nullable: true },
       technician: { type: "object", nullable: true, properties: { id: { type: "string" }, name: { type: "string", nullable: true } } },
+      jobRef: { type: "string", nullable: true, description: "The visit's human-readable job reference, e.g. `JOB-000123`. Set by the property and technician galleries." },
+      reviewStatus: ref("PhotoReviewStatus"), // property and technician galleries only
+      propertyAddress: { type: "string", nullable: true, description: "Address of the visit's property. Set by the property and technician galleries." },
+      customerName: { type: "string", nullable: true, description: "Customer of the visit's property. Set by the property and technician galleries." },
     },
   },
   PhotoPage: {
@@ -4847,8 +4994,8 @@ const paths: OpenAPIV3.PathsObject = {
   "/customers": {
     post: {
       tags: ["Customers"],
-      summary: "Create a standalone customer (no property)",
-      description: "Creates a Customer record without an attached property. Use POST /properties to create a Customer+Property+ServicePlan in one shot.",
+      summary: "Create a customer, optionally with its first property and plan",
+      description: "Without `property`: a Customer with no property (it is still listed by GET /customers as a `hasNoProperty` row). With `property` (same fields as POST /customers/{id}/properties): customer + property + first plan in ONE transaction; the response then also carries `propertyId`, `servicePlanId`, `assigned`. 400/404 as for the property endpoints (ROUND_SERVICE_AREA_MISMATCH, SERVICE_INACTIVE).",
       requestBody: jsonBody({
         type: "object",
         required: ["name"],
@@ -4857,10 +5004,11 @@ const paths: OpenAPIV3.PathsObject = {
           phone: { type: "string", nullable: true },
           email: { type: "string", nullable: true },
           paymentMethod: { ...nullableRef("PaymentMethod") },
+          property: { type: "object", additionalProperties: true, description: "Optional first property + plan: addressLine, postcode, serviceAreaId, price (required) and serviceId, propertyName, propertyType, cleanMethod, paymentMethod, nextDueDate, lastCleanedDate, accessNotes, riskNotes, roundId." },
         },
       }),
       responses: {
-        "201": jsonResponse("Created customer.", ref("CustomerListRow")),
+        "201": jsonResponse("Created customer (+ propertyId/servicePlanId/assigned when a property was sent).", { type: "object", additionalProperties: true }),
         "400": ERR[400],
         "401": ERR[401],
         "403": ERR[403],
@@ -5082,6 +5230,17 @@ const paths: OpenAPIV3.PathsObject = {
   },
   "/properties/{id}": {
     parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Properties"],
+      summary: "One property with customer summary, plans, round, technician, payment status, pause state and next visit",
+      description: "Contract: docs/BACKEND_CHANGES_2026-11-03.md section 19. `pause.state` is NONE | PAUSED | SCHEDULED (primary plan; SCHEDULED = ACTIVE plan with a stored future pause window). 404 when unknown.",
+      responses: {
+        "200": jsonResponse("Property detail.", { type: "object", additionalProperties: true }),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
     patch: {
       tags: ["Properties"],
       summary: "Update property (+ Move Round: assign/unassign, frequency move)",
@@ -5118,7 +5277,7 @@ const paths: OpenAPIV3.PathsObject = {
       description:
         "Pauses the property's primary plan. SCHEDULED visits of the plan inside [pauseStartDate, pauseEndDate] (end inclusive; open-ended = every visit from the start) are CANCELLED with `cancelReason: \"PAUSED\"`. " +
         "A start on/before today sets the plan PAUSED now; a future start keeps it ACTIVE with the window stored (`pauseScheduled: true`) and the nightly job pauses it on the day. " +
-        "409 if the plan is already PAUSED. `reason` is validated but not persisted (no column).",
+        "400 `PAUSE_START_IN_PAST` when pauseStartDate is before today (tenant time zone). 409 if the plan is already PAUSED or cancelled. A scheduled pause is cancelled with POST /properties/{id}/resume. `reason` is validated but not persisted (no column).",
       requestBody: jsonBody(ref("PauseServiceInput")),
       responses: {
         "200": jsonResponse("Updated ServicePlan + pause outcome.", ref("PauseResult")),
@@ -5858,6 +6017,49 @@ const paths: OpenAPIV3.PathsObject = {
     },
   },
 
+  "/rounds/{id}/weather-hold/preview": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Rounds"],
+      summary: "Preview a weather hold",
+      description:
+        "Read-only. Returns how many SCHEDULED visits / customers the hold would affect on `date`, the new date, and the customer message rendered for the first affected customer (tenant \"Weather Hold\" template, else the built-in wording).",
+      parameters: [
+        { name: "date", in: "query", required: true, schema: { type: "string", format: "date" } },
+        { name: "condition", in: "query", required: true, schema: { type: "string", enum: ["heavy-rain", "high-winds", "snow-ice", "technician-safety"] } },
+        { name: "rescheduling", in: "query", required: true, schema: { type: "string", enum: ["next-available", "next-cycle", "manual"] } },
+      ],
+      responses: {
+        "200": jsonResponse("Preview.", ref("WeatherHoldPreview")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
+  "/rounds/{id}/weather-hold": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    post: {
+      tags: ["Rounds"],
+      summary: "Hold a round-day for the weather",
+      description:
+        "Acts on the round's SCHEDULED visits on `date` (IN_PROGRESS / finished visits are left alone): `next-available` moves them to the next working day; `next-cycle` moves each to its next regular cycle date and advances its plan's nextDueDate a cycle; `manual` marks them SKIPPED with reason \"Weather hold: <condition>\". Moved visits get their pre-clean reminder markers cleared. " +
+        "Writes a WEATHER_HOLD activity-log entry (entityId = round id). With `notifyCustomers`, each affected customer is messaged through the shared broadcast path (opt-out honoured, Message rows recorded); a delivery failure never undoes the hold — see `notification.recipients`. " +
+        "GoHighLevel must be connected when notifying (409 before anything changes). 409 NO_VISITS_TO_HOLD when nothing is scheduled; 409 if the operational day is already closed (date = today).",
+      requestBody: jsonBody(ref("WeatherHoldInput")),
+      responses: {
+        "200": jsonResponse("Hold applied.", ref("WeatherHoldResult")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+        "409": errorResponse("GoHighLevel is not connected, no visits to hold, or the operational day is closed.", "No scheduled visits to hold on this date"),
+      },
+    },
+  },
+
   "/rounds/{id}/generate-visits": {
     parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
     post: {
@@ -5960,8 +6162,10 @@ const paths: OpenAPIV3.PathsObject = {
     get: {
       tags: ["Technicians"],
       summary: "Photos from the technician's visits (B4 · GAP-019)",
-      description: "Newest first, 1-hour signed URLs. `pageSize` default 24, max 100.",
+      description: "Paged by VISIT, newest visit first: `page`/`pageSize` count visits, and `rows` holds every (matching) photo of the visits on the page, so a visit never splits across pages; `pagination.total` is the number of visits. 1-hour signed URLs. `pageSize` default 24, max 100. `search` matches the visit's customer name, property address / postcode / name, job ref (`JOB-000123`, `123`) or visit id, case-insensitive. `reviewStatus` keeps only visits with, and only returns, photos in that state.",
       parameters: [
+        { name: "search", in: "query", required: false, schema: { type: "string", maxLength: 100 }, description: "Customer name, address / postcode, job ref (`JOB-000123`) or visit id." },
+        { name: "reviewStatus", in: "query", required: false, schema: ref("PhotoReviewStatus") },
         { name: "page", in: "query", required: false, schema: { type: "integer", minimum: 1, default: 1 } },
         { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 24 } },
       ],
@@ -5971,6 +6175,60 @@ const paths: OpenAPIV3.PathsObject = {
         "401": ERR[401],
         "403": ERR[403],
         "404": errorResponse("Technician not found.", "Technician not found"),
+      },
+    },
+  },
+
+  "/technicians/{id}/photos/approve": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    post: {
+      tags: ["Technicians"],
+      summary: "Bulk-approve the technician's pending photos",
+      description: "Marks PENDING photos on the technician's visits APPROVED (stamping `reviewedAt` / `reviewedById`). Pass `photoIds` to approve only those (ids that aren't the technician's or aren't PENDING are ignored); omit it to approve every pending photo. ADMIN / MANAGER only.",
+      requestBody: jsonBody({
+        type: "object",
+        properties: { photoIds: { type: "array", items: { type: "string" }, maxItems: 500 } },
+        example: { photoIds: ["ph_1", "ph_2"] },
+      }),
+      responses: {
+        "200": jsonResponse("How many photos changed.", {
+          type: "object",
+          required: ["updated"],
+          properties: { updated: { type: "integer" } },
+        }),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": errorResponse("Technician not found.", "Technician not found"),
+      },
+    },
+  },
+
+  "/technicians/{id}/photos/{photoId}/review": {
+    parameters: [
+      { name: "id", in: "path", required: true, schema: { type: "string" } },
+      { name: "photoId", in: "path", required: true, schema: { type: "string" } },
+    ],
+    patch: {
+      tags: ["Technicians"],
+      summary: "Approve or reject one of the technician's photos",
+      description: "Can be re-run to change an earlier decision. ADMIN / MANAGER only.",
+      requestBody: jsonBody({
+        type: "object",
+        required: ["status"],
+        properties: { status: { type: "string", enum: ["APPROVED", "REJECTED"] } },
+        example: { status: "REJECTED" },
+      }),
+      responses: {
+        "200": jsonResponse("Updated review state.", {
+          type: "object",
+          required: ["id", "reviewStatus", "reviewedAt"],
+          properties: { id: { type: "string" }, reviewStatus: ref("PhotoReviewStatus"), reviewedAt: { ...dateTime, nullable: true } },
+        }),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": errorResponse("Photo not found for this technician.", "Photo not found"),
       },
     },
   },
@@ -6146,18 +6404,41 @@ const paths: OpenAPIV3.PathsObject = {
     },
   },
 
+  "/messages/bulk/recipients": {
+    get: {
+      tags: ["Messages"],
+      summary: "Preview who a round broadcast would reach",
+      description:
+        "Read-only (GoHighLevel need not be connected). One row per distinct customer of the round with a per-customer `status` for the channel (default sms): ok, opted_out or no_contact. `excludePaymentHold=true` applies the same payment-hold filter as the broadcast. Use `customerIds` on POST /messages/bulk to message a subset.",
+      parameters: [
+        { name: "roundId", in: "query", required: true, schema: { type: "string" } },
+        { name: "channel", in: "query", required: false, schema: { type: "string", enum: ["sms", "email", "whatsapp"] } },
+        { name: "excludePaymentHold", in: "query", required: false, schema: { type: "boolean" } },
+      ],
+      responses: {
+        "200": jsonResponse("Recipients.", ref("BulkRecipientsResult")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+
   "/messages/bulk": {
     post: {
       tags: ["Messages"],
       summary: "Broadcast one message to every customer in a round",
       description:
-        "Sends right now — no scheduling. `excludePaymentHold: true` drops any customer whose round properties all have a payment-hold visit. Best-effort: a per-recipient failure is logged and skipped; `queued` counts successes, not attempts. 409 if GoHighLevel isn't connected.",
+        "`{{variables}}` (customerName, firstName, address, date, technicianName, roundName, businessName, amount) are rendered per customer — never sent literally. Sends now, or queues each message on the outbox when `scheduledFor` is given (the Message row is then recorded at send time). " +
+        "Customers with `messagesOptOut` are skipped; each success is recorded as an OUTBOUND Message. `excludePaymentHold: true` drops any customer whose round properties all have a payment-hold visit. Best-effort per recipient: the outcome of every customer is in `recipients`. 409 if GoHighLevel isn't connected; 404 for an unknown round.",
       requestBody: jsonBody(ref("MessageBulkInput")),
       responses: {
         "201": jsonResponse("Broadcast result.", ref("MessageBulkResult")),
         "400": ERR[400],
         "401": ERR[401],
         "403": ERR[403],
+        "404": ERR[404],
         "409": errorResponse("GoHighLevel is not connected.", "GoHighLevel is not connected"),
       },
     },
@@ -6952,7 +7233,7 @@ const paths: OpenAPIV3.PathsObject = {
     post: {
       tags: ["Service Plans"],
       summary: "Pause a service plan",
-      description: "Mirrors POST /properties/{id}/pause (cancels SCHEDULED visits in the window with cancelReason PAUSED; a future start is stored as a scheduled pause). `reason` is required by the UI but not persisted (no column).",
+      description: "Mirrors POST /properties/{id}/pause (cancels SCHEDULED visits in the window with cancelReason PAUSED; a future start is stored as a scheduled pause). `reason` is required by the UI but not persisted (no column). 400 `PAUSE_START_IN_PAST` when pauseStartDate is before today in the tenant time zone. To cancel a scheduled (future) pause call POST /service-plans/{id}/resume.",
       requestBody: jsonBody(ref("PauseServiceInput")),
       responses: {
         "200": jsonResponse("Paused service plan + outcome.", ref("PauseResult")),
@@ -7141,6 +7422,25 @@ const paths: OpenAPIV3.PathsObject = {
       },
     },
   },
+  "/mobile/schedule": {
+    get: {
+      tags: ["Mobile"],
+      summary: "The caller's visits over a date range (upcoming and past)",
+      description: "Only the signed-in technician's own visits, CANCELLED excluded, COMPLETED/SKIPPED included. Dates are tenant-local days (BusinessSettings.timezone, default Europe/London); defaults `from` = today, `to` = from + 13 days. Max span 62 days. Rows are ordered by date, then round, then round order (`position`), paged (`pageSize` default 100, max 200). `summary` covers the WHOLE range (per day with visits: `count`, `completedCount`) so a calendar can be drawn without paging. 400 `INVALID_DATE_RANGE` (malformed date or from > to), 400 `RANGE_TOO_LARGE`.",
+      parameters: [
+        { name: "from", in: "query", required: false, schema: { type: "string", format: "date" } },
+        { name: "to", in: "query", required: false, schema: { type: "string", format: "date" } },
+        { name: "page", in: "query", required: false, schema: { type: "integer", minimum: 1 } },
+        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 200 } },
+      ],
+      responses: {
+        "200": jsonResponse("Schedule page.", { type: "object", properties: { from: { type: "string" }, to: { type: "string" }, timeZone: { type: "string" }, rows: { type: "array", items: { type: "object", additionalProperties: true, description: "MobileVisitRow plus date (YYYY-MM-DD), paymentHold, vatAmount, grossTotal." } }, summary: { type: "array", items: { type: "object", properties: { date: { type: "string" }, count: { type: "integer" }, completedCount: { type: "integer" } } } }, pagination: { type: "object", additionalProperties: true } } }),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": MOBILE_ERR_403,
+      },
+    },
+  },
   "/mobile/visits/today": {
     get: {
       tags: ["Mobile"],
@@ -7150,6 +7450,44 @@ const paths: OpenAPIV3.PathsObject = {
         "200": jsonResponse("Visit rows.", { type: "array", items: ref("MobileVisitRow") }),
         "401": ERR[401],
         "403": MOBILE_ERR_403,
+      },
+    },
+  },
+  "/mobile/day": {
+    get: {
+      tags: ["Mobile"],
+      summary: "The caller's end-of-day state",
+      description: "Default today (tenant-local); `date` = YYYY-MM-DD for an earlier day. 400 INVALID_DATE / FUTURE_DATE.",
+      parameters: [{ name: "date", in: "query", required: false, schema: { type: "string", format: "date" } }],
+      responses: {
+        "200": jsonResponse("Day state.", ref("MobileDayStatus")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": MOBILE_ERR_403,
+      },
+    },
+  },
+  "/mobile/day/close": {
+    post: {
+      tags: ["Mobile"],
+      summary: "Technician end-of-day sign-off",
+      description:
+        "Records that the caller has nothing left open for the day (default today): every visit is COMPLETED or SKIPPED. Changes no visit and does not close the office's business day (POST /today/close); a TECHNICIAN_DAY_CLOSED entry appears in the activity log. " +
+        "Idempotent: closing a closed day returns the stored sign-off with `alreadyClosed: true`. 409 UNFINISHED_VISITS (body is the day state, `remaining` lists what is left) while any visit is SCHEDULED/IN_PROGRESS.",
+      requestBody: jsonBody({
+        type: "object",
+        properties: { date: { type: "string", format: "date", description: "Defaults to today; future days are rejected." } },
+      }),
+      responses: {
+        "200": jsonResponse("Day closed.", {
+          allOf: [ref("MobileDayStatus"), { type: "object", required: ["alreadyClosed"], properties: { alreadyClosed: { type: "boolean" } } }],
+        }),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": MOBILE_ERR_403,
+        "409": jsonResponse("Visits still open (code UNFINISHED_VISITS), or the idempotency key was reused.", {
+          allOf: [ref("MobileDayStatus"), { type: "object", required: ["error", "code"], properties: { error: { type: "string" }, code: { type: "string", example: "UNFINISHED_VISITS" } } }],
+        }),
       },
     },
   },
@@ -7402,6 +7740,200 @@ const paths: OpenAPIV3.PathsObject = {
   },
 
   // =====================================================================
+  // QA batch 2026-11-03 — full request/response shapes are in
+  // docs/BACKEND_CHANGES_2026-11-03.md.
+  // =====================================================================
+  "/properties/{id}/services": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    put: {
+      tags: ["Properties"],
+      summary: "Replace the property's service list (add / remove / re-price)",
+      description: "One transaction. Added services get a plan at the catalogue price (or `prices[serviceId]`) inheriting frequency, payment method, clean method and nextDueDate from the primary plan, plus a mirrored SCHEDULED visit when the primary plan has an upcoming one. Removed services: plan CANCELLED and its SCHEDULED visits CANCELLED (reason SERVICE_REMOVED). Kept services named in `prices` are re-priced (plan + upcoming un-adjusted SCHEDULED visits). Completed visits and invoices are never touched. Writes an ActivityLog entry (PROPERTY_SERVICES_CHANGED). 400 SERVICES_REQUIRED (empty list) / SERVICE_INACTIVE; 404 unknown property or service; 409 cancelled property.",
+      requestBody: jsonBody({ type: "object", required: ["serviceIds"], properties: { serviceIds: { type: "array", items: { type: "string" }, minItems: 1 }, prices: { type: "object", additionalProperties: { type: "number", minimum: 0 }, description: "serviceId -> price override." } } }),
+      responses: {
+        "200": jsonResponse("New plan list and total.", { type: "object", properties: { propertyId: { type: "string" }, servicePlans: { type: "array", items: { type: "object", additionalProperties: true } }, totalPrice: { type: "number" }, added: { type: "array", items: { type: "string" } }, removed: { type: "array", items: { type: "string" } }, cancelledVisits: { type: "integer" } } }),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+        "409": ERR[409],
+      },
+    },
+  },
+  "/properties/{id}/services/history": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Properties"],
+      summary: "History of service-list changes (newest first)",
+      description: "`{ rows: [{ id, changedAt, actorId, actorRole, oldServices, newServices, added, removed }], pagination }`.",
+      parameters: [
+        { name: "page", in: "query", schema: { type: "integer", minimum: 1 } },
+        { name: "pageSize", in: "query", schema: { type: "integer", minimum: 1, maximum: 100 } },
+      ],
+      responses: {
+        "200": jsonResponse("History page.", { type: "object", additionalProperties: true }),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+  "/rounds/{id}/properties": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Rounds"],
+      summary: "The round's properties, paged (any page; pageSize max 100)",
+      description: "`{ rows: [{ propertyId, addressLine, postcode, status, customerId, customerName, assignedTechnicianId, servicePlans }], pagination: { page, pageSize, total, totalPages } }`.",
+      parameters: [
+        { name: "page", in: "query", schema: { type: "integer", minimum: 1 } },
+        { name: "pageSize", in: "query", schema: { type: "integer", minimum: 1, maximum: 100 } },
+      ],
+      responses: {
+        "200": jsonResponse("Properties page.", { type: "object", additionalProperties: true }),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+  },
+  "/visits/{id}/assign": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    patch: {
+      tags: ["Visits"],
+      summary: "Assign or unassign one SCHEDULED visit",
+      description: "`technicianId: null` unassigns. The change is a manual override (later restamps leave the visit alone). 409 VISIT_NOT_SCHEDULED for any other status; 400 technician inactive / invite not accepted; 404 unknown visit or technician.",
+      requestBody: jsonBody({ type: "object", required: ["technicianId"], properties: { technicianId: { type: "string", nullable: true } } }),
+      responses: {
+        "200": jsonResponse("The visit's assignment.", { type: "object", properties: { id: { type: "string" }, status: { type: "string" }, technicianId: { type: "string", nullable: true }, technicianName: { type: "string", nullable: true }, technicianOverride: { type: "boolean" } } }),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+        "409": ERR[409],
+      },
+    },
+  },
+  "/visits/{id}/reschedule": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    patch: {
+      tags: ["Visits"],
+      summary: "Reschedule a SCHEDULED or SKIPPED visit",
+      description:
+        "Moves the visit to `date` (today or later). A SKIPPED visit (e.g. after a manual weather hold) becomes SCHEDULED again and its skip reason is cleared. The visit's reminder markers are reset, reminders still queued with the old date are cancelled, and a VISIT_RESCHEDULED activity-log entry (entityId = visit id) is written. " +
+        "404 unknown visit; 409 VISIT_NOT_RESCHEDULABLE for completed / in-progress / cancelled visits; 409 if `date` is today and the operational day is closed.",
+      requestBody: jsonBody(ref("VisitRescheduleInput")),
+      responses: {
+        "200": jsonResponse("The rescheduled visit.", ref("VisitRescheduleResult")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+        "409": ERR[409],
+      },
+    },
+  },
+  "/debt/bulk": {
+    post: {
+      tags: ["Debt"],
+      summary: "Bulk debt action on up to 100 invoices",
+      description: "`action`: remind | hold | bad-debt. Each id runs the same service call as the single-row endpoint; failures are reported per id in `results` (HTTP 200) and never abort the batch. Optional `channel`, `message`, `reason`, `notify` as on the single endpoints.",
+      requestBody: jsonBody({ type: "object", required: ["ids", "action"], properties: { ids: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 100 }, action: { type: "string", enum: ["remind", "hold", "bad-debt"] }, channel: { type: "string" }, message: { type: "string" }, reason: { type: "string" }, notify: { type: "boolean" } } }),
+      responses: {
+        "200": jsonResponse("Per-id outcome.", { type: "object", properties: { action: { type: "string" }, total: { type: "integer" }, succeeded: { type: "integer" }, failed: { type: "integer" }, results: { type: "array", items: { type: "object", properties: { id: { type: "string" }, ok: { type: "boolean" }, error: { type: "string" }, code: { type: "string" } } } } } }),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+  "/messages/inbox": {
+    get: {
+      tags: ["Messages"],
+      summary: "Inbound customer replies (from GHL), newest first",
+      description: "`{ rows: [{ id, customerId, customerName, channel, body, receivedAt, unread }], unreadCount, pagination }`.",
+      parameters: [
+        { name: "customerId", in: "query", schema: { type: "string" } },
+        { name: "unreadOnly", in: "query", schema: { type: "boolean" } },
+        { name: "page", in: "query", schema: { type: "integer", minimum: 1 } },
+        { name: "pageSize", in: "query", schema: { type: "integer", minimum: 1, maximum: 100 } },
+      ],
+      responses: { "200": jsonResponse("Inbox page.", { type: "object", additionalProperties: true }), "400": ERR[400], "401": ERR[401], "403": ERR[403] },
+    },
+  },
+  "/messages/inbox/read": {
+    post: {
+      tags: ["Messages"],
+      summary: "Mark inbound replies read",
+      description: "By `ids` and/or `customerId` (all that customer's unread replies). 400 when neither is sent. -> `{ updated }`.",
+      requestBody: jsonBody({ type: "object", properties: { ids: { type: "array", items: { type: "string" } }, customerId: { type: "string" } } }),
+      responses: { "200": jsonResponse("Rows updated.", { type: "object", properties: { updated: { type: "integer" } } }), "400": ERR[400], "401": ERR[401], "403": ERR[403] },
+    },
+  },
+  "/chat/threads": {
+    get: {
+      tags: ["Chat"],
+      summary: "Office chat: rounds that have messages (ADMIN/MANAGER only)",
+      description: "`{ threads: [{ roundId, roundName, technicians, lastMessage, unreadCount }] }`, most recent activity first. Technicians get 403 (they use /mobile/chat/*).",
+      responses: { "200": jsonResponse("Threads.", { type: "object", additionalProperties: true }), "401": ERR[401], "403": ERR[403] },
+    },
+  },
+  "/chat/unread-count": {
+    get: {
+      tags: ["Chat"],
+      summary: "Office chat: unread totals for the signed-in user",
+      description: "`{ total, rounds: [{ roundId, unread }] }` (rounds with unread > 0).",
+      responses: { "200": jsonResponse("Unread counts.", { type: "object", additionalProperties: true }), "401": ERR[401], "403": ERR[403] },
+    },
+  },
+  "/chat/rounds/{roundId}/messages": {
+    parameters: [{ name: "roundId", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Chat"],
+      summary: "Office chat: a round's messages (oldest first)",
+      description: "`since` polls for newer messages; otherwise the newest `limit` (default 100, max 200), or those older than `before`. -> `{ messages, hasMore }`. 404 unknown round; 400 invalid since/before/limit or both since and before.",
+      parameters: [
+        { name: "since", in: "query", schema: { type: "string", format: "date-time" } },
+        { name: "before", in: "query", schema: { type: "string", format: "date-time" } },
+        { name: "limit", in: "query", schema: { type: "integer", minimum: 1, maximum: 200 } },
+      ],
+      responses: { "200": jsonResponse("Messages.", { type: "object", additionalProperties: true }), "400": ERR[400], "401": ERR[401], "403": ERR[403], "404": ERR[404] },
+    },
+    post: {
+      tags: ["Chat"],
+      summary: "Office chat: send a message to a round",
+      description: "`text` 1..2000 chars (optional when `photoUrls` given), `photoUrls` = this round's chat attachment paths (max 10), `clientMsgId` makes a retry idempotent (existing message returned with 200). senderRole OFFICE; the round's technicians are notified (in-app + push when registered).",
+      requestBody: jsonBody({ type: "object", properties: { text: { type: "string", maxLength: 2000 }, photoUrls: { type: "array", items: { type: "string" } }, clientMsgId: { type: "string", maxLength: 100 } } }),
+      responses: { "200": jsonResponse("Duplicate clientMsgId: the existing message.", { type: "object", additionalProperties: true }), "201": jsonResponse("Created message.", { type: "object", additionalProperties: true }), "400": ERR[400], "401": ERR[401], "403": ERR[403], "404": ERR[404] },
+    },
+  },
+  "/chat/rounds/{roundId}/read": {
+    parameters: [{ name: "roundId", in: "path", required: true, schema: { type: "string" } }],
+    post: {
+      tags: ["Chat"],
+      summary: "Office chat: mark a round's thread read for the signed-in user",
+      responses: { "200": jsonResponse("Read marker.", { type: "object", properties: { roundId: { type: "string" }, lastReadAt: { type: "string", format: "date-time" } } }), "401": ERR[401], "403": ERR[403], "404": ERR[404] },
+    },
+  },
+  "/mobile/chat/unread": {
+    get: {
+      tags: ["Mobile"],
+      summary: "Unread chat messages for the technician",
+      description: "`{ total, rounds: [{ roundId, unread }] }` over the rounds the technician is on (or just `roundId`). Unread = messages from others newer than the last POST /mobile/chat/read.",
+      parameters: [{ name: "roundId", in: "query", required: false, schema: { type: "string" } }],
+      responses: { "200": jsonResponse("Unread counts.", { type: "object", additionalProperties: true }), "401": ERR[401], "403": MOBILE_ERR_403 },
+    },
+  },
+  "/mobile/chat/read": {
+    post: {
+      tags: ["Mobile"],
+      summary: "Mark a round's chat read for the technician",
+      requestBody: jsonBody({ type: "object", required: ["roundId"], properties: { roundId: { type: "string" } } }),
+      responses: { "200": jsonResponse("Read marker.", { type: "object", properties: { roundId: { type: "string" }, lastReadAt: { type: "string", format: "date-time" } } }), "400": ERR[400], "401": ERR[401], "403": MOBILE_ERR_403 },
+    },
+  },
+
+  // =====================================================================
   // Webhooks — mounted with express.raw (raw JSON body) before the JSON
   // parser and method guards. No Bearer token: verified by provider
   // signature and/or a per-tenant URL secret. Processing is async after
@@ -7486,6 +8018,7 @@ const MOBILE_VISIT_WRITES: Array<[string, "patch" | "post"]> = [
   ["/mobile/visits/{id}/photos", "post"],
   ["/mobile/visits/{id}/debt-payment", "post"],
   ["/mobile/visits/{id}/upsells", "post"],
+  ["/mobile/day/close", "post"],
 ];
 
 const idempotencyKeyParam: OpenAPIV3.ParameterObject = {
@@ -7586,7 +8119,7 @@ export const openApiDocument: OpenAPIV3.Document = {
     { name: "Complaints", description: "Customer service complaint queue — log, review, schedule revisits, resolve, reopen. All mutations: ADMIN/MANAGER only." },
     { name: "Dashboard", description: "Dashboard screen data — KPI cards, alert counts, today's rounds, technician performance, and chart series. ADMIN/MANAGER only." },
     { name: "Emergencies", description: "Technician emergency reporting and reassignment flow — report, list, inspect, pick a replacement, and confirm reassignment." },
-    { name: "Rounds", description: "Round CRUD, the planner (calendar + list/map views, including batched multi-round variants), the Today panel, reassign, push-missed, and on-demand visit generation. ADMIN/MANAGER only." },
+    { name: "Rounds", description: "Round CRUD, the planner (calendar + list/map views, including batched multi-round variants), the Today panel, reassign, push-missed, weather hold (preview + apply), and on-demand visit generation. ADMIN/MANAGER only." },
     { name: "Technicians", description: "Technician directory — list/detail/create/update with round names and today's job stats. Distinct from Settings → /settings/technicians, which is the invite-pending-only editor. ADMIN/MANAGER only." },
     { name: "Messages", description: "Direct GoHighLevel-backed messaging — send to a single customer, or broadcast to every customer in a round. ADMIN/MANAGER only." },
     { name: "Debt", description: "Collections — the debt board (paginated, bucketed), bucket counts, invoice detail, reminders, payment links, and bad-debt/hold flags. ADMIN/MANAGER only." },

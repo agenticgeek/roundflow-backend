@@ -4,6 +4,7 @@ import { CleaningFrequency, DayOfWeek, LifecycleStatus, RoundStatus, VisitStatus
 import { queueGhlEvent } from "../integrations/ghl/sync";
 import { nextDueAfter, nextOccurrenceOfDay, snapToWeekday, startOfUtcDay } from "../lib/schedule";
 import { resolveTechnicianForVisit, technicianIdsUnavailableOn } from "../services/visit-assignment";
+import { tenantToday } from "../services/business-time";
 import { pausePlan, resumePlan } from "../services/service-plan-lifecycle";
 
 // Visit date for a due plan: the round day on or after nextDueDate, or the
@@ -13,13 +14,13 @@ function visitDateFor(nextDueDate: Date, defaultDay: DayOfWeek | null | undefine
 }
 
 export async function runVisitGeneration(): Promise<void> {
-  const today = startOfUtcDay(new Date());
-
   const tenants = await prisma.tenant.findMany({ select: { schemaName: true } });
 
   for (const tenant of tenants) {
     try {
-      await generateForTenant(getTenantPrismaForSchema(tenant.schemaName), today);
+      const tp = getTenantPrismaForSchema(tenant.schemaName);
+      // EMU-6: "today" is the tenant's local calendar day, not the server's UTC day.
+      await generateForTenant(tp, await tenantToday(tp));
     } catch (err) {
       console.error(`[visitGen] ${tenant.schemaName}:`, err);
     }
@@ -93,7 +94,6 @@ export async function generateForRound(
         id: true,
         customerId: true,
         assignedTechnicianId: true,
-        customer: { select: { holdNextClean: true } },
         servicePlans: {
           where: { status: LifecycleStatus.ACTIVE, nextDueDate: { lte: today } },
           select: {
@@ -103,7 +103,7 @@ export async function generateForRound(
         },
       },
     }),
-    tp.roundTechnician.findMany({ where: { roundId: round.id }, select: { technicianId: true } }),
+    tp.roundTechnician.findMany({ where: { roundId: round.id, technician: { active: true } }, select: { technicianId: true } }),
   ]);
   const roundTechnicianIds = roundTechs.map((r) => r.technicianId);
 
@@ -154,7 +154,9 @@ export async function generateForRound(
           price:        plan.price,
           isOneOff:     false,
           status:       VisitStatus.SCHEDULED,
-          paymentHold:  property.customer.holdNextClean,
+          // BUG-02: new visits are never auto-held. A manual hold (debt board /
+          // Pause service) acts on the customer and is enforced by the debt gate.
+          paymentHold:  false,
           technicianId: resolveTechnicianForVisit({
             assignedTechnicianId: property.assignedTechnicianId,
             roundTechnicianIds,

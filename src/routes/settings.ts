@@ -18,6 +18,8 @@ import { signOAuthState, verifyOAuthState } from "../lib/oauth-state";
 import { toBusinessSettingsDto } from "../lib/settings-dto";
 import {
   optReminderMode,
+  optPreCleanReminders,
+  optPaymentMethods,
   optReminderTime,
   optCleanMethod,
   optPaymentMethod,
@@ -262,6 +264,7 @@ settingsRouter.patch(
     const input: RoundSettingsUpdateInput = {
       defaultCycleLength: optCycleLength(body.defaultCycleLength),
       defaultWorkingDays: optWorkingDays(body.defaultWorkingDays, "defaultWorkingDays"),
+      preCleanReminders: optPreCleanReminders(body.preCleanReminders),
       reminderMode: optReminderMode(body.reminderMode),
       reminderTime: optReminderTime(body.reminderTime),
       defaultCleanMethod: optCleanMethod(body.defaultCleanMethod),
@@ -278,7 +281,7 @@ settingsRouter.patch(
         return arr;
       })(),
     };
-    if (input.preCleanReminderTimings && input.reminderMode === undefined) {
+    if (input.preCleanReminderTimings && input.reminderMode === undefined && input.preCleanReminders === undefined) {
       input.reminderMode = reminderModeFromLegacy(input.preCleanReminderTimings);
     }
     res.json(toBusinessSettingsDto(await svc(req).updateRoundSettings(input)));
@@ -469,6 +472,7 @@ settingsRouter.patch(
       debtHoldMaxInvoices: body.debtHoldMaxInvoices !== undefined ? (body.debtHoldMaxInvoices === null ? null : Number(body.debtHoldMaxInvoices)) : undefined,
       debtHoldMaxAmount: body.debtHoldMaxAmount !== undefined ? (body.debtHoldMaxAmount === null ? null : Number(body.debtHoldMaxAmount)) : undefined,
       defaultPaymentMethod: optPaymentMethod(body.defaultPaymentMethod, "defaultPaymentMethod"),
+      acceptedPaymentMethods: optPaymentMethods(body.acceptedPaymentMethods),
       invoiceDueDays: optInvoiceDueDays(body.invoiceDueDays),
       noDirectDebitAction: optNoDirectDebitAction(body.noDirectDebitAction),
     };

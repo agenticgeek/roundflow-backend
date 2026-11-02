@@ -38,8 +38,48 @@ export interface VisitDetail {
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
+export interface VisitAssignment {
+  id: string;
+  status: string;
+  technicianId: string | null;
+  technicianName: string | null;
+  technicianOverride: boolean;
+}
+
 class VisitService {
   constructor(private readonly prisma: TenantPrismaClient) {}
+
+  // B2: assign / unassign ONE visit. SCHEDULED visits only. The change is a
+  // manual decision, so technicianOverride is set (also when unassigning) and
+  // later restamps (round technician / allocation changes) leave the visit alone.
+  async assignVisit(visitId: string, technicianId: string | null): Promise<VisitAssignment> {
+    const visit = await this.prisma.visit.findUnique({ where: { id: visitId }, select: { id: true, status: true } });
+    if (!visit) throw new AppError(404, "Visit not found");
+    if (visit.status !== VisitStatus.SCHEDULED) {
+      throw new AppError(409, `Only SCHEDULED visits can be assigned or unassigned (this visit is ${visit.status})`, "VISIT_NOT_SCHEDULED");
+    }
+    if (technicianId !== null) {
+      const tech = await this.prisma.technician.findUnique({
+        where: { id: technicianId },
+        select: { id: true, active: true, profileId: true },
+      });
+      if (!tech) throw new AppError(404, "Technician not found");
+      if (tech.profileId === null) throw new AppError(400, "Technician has not accepted their invite");
+      if (!tech.active) throw new AppError(400, "Technician is inactive", "TECHNICIAN_INACTIVE");
+    }
+    const updated = await this.prisma.visit.update({
+      where: { id: visitId },
+      data: { technicianId, technicianOverride: true },
+      include: { technician: { select: { name: true } } },
+    });
+    return {
+      id: updated.id,
+      status: updated.status,
+      technicianId: updated.technicianId,
+      technicianName: updated.technician?.name ?? null,
+      technicianOverride: updated.technicianOverride,
+    };
+  }
 
   async createVisit(input: VisitCreateInput): Promise<VisitDetail> {
     if (!DATE_RE.test(input.date)) {

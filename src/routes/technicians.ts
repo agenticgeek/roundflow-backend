@@ -5,7 +5,7 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
-import { IncidentType } from "../generated/tenant-client";
+import { IncidentType, PhotoReviewStatus } from "../generated/tenant-client";
 import {
   asObject,
   h,
@@ -192,8 +192,13 @@ techniciansRouter.get(
 );
 
 // ==========================================================================
-// GET /technicians/:id/photos?page&pageSize (B4 · GAP-019)
+// Photo archive (B4 · GAP-019) + admin review
 // ==========================================================================
+const PHOTO_REVIEW_STATUSES = Object.values(PhotoReviewStatus) as string[];
+const MAX_APPROVE_PHOTO_IDS = 500;
+const MAX_PHOTO_SEARCH_LENGTH = 100;
+
+// GET /technicians/:id/photos?page&pageSize&search&reviewStatus
 techniciansRouter.get(
   "/:id/photos",
   h(async (req, res) => {
@@ -201,8 +206,58 @@ techniciansRouter.get(
       defaultPageSize: 24,
       maxPageSize: 100,
     });
+    const { search, reviewStatus } = req.query;
+    if (search !== undefined && typeof search !== "string") throw new AppError(400, '"search" must be a string.');
+    if (search && search.length > MAX_PHOTO_SEARCH_LENGTH) {
+      throw new AppError(400, `"search" must be at most ${MAX_PHOTO_SEARCH_LENGTH} characters.`);
+    }
+    if (reviewStatus !== undefined && (typeof reviewStatus !== "string" || !PHOTO_REVIEW_STATUSES.includes(reviewStatus))) {
+      throw new AppError(400, `reviewStatus must be one of: ${PHOTO_REVIEW_STATUSES.join(", ")}`);
+    }
     res.json(
-      await createPhotoGalleryService(req.tenantPrisma!).listTechnicianPhotos(req.params.id, { page, pageSize })
+      await createPhotoGalleryService(req.tenantPrisma!).listTechnicianPhotos(req.params.id, {
+        page,
+        pageSize,
+        search,
+        reviewStatus: reviewStatus as PhotoReviewStatus | undefined,
+      })
+    );
+  })
+);
+
+// POST /technicians/:id/photos/approve { photoIds? } → { updated }
+// Approves the technician's PENDING photos: only photoIds when given, else all.
+techniciansRouter.post(
+  "/:id/photos/approve",
+  h(async (req, res) => {
+    const body = asObject(req.body);
+    const photoIds = optStringArray(body.photoIds, "photoIds");
+    if (photoIds && photoIds.length > MAX_APPROVE_PHOTO_IDS) {
+      throw new AppError(400, `"photoIds" must have at most ${MAX_APPROVE_PHOTO_IDS} entries.`);
+    }
+    res.json(
+      await createPhotoGalleryService(req.tenantPrisma!).approveTechnicianPhotos(req.params.id, photoIds, {
+        reviewedById: req.profile?.id ?? null,
+      })
+    );
+  })
+);
+
+// PATCH /technicians/:id/photos/:photoId/review { status: APPROVED | REJECTED } → { id, reviewStatus, reviewedAt }
+techniciansRouter.patch(
+  "/:id/photos/:photoId/review",
+  h(async (req, res) => {
+    const { status } = asObject(req.body);
+    if (status !== "APPROVED" && status !== "REJECTED") {
+      throw new AppError(400, "status must be one of: APPROVED, REJECTED");
+    }
+    res.json(
+      await createPhotoGalleryService(req.tenantPrisma!).reviewTechnicianPhoto(
+        req.params.id,
+        req.params.photoId,
+        status,
+        { reviewedById: req.profile?.id ?? null }
+      )
     );
   })
 );

@@ -103,18 +103,21 @@ it("queues one reminder per eligible visit tomorrow and stamps reminderSentAt", 
     where: {
       date: { gte: d("2026-10-31"), lt: d("2026-11-01") },
       status: "SCHEDULED",
-      reminderSentAt: null,
+      NOT: { reminderSentTypes: { has: "EVENING_BEFORE" } },
       paymentHold: false,
       property: { customer: { status: "ACTIVE", holdNextClean: false, messagesOptOut: false } },
     },
   }));
-  expect(tp.tx.visit.updateMany).toHaveBeenCalledWith({ where: { id: "v1", reminderSentAt: null }, data: { reminderSentAt: now } });
+  expect(tp.tx.visit.updateMany).toHaveBeenCalledWith({
+    where: { id: "v1", NOT: { reminderSentTypes: { has: "EVENING_BEFORE" } } },
+    data: { reminderSentAt: now, reminderSentTypes: { push: "EVENING_BEFORE" } },
+  });
   expect(tp.tx.integrationOutbox.create).toHaveBeenNthCalledWith(1, {
     data: {
       eventType: "message.send",
       payload: {
         customerId: "c-v1", visitId: "v1", channel: "SMS",
-        body: "Hi Jo Bloggs, see you Saturday 31 October", templateId: "tpl1", reason: "PRE_CLEAN_REMINDER",
+        body: "Hi Jo Bloggs, see you Saturday 31 October", templateId: "tpl1", reason: "PRE_CLEAN_REMINDER", reminderType: "EVENING_BEFORE",
       },
     },
   });

@@ -9,14 +9,13 @@ import { resolveTechnicianForVisit } from "./visit-assignment";
 // drift from what activation actually writes.
 
 export const activationRoundInclude = {
-  roundTechnicians: { select: { technicianId: true } },
+  roundTechnicians: { where: { technician: { active: true } }, select: { technicianId: true } },
   properties: {
     where: { status: LifecycleStatus.ACTIVE },
     orderBy: { createdAt: "asc" },
     select: {
       id: true,
       assignedTechnicianId: true,
-      customer: { select: { holdNextClean: true } },
       servicePlans: {
         where: { status: LifecycleStatus.ACTIVE },
         orderBy: { createdAt: "asc" },
@@ -92,7 +91,7 @@ export function buildActivationPlan(
         frequency,
       });
 
-      for (const [i, date] of dates.entries()) {
+      for (const date of dates) {
         const unavailableTechnicianIds = input.windows
           .filter((w) => w.from <= date && w.to >= date)
           .map((w) => w.technicianId);
@@ -109,8 +108,7 @@ export function buildActivationPlan(
             roundTechnicianIds,
             unavailableTechnicianIds,
           }),
-          // A3: a customer on hold has their next clean held — the first one.
-          paymentHold: i === 0 && property.customer.holdNextClean,
+          paymentHold: false, // BUG-02: activation never auto-holds visits
         });
       }
       count += dates.length;

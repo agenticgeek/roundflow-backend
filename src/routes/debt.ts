@@ -6,6 +6,7 @@ import { h, optString, parsePageParams } from "../lib/http";
 import { optIsoDate } from "../lib/validation";
 import { createDebtService } from "../services/debt.service";
 import { optOutboundChannel } from "../services/message.service";
+import { parseBulkDebtRequest, runBulkDebtAction } from "../services/debt-bulk";
 import { queueGhlEvent } from "../integrations/ghl/sync";
 
 export const debtRouter = Router();
@@ -45,6 +46,31 @@ debtRouter.get("/board", h(async (req, res) => {
 debtRouter.get("/board/counts", h(async (req, res) => {
   const { roundId, paymentMethod, search } = req.query as Record<string, string | undefined>;
   const result = await svc(req).getBucketCounts(roundId, paymentMethod, search);
+  return res.json(result);
+}));
+
+// POST /debt/bulk { ids: string[] (invoice ids, max 100), action: "remind" | "hold" | "bad-debt",
+//   channel?, message?, reason?, notify? } → 200 { action, total, succeeded, failed,
+//   results: [{ id, ok, error?, code? }] }. Each id runs the single-row service call;
+//   failures are reported per id, never abort the batch.
+debtRouter.post("/bulk", h(async (req, res) => {
+  const body = req.body as Record<string, unknown>; // express.json() always sets {}
+  const { ids, action } = parseBulkDebtRequest(body);
+  if (body.reason !== undefined && typeof body.reason !== "string") {
+    return res.status(400).json({ error: "reason must be a string" });
+  }
+  if (body.notify !== undefined && typeof body.notify !== "boolean") {
+    return res.status(400).json({ error: "notify must be a boolean" });
+  }
+  const result = await runBulkDebtAction(svc(req), ids, action, {
+    channel: optOutboundChannel(body.channel),
+    message: optMessage(body.message),
+    reason: body.reason,
+    notify: body.notify,
+    onReminded: (customerId) => {
+      queueGhlEvent(req.tenantPrisma!, "debt.overdue", customerId).catch(console.error);
+    },
+  });
   return res.json(result);
 }));
 

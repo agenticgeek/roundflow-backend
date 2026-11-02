@@ -1,12 +1,14 @@
 import { VisitStatus, Prisma } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
-import { todayRange } from "../lib/dates";
+import { tenantTodayRange } from "./business-time";
 import { getCachedBusinessSettings, invalidateCachedBusinessSettings } from "./settings.service";
 
 // ---------------------------------------------------------------------------
 // M4 — Today's Work (BE-M4-01, BE-M4-05).
 // ---------------------------------------------------------------------------
+
+export const DEFAULT_CLOSE_DAY_SKIP_REASON = "Not completed - day closed";
 
 // Returns the next Mon–Fri date after `date` (UTC). Skips Sat → Mon, Sun → Mon.
 function nextWorkingDay(date: Date): Date {
@@ -107,7 +109,7 @@ class TodayService {
   // ---- GET /today (Screen 12 aggregate) ----
 
   async getTodaysWork(): Promise<TodaysWorkAggregate> {
-    const { start, end } = todayRange();
+    const { start, end } = await tenantTodayRange(this.prisma);
     const today = start.toISOString().slice(0, 10);
 
     const [settings, visits] = await Promise.all([
@@ -132,9 +134,10 @@ class TodayService {
   // ---- POST /today/close (M21) ----
 
   async closeDay(
-    unfinishedAction: "push_to_tomorrow" | "mark_as_skipped"
+    unfinishedAction: "push_to_tomorrow" | "mark_as_skipped",
+    skipReason?: string | null
   ): Promise<CloseDaySummary> {
-    const { start, end } = todayRange();
+    const { start, end } = await tenantTodayRange(this.prisma);
 
     const result = await this.prisma.$transaction(async (tx) => {
       const today = start.toISOString().slice(0, 10);
@@ -179,7 +182,8 @@ class TodayService {
         } else {
           await tx.visit.updateMany({
             where: { id: { in: unfinishedIds } },
-            data: { status: VisitStatus.SKIPPED },
+            // B6: the close-of-day reason is stored on each visit (default text when none given).
+            data: { status: VisitStatus.SKIPPED, skipReason: skipReason?.trim() || DEFAULT_CLOSE_DAY_SKIP_REASON },
           });
         }
       }

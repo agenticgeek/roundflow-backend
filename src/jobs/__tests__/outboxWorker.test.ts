@@ -70,6 +70,18 @@ describe("runOutboxWorker", () => {
     });
   });
 
+  it("only drains rows that are due (runAfter unset or passed)", async () => {
+    tenantFindMany.mockResolvedValue([{ schemaName: "t_1" }]);
+    const tp = makeTp([]);
+    getTenantPrismaForSchema.mockReturnValue(tp);
+    await runOutboxWorker();
+    expect(tp.integrationOutbox.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { status: "pending", OR: [{ runAfter: null }, { runAfter: { lte: expect.any(Date) } }] },
+      }),
+    );
+  });
+
   it("calls syncCustomerToGhl for a customer.synced row and marks it sent", async () => {
     tenantFindMany.mockResolvedValue([{ schemaName: "t_1" }]);
     const row: Row = { id: "row-1", eventType: "customer.synced", payload: { customerId: "cust-1" }, attempts: 0 };

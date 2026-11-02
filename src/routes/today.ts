@@ -3,7 +3,7 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
-import { asObject, h, requireString } from "../lib/http";
+import { asObject, h, requireString, optString } from "../lib/http";
 import { createTodayService } from "../services/today.service";
 import { createReportsService } from "../services/reports.service";
 
@@ -30,7 +30,9 @@ todayRouter.get(
 
 // ==========================================================================
 // POST /today/close — Close Operational Day (M21).
-//   Body: { unfinishedAction: "push_to_tomorrow" | "mark_as_skipped" }
+//   Body: { unfinishedAction: "push_to_tomorrow" | "mark_as_skipped", skipReason?: string }
+//   skipReason (max 255, mark_as_skipped only) is stored on every visit skipped by the close;
+//   default "Not completed - day closed".
 // ==========================================================================
 todayRouter.post(
   "/close",
@@ -43,7 +45,8 @@ todayRouter.post(
         '"unfinishedAction" must be "push_to_tomorrow" or "mark_as_skipped"'
       );
     }
-    const result = await svc(req).closeDay(raw);
+    const skipReason = optString(body.skipReason, "skipReason", { maxLength: 255 });
+    const result = await svc(req).closeDay(raw, skipReason);
     void createReportsService(req.tenantPrisma!).logActivity(
       "DAY_CLOSED",
       `Operational day closed (unfinished: ${raw})`,

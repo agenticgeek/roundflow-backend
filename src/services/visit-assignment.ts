@@ -14,12 +14,15 @@ export type TenantDb = TenantPrismaClient | Prisma.TransactionClient;
 // 2. Otherwise the round's only available technician.
 // 3. Otherwise null (unassigned — multi-tech round without an allocation, or
 //    nobody available).
+// Deactivated technicians (C1) are never picked: callers either pass only
+// active round technicians or list the inactive ones in `inactiveTechnicianIds`.
 export function resolveTechnicianForVisit(input: {
   assignedTechnicianId: string | null;
   roundTechnicianIds: string[];
   unavailableTechnicianIds?: string[];
+  inactiveTechnicianIds?: string[];
 }): string | null {
-  const unavailable = new Set(input.unavailableTechnicianIds ?? []);
+  const unavailable = new Set([...(input.unavailableTechnicianIds ?? []), ...(input.inactiveTechnicianIds ?? [])]);
   const available = input.roundTechnicianIds.filter((id) => !unavailable.has(id));
   if (input.assignedTechnicianId && available.includes(input.assignedTechnicianId)) {
     return input.assignedTechnicianId;
@@ -81,6 +84,26 @@ export function autoSplit(properties: SplitProperty[], technicianIds: string[]):
   return result;
 }
 
+// C1: a deactivated technician's upcoming work goes back to "needs assignment":
+// their future SCHEDULED visits (date >= today, manual overrides included)
+// lose the technician, and property allocations to them are cleared.
+// Started/finished visits keep their history. Returns the counts.
+export async function releaseTechnicianWork(
+  tp: TenantDb,
+  technicianId: string,
+  today: Date
+): Promise<{ visits: number; properties: number }> {
+  const visits = await tp.visit.updateMany({
+    where: { technicianId, status: VisitStatus.SCHEDULED, date: { gte: startOfUtcDay(today) } },
+    data: { technicianId: null, technicianOverride: false },
+  });
+  const properties = await tp.property.updateMany({
+    where: { assignedTechnicianId: technicianId },
+    data: { assignedTechnicianId: null },
+  });
+  return { visits: visits.count, properties: properties.count };
+}
+
 // Technicians with a TechnicianAvailability window covering `date` (inclusive).
 export async function technicianIdsUnavailableOn(tp: TenantDb, date: Date): Promise<Set<string>> {
   const rows = await tp.technicianAvailability.findMany({
@@ -98,7 +121,7 @@ export async function restampFutureVisits(tp: TenantDb, roundId: string, today: 
   const from = startOfUtcDay(today);
 
   const [roundTechs, visits] = await Promise.all([
-    tp.roundTechnician.findMany({ where: { roundId }, select: { technicianId: true } }),
+    tp.roundTechnician.findMany({ where: { roundId, technician: { active: true } }, select: { technicianId: true } }),
     tp.visit.findMany({
       where: { roundId, status: VisitStatus.SCHEDULED, date: { gte: from }, technicianOverride: false },
       select: { id: true, date: true, technicianId: true, property: { select: { assignedTechnicianId: true } } },

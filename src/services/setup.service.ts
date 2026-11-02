@@ -27,10 +27,18 @@ import type {
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { Prisma as TenantPrisma } from "../generated/tenant-client";
 import { AppError } from "../lib/app-error";
+import {
+  resolveReminderInput,
+  parseStoredReminders,
+  legacyFromReminders,
+  resolvePaymentMethods,
+  type PreCleanReminder,
+} from "../lib/settings-validators";
 import { randomUUID } from "crypto";
 import { addWeeks, initialNextDueDate, nextOccurrenceOfDay, startOfUtcDay } from "../lib/schedule";
 import { CustomerIndex } from "../lib/customer-match";
 import { rowError, type RowError } from "../lib/row-error";
+import { assertSectorsInServiceArea } from "../lib/postcode-sectors";
 import { buildActivationPlan, loadActivationInputs } from "./activation-plan";
 
 // ---------------------------------------------------------------------------
@@ -92,6 +100,8 @@ export interface BusinessProfileInput {
 export interface RoundSettingsInput {
   defaultCycleLength?: number | null;
   defaultWorkingDays?: string[];
+  /** BUG-01: list of { type, time }; [] = no reminders. Wins over reminderMode/reminderTime. */
+  preCleanReminders?: PreCleanReminder[];
   reminderMode?: ReminderMode;
   reminderTime?: string;
   defaultCleanMethod?: CleanMethod | null;
@@ -105,6 +115,8 @@ export interface PaymentSetupInput {
   debtHoldEnabled?: boolean;
   vatInInvoices?: boolean;
   defaultPaymentMethod?: PaymentMethod | null;
+  /** BUG-05: methods the business accepts; defaultPaymentMethod must be one of them. */
+  acceptedPaymentMethods?: PaymentMethod[];
   invoiceDueDays?: number;
   noDirectDebitAction?: NoDirectDebitAction;
 }
@@ -137,6 +149,7 @@ export interface FirstRoundInput {
   defaultDay?: string | null;
   frequency?: string | null;
   serviceAreaId?: string | null;
+  postcodeSectors?: string[];
 }
 
 export interface SetupPropertyInput {
@@ -149,15 +162,15 @@ export interface SetupPropertyInput {
   postcode: string;
   serviceAreaId: string;
   propertyType?: string | null;
-  // Service plan: `price` is the combined/total price across whichever
-  // service(s) this row represents.
+  // Service plan price. Used only on the single-service path (`serviceId` /
+  // none); when `serviceIds` is given it is ignored and each plan takes its
+  // own catalogue (Service.defaultPrice) price (BUG-06).
   price: number;
   cleaningFrequency?: string | null;
   paymentMethod?: string | null;
   serviceId?: string | null;
   // When given (non-empty), one ServicePlan is created per id instead of a
-  // single plan for `serviceId`, splitting `price` evenly across them
-  // (remainder pence assigned to the last plan so the total stays exact).
+  // single plan for `serviceId`, each at its own catalogue price.
   serviceIds?: string[] | null;
   // Notes
   accessNotes?: string | null;
@@ -256,28 +269,32 @@ export interface ActivationResult {
 // schema), so every query here is already tenant-scoped by the client it runs
 // on. BusinessSettings is a singleton within that schema.
 
-// Splits `total` across `count` plans, each rounded to 2dp; the last plan
-// absorbs the rounding remainder so the parts always sum back to `total`.
-function splitPrice(total: number, index: number, count: number): number {
-  if (count <= 1) return total;
-  const base = Math.floor((total / count) * 100) / 100;
-  if (index < count - 1) return base;
-  return Math.round((total - base * (count - 1)) * 100) / 100;
+// Catalogue rows a setup property row may reference (id -> price/active).
+type ServiceCatalogue = Map<string, { defaultPrice: number; active: boolean }>;
+
+// BUG-06: one row's service-plan entries. With `serviceIds` the client price
+// is ignored — each plan is created at its own catalogue price (the row's
+// total is the sum). The legacy single `serviceId` path keeps `price`. Unknown
+// or inactive services are rejected (C5).
+function servicePlanEntries(
+  input: Pick<SetupPropertyInput, "serviceId" | "serviceIds" | "price">,
+  catalogue: ServiceCatalogue
+): { serviceId: string | null; price: number }[] {
+  const check = (id: string) => {
+    const service = catalogue.get(id);
+    if (!service) throw new AppError(404, `Service not found: ${id}`);
+    if (!service.active) throw new AppError(400, `Service is inactive and cannot be added: ${id}`, "SERVICE_INACTIVE");
+    return service;
+  };
+  if (input.serviceIds && input.serviceIds.length > 0) {
+    return [...new Set(input.serviceIds)].map((serviceId) => ({ serviceId, price: check(serviceId).defaultPrice }));
+  }
+  if (input.serviceId) check(input.serviceId);
+  return [{ serviceId: input.serviceId ?? null, price: input.price }];
 }
 
-// One row's service-plan entries: a single plan for `serviceId` by default,
-// or one plan per id in `serviceIds` (splitting `price` evenly) when given.
-function servicePlanEntries(
-  input: Pick<SetupPropertyInput, "serviceId" | "serviceIds" | "price">
-): { serviceId: string | null; price: number }[] {
-  if (input.serviceIds && input.serviceIds.length > 0) {
-    const ids = input.serviceIds;
-    return ids.map((serviceId, index) => ({
-      serviceId,
-      price: splitPrice(input.price, index, ids.length),
-    }));
-  }
-  return [{ serviceId: input.serviceId ?? null, price: input.price }];
+function serviceIdsOf(inputs: Pick<SetupPropertyInput, "serviceId" | "serviceIds">[]): string[] {
+  return [...new Set(inputs.flatMap((i) => [...(i.serviceIds ?? []), ...(i.serviceId ? [i.serviceId] : [])]))];
 }
 
 // A2 / X-2: a plan's first nextDueDate. With a frequency (the plan's own, or
@@ -506,11 +523,17 @@ class SetupService {
   async saveRoundSettings(
     input: RoundSettingsInput
   ): Promise<BusinessSettings> {
+    const current = await this.getSettings();
+    const reminders = resolveReminderInput(
+      input,
+      parseStoredReminders(current?.preCleanReminders, current?.reminderMode, current?.reminderTime)
+    );
     const data = {
       defaultCycleLength: input.defaultCycleLength,
       defaultWorkingDays: input.defaultWorkingDays,
-      reminderMode: input.reminderMode,
-      reminderTime: input.reminderTime,
+      ...(reminders
+        ? { preCleanReminders: reminders as unknown as TenantPrisma.InputJsonValue, ...legacyFromReminders(reminders) }
+        : {}),
       defaultCleanMethod: input.defaultCleanMethod,
       autoCreateNextVisit: input.autoCreateNextVisit,
       completedSteps: await this.completedStepsWith(4),
@@ -528,11 +551,13 @@ class SetupService {
     // Same singleton upsert as saveBusinessProfile. Rules and defaults only:
     // the gocardless/stripe connection flags change only through the real
     // connect flows (A6).
+    const methods = resolvePaymentMethods(input, await this.getSettings());
     const data = {
       paymentRule: input.paymentRule,
       debtHoldEnabled: input.debtHoldEnabled,
       vatInInvoices: input.vatInInvoices,
-      defaultPaymentMethod: input.defaultPaymentMethod,
+      defaultPaymentMethod: methods.defaultPaymentMethod,
+      acceptedPaymentMethods: methods.acceptedPaymentMethods,
       invoiceDueDays: input.invoiceDueDays,
       noDirectDebitAction: input.noDirectDebitAction,
       completedSteps: await this.completedStepsWith(2),
@@ -691,9 +716,16 @@ class SetupService {
     if (input.serviceAreaId) {
       await this.assertServiceAreaExists(input.serviceAreaId);
     }
+    if (input.postcodeSectors && input.postcodeSectors.length > 0) {
+      const area = input.serviceAreaId
+        ? await this.prisma.serviceArea.findUnique({ where: { id: input.serviceAreaId } })
+        : null;
+      assertSectorsInServiceArea(input.postcodeSectors, area);
+    }
 
     const data = {
       name: input.name,
+      postcodeSectors: input.postcodeSectors,
       defaultDay: (input.defaultDay as DayOfWeek) ?? null,
       frequency: (input.frequency as CleaningFrequency) ?? null,
       serviceAreaId: input.serviceAreaId ?? null,
@@ -789,6 +821,10 @@ class SetupService {
       lastCleanedDate,
       today: new Date(),
     });
+    const catalogue = await this.loadServiceCatalogue(serviceIdsOf([input]));
+    const entries = servicePlanEntries(input, catalogue); // BUG-06 / C5: validates services before any write
+    // BUG-05: no explicit method -> the business default.
+    const paymentMethod = (input.paymentMethod as PaymentMethod) ?? (await this.getSettings())?.defaultPaymentMethod ?? null;
 
     const result = await this.prisma.$transaction(async (tx) => {
       const customer = existingCustomer ?? await tx.customer.create({
@@ -797,7 +833,7 @@ class SetupService {
           phone: input.phone ?? null,
           landline: input.landline ?? null,
           email: input.email ?? null,
-          paymentMethod: (input.paymentMethod as PaymentMethod) ?? null,
+          paymentMethod,
         },
       });
       const property = await tx.property.create({
@@ -814,14 +850,14 @@ class SetupService {
         },
       });
       const servicePlans: ServicePlan[] = [];
-      for (const entry of servicePlanEntries(input)) {
+      for (const entry of entries) {
         servicePlans.push(
           await tx.servicePlan.create({
             data: {
               propertyId: property.id,
               serviceId: entry.serviceId,
               price: entry.price,
-              paymentMethod: (input.paymentMethod as PaymentMethod) ?? null,
+              paymentMethod,
               cleaningFrequency,
               nextDueDate,
             },
@@ -832,6 +868,15 @@ class SetupService {
     });
     await this.markStepComplete(9);
     return result;
+  }
+
+  private async loadServiceCatalogue(ids: string[]): Promise<ServiceCatalogue> {
+    if (ids.length === 0) return new Map();
+    const rows = await this.prisma.service.findMany({
+      where: { id: { in: ids } },
+      select: { id: true, defaultPrice: true, active: true },
+    });
+    return new Map(rows.map((s) => [s.id, { defaultPrice: Number(s.defaultPrice), active: s.active }]));
   }
 
   // Every existing customer's mobile/email, for GAP-010 matching. Setup-sized
@@ -964,15 +1009,28 @@ class SetupService {
       }
     }
 
+    // BUG-06 / C5: service-plan entries per row, from the catalogue. A row that
+    // references an unknown/inactive service is reported and dropped.
+    const catalogue = await this.loadServiceCatalogue(serviceIdsOf(resolved.map((r) => r.input)));
+    const defaultPaymentMethod = resolved.length > 0 ? (await this.getSettings())?.defaultPaymentMethod ?? null : null;
+    const withEntries: Array<(typeof resolved)[number] & { entries: { serviceId: string | null; price: number }[] }> = [];
+    for (const r of resolved) {
+      try {
+        withEntries.push({ ...r, entries: servicePlanEntries(r.input, catalogue) });
+      } catch (err) {
+        errors.push(rowError(r.originalIndex, r.input.serviceIds?.length ? "serviceIds" : "serviceId", (err as Error).message));
+      }
+    }
+
     // GAP-010: rows reuse an existing customer (or one created earlier in
     // this same import) with the same mobile or email.
-    const committed = resolved.length > 0 ? await this.loadCustomerIndex() : new CustomerIndex();
+    const committed = withEntries.length > 0 ? await this.loadCustomerIndex() : new CustomerIndex();
 
     const BATCH_SIZE = 100;
     const allResults: SetupPropertyResult[] = [];
 
-    for (let batchStart = 0; batchStart < resolved.length; batchStart += BATCH_SIZE) {
-      const batch = resolved.slice(batchStart, batchStart + BATCH_SIZE);
+    for (let batchStart = 0; batchStart < withEntries.length; batchStart += BATCH_SIZE) {
+      const batch = withEntries.slice(batchStart, batchStart + BATCH_SIZE);
       // Customers created by this batch — only merged into `committed` once
       // the batch commits, so a failed batch can't leave later rows pointing
       // at a customer that was never written.
@@ -998,7 +1056,7 @@ class SetupService {
           customerId,
           isNewCustomer: !matchedId,
           propertyId: randomUUID(),
-          plans: servicePlanEntries(c.input).map((entry) => ({ ...entry, id: randomUUID() })),
+          plans: c.entries.map((entry) => ({ ...entry, id: randomUUID() })),
         };
       });
       const newCustomerRows = rows.filter((r) => r.isNewCustomer);
@@ -1012,7 +1070,7 @@ class SetupService {
               phone: inp.phone ?? null,
               landline: inp.landline ?? null,
               email: inp.email ?? null,
-              paymentMethod: (inp.paymentMethod as PaymentMethod) ?? null,
+              paymentMethod: (inp.paymentMethod as PaymentMethod) ?? defaultPaymentMethod,
             })),
           }),
           this.prisma.property.createMany({
@@ -1036,7 +1094,7 @@ class SetupService {
                 propertyId,
                 serviceId: plan.serviceId,
                 price: plan.price,
-                paymentMethod: (inp.paymentMethod as PaymentMethod) ?? null,
+                paymentMethod: (inp.paymentMethod as PaymentMethod) ?? defaultPaymentMethod,
                 cleaningFrequency,
                 nextDueDate,
               }))
@@ -1292,7 +1350,7 @@ class SetupService {
     }
 
     // X-1: technicianId is stamped per visit (property allocation → sole
-    // round technician → unassigned), paymentHold from customer.holdNextClean,
+    // round technician → unassigned), paymentHold always false (BUG-02),
     // and X-2: each plan's nextDueDate continues the series after the window
     // so the nightly generator picks it up.
     const plan = buildActivationPlan(rounds, { ...window, windows });

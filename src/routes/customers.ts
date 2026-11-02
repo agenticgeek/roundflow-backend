@@ -48,8 +48,34 @@ const svc = (req: Request) => {
 // Thin routes: validate → call service → respond. No DB access here.
 // Returns the Supabase user ID of the acting caller (the profileId seam).
 
+// Property + first plan fields (POST /customers/:id/properties and the optional
+// `property` object of POST /customers).
+function parsePropertyAdd(raw: unknown, field = ""): PropertyAddInput {
+  const body = asObject(raw);
+  const price = requireNumber(body.price, `${field}price`);
+  assertPositive(price, `${field}price`, 9999.99);
+  return {
+    addressLine: requireString(body.addressLine, `${field}addressLine`, { maxLength: MAX_ADDRESS_LENGTH }).trim(),
+    postcode: requireString(body.postcode, `${field}postcode`, { maxLength: MAX_ADDRESS_LENGTH }).trim(),
+    propertyName: optString(body.propertyName, "propertyName", { maxLength: MAX_NAME_LENGTH }),
+    propertyType: optPropertyType(body.propertyType),
+    serviceAreaId: requireString(body.serviceAreaId, `${field}serviceAreaId`),
+    serviceId: optId(body.serviceId, "serviceId"),
+    price,
+    cleanMethod: optString(body.cleanMethod, "cleanMethod"),
+    paymentMethod: optPaymentMethod(body.paymentMethod),
+    nextDueDate: optIsoDate(body.nextDueDate, "nextDueDate"),
+    lastCleanedDate: optIsoDate(body.lastCleanedDate, "lastCleanedDate"),
+    accessNotes: optString(body.accessNotes, "accessNotes", { maxLength: MAX_NOTES_LENGTH }),
+    riskNotes: optString(body.riskNotes, "riskNotes", { maxLength: MAX_NOTES_LENGTH }),
+    roundId: optId(body.roundId, "roundId"),
+  };
+}
+
 // ==========================================================================
-// POST /customers — create a standalone customer (no property yet)
+// POST /customers — create a customer. Optional `property` (same fields as
+// POST /customers/:id/properties) creates the first property + plan in the
+// same transaction; the response then also carries propertyId / servicePlanId / assigned.
 // ==========================================================================
 customersRouter.post(
   "/",
@@ -60,10 +86,11 @@ customersRouter.post(
       phone: optString(body.phone, "phone"),
       email: optString(body.email, "email"),
       paymentMethod: optPaymentMethod(body.paymentMethod),
+      property: body.property === undefined || body.property === null ? undefined : parsePropertyAdd(body.property, "property."),
     };
-    const customer = await svc(req).createCustomer(input);
+    const { customer, property } = await svc(req).createCustomerWithProperty(input);
     queueGhlEvent(req.tenantPrisma!, "customer.synced", customer.id).catch(console.error);
-    res.status(201).json(customer);
+    res.status(201).json(property ? { ...customer, ...property } : customer);
   })
 );
 
@@ -224,25 +251,7 @@ customersRouter.delete(
 customersRouter.post(
   "/:id/properties",
   h(async (req, res) => {
-    const body = asObject(req.body);
-    const price = requireNumber(body.price, "price");
-    assertPositive(price, "price", 9999.99);
-    const input: PropertyAddInput = {
-      addressLine: requireString(body.addressLine, "addressLine", { maxLength: MAX_ADDRESS_LENGTH }).trim(),
-      postcode: requireString(body.postcode, "postcode", { maxLength: MAX_ADDRESS_LENGTH }).trim(),
-      propertyName: optString(body.propertyName, "propertyName", { maxLength: MAX_NAME_LENGTH }),
-      propertyType: optPropertyType(body.propertyType),
-      serviceAreaId: requireString(body.serviceAreaId, "serviceAreaId"),
-      serviceId: optId(body.serviceId, "serviceId"),
-      price,
-      cleanMethod: optString(body.cleanMethod, "cleanMethod"),
-      paymentMethod: optPaymentMethod(body.paymentMethod),
-      nextDueDate: optIsoDate(body.nextDueDate, "nextDueDate"),
-      lastCleanedDate: optIsoDate(body.lastCleanedDate, "lastCleanedDate"),
-      accessNotes: optString(body.accessNotes, "accessNotes", { maxLength: MAX_NOTES_LENGTH }),
-      riskNotes: optString(body.riskNotes, "riskNotes", { maxLength: MAX_NOTES_LENGTH }),
-      roundId: optId(body.roundId, "roundId"),
-    };
+    const input: PropertyAddInput = parsePropertyAdd(req.body);
     res.status(201).json(await svc(req).addPropertyToCustomer(req.params.id, input));
   })
 );

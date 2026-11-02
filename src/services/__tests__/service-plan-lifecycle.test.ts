@@ -50,7 +50,7 @@ it("pausePlan with a start today pauses now and cancels visits in the inclusive 
   });
   expect(tx.servicePlan.update.mock.calls[0][0].data).toEqual({
     status: LifecycleStatus.PAUSED,
-    pauseStartDate: NOW,
+    pauseStartDate: day("2026-10-30"), // stored as UTC midnight
     pauseEndDate: day("2026-11-20"),
   });
   expect(result).toMatchObject({ cancelledVisits: 3, pauseScheduled: false });

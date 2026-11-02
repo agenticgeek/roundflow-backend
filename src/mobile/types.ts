@@ -58,10 +58,12 @@ export interface ChatMessageRow {
   id: string;
   roundId: string;
   senderProfileId: string;
+  senderRole: "TECHNICIAN" | "OFFICE";
   body: string | null;
   type: string;
   visitId: string | null;
   photoUrls: string[];
+  clientMsgId: string | null;
   createdAt: Date;
   isMine: boolean; // sent by the signed-in technician
 }

@@ -122,7 +122,8 @@ async function processTenant(schemaName: string): Promise<void> {
   const tp = getTenantPrismaForSchema(schemaName);
 
   const rows = await tp.integrationOutbox.findMany({
-    where: { status: "pending" },
+    // runAfter = delayed sends (scheduled round messages): not drained before their time.
+    where: { status: "pending", OR: [{ runAfter: null }, { runAfter: { lte: new Date() } }] },
     orderBy: { createdAt: "asc" },
     take: BATCH,
   });

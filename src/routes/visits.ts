@@ -9,6 +9,8 @@ import { createVisitService, VisitCreateInput } from "../services/visit.service"
 import { createReportsService } from "../services/reports.service";
 import { createVisitCompletionService, parseCompletionPayment } from "../services/visit-completion";
 import { createVisitPhotosService } from "../services/visit-photos.service";
+import { createVisitRescheduleService } from "../services/visit-reschedule";
+import { parseOptionalDateOnly } from "../lib/validation";
 
 export const visitsRouter = Router();
 visitsRouter.use(requireAuth);
@@ -51,6 +53,53 @@ visitsRouter.post(
     );
 
     res.status(201).json(result);
+  })
+);
+
+// PATCH /visits/:id/assign { technicianId: string | null } (B2)
+// Assign (id) or unassign (null) one SCHEDULED visit.
+//   -> 200 { id, status, technicianId, technicianName, technicianOverride }
+//   400 technician inactive / invite not accepted · 404 unknown visit or technician
+//   409 VISIT_NOT_SCHEDULED
+visitsRouter.patch(
+  "/:id/assign",
+  h(async (req, res) => {
+    const body = asObject(req.body);
+    if (body.technicianId === undefined) {
+      throw new AppError(400, '"technicianId" is required (a technician id, or null to unassign).');
+    }
+    const technicianId = optId(body.technicianId, "technicianId") ?? null;
+    const result = await svc(req).assignVisit(req.params.id, technicianId);
+    void createReportsService(req.tenantPrisma!).logActivity(
+      "VISIT_ASSIGNED",
+      technicianId ? `Visit ${req.params.id} assigned to technician ${technicianId}` : `Visit ${req.params.id} unassigned`,
+      req.profile?.id,
+      req.profile?.role ?? undefined,
+    );
+    res.json(result);
+  })
+);
+
+// PATCH /visits/:id/reschedule { date: YYYY-MM-DD }
+// Moves a SCHEDULED or SKIPPED visit to a new date (a skipped one becomes SCHEDULED again,
+// e.g. after a "manual" weather hold). Clears its reminder markers, cancels reminders still
+// queued with the old date and logs VISIT_RESCHEDULED.
+//   -> 200 { id, status, date }
+//   400 date missing / invalid / in the past · 404 unknown visit
+//   409 VISIT_NOT_RESCHEDULABLE (completed / in progress / cancelled) · 409 day already closed (date = today)
+visitsRouter.patch(
+  "/:id/reschedule",
+  h(async (req, res) => {
+    const body = asObject(req.body);
+    const date = parseOptionalDateOnly(body.date, "date");
+    if (!date) throw new AppError(400, '"date" is required (YYYY-MM-DD)');
+    if (!req.tenantPrisma) throw new AppError(500, "Tenant client not initialised");
+    res.json(
+      await createVisitRescheduleService(req.tenantPrisma).reschedule(req.params.id, {
+        date,
+        actor: { id: req.profile?.id, role: req.profile?.role ?? undefined },
+      })
+    );
   })
 );
 

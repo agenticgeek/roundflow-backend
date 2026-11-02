@@ -24,10 +24,15 @@ export async function requireTechnician(req: Request, res: Response, next: NextF
     }
     const tech = await req.tenantPrisma!.technician.findUnique({
       where: { profileId: req.profile.id },
-      select: { id: true },
+      select: { id: true, active: true },
     });
     if (!tech) {
       res.status(403).json({ error: "No technician record is linked to this account", code: "NO_TECHNICIAN" });
+      return;
+    }
+    // C1: a deactivated technician can no longer use the app.
+    if (!tech.active) {
+      res.status(403).json({ error: "This technician account has been deactivated", code: "TECHNICIAN_INACTIVE" });
       return;
     }
     req.technician = { id: tech.id };

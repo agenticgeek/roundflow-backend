@@ -3,16 +3,20 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { prisma } from "../lib/prisma";
 import { AppError } from "../lib/app-error";
-import { asObject, h, requireString, requireNumber, optString, optReqString, optStringArray, optBool } from "../lib/http";
+import { asObject, h, requireString, requireNumber, optString, optReqString, optStringArray, optBool, parsePageParams } from "../lib/http";
 import { IssueType } from "../generated/tenant-client";
 import { ALLOWED_PHOTO_MIME_TYPES, MAX_PHOTO_BYTES } from "../lib/storage.js";
 import { createHomeService } from "./services/home.service";
 import { createJobDetailService } from "./services/job-detail.service";
 import { createJobTrackerService } from "./services/job-tracker.service";
 import { createMediaService } from "./services/media.service";
+import { createScheduleService, SCHEDULE_DEFAULT_PAGE_SIZE, SCHEDULE_MAX_PAGE_SIZE } from "./services/schedule.service";
 import { createChatService } from "./services/chat.service";
+import { assertChatPhotoUrls, parseChatListQuery, parseChatText, parseClientMsgId, type ChatSendInput } from "../services/chat.service";
 import { createNotificationService } from "./services/notification.service";
 import { createUpsellService } from "./services/upsell.service";
+import { createDayCloseService } from "./services/day-close.service";
+import { createReportsService } from "../services/reports.service";
 import { createVisitCompletionService, parseCompletionPayment } from "../services/visit-completion";
 import { requireTechnician, requireVisitOwner, assertRoundMember, assertVisitOwner } from "./ownership";
 import { idempotency } from "./idempotency";
@@ -32,12 +36,14 @@ const tp = (req: Request) => {
   return req.tenantPrisma;
 };
 const home    = (req: Request) => createHomeService(tp(req));
+const schedule = (req: Request) => createScheduleService(tp(req));
 const detail  = (req: Request) => createJobDetailService(tp(req));
 const tracker = (req: Request) => createJobTrackerService(tp(req));
 const media   = (req: Request) => createMediaService(tp(req));
 const chat    = (req: Request) => createChatService(tp(req));
 const notif   = (req: Request) => createNotificationService(tp(req));
 const upsells = (req: Request) => createUpsellService(tp(req));
+const dayClose = (req: Request) => createDayCloseService(tp(req));
 
 // Build the GET/PATCH /mobile/me response (public Profile name/DOB + tenant Technician avatar/area).
 async function meResponse(req: Request) {
@@ -195,9 +201,57 @@ mobileRouter.get("/rounds/today", h(async (req, res) => {
   res.json(await home(req).getRoundsSummary(req.profile!.id));
 }));
 
+// GET /mobile/schedule?from=YYYY-MM-DD&to=YYYY-MM-DD&page=1&pageSize=100
+// The caller's own visits (never another technician's) over a range of tenant-local days,
+// excluding CANCELLED, including COMPLETED/SKIPPED. Defaults: from = today, to = from + 13 days.
+// Max span 62 days (400 RANGE_TOO_LARGE; 400 INVALID_DATE_RANGE for malformed dates or from > to).
+// -> { from, to, timeZone, rows: [Today-list row + date, paymentHold, vatAmount, grossTotal],
+//      summary: [{ date, count, completedCount }], pagination }. Rows: date, then round, then round order.
+mobileRouter.get("/schedule", h(async (req, res) => {
+  const { page, pageSize } = parsePageParams(req.query as Record<string, unknown>, {
+    defaultPageSize: SCHEDULE_DEFAULT_PAGE_SIZE,
+    maxPageSize: SCHEDULE_MAX_PAGE_SIZE,
+  });
+  res.json(await schedule(req).getSchedule(req.technician!.id, { from: req.query.from, to: req.query.to, page, pageSize }));
+}));
+
 // GET /mobile/visits/today
 mobileRouter.get("/visits/today", h(async (req, res) => {
   res.json(await home(req).getTodayVisits(req.profile!.id));
+}));
+
+// GET /mobile/day[?date=YYYY-MM-DD] -> { date, closed, closedAt, completedCount, skippedCount, remaining[] }
+// The caller's own end-of-day state (default today). remaining = visits still SCHEDULED / IN_PROGRESS.
+mobileRouter.get("/day", h(async (req, res) => {
+  res.json(await dayClose(req).getStatus(req.technician!.id, optString(req.query.date as string | undefined, "date")));
+}));
+
+// POST /mobile/day/close { date?: YYYY-MM-DD } — technician end-of-day sign-off (default today).
+// 200 { alreadyClosed, ...day } when every visit is COMPLETED/SKIPPED (idempotent: a repeat returns the stored
+// sign-off); 409 UNFINISHED_VISITS { remaining[] } while any is SCHEDULED/IN_PROGRESS. Changes no visit and
+// does not close the office's business day (POST /today/close); the office sees it in the activity log.
+mobileRouter.post("/day/close", idempotency(), h(async (req, res) => {
+  const date = optString(asObject(req.body).date, "date");
+  const result = await dayClose(req).close(req.technician!.id, date);
+  if (!result.ok) {
+    res.status(409).json({
+      error: `${result.day.remaining.length} visit(s) still need completing or skipping before you can finish the day`,
+      code: "UNFINISHED_VISITS",
+      ...result.day,
+    });
+    return;
+  }
+  if (!result.alreadyClosed) {
+    void createReportsService(tp(req))
+      .logActivity(
+        "TECHNICIAN_DAY_CLOSED",
+        `${req.profile!.name ?? "Technician"} finished ${result.day.date} (${result.day.completedCount} completed, ${result.day.skippedCount} skipped)`,
+        req.profile!.id,
+        req.profile!.role ?? undefined,
+      )
+      .catch((err: unknown) => console.error("[day-close] activity log failed:", err));
+  }
+  res.json({ alreadyClosed: result.alreadyClosed, ...result.day });
 }));
 
 // GET /mobile/completions
@@ -207,8 +261,10 @@ mobileRouter.get("/completions", h(async (req, res) => {
 
 // GET /mobile/visits/:id
 mobileRouter.get("/visits/:id", requireVisitOwner, h(async (req, res) => {
-  const visit = await detail(req).getVisitDetail(req.params.id);
-  res.json({ ...visit, photos: await signPhotos(req.profile!.tenantId, visit.photos) });
+  const visit = await detail(req).getVisitDetail(req.params.id, req.profile!.id);
+  const { tenantId } = req.profile!;
+  const propertyPhotos = await signPhotos(tenantId, visit.property.photos);
+  res.json({ ...visit, property: { ...visit.property, photos: propertyPhotos }, photos: await signPhotos(tenantId, visit.photos) });
 }));
 
 // PATCH /mobile/visits/:id/start
@@ -262,14 +318,17 @@ mobileRouter.post("/visits/:id/access-issues", ...visitWrite, h(async (req, res)
   if (photoPaths.some((p) => !p.startsWith(prefix) || p.includes(".."))) {
     throw new AppError(400, "photoPaths must be storage paths returned by this visit's photos/upload-url");
   }
-  const { id } = await tracker(req).reportAccessIssue(req.params.id, type, description, photoPaths);
+  const { id } = await tracker(req).reportAccessIssue(req.params.id, type, description, photoPaths, {
+    technicianName: req.profile!.name,
+    profileId: req.profile!.id,
+  });
   res.status(201).json({ recorded: true, id, photoCount: photoPaths.length });
 }));
 
 // POST /mobile/visits/:id/notes
 mobileRouter.post("/visits/:id/notes", ...visitWrite, h(async (req, res) => {
   const body = asObject(req.body);
-  await media(req).addVisitNote(req.params.id, requireString(body.text, "text"));
+  await media(req).addVisitNote(req.params.id, requireString(body.text, "text"), req.profile!.id);
   res.status(201).json({ recorded: true });
 }));
 
@@ -318,18 +377,48 @@ mobileRouter.post("/visits/:id/debt-payment", ...visitWrite, h(async (req, res) 
   res.json(await detail(req).collectDebtPayment(req.params.id, { method, chequeNumber, actorProfileId: req.profile!.id }));
 }));
 
-// GET /mobile/chat/messages?roundId=X[&since=ISO]
+// GET /mobile/chat/messages?roundId=X[&since=ISO][&before=ISO][&limit=1..200]
+// Oldest first. since = poll for newer messages; otherwise the newest `limit`
+// (default 100) or those older than `before`. Rows carry isMine, senderRole
+// (TECHNICIAN | OFFICE) and photoSignedUrls. 403 NOT_YOUR_ROUND for a round you are not on.
 mobileRouter.get("/chat/messages", h(async (req, res) => {
   const roundId = requireString(req.query.roundId as string | undefined, "roundId");
-  const sinceStr = req.query.since as string | undefined;
-  const since = sinceStr ? new Date(sinceStr) : undefined;
-  if (since && isNaN(since.getTime())) throw new AppError(400, "since must be a valid ISO date");
+  const { since, before, limit } = parseChatListQuery(req.query as Record<string, unknown>);
   await assertRoundMember(tp(req), roundId, req.technician!.id);
-  const rows = await chat(req).getChatMessages(roundId, { profileId: req.profile!.id, supabaseUserId: req.user!.supabaseUserId }, since);
+  const rows = await chat(req).getChatMessages(
+    roundId,
+    { profileId: req.profile!.id, supabaseUserId: req.user!.supabaseUserId },
+    since,
+    { before, limit }
+  );
   res.json(await signChatRows(req.profile!.tenantId, rows));
 }));
 
-// POST /mobile/chat/messages
+// GET /mobile/chat/unread[?roundId=X] -> { total, rounds: [{ roundId, unread }] }
+// Unread = office/other-sender messages newer than your last POST /mobile/chat/read for the round.
+mobileRouter.get("/chat/unread", h(async (req, res) => {
+  const roundId = optString(req.query.roundId as string | undefined, "roundId");
+  if (roundId) await assertRoundMember(tp(req), roundId, req.technician!.id);
+  res.json(
+    await chat(req).unread(
+      req.technician!.id,
+      { profileId: req.profile!.id, supabaseUserId: req.user!.supabaseUserId },
+      roundId ?? undefined
+    )
+  );
+}));
+
+// POST /mobile/chat/read { roundId } -> { roundId, lastReadAt }
+mobileRouter.post("/chat/read", h(async (req, res) => {
+  const roundId = requireString(asObject(req.body).roundId, "roundId");
+  await assertRoundMember(tp(req), roundId, req.technician!.id);
+  res.json(await chat(req).markRead(roundId, { profileId: req.profile!.id, supabaseUserId: req.user!.supabaseUserId }));
+}));
+
+// POST /mobile/chat/messages { roundId, type?: TEXT|WORK_PHOTOS|PHOTOS, text?, visitId?, photoUrls?, clientMsgId? }
+// text <= 2000 chars; photoUrls must be this round's chat attachment paths
+// (<tenantId>/chat/<roundId>/...). clientMsgId makes a retry idempotent: the
+// existing message comes back with 200 instead of a second 201.
 mobileRouter.post("/chat/messages", h(async (req, res) => {
   const body = asObject(req.body);
   const roundId = requireString(body.roundId, "roundId");
@@ -337,22 +426,25 @@ mobileRouter.post("/chat/messages", h(async (req, res) => {
   await assertRoundMember(tp(req), roundId, req.technician!.id);
   // D-4: senderProfileId is the public Profile id, not the Supabase user id.
   const sender = req.profile!.id;
+  const clientMsgId = parseClientMsgId(body.clientMsgId);
+  let input: ChatSendInput;
   if (type === "WORK_PHOTOS") {
     const visitId = requireString(body.visitId, "visitId");
     await assertVisitOwner(tp(req), visitId, req.technician!.id);
-    const msg = await chat(req).sendWorkPhotosMessage(roundId, sender, visitId);
-    return res.status(201).json((await signChatRows(req.profile!.tenantId, [msg]))[0]);
-  }
-  if (type === "PHOTOS") {
+    input = { type: "WORK_PHOTOS", visitId, clientMsgId };
+  } else if (type === "PHOTOS") {
     const photoUrls = optStringArray(body.photoUrls, "photoUrls") ?? [];
     if (photoUrls.length === 0) throw new AppError(400, "photoUrls must be a non-empty array for type PHOTOS");
+    assertChatPhotoUrls(photoUrls, req.profile!.tenantId, roundId);
     const text = optString(body.text, "text");
-    const msg = await chat(req).sendPhotosMessage(roundId, sender, photoUrls, text ?? undefined);
-    return res.status(201).json((await signChatRows(req.profile!.tenantId, [msg]))[0]);
+    input = { type: "PHOTOS", photoUrls, text: text ? parseChatText(text) : null, clientMsgId };
+  } else if (type === "TEXT") {
+    input = { type: "TEXT", text: parseChatText(body.text), clientMsgId };
+  } else {
+    throw new AppError(400, 'type must be "TEXT", "WORK_PHOTOS", or "PHOTOS"');
   }
-  if (type !== "TEXT") throw new AppError(400, 'type must be "TEXT", "WORK_PHOTOS", or "PHOTOS"');
-  const msg = await chat(req).sendChatMessage(roundId, sender, requireString(body.text, "text"));
-  res.status(201).json((await signChatRows(req.profile!.tenantId, [msg]))[0]);
+  const { row, duplicate } = await chat(req).send(roundId, sender, input);
+  res.status(duplicate ? 200 : 201).json((await signChatRows(req.profile!.tenantId, [row]))[0]);
 }));
 
 // PATCH /mobile/visits/:id/complete

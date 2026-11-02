@@ -50,7 +50,9 @@ export async function pausePlan(
 ): Promise<PauseResult> {
   const today = startOfUtcDay(now);
   const start = startOfUtcDay(input.pauseStartDate);
-  const end = input.pauseEndDate ? new Date(startOfUtcDay(input.pauseEndDate).getTime() + DAY_MS) : null;
+  const endDay = input.pauseEndDate ? startOfUtcDay(input.pauseEndDate) : null;
+  if (endDay && endDay <= start) throw new AppError(400, "pauseEndDate must be after pauseStartDate");
+  const end = endDay ? new Date(endDay.getTime() + DAY_MS) : null;
   const startsNow = start <= today;
 
   return tp.$transaction(async (tx) => {
@@ -66,8 +68,11 @@ export async function pausePlan(
       where: { id: plan.id },
       data: {
         ...(startsNow ? { status: LifecycleStatus.PAUSED } : {}),
-        pauseStartDate: input.pauseStartDate,
-        pauseEndDate: input.pauseEndDate ?? null,
+        // Stored as UTC midnight: the nightly job and visit generation compare
+        // these against date-only values, so a time-of-day would shift the
+        // window by a day.
+        pauseStartDate: start,
+        pauseEndDate: endDay,
       },
     });
     return { ...updated, cancelledVisits: cancelled.count, pauseScheduled: !startsNow };
@@ -95,6 +100,56 @@ export async function resumePlan(
     where: { id: plan.id },
     data: { status: LifecycleStatus.ACTIVE, pauseStartDate: null, pauseEndDate: null, nextDueDate },
   });
+}
+
+// ---- round move (B3) -------------------------------------------------------
+
+export interface RoundMoveTarget {
+  id: string;
+  defaultDay: DayOfWeek | null;
+  frequency: CleaningFrequency | null;
+}
+
+// B3: when a property joins a different round, its future SCHEDULED visits
+// follow it (visits already started/finished are untouched), arrive
+// unassigned (technicianId null, no manual override) and each ACTIVE plan's
+// nextDueDate is recomputed for the new round's day. Callers update the
+// property row itself (roundId + assignedTechnicianId: null). Visit dates are
+// kept: only the round and technician change.
+export async function moveFutureVisitsToRound(
+  tx: Prisma.TransactionClient,
+  input: { propertyId: string; target: RoundMoveTarget; now: Date }
+): Promise<{ movedVisits: number }> {
+  const today = startOfUtcDay(input.now);
+  const moved = await tx.visit.updateMany({
+    where: {
+      propertyId: input.propertyId,
+      status: VisitStatus.SCHEDULED,
+      date: { gte: today },
+      OR: [{ roundId: null }, { roundId: { not: input.target.id } }],
+    },
+    data: { roundId: input.target.id, technicianId: null, technicianOverride: false },
+  });
+  const plans = await tx.servicePlan.findMany({
+    where: { propertyId: input.propertyId, status: LifecycleStatus.ACTIVE },
+    select: { id: true, lastCompleted: true, cleaningFrequency: true },
+  });
+  for (const plan of plans) {
+    const frequency = plan.cleaningFrequency ?? input.target.frequency;
+    if (!frequency) continue;
+    await tx.servicePlan.update({
+      where: { id: plan.id },
+      data: {
+        nextDueDate: initialNextDueDate({
+          lastCleanedDate: plan.lastCompleted,
+          frequency,
+          roundDefaultDay: input.target.defaultDay,
+          today,
+        }),
+      },
+    });
+  }
+  return { movedVisits: moved.count };
 }
 
 // ---- frequency change (B3) -------------------------------------------------

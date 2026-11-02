@@ -18,6 +18,19 @@ export function appErrorBody(err: AppError): Record<string, unknown> {
   return body;
 }
 
+// Prisma connectivity failures: can't reach / timed out / connection closed
+// (P1001, P1002, P1017), pool timeout (P2024) and client start-up failures.
+// Matched by name + code so errors from either generated client are covered.
+const DB_UNAVAILABLE_CODES = new Set(["P1001", "P1002", "P1017", "P2024"]);
+
+export function isDatabaseUnavailable(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const e = err as { name?: unknown; code?: unknown; errorCode?: unknown };
+  if (e.name === "PrismaClientInitializationError") return true;
+  const code = typeof e.code === "string" ? e.code : typeof e.errorCode === "string" ? e.errorCode : "";
+  return typeof e.name === "string" && e.name.startsWith("PrismaClient") && DB_UNAVAILABLE_CODES.has(code);
+}
+
 // Centralised error handler. Must be last and take 4 args so Express treats it
 // as error-handling middleware. Route handlers forward errors via next(err).
 // Typed AppErrors carry their own status + message; anything else is a 500.
@@ -34,6 +47,14 @@ export function errorHandler(err: unknown, _req: Request, res: Response, _next: 
   // so callers know the operation is blocked by a dependency, not a server bug.
   if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2003") {
     return res.status(409).json({ error: "Cannot delete: record is referenced by other data." });
+  }
+  if (isDatabaseUnavailable(err)) {
+    console.error(err);
+    res.set("Retry-After", "5");
+    return res.status(503).json({
+      error: "The service is temporarily unavailable. Please try again in a moment.",
+      code: "DATABASE_UNAVAILABLE",
+    });
   }
   console.error(err);
   res.status(500).json({ error: "Internal Server Error" });

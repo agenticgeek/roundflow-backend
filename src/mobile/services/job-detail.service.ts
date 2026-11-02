@@ -1,14 +1,18 @@
-import { InvoiceStatus, PaymentMethod, PaymentStatus, Prisma, VisitStatus } from "../../generated/tenant-client";
+import { InvoiceStatus, PaymentMethod, PaymentStatus, PhotoType, Prisma, VisitStatus } from "../../generated/tenant-client";
 import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
 import { AppError } from "../../lib/app-error";
 import type { ActivityLogEntry, OutstandingInvoice } from "../types";
-import { todayRange } from "../../lib/dates";
 import { evaluateDebtGate } from "./debt-gate";
+import { getCachedBusinessSettings } from "../../services/settings.service";
+import { releaseHoldIfSettled } from "../../services/payment-hold";
+import { vatOn, vatRateOf, grossOf } from "../../lib/vat";
 
 const visitDetailInclude = {
   property: {
     select: {
       id: true, addressLine: true, postcode: true, latitude: true, longitude: true,
+      // C2: the gate code / risk warning typed on the customer & property forms.
+      accessNotes: true, riskNotes: true,
       customer: {
         select: {
           id: true, name: true, badDebt: true, paymentMethod: true,
@@ -18,7 +22,9 @@ const visitDetailInclude = {
           },
         },
       },
-      notes: { select: { id: true, type: true, body: true } },
+      notes: { select: { id: true, type: true, body: true, createdAt: true, authorProfileId: true }, orderBy: { createdAt: "asc" } },
+      // The property's own photo (newest PROPERTY photo); the route signs it for the app's job card.
+      photos: { where: { type: PhotoType.PROPERTY }, select: { id: true, url: true }, orderBy: { createdAt: "desc" }, take: 1 },
     },
   },
   round: { select: { id: true, name: true } },
@@ -39,12 +45,29 @@ export interface DebtPaymentResult {
   method: "CASH" | "CHEQUE";
 }
 
-export interface VisitDetail extends VisitDetailBase {
+// C2/D6: who wrote a property note. TECHNICIAN notes (the app's "note for
+// office") are not access notes and must be shown separately.
+export type VisitNote = {
+  id: string;
+  type: string;
+  body: string;
+  createdAt: Date;
+  source: "TECHNICIAN" | "OFFICE";
+  mine: boolean;
+};
+
+export interface VisitDetail extends Omit<VisitDetailBase, "property"> {
+  property: Omit<VisitDetailBase["property"], "notes"> & { notes: VisitNote[] };
   lastClean: Date | null;
   roundPosition: { position: number; total: number } | null;
   activityLog: ActivityLogEntry[];
   outstandingInvoices: OutstandingInvoice[];
   debtAmount: number;
+  // A3: what the customer owes for this visit and what the technician should
+  // take: price (net) + VAT when the business adds VAT to invoices.
+  vatAmount: number;
+  vatRate: number;
+  grossTotal: number;
   canStart: boolean;
   blockReason: string | null;
 }
@@ -52,7 +75,7 @@ export interface VisitDetail extends VisitDetailBase {
 class JobDetailService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
-  async getVisitDetail(visitId: string): Promise<VisitDetail> {
+  async getVisitDetail(visitId: string, viewerProfileId?: string): Promise<VisitDetail> {
     const visit = await this.prisma.visit.findUnique({
       where: { id: visitId },
       include: visitDetailInclude,
@@ -67,10 +90,12 @@ class JobDetailService {
 
     let roundPosition: { position: number; total: number } | null = null;
     if (visit.roundId) {
-      const { start, end } = todayRange();
+      // Same scope and order as the Today list and GET /mobile/schedule: this
+      // technician's visits in the round on the visit's own day, by createdAt
+      // then id (stable - starting the visit does not change it).
       const roundVisits = await this.prisma.visit.findMany({
-        where: { roundId: visit.roundId, date: { gte: start, lt: end }, status: { not: VisitStatus.CANCELLED } },
-        orderBy: { createdAt: "asc" },
+        where: { roundId: visit.roundId, technicianId: visit.technicianId, date: visit.date, status: { not: VisitStatus.CANCELLED } },
+        orderBy: [{ createdAt: "asc" }, { id: "asc" }],
         select: { id: true },
       });
       const pos = roundVisits.findIndex(v => v.id === visitId);
@@ -96,7 +121,30 @@ class JobDetailService {
     // Effective method (visit → plan → customer) drives the app's payment sheet.
     const paymentMethod = visit.paymentMethod ?? visit.servicePlan?.paymentMethod ?? visit.property.customer.paymentMethod ?? null;
 
-    return { ...visit, paymentMethod, lastClean: lastVisit?.completedAt ?? null, roundPosition, activityLog, outstandingInvoices, debtAmount, canStart: gate.canStart, blockReason: gate.blockReason };
+    const settings = await getCachedBusinessSettings(this.prisma);
+    const net = visit.price.toNumber();
+    const vatAmount = vatOn(net, settings);
+    const vatRate = settings?.vatInInvoices ? vatRateOf(settings) : 0;
+
+    // Notes written by technicians (their profile is linked to a Technician row) are
+    // tagged so the app can keep them out of the ACCESS NOTES card.
+    const authorIds = [...new Set(visit.property.notes.map((n) => n.authorProfileId).filter((a): a is string => !!a))];
+    const techAuthors = authorIds.length
+      ? new Set(
+          (await this.prisma.technician.findMany({ where: { profileId: { in: authorIds } }, select: { profileId: true } }))
+            .map((t) => t.profileId)
+        )
+      : new Set<string | null>();
+    const notes: VisitNote[] = visit.property.notes.map((n) => ({
+      id: n.id,
+      type: n.type,
+      body: n.body,
+      createdAt: n.createdAt,
+      source: n.authorProfileId && techAuthors.has(n.authorProfileId) ? "TECHNICIAN" : "OFFICE",
+      mine: !!viewerProfileId && n.authorProfileId === viewerProfileId,
+    }));
+
+    return { ...visit, property: { ...visit.property, notes }, paymentMethod, vatAmount, vatRate, grossTotal: grossOf(net, settings), lastClean: lastVisit?.completedAt ?? null, roundPosition, activityLog, outstandingInvoices, debtAmount, canStart: gate.canStart, blockReason: gate.blockReason };
   }
 
   // On-site debt collection. CASH clears the outstanding invoices immediately.
@@ -148,19 +196,21 @@ class JobDetailService {
       return { cleared: false, amountPaid: 0, amountPending: totalAmount, method: "CHEQUE" };
     }
 
+    const paidAt = new Date();
     await this.prisma.$transaction([
       this.prisma.invoice.updateMany({
         where: { id: { in: invoices.map(i => i.id) } },
-        data: { status: InvoiceStatus.PAID },
+        data: { status: InvoiceStatus.PAID, paidAt }, // A8: paid date was never set here
       }),
       this.prisma.payment.create({
-        data: { customerId, amount: totalAmount, method: PaymentMethod.CASH, status: PaymentStatus.PAID, paidAt: new Date() },
+        data: { customerId, amount: totalAmount, method: PaymentMethod.CASH, status: PaymentStatus.PAID, paidAt },
       }),
       this.prisma.customer.update({
         where: { id: customerId },
         data: { badDebt: false },
       }),
     ]);
+    await releaseHoldIfSettled(this.prisma, customerId); // A8: same release rule as every other paid path
 
     return { cleared: true, amountPaid: totalAmount, amountPending: 0, method: "CASH" };
   }

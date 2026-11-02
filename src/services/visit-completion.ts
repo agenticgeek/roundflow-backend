@@ -1,7 +1,10 @@
-import { PaymentMethod, PaymentStatus, Prisma, VisitStatus } from "../generated/tenant-client";
+import { InvoiceStatus, PaymentMethod, PaymentStatus, Prisma, VisitStatus } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 import { TEMPLATE_NAMES } from "./message-templates";
+import { getCachedBusinessSettings } from "./settings.service";
+import { createInvoiceService } from "./invoice.service";
+import { grossOf } from "../lib/vat";
 
 // Shared visit completion used by PATCH /visits/:id/complete (web) and
 // PATCH /mobile/visits/:id/complete (technician app).
@@ -30,6 +33,10 @@ export interface CompleteVisitResult {
   id: string;
   status: VisitStatus;
   payment: { id: string; method: PaymentMethod; status: PaymentStatus; amount: number } | null;
+  // A1: the invoice created automatically at completion (null when none was
+  // created: customer/visit on payment hold, already invoiced, or a
+  // best-effort failure — the office can still invoice the visit by hand).
+  invoice: { id: string; status: InvoiceStatus } | null;
 }
 
 // Outbox event for the "Visit completed" customer message (A5). The outbox
@@ -99,7 +106,7 @@ export function createVisitCompletionService(tp: TenantPrismaClient) {
         include: { property: { include: { customer: true } }, servicePlan: true, payment: true },
       });
       if (!visit) throw new AppError(404, "Visit not found");
-      if (visit.status === VisitStatus.COMPLETED) return { id: visit.id, status: visit.status, payment: null };
+      if (visit.status === VisitStatus.COMPLETED) return { id: visit.id, status: visit.status, payment: null, invoice: null };
       if (visit.status === VisitStatus.SKIPPED) throw new AppError(409, "Cannot complete a skipped visit");
       if (visit.status === VisitStatus.CANCELLED) throw new AppError(409, "Cannot complete a cancelled visit");
 
@@ -109,17 +116,19 @@ export function createVisitCompletionService(tp: TenantPrismaClient) {
       const effectiveMethod =
         (visit.paymentMethod ?? visit.servicePlan?.paymentMethod ?? customer.paymentMethod) as PaymentMethod | null;
       const input = opts.payment;
+      // A3: money is taken at the VAT-inclusive total (the invoice amount).
+      const gross = grossOf(visit.price.toNumber(), await getCachedBusinessSettings(tp));
 
       // ---- 1. Decide the payment (validation only, no writes) -------------
       let planned: PlannedPayment | null = null;
       if (!visit.payment) {
         if (input?.method === "CASH") {
-          planned = { method: PaymentMethod.CASH, status: PaymentStatus.PAID, amount: input.amount ?? visit.price };
+          planned = { method: PaymentMethod.CASH, status: PaymentStatus.PAID, amount: input.amount ?? gross };
         } else if (input?.method === "CHEQUE") {
           planned = {
             method: PaymentMethod.CHEQUE,
             status: PaymentStatus.PENDING,
-            amount: input.amount ?? visit.price,
+            amount: input.amount ?? gross,
             chequeNumber: input.chequeNumber,
           };
         } else if (effectiveMethod === PaymentMethod.CASH) {
@@ -129,7 +138,7 @@ export function createVisitCompletionService(tp: TenantPrismaClient) {
             "PAYMENT_CONFIRMATION_REQUIRED",
           );
         } else if (effectiveMethod === PaymentMethod.BACS || effectiveMethod === PaymentMethod.CHEQUE) {
-          planned = { method: effectiveMethod, status: PaymentStatus.PENDING, amount: visit.price };
+          planned = { method: effectiveMethod, status: PaymentStatus.PENDING, amount: gross };
         } else if (
           effectiveMethod === PaymentMethod.GOCARDLESS &&
           customer.gocardlessMandateId &&
@@ -146,12 +155,12 @@ export function createVisitCompletionService(tp: TenantPrismaClient) {
             const client = getGcClient(decrypt(bs.gocardlessAccessTokenEncrypted), bs.gocardlessEnvironment ?? "sandbox");
             const gcPayment = await createGcPayment(client, {
               mandateId: customer.gocardlessMandateId,
-              amountPence: Math.round(visit.price.toNumber() * 100),
+              amountPence: Math.round(gross * 100),
               description: `Window cleaning — visit ${visit.id}`,
               reference: visit.id.slice(-8).toUpperCase(),
               metadata: { visitId: visit.id, customerId },
             });
-            planned = { method: PaymentMethod.GOCARDLESS, status: PaymentStatus.PENDING, amount: visit.price, gocardlessId: gcPayment.id };
+            planned = { method: PaymentMethod.GOCARDLESS, status: PaymentStatus.PENDING, amount: gross, gocardlessId: gcPayment.id };
           }
         }
       }
@@ -191,6 +200,10 @@ export function createVisitCompletionService(tp: TenantPrismaClient) {
           );
         }
       }
+      // A6: the plan's "last completed" date (shown as Last clean in the app).
+      if (visit.servicePlanId) {
+        ops.push(tp.servicePlan.update({ where: { id: visit.servicePlanId }, data: { lastCompleted: now } }));
+      }
       if (opts.note) {
         ops.push(tp.propertyNote.create({ data: { propertyId: visit.propertyId, body: opts.note, type: "INTERNAL" } }));
       }
@@ -218,12 +231,24 @@ export function createVisitCompletionService(tp: TenantPrismaClient) {
         ? (results[1] as { id: string; method: PaymentMethod; status: PaymentStatus; amount: Prisma.Decimal })
         : null;
 
+      // A1: invoice on completion, after the completion has committed so a
+      // billing problem can never undo or block the technician's work. The
+      // payment (A2: PAID cash -> PAID invoice) is already stored at this point.
+      let invoice: CompleteVisitResult["invoice"] = null;
+      try {
+        const created = await createInvoiceService(tp).autoCreateForCompletedVisit(visit.id);
+        invoice = created ? { id: created.invoiceId, status: created.status } : null;
+      } catch (err) {
+        console.error(`[visit-completion] auto-invoice failed for visit ${visit.id}:`, err);
+      }
+
       return {
         id: updated.id,
         status: updated.status,
         payment: payment
           ? { id: payment.id, method: payment.method, status: payment.status, amount: Number(payment.amount) }
           : null,
+        invoice,
       };
     },
   };

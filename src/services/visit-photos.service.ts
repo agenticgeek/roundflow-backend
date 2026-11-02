@@ -1,6 +1,7 @@
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
+import type { SignedPhotoUrls } from "../lib/signed-read-url";
 import { AppError } from "../lib/app-error";
-import { createSignedReadUrls } from "../lib/signed-read-url";
+import { createSignedPhotoUrls } from "../lib/signed-read-url";
 
 // B4: before/after photos for the admin app. URLs are signed reads (1 h TTL).
 
@@ -13,6 +14,7 @@ export interface PhotoRow {
   visitId: string | null;
   visitDate: string | null;
   technician: { id: string; name: string | null } | null;
+  reviewStatus: string;
 }
 
 export function createVisitPhotosService(tp: TenantPrismaClient) {
@@ -27,23 +29,23 @@ export function createVisitPhotosService(tp: TenantPrismaClient) {
       const photos = await tp.photo.findMany({
         where: { visitId },
         orderBy: { createdAt: "asc" },
-        select: { id: true, type: true, url: true, createdAt: true },
+        select: { id: true, type: true, url: true, createdAt: true, reviewStatus: true },
       });
-      const signed = await createSignedReadUrls(photos.map((p) => p.url));
+      const signed = await createSignedPhotoUrls(photos.map((p) => p.url));
       const visitDate = visit.date.toISOString().slice(0, 10);
 
       const rows: PhotoRow[] = photos.map((p) => {
-        const url = signed.get(p.url) as string | null; // every input path is a key
+        const urls = signed.get(p.url) as SignedPhotoUrls; // every input path is a key
         return {
           id: p.id,
           type: p.type,
-          url,
-          // No server-side thumbnails yet: the client scales the signed URL.
-          thumbnailUrl: url,
+          url: urls.url,
+          thumbnailUrl: urls.thumbnailUrl, // transformed when Storage allows, else the full url
           takenAt: p.createdAt,
           visitId: visit.id,
           visitDate,
           technician: visit.technician ? { id: visit.technician.id, name: visit.technician.name } : null,
+          reviewStatus: p.reviewStatus,
         };
       });
       return {

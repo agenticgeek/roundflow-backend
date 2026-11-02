@@ -10,7 +10,7 @@ import express from "express";
 
 const profileFindUnique = vi.fn();
 const profileUpdate = vi.fn().mockResolvedValue({});
-const technicianFindUnique = vi.fn().mockResolvedValue({ id: "tech-1", avatarUrl: null, serviceAreas: [] });
+const technicianFindUnique = vi.fn().mockResolvedValue({ id: "tech-1", active: true, avatarUrl: null, serviceAreas: [] });
 const technicianUpdateMany = vi.fn().mockResolvedValue({});
 
 vi.mock("../../lib/prisma", () => ({
@@ -64,7 +64,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   profileFindUnique.mockResolvedValue({ name: "James Carter", dateOfBirth: null });
   profileUpdate.mockResolvedValue({});
-  technicianFindUnique.mockResolvedValue({ id: "tech-1", avatarUrl: null, serviceAreas: [] });
+  technicianFindUnique.mockResolvedValue({ id: "tech-1", active: true, avatarUrl: null, serviceAreas: [] });
   technicianUpdateMany.mockResolvedValue({});
 });
 
@@ -156,7 +156,7 @@ it("PATCH /mobile/me without a dateOfBirth skips the date validation", async () 
 // ---------------------------------------------------------------------------
 
 it("GET /mobile/me returns the stored avatarUrl plus a signed avatarSignedUrl", async () => {
-  technicianFindUnique.mockResolvedValue({ id: "tech-1", avatarUrl: "tenant-1/avatars/p.jpg", serviceAreas: [] });
+  technicianFindUnique.mockResolvedValue({ id: "tech-1", active: true, avatarUrl: "tenant-1/avatars/p.jpg", serviceAreas: [] });
   const res = await request(makeApp()).get("/mobile/me");
   expect(res.status).toBe(200);
   expect(res.body.avatarUrl).toBe("tenant-1/avatars/p.jpg");

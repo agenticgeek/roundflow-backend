@@ -23,10 +23,13 @@ import {
   optBool,
   optStringArray,
 } from "../lib/http";
+import { optPostcodeSectors } from "../lib/postcode-sectors";
 import { toBusinessSettingsDto } from "../lib/settings-dto";
 import { rowError } from "../lib/row-error";
 import {
   optReminderMode,
+  optPreCleanReminders,
+  optPaymentMethods,
   optReminderTime,
   optCleanMethod,
   optPaymentMethod,
@@ -170,6 +173,7 @@ setupRouter.post(
       vatInInvoices:
         typeof body.vatInInvoices === "boolean" ? body.vatInInvoices : undefined,
       defaultPaymentMethod: optPaymentMethod(body.defaultPaymentMethod, "defaultPaymentMethod"),
+      acceptedPaymentMethods: optPaymentMethods(body.acceptedPaymentMethods),
       invoiceDueDays: optInvoiceDueDays(body.invoiceDueDays),
       noDirectDebitAction: optNoDirectDebitAction(body.noDirectDebitAction),
     };
@@ -229,6 +233,7 @@ setupRouter.post(
       defaultWorkingDays: Array.isArray(body.defaultWorkingDays)
         ? validateWorkingDays(body.defaultWorkingDays)
         : undefined,
+      preCleanReminders: optPreCleanReminders(body.preCleanReminders),
       reminderMode: optReminderMode(body.reminderMode),
       reminderTime: optReminderTime(body.reminderTime),
       defaultCleanMethod: optCleanMethod(body.defaultCleanMethod),
@@ -329,10 +334,18 @@ setupRouter.post(
       defaultDay: body.defaultDay as string | undefined,
       frequency: body.frequency as string | undefined,
       serviceAreaId: body.serviceAreaId as string | undefined,
+      postcodeSectors: optPostcodeSectors(body.postcodeSectors),
     };
     res.json(await svc(req).saveFirstRound(input));
   })
 );
+
+// BUG-06: with a non-empty serviceIds the client price is ignored (each plan
+// takes its catalogue price), so `price` is optional there. Otherwise required.
+function setupRowPrice(body: Record<string, unknown>): number {
+  if (Array.isArray(body.serviceIds) && body.serviceIds.length > 0) return 0;
+  return assertPositive(requireNumber(body.price, "price"), "price");
+}
 
 // ---- Step 9: Add Property ------------------------------------------------
 // One-time setup property creation. Does NOT reuse /customers or /properties.
@@ -361,7 +374,7 @@ setupRouter.post(
       postcode: requireString(body.postcode, "postcode", { maxLength: MAX_ADDRESS_LENGTH }),
       serviceAreaId: requireString(body.serviceAreaId, "serviceAreaId"),
       propertyType: optString(body.propertyType, "propertyType") ?? null,
-      price: assertPositive(requireNumber(body.price, "price"), "price"),
+      price: setupRowPrice(body),
       cleaningFrequency: optString(body.cleaningFrequency, "cleaningFrequency") ?? null,
       paymentMethod: optString(body.paymentMethod, "paymentMethod") ?? null,
       serviceId: optId(body.serviceId, "serviceId") ?? null,
@@ -416,7 +429,7 @@ function parseBulkRow(body: Record<string, unknown>): SetupPropertyInput {
     postcode: need("postcode", () => requireString(body.postcode, "postcode", { maxLength: MAX_ADDRESS_LENGTH })),
     serviceAreaId: need("serviceAreaId", () => requireString(body.serviceAreaId, "serviceAreaId")),
     propertyType: need("propertyType", () => optString(body.propertyType, "propertyType") ?? null),
-    price: need("price", () => assertPositive(requireNumber(body.price, "price"), "price")),
+    price: need("price", () => setupRowPrice(body)),
     cleaningFrequency: need("cleaningFrequency", () => optString(body.cleaningFrequency, "cleaningFrequency") ?? null),
     paymentMethod: need("paymentMethod", () => optString(body.paymentMethod, "paymentMethod") ?? null),
     serviceId: need("serviceId", () => optId(body.serviceId, "serviceId") ?? null),

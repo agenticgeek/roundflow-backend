@@ -18,7 +18,7 @@ const row = {
 
 it("strips every *Encrypted field and converts vatRate to a number", () => {
   const dto = toBusinessSettingsDto(row) as unknown as Record<string, unknown>;
-  expect(dto).toEqual({ id: "bs1", businessName: "Coates Windows", vatRate: 17.5, ghlConnected: true });
+  expect(dto).toEqual({ id: "bs1", businessName: "Coates Windows", vatRate: 17.5, ghlConnected: true, preCleanReminders: [{ type: "EVENING_BEFORE", time: "19:00" }] });
   expect(JSON.stringify(dto)).not.toMatch(/Encrypted|gc-token|ghl-at|sk"/);
 });
 

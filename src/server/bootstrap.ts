@@ -26,6 +26,7 @@ import { paymentsRouter } from "../routes/payments";
 import { stripeWebhookRouter } from "../routes/stripeWebhook";
 import { gocardlessWebhookRouter } from "../routes/gocardlessWebhook";
 import { ghlWebhookRouter } from "../routes/ghlWebhook";
+import { chatRouter } from "../routes/chat";
 import { mobileRouter } from "../mobile";
 import { openApiDocument } from "../swagger";
 import { errorHandler } from "../lib/error-handler";
@@ -156,6 +157,7 @@ export function createApp({ allowedOrigins, readiness }: CreateAppOptions): Expr
   app.use("/dashboard", dashboardRouter);
   app.use("/emergencies", emergenciesRouter);
   app.use("/payments", paymentsRouter);
+  app.use("/chat", chatRouter);
   app.use("/mobile", mobileRouter);
 
   // API docs (public) — interactive UI at /docs, raw spec at /openapi.json.

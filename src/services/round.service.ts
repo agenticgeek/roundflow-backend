@@ -2,11 +2,12 @@ import { CleaningFrequency, DayOfWeek, LifecycleStatus, RoundStatus, VisitStatus
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 import { getCachedBusinessSettings } from "./settings.service";
-import { todayRange } from "../lib/dates";
+import { tenantTodayRange, tenantToday } from "./business-time";
 import { createMessageService } from "./message.service";
 import { generateForRound } from "../jobs/visitGeneration";
 import { autoSplit, resolveTechnicianForVisit, restampFutureVisits } from "./visit-assignment";
 import { startOfUtcDay } from "../lib/schedule";
+import { assertSectorsInServiceArea } from "../lib/postcode-sectors";
 
 // ---- input types ----------------------------------------------------------
 
@@ -16,6 +17,7 @@ export interface RoundCreateInput {
   serviceAreaId: string;
   defaultDay?: DayOfWeek | null;
   description?: string | null;
+  postcodeSectors?: string[];
 }
 
 export interface RoundUpdateInput {
@@ -25,6 +27,7 @@ export interface RoundUpdateInput {
   defaultDay?: DayOfWeek | null;
   description?: string | null;
   status?: RoundStatus;
+  postcodeSectors?: string[]; // [] = clear
 }
 
 // ---- output types ---------------------------------------------------------
@@ -37,6 +40,7 @@ export interface RoundSummary {
   status: RoundStatus;
   serviceAreaId: string | null;
   serviceAreaName: string | null;
+  postcodeSectors: string[];
   technicianCount: number;
   propertyCount: number;
 }
@@ -56,8 +60,23 @@ export interface RoundDetail {
   status: RoundStatus;
   serviceAreaId: string | null;
   serviceAreaName: string | null;
+  postcodeSectors: string[];
   technicians: TechnicianRef[];
   propertyCount: number;
+}
+
+export interface RoundPropertyPage {
+  rows: Array<{
+    propertyId: string;
+    addressLine: string;
+    postcode: string;
+    status: LifecycleStatus;
+    customerId: string;
+    customerName: string;
+    assignedTechnicianId: string | null;
+    servicePlans: Array<{ servicePlanId: string; serviceName: string | null; price: number; status: LifecycleStatus }>;
+  }>;
+  pagination: { page: number; pageSize: number; total: number; totalPages: number };
 }
 
 // ---- planner output types -------------------------------------------------
@@ -295,6 +314,7 @@ class RoundService {
       status: r.status,
       serviceAreaId: r.serviceAreaId,
       serviceAreaName: r.serviceArea?.name ?? null,
+      postcodeSectors: r.postcodeSectors,
       technicianCount: r._count.roundTechnicians,
       propertyCount: r._count.properties,
     }));
@@ -303,13 +323,15 @@ class RoundService {
   // ---- create ----
 
   async createRound(input: RoundCreateInput): Promise<RoundDetail> {
-    await this.assertServiceAreaExists(input.serviceAreaId);
+    const area = await this.assertServiceAreaExists(input.serviceAreaId);
+    if (input.postcodeSectors) assertSectorsInServiceArea(input.postcodeSectors, area);
 
     const round = await this.prisma.round.create({
       data: {
         name: input.name,
         frequency: input.frequency,
         serviceAreaId: input.serviceAreaId,
+        postcodeSectors: input.postcodeSectors ?? [],
         defaultDay: input.defaultDay ?? null,
         description: input.description ?? null,
         status: RoundStatus.ACTIVE,
@@ -341,7 +363,7 @@ class RoundService {
   // Push Missed must not silently mutate visits after Close Day has run.
   private async assertDayNotClosed(): Promise<void> {
     const settings = await getCachedBusinessSettings(this.prisma);
-    const today = todayRange().start.toISOString().slice(0, 10);
+    const today = (await tenantTodayRange(this.prisma)).start.toISOString().slice(0, 10);
     if (settings?.lastClosedDate === today) {
       throw new AppError(409, "Operational day has already been closed");
     }
@@ -354,7 +376,15 @@ class RoundService {
     input: RoundUpdateInput
   ): Promise<RoundDetail> {
     await this.assertRoundExists(roundId);
-    if (input.serviceAreaId) await this.assertServiceAreaExists(input.serviceAreaId);
+    let area = input.serviceAreaId ? await this.assertServiceAreaExists(input.serviceAreaId) : null;
+    // Sectors are validated against the service area the round will end up in.
+    if (input.postcodeSectors && input.postcodeSectors.length > 0) {
+      if (!area && input.serviceAreaId !== null) {
+        const current = await this.prisma.round.findUnique({ where: { id: roundId }, select: { serviceArea: true } });
+        area = current?.serviceArea ?? null;
+      }
+      assertSectorsInServiceArea(input.postcodeSectors, area);
+    }
 
     const round = await this.prisma.round.update({
       where: { id: roundId },
@@ -362,6 +392,7 @@ class RoundService {
         name: input.name,
         frequency: input.frequency,
         serviceAreaId: input.serviceAreaId,
+        postcodeSectors: input.postcodeSectors,
         defaultDay: input.defaultDay,
         description: input.description,
         status: input.status,
@@ -370,6 +401,56 @@ class RoundService {
     });
 
     return this.toDetail(round);
+  }
+
+  // ---- paginated property listing (no 100-row ceiling: page through with total) ----
+
+  async listProperties(
+    roundId: string,
+    page: number,
+    pageSize: number
+  ): Promise<RoundPropertyPage> {
+    await this.assertRoundExists(roundId);
+    const where = { roundId, status: { not: LifecycleStatus.CANCELLED } };
+    const [total, rows] = await Promise.all([
+      this.prisma.property.count({ where }),
+      this.prisma.property.findMany({
+        where,
+        orderBy: [{ addressLine: "asc" }, { id: "asc" }],
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+        select: {
+          id: true,
+          addressLine: true,
+          postcode: true,
+          status: true,
+          assignedTechnicianId: true,
+          customer: { select: { id: true, name: true } },
+          servicePlans: {
+            where: { status: { not: LifecycleStatus.CANCELLED } },
+            select: { id: true, price: true, status: true, service: { select: { name: true } } },
+          },
+        },
+      }),
+    ]);
+    return {
+      rows: rows.map((p) => ({
+        propertyId: p.id,
+        addressLine: p.addressLine,
+        postcode: p.postcode,
+        status: p.status,
+        customerId: p.customer.id,
+        customerName: p.customer.name,
+        assignedTechnicianId: p.assignedTechnicianId,
+        servicePlans: p.servicePlans.map((sp) => ({
+          servicePlanId: sp.id,
+          serviceName: sp.service?.name ?? null,
+          price: Number(sp.price),
+          status: sp.status,
+        })),
+      })),
+      pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) },
+    };
   }
 
   // ---- set technicians (replace semantics) + property split (A1) ----
@@ -776,6 +857,7 @@ class RoundService {
       status: round.status,
       serviceAreaId: round.serviceAreaId,
       serviceAreaName: round.serviceArea?.name ?? null,
+      postcodeSectors: round.postcodeSectors,
       technicians: round.roundTechnicians.map((rt) => ({
         id: rt.technician.id,
         name: rt.technician.name ?? null,
@@ -851,10 +933,10 @@ class RoundService {
     return rest;
   }
 
-  private async assertServiceAreaExists(id: string): Promise<void> {
-    if (!(await this.prisma.serviceArea.findUnique({ where: { id } }))) {
-      throw new AppError(404, `Service area not found: ${id}`);
-    }
+  private async assertServiceAreaExists(id: string) {
+    const area = await this.prisma.serviceArea.findUnique({ where: { id } });
+    if (!area) throw new AppError(404, `Service area not found: ${id}`);
+    return area;
   }
 
   // ---- M4: today panel (Screen 13) ----------------------------------------
@@ -945,7 +1027,7 @@ class RoundService {
 
     await this.assertRoundExists(roundId);
 
-    const today = startOfUtcDay(new Date());
+    const today = await tenantToday(this.prisma);
     const start = startOfUtcDay(input.date ?? today);
     if (start < today) throw new AppError(400, '"date" must be today or later');
     if (start.getTime() === today.getTime()) await this.assertDayNotClosed();

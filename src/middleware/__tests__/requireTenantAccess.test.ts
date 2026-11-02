@@ -15,6 +15,7 @@ vi.mock("../../lib/tenant-prisma-manager", () => ({
 // isolation behavior below is exercised against real cache semantics.
 vi.mock("lru-cache", async (importOriginal) => {
   const actual = await importOriginal<typeof import("lru-cache")>();
+  // eslint-disable-next-line @typescript-eslint/no-empty-object-type
   class RecordingLRUCache<K extends {}, V extends {}> extends actual.LRUCache<K, V> {
     constructor(options: ConstructorParameters<typeof actual.LRUCache<K, V>>[0]) {
       lruCtorCalls.push(options);

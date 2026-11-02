@@ -19,7 +19,7 @@ function makePrisma() {
     payment: { create: vi.fn() },
     activityLog: { create: vi.fn() },
     chatMessage: { findMany: vi.fn(), create: vi.fn() },
-    $transaction: vi.fn(async (ops: unknown[]) => ops),
+    $transaction: vi.fn(async (ops: unknown[]) => Promise.all(ops)),
     businessSettings: { findFirst: vi.fn().mockResolvedValue({ debtHoldEnabled: false, debtHoldMaxInvoices: null, debtHoldMaxAmount: null }) },
     notification: { findMany: vi.fn(), count: vi.fn(), updateMany: vi.fn(), create: vi.fn() },
     device: { findMany: vi.fn(), upsert: vi.fn(), deleteMany: vi.fn() },
@@ -617,7 +617,7 @@ it("revenueByMethod and row paymentMethod use visit, then plan, then customer me
 it("getVisitDetail returns the effective payment method and skips CANCELLED in roundPosition", async () => {
   const prisma = makePrisma();
   fn(prisma.visit.findUnique).mockResolvedValue({
-    id: "v1", status: "SCHEDULED", date: new Date(), roundId: "r1", propertyId: "p1", paymentMethod: null,
+    id: "v1", status: "SCHEDULED", date: new Date(), roundId: "r1", price: { toNumber: () => 20 }, propertyId: "p1", paymentMethod: null,
     servicePlan: { paymentMethod: "BACS" },
     property: { id: "p1", customer: { id: "c1", name: "A", badDebt: false, paymentMethod: "CASH", invoices: [] }, notes: [] },
   });
@@ -632,7 +632,7 @@ it("getVisitDetail returns the effective payment method and skips CANCELLED in r
 
 it("getVisitDetail falls back to the customer method, then null", async () => {
   const prisma = makePrisma();
-  const base = { id: "v1", status: "SCHEDULED", date: new Date(), roundId: null, propertyId: "p1", paymentMethod: null, servicePlan: null };
+  const base = { id: "v1", status: "SCHEDULED", date: new Date(), roundId: null, price: { toNumber: () => 20 }, propertyId: "p1", paymentMethod: null, servicePlan: null };
   fn(prisma.visit.findFirst).mockResolvedValue(null);
   fn(prisma.visit.findUnique).mockResolvedValueOnce({
     ...base, property: { id: "p1", customer: { id: "c1", name: "A", badDebt: false, paymentMethod: "CASH", invoices: [] }, notes: [] },
@@ -710,13 +710,13 @@ describe("chat service (D-4)", () => {
     expect(fn(prisma.chatMessage.findMany).mock.calls[1][0].where).toEqual({ roundId: "r1" });
   });
 
-  it("sends store the given sender and return isMine", async () => {
+  it("sends store the given sender as a TECHNICIAN message and return isMine", async () => {
     const prisma = makePrisma();
     fn(prisma.chatMessage.create).mockImplementation(async (a: any) => ({ id: "m", ...a.data }));
     const svc = createChatService(prisma);
-    expect(await svc.sendChatMessage("r1", "prof-1", "hi")).toMatchObject({ senderProfileId: "prof-1", type: "TEXT", isMine: true });
-    expect(await svc.sendWorkPhotosMessage("r1", "prof-1", "v1")).toMatchObject({ type: "WORK_PHOTOS", visitId: "v1", isMine: true });
-    expect(await svc.sendPhotosMessage("r1", "prof-1", ["a"])).toMatchObject({ type: "PHOTOS", body: null, isMine: true });
-    expect(await svc.sendPhotosMessage("r1", "prof-1", ["a"], "look")).toMatchObject({ body: "look" });
+    const text = await svc.send("r1", "prof-1", { type: "TEXT", text: "hi" });
+    expect(text).toMatchObject({ duplicate: false, row: { senderProfileId: "prof-1", senderRole: "TECHNICIAN", type: "TEXT", body: "hi", isMine: true } });
+    expect((await svc.send("r1", "prof-1", { type: "WORK_PHOTOS", visitId: "v1" })).row).toMatchObject({ type: "WORK_PHOTOS", visitId: "v1" });
+    expect((await svc.send("r1", "prof-1", { type: "PHOTOS", photoUrls: ["a"], text: "look" })).row).toMatchObject({ type: "PHOTOS", body: "look", photoUrls: ["a"] });
   });
 });

@@ -50,7 +50,7 @@ it("holds only the first visit for a customer on hold, skips unavailable technic
     windows: [{ technicianId: "t1", from: d("2026-12-01"), to: d("2026-12-31") }],
   });
   expect(plan.visits.map((v) => [v.date, v.technicianId, v.paymentHold])).toEqual([
-    [d("2026-10-30"), "t1", true],
+    [d("2026-10-30"), "t1", false], // BUG-02: held customer, visit still not held
     [d("2026-12-11"), "t2", false], // t1 away → the other technician
   ]);
 });

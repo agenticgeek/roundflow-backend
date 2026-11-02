@@ -93,14 +93,14 @@ describe("generateForRound", () => {
     });
   });
 
-  it("stamps the round's sole technician and the customer's payment hold (X-1, A3)", async () => {
+  it("stamps the round's sole technician and never auto-holds, even for a held customer (X-1, BUG-02)", async () => {
     const tp: any = withProperties([property({ customer: { holdNextClean: true } })], {
       roundTechnician: { findMany: vi.fn().mockResolvedValue([{ technicianId: "t1" }]) },
     });
 
     await generateForRound(tp, { id: "round-1", frequency: null }, TODAY);
 
-    expect(tp.visit.create.mock.calls[0][0].data).toMatchObject({ technicianId: "t1", paymentHold: true });
+    expect(tp.visit.create.mock.calls[0][0].data).toMatchObject({ technicianId: "t1", paymentHold: false });
   });
 
   it("stamps the property's assigned technician on a multi-technician round", async () => {

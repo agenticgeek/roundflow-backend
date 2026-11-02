@@ -41,14 +41,14 @@ describe("requireTechnician", () => {
     const res = makeRes();
     const next = vi.fn();
     await requireTechnician({ profile: { id: "p1", role: "TECHNICIAN" }, tenantPrisma: tp } as any, res, next);
-    expect(tp.technician.findUnique).toHaveBeenCalledWith({ where: { profileId: "p1" }, select: { id: true } });
+    expect(tp.technician.findUnique).toHaveBeenCalledWith({ where: { profileId: "p1" }, select: { id: true, active: true } });
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: "NO_TECHNICIAN" }));
     expect(next).not.toHaveBeenCalled();
   });
 
   it("sets req.technician and continues for a linked technician", async () => {
     const tp = makeTp();
-    tp.technician.findUnique.mockResolvedValue({ id: "t1" });
+    tp.technician.findUnique.mockResolvedValue({ id: "t1", active: true });
     const req: any = { profile: { id: "p1", role: "TECHNICIAN" }, tenantPrisma: tp };
     const next = vi.fn();
     await requireTechnician(req, makeRes(), next);

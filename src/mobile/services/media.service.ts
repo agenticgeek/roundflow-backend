@@ -5,14 +5,14 @@ import { buildVisitPhotoPath, buildAvatarPath, buildChatAttachmentPath, createSi
 class MediaService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
-  async addVisitNote(visitId: string, text: string): Promise<void> {
+  async addVisitNote(visitId: string, text: string, authorProfileId?: string): Promise<void> {
     const visit = await this.prisma.visit.findUnique({
       where: { id: visitId },
       select: { id: true, propertyId: true },
     });
     if (!visit) throw new AppError(404, "Visit not found");
     await this.prisma.propertyNote.create({
-      data: { propertyId: visit.propertyId, body: text, type: "INTERNAL" },
+      data: { propertyId: visit.propertyId, body: text, type: "INTERNAL", authorProfileId: authorProfileId ?? null },
     });
   }
 

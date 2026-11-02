@@ -376,7 +376,7 @@ describe("activation (A2, X-1, X-2, GAP-016)", () => {
 
     const visits = (p.visit.createMany as Fn).mock.calls[0][0].data;
     expect(visits.map((v: any) => [v.date, v.technicianId, v.paymentHold])).toEqual([
-      [d("2026-10-30"), "t1", true],
+      [d("2026-10-30"), "t1", false], // BUG-02: never auto-held
       [d("2026-11-27"), "t1", false],
     ]);
     expect(p.servicePlan.update).toHaveBeenCalledWith({ where: { id: "sp1" }, data: { nextDueDate: d("2026-12-25") } });
