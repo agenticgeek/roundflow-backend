@@ -270,7 +270,7 @@ export interface ActivationResult {
 // on. BusinessSettings is a singleton within that schema.
 
 // Catalogue rows a setup property row may reference (id -> price/active).
-type ServiceCatalogue = Map<string, { defaultPrice: number; active: boolean }>;
+type ServiceCatalogue = Map<string, { defaultPrice: number; active: boolean; name?: string }>;
 
 // BUG-06: one row's service-plan entries. With `serviceIds` the client price
 // is ignored — each plan is created at its own catalogue price (the row's
@@ -283,7 +283,13 @@ function servicePlanEntries(
   const check = (id: string) => {
     const service = catalogue.get(id);
     if (!service) throw new AppError(404, `Service not found: ${id}`);
-    if (!service.active) throw new AppError(400, `Service is inactive and cannot be added: ${id}`, "SERVICE_INACTIVE");
+    if (!service.active) {
+      throw new AppError(
+        400,
+        `"${service.name ?? id}" is inactive. Reactivate it in Settings → Services or remove it from this row.`,
+        "SERVICE_INACTIVE"
+      );
+    }
     return service;
   };
   if (input.serviceIds && input.serviceIds.length > 0) {
@@ -373,8 +379,11 @@ class SetupService {
   }
 
   async getStatus(): Promise<SetupStatus> {
-    const [settings, activeRounds] = await Promise.all([
+    const [settings, technicianCount, activeRounds] = await Promise.all([
       this.getSettings(),
+      // Step 6: the wizard adds technicians one at a time via POST /technicians
+      // (never the bulk step-6 replace), so completion is derived from their existence.
+      this.prisma.technician.count(),
       // Step 10: also complete when all ACTIVE rounds have ≥1 technician
       // (technicians are now assigned from the Round Planner after setup).
       this.prisma.round.findMany({
@@ -384,6 +393,7 @@ class SetupService {
     ]);
 
     const done = new Set(settings?.completedSteps ?? []);
+    if (technicianCount > 0) done.add(6);
     const allRoundsAssigned =
       activeRounds.length > 0 &&
       activeRounds.every((r) => r.roundTechnicians.length > 0);
@@ -874,9 +884,9 @@ class SetupService {
     if (ids.length === 0) return new Map();
     const rows = await this.prisma.service.findMany({
       where: { id: { in: ids } },
-      select: { id: true, defaultPrice: true, active: true },
+      select: { id: true, name: true, defaultPrice: true, active: true },
     });
-    return new Map(rows.map((s) => [s.id, { defaultPrice: Number(s.defaultPrice), active: s.active }]));
+    return new Map(rows.map((s) => [s.id, { defaultPrice: Number(s.defaultPrice), active: s.active, name: s.name }]));
   }
 
   // Every existing customer's mobile/email, for GAP-010 matching. Setup-sized

@@ -22,7 +22,7 @@ function makePrisma() {
       create: vi.fn(),
       delete: vi.fn(),
     },
-    technician: { findMany: vi.fn().mockResolvedValue([]), deleteMany: vi.fn(), createMany: vi.fn() },
+    technician: { findMany: vi.fn().mockResolvedValue([]), deleteMany: vi.fn(), createMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
     technicianServiceArea: { createMany: vi.fn() },
     technicianAvailability: { findMany: vi.fn().mockResolvedValue([]) },
     round: {
@@ -85,6 +85,16 @@ describe("completedSteps / getStatus (GAP-002)", () => {
     ]);
     expect(status.allRequiredComplete).toBe(false);
     expect(p.service.findMany).not.toHaveBeenCalled();
+  });
+
+  it("step 6 is complete once any technician exists, even though POST /technicians never marks it", async () => {
+    const p = makePrisma();
+    expect((await svcFor(p).getStatus()).steps.find((s) => s.step === 6)?.complete).toBe(false);
+
+    p.technician.count.mockResolvedValue(1);
+    const status = await svcFor(p).getStatus();
+    expect(status.steps.find((s) => s.step === 6)?.complete).toBe(true);
+    expect(status.wizardSteps.find((w) => w.step === 6)?.complete).toBe(true);
   });
 
   it("all required steps saved → allRequiredComplete; step 10 via completedSteps", async () => {
