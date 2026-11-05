@@ -1,5 +1,9 @@
 import type Stripe from "stripe";
 import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
+import { AppError } from "../../lib/app-error";
+import { decrypt } from "../../lib/crypto";
+import { getStripeClient } from "./client";
+import { Prisma, StripeSessionStatus, StripeSessionType } from "../../generated/tenant-client";
 
 interface OneTimeSessionInput {
   tenantId: string;
@@ -83,6 +87,56 @@ export async function createOneTimeSession(
     url: session.url!,
     expiresAt: session.expires_at ? new Date(session.expires_at * 1000) : null,
   };
+}
+
+// Payment link for one invoice (A5): a real Checkout Session on the tenant's
+// connected Stripe account. Reuses a still-open PENDING session for the same
+// invoice instead of minting a new one per click. No static fallback — a
+// tenant without Stripe gets 409 STRIPE_NOT_CONNECTED.
+export async function getInvoiceCheckoutLink(
+  tp: TenantPrismaClient,
+  input: { tenantId: string; invoiceId: string; customerId: string; invoiceNumber: string; amount: Prisma.Decimal }
+): Promise<{ url: string; expiresAt: Date | null }> {
+  const bs = await tp.businessSettings.findFirst({
+    select: { stripeConnected: true, stripeSecretKeyEncrypted: true },
+  });
+  if (!bs?.stripeConnected || !bs.stripeSecretKeyEncrypted) {
+    throw new AppError(409, "Stripe is not connected. Connect Stripe in Settings › Payments to send payment links.", "STRIPE_NOT_CONNECTED");
+  }
+
+  const existing = await tp.stripeSession.findFirst({
+    where: {
+      invoiceId: input.invoiceId,
+      status: StripeSessionStatus.PENDING,
+      OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
+    },
+  });
+  if (existing) return { url: existing.url, expiresAt: existing.expiresAt };
+
+  const stripe = getStripeClient(decrypt(bs.stripeSecretKeyEncrypted));
+  const frontend = process.env.FRONTEND_URL?.split(",")[0].trim() ?? "";
+  const result = await createOneTimeSession(stripe, tp, {
+    tenantId: input.tenantId,
+    customerId: input.customerId,
+    invoiceId: input.invoiceId,
+    invoiceNumber: input.invoiceNumber,
+    amountPence: Math.round(Number(input.amount) * 100),
+    successUrl: `${frontend}/invoices/${input.invoiceId}?payment=success`,
+    cancelUrl: `${frontend}/invoices/${input.invoiceId}?payment=cancelled`,
+  });
+  await tp.stripeSession.create({
+    data: {
+      stripeSessionId: result.stripeSessionId,
+      type: StripeSessionType.ONE_TIME,
+      customerId: input.customerId,
+      invoiceId: input.invoiceId,
+      amountTotal: input.amount,
+      currency: "gbp",
+      url: result.url,
+      expiresAt: result.expiresAt,
+    },
+  });
+  return { url: result.url, expiresAt: result.expiresAt };
 }
 
 export async function createSetupSession(

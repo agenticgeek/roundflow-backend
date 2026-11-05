@@ -3,7 +3,7 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
-import { asObject, h, requireString, optReqString, optString, optId, optBool } from "../lib/http";
+import { asObject, h, requireString, optReqString, optString, optId, optBool, parsePageParams } from "../lib/http";
 import {
   requireCleaningFrequency,
   optCleaningFrequency,
@@ -16,15 +16,47 @@ import {
   RoundUpdateInput,
   ReassignInput,
   PushMissedInput,
+  SplitInput,
 } from "../services/round.service";
+import { optPostcodeSectors } from "../lib/postcode-sectors";
 import { createReportsService } from "../services/reports.service";
 import { parseIsoDate, parseOptionalDateOnly } from "../lib/validation";
+import {
+  createWeatherHoldService,
+  WEATHER_CONDITIONS,
+  WEATHER_RESCHEDULING,
+  type WeatherCondition,
+  type WeatherHoldInput,
+  type WeatherRescheduling,
+} from "../services/weather-hold.service";
 
 export const roundsRouter = Router();
 roundsRouter.use(requireAuth);
 roundsRouter.use(requireTenantAccess);
 // Authorization: reads allowed for any known role; mutations require ADMIN/MANAGER.
 roundsRouter.use(requireBusinessAccess());
+
+// PUT /rounds/:id/technicians `split` body. undefined = let the service pick
+// (SINGLE for one technician, AUTO for more).
+function parseSplit(v: unknown): SplitInput | undefined {
+  if (v === undefined || v === null) return undefined;
+  const split = asObject(v);
+  const mode = split.mode;
+  if (mode !== "SINGLE" && mode !== "AUTO" && mode !== "MANUAL") {
+    throw new AppError(400, '"split.mode" must be "SINGLE", "AUTO" or "MANUAL"');
+  }
+  if (mode !== "MANUAL") return { mode };
+  const allocations = split.allocations;
+  if (
+    !Array.isArray(allocations) ||
+    !allocations.every(
+      (a) => a && typeof a === "object" && typeof a.propertyId === "string" && typeof a.technicianId === "string"
+    )
+  ) {
+    throw new AppError(400, '"split.allocations" must be an array of { propertyId, technicianId } for MANUAL');
+  }
+  return { mode, allocations: allocations as { propertyId: string; technicianId: string }[] };
+}
 
 // Thin routes: validate → call service → respond. No DB access here.
 const svc = (req: Request) => {
@@ -56,6 +88,7 @@ roundsRouter.post(
       serviceAreaId: requireString(body.serviceAreaId, "serviceAreaId"),
       defaultDay: optDayOfWeek(body.defaultDay),
       description: optString(body.description, "description"),
+      postcodeSectors: optPostcodeSectors(body.postcodeSectors),
     };
     res.status(201).json(await svc(req).createRound(input));
   })
@@ -133,6 +166,19 @@ roundsRouter.get(
 );
 
 // ==========================================================================
+// GET /rounds/:id/properties?page&pageSize — the round's non-cancelled
+// properties, paged (pageSize max 100, any page): { rows, pagination: { page,
+// pageSize, total, totalPages } }
+// ==========================================================================
+roundsRouter.get(
+  "/:id/properties",
+  h(async (req, res) => {
+    const { page, pageSize } = parsePageParams(req.query as Record<string, unknown>, { defaultPageSize: 50, maxPageSize: 100 });
+    res.json(await svc(req).listProperties(req.params.id, page, pageSize));
+  })
+);
+
+// ==========================================================================
 // PATCH /rounds/:id — partial update (name, frequency, serviceAreaId, defaultDay, description, status)
 // ==========================================================================
 roundsRouter.patch(
@@ -146,6 +192,7 @@ roundsRouter.patch(
       defaultDay: optDayOfWeek(body.defaultDay),
       description: optString(body.description, "description"),
       status: optRoundStatus(body.status),
+      postcodeSectors: optPostcodeSectors(body.postcodeSectors),
     };
     const result = await svc(req).updateRound(req.params.id, input);
     void createReportsService(req.tenantPrisma!).logActivity(
@@ -188,7 +235,10 @@ roundsRouter.get(
 );
 
 // ==========================================================================
-// PUT /rounds/:id/technicians — replace technician list (empty array = clear all)
+// PUT /rounds/:id/technicians — replace technician list (empty array = clear
+//   all) and split the round's properties between them (A1 / GAP-012).
+//   Body: { technicianIds, split?: { mode: SINGLE|AUTO|MANUAL, allocations? } }
+//   ?dryRun=true returns the same response without saving anything.
 // ==========================================================================
 roundsRouter.put(
   "/:id/technicians",
@@ -200,14 +250,29 @@ roundsRouter.put(
     ) {
       throw new AppError(400, '"technicianIds" must be an array of strings.');
     }
-    const result = await svc(req).setTechnicians(req.params.id, body.technicianIds as string[]);
-    void createReportsService(req.tenantPrisma!).logActivity(
-      "TECHNICIAN_ASSIGNED",
-      `Technicians assigned to round: ${req.params.id}`,
-      req.profile?.id,
-      req.profile?.role ?? undefined,
-    );
+    const split = parseSplit(body.split);
+    const dryRun = req.query.dryRun === "true";
+    // AllocationError's `fields` are forwarded by the central error handler.
+    const result = await svc(req).setTechnicians(req.params.id, body.technicianIds as string[], split, { dryRun });
+    if (!dryRun) {
+      void createReportsService(req.tenantPrisma!).logActivity(
+        "TECHNICIAN_ASSIGNED",
+        `Technicians assigned to round: ${req.params.id}`,
+        req.profile?.id,
+        req.profile?.role ?? undefined,
+      );
+    }
     res.json(result);
+  })
+);
+
+// ==========================================================================
+// GET /rounds/:id/allocation — current property split: { mode, allocation }
+// ==========================================================================
+roundsRouter.get(
+  "/:id/allocation",
+  h(async (req, res) => {
+    res.json(await svc(req).getAllocation(req.params.id));
   })
 );
 
@@ -222,22 +287,26 @@ roundsRouter.get(
 );
 
 // ==========================================================================
-// POST /rounds/:id/reassign — reassign technician for today's visits (M15)
-//   Body: { fromTechnicianId, toTechnicianId, scope: "remaining"|"all",
-//           note?, notify }
+// POST /rounds/:id/reassign — reassign one date's visits (M15, GAP-013)
+//   Body: { date?: YYYY-MM-DD (default today), fromTechnicianId: id | null
+//           (null = unassigned visits), toTechnicianId,
+//           scope: "REMAINING"|"ALL", permanent?, note?, notify }
+//   Lowercase scope values are still accepted from older clients.
 // ==========================================================================
 roundsRouter.post(
   "/:id/reassign",
   h(async (req, res) => {
     const body = asObject(req.body);
-    const rawScope = requireString(body.scope, "scope");
-    if (rawScope !== "remaining" && rawScope !== "all") {
-      throw new AppError(400, '"scope" must be "remaining" or "all"');
+    const rawScope = requireString(body.scope, "scope").toUpperCase();
+    if (rawScope !== "REMAINING" && rawScope !== "ALL") {
+      throw new AppError(400, '"scope" must be "REMAINING" or "ALL"');
     }
     const input: ReassignInput = {
-      fromTechnicianId: requireString(body.fromTechnicianId, "fromTechnicianId"),
+      date: parseOptionalDateOnly(body.date ?? undefined, "date"),
+      fromTechnicianId: optId(body.fromTechnicianId, "fromTechnicianId") ?? null,
       toTechnicianId: requireString(body.toTechnicianId, "toTechnicianId"),
       scope: rawScope,
+      permanent: optBool(body.permanent, "permanent") ?? false,
       note: optString(body.note, "note"),
       notify: optBool(body.notify, "notify") ?? false,
     };
@@ -278,6 +347,58 @@ roundsRouter.post(
       req.profile?.id,
       req.profile?.role ?? undefined,
     );
+    res.json(result);
+  })
+);
+
+// Weather hold inputs, from a JSON body or the preview's query string.
+function parseWeatherHold(src: Record<string, unknown>): WeatherHoldInput {
+  const condition = requireString(src.condition, "condition");
+  if (!Object.prototype.hasOwnProperty.call(WEATHER_CONDITIONS, condition)) {
+    throw new AppError(400, `"condition" must be one of: ${Object.keys(WEATHER_CONDITIONS).join(", ")}`);
+  }
+  const rescheduling = requireString(src.rescheduling, "rescheduling");
+  if (!(WEATHER_RESCHEDULING as readonly string[]).includes(rescheduling)) {
+    throw new AppError(400, `"rescheduling" must be one of: ${WEATHER_RESCHEDULING.join(", ")}`);
+  }
+  const date = parseOptionalDateOnly(src.date, "date");
+  if (!date) throw new AppError(400, '"date" is required (YYYY-MM-DD)');
+  return { date, condition: condition as WeatherCondition, rescheduling: rescheduling as WeatherRescheduling };
+}
+
+const weatherHoldSvc = (req: Request) => {
+  if (!req.tenantPrisma) throw new AppError(500, "Tenant client not initialised");
+  return createWeatherHoldService(req.tenantPrisma);
+};
+
+// ==========================================================================
+// GET /rounds/:id/weather-hold/preview?date=YYYY-MM-DD&condition=&rescheduling=
+//   Read-only: affected visit/customer counts, the new date and the customer
+//   message rendered for the first affected customer.
+// ==========================================================================
+roundsRouter.get(
+  "/:id/weather-hold/preview",
+  h(async (req, res) => {
+    res.json(await weatherHoldSvc(req).preview(req.params.id, parseWeatherHold(req.query as Record<string, unknown>)));
+  })
+);
+
+// ==========================================================================
+// POST /rounds/:id/weather-hold — hold one round-day for the weather.
+//   Body: { date: YYYY-MM-DD, condition: heavy-rain|high-winds|snow-ice|technician-safety,
+//           rescheduling: next-available|next-cycle|manual, notifyCustomers? }
+//   Moves (or, for "manual", skips) the round's SCHEDULED visits on that date,
+//   logs WEATHER_HOLD, then messages the affected customers when asked.
+// ==========================================================================
+roundsRouter.post(
+  "/:id/weather-hold",
+  h(async (req, res) => {
+    const body = asObject(req.body);
+    const result = await weatherHoldSvc(req).apply(req.params.id, {
+      ...parseWeatherHold(body),
+      notifyCustomers: optBool(body.notifyCustomers, "notifyCustomers") ?? false,
+      actor: { id: req.profile?.id, role: req.profile?.role ?? undefined },
+    });
     res.json(result);
   })
 );

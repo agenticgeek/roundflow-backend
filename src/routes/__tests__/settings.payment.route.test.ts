@@ -205,11 +205,24 @@ describe("PATCH /settings/payment/gocardless/webhook-secret", () => {
 });
 
 describe("GET /settings/stripe/authorize", () => {
-  it("redirects to the Stripe Connect authorize url", async () => {
-    const res = await request(makeApp()).get("/settings/stripe/authorize");
+  it("returns the Stripe Connect authorize url as JSON", async () => {
+    const res = await request(makeApp()).get("/settings/stripe/authorize").set("Accept", "application/json");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ url: "https://connect.stripe.com/oauth/authorize?mock=1" });
+    expect(buildStripeAuthUrl).toHaveBeenCalledWith(expect.stringMatching(/^tenant-1:[0-9a-f]+$/));
+  });
+
+  it("still redirects a top-level browser navigation (one release)", async () => {
+    const res = await request(makeApp()).get("/settings/stripe/authorize").set("Accept", "text/html,application/xhtml+xml");
     expect(res.status).toBe(302);
     expect(res.headers.location).toBe("https://connect.stripe.com/oauth/authorize?mock=1");
-    expect(buildStripeAuthUrl).toHaveBeenCalledWith(expect.stringMatching(/^tenant-1:[0-9a-f]+$/));
+  });
+
+  it("works before setup is complete (no assertSetupComplete)", async () => {
+    assertSetupComplete.mockRejectedValue(new AppError(403, "Setup is not complete"));
+    const res = await request(makeApp()).get("/settings/stripe/authorize");
+    expect(res.status).toBe(200);
+    expect(assertSetupComplete).not.toHaveBeenCalled();
   });
 });
 
@@ -247,6 +260,20 @@ describe("GET /settings/stripe/callback", () => {
     });
     expect(tenantUpdate).toHaveBeenCalledWith({ where: { id: "tenant-1" }, data: { stripeConnectAccountId: "acct_123" } });
     expect(invalidateCachedBusinessSettings).toHaveBeenCalledWith(tp);
+  });
+
+  it("answers 200 JSON instead of redirecting when the web calls it with Accept: application/json", async () => {
+    exchangeStripeCode.mockResolvedValue({
+      access_token: "acct_token",
+      stripe_user_id: "acct_123",
+      stripe_publishable_key: "pk_test_123",
+      livemode: false,
+    });
+    const res = await request(makeApp())
+      .get("/settings/stripe/callback?code=ac_123&state=abc")
+      .set("Accept", "application/json");
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ status: "connected", stripeConnectAccountId: "acct_123" });
   });
 });
 

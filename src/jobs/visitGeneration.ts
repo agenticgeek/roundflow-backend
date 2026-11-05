@@ -1,38 +1,26 @@
 import { prisma } from "../lib/prisma";
 import { getTenantPrismaForSchema, type TenantPrismaClient } from "../lib/tenant-prisma-manager";
-import { CleaningFrequency, LifecycleStatus, RoundStatus, VisitStatus } from "../generated/tenant-client";
+import { CleaningFrequency, DayOfWeek, LifecycleStatus, RoundStatus, VisitStatus } from "../generated/tenant-client";
 import { queueGhlEvent } from "../integrations/ghl/sync";
+import { nextDueAfter, nextOccurrenceOfDay, snapToWeekday, startOfUtcDay } from "../lib/schedule";
+import { resolveTechnicianForVisit, technicianIdsUnavailableOn } from "../services/visit-assignment";
+import { tenantToday } from "../services/business-time";
+import { pausePlan, resumePlan } from "../services/service-plan-lifecycle";
 
-const FREQ_WEEKS: Record<CleaningFrequency, number> = {
-  FOUR_WEEKLY:   4,
-  SIX_WEEKLY:    6,
-  EIGHT_WEEKLY:  8,
-  TWELVE_WEEKLY: 12,
-};
-
-function addWeeks(date: Date, weeks: number): Date {
-  const d = new Date(date);
-  d.setUTCDate(d.getUTCDate() + weeks * 7);
-  return d;
-}
-
-// Snap to nearest working day: Sat → Mon, Sun → Mon
-function snapToWeekday(date: Date): Date {
-  const day = date.getUTCDay();
-  if (day === 6) date.setUTCDate(date.getUTCDate() + 2);
-  else if (day === 0) date.setUTCDate(date.getUTCDate() + 1);
-  return date;
+// Visit date for a due plan: the round day on or after nextDueDate, or the
+// nearest weekday when the round has no day.
+function visitDateFor(nextDueDate: Date, defaultDay: DayOfWeek | null | undefined): Date {
+  return defaultDay ? nextOccurrenceOfDay(nextDueDate, defaultDay) : snapToWeekday(startOfUtcDay(nextDueDate));
 }
 
 export async function runVisitGeneration(): Promise<void> {
-  const today = new Date();
-  today.setUTCHours(0, 0, 0, 0);
-
   const tenants = await prisma.tenant.findMany({ select: { schemaName: true } });
 
   for (const tenant of tenants) {
     try {
-      await generateForTenant(getTenantPrismaForSchema(tenant.schemaName), today);
+      const tp = getTenantPrismaForSchema(tenant.schemaName);
+      // EMU-6: "today" is the tenant's local calendar day, not the server's UTC day.
+      await generateForTenant(tp, await tenantToday(tp));
     } catch (err) {
       console.error(`[visitGen] ${tenant.schemaName}:`, err);
     }
@@ -42,13 +30,49 @@ export async function runVisitGeneration(): Promise<void> {
 type TP = ReturnType<typeof getTenantPrismaForSchema>;
 
 async function generateForTenant(tp: TP, today: Date): Promise<void> {
+  // Pause transitions run whatever the tenant's generation setting is.
+  await applyPauseTransitions(tp, today);
+
+  // B2: tenants that turned off "auto-create next visit" get no generation.
+  const settings = await tp.businessSettings.findFirst({ select: { autoCreateNextVisit: true } });
+  if (settings?.autoCreateNextVisit === false) return;
+
   const rounds = await tp.round.findMany({
     where: { status: RoundStatus.ACTIVE },
-    select: { id: true, frequency: true },
+    select: { id: true, frequency: true, defaultDay: true },
   });
 
   for (const round of rounds) {
     await generateForRound(tp, round, today);
+  }
+}
+
+// A4 nightly step — delegates to service-plan-lifecycle so the manual
+// pause/resume routes and the nightly job share one implementation.
+// - ACTIVE plans whose (future-dated) pause has started go through pausePlan():
+//   PAUSED, and their SCHEDULED visits inside the window cancelled (PAUSED).
+// - PAUSED plans whose pauseEndDate has passed (end date inclusive) go through
+//   resumePlan(): ACTIVE, pause dates cleared, nextDueDate = the round day on
+//   or after today. Cancelled visits are not resurrected.
+export async function applyPauseTransitions(tp: TenantPrismaClient, today: Date): Promise<void> {
+  const starting = await tp.servicePlan.findMany({
+    where: {
+      status: LifecycleStatus.ACTIVE,
+      pauseStartDate: { lte: today },
+      OR: [{ pauseEndDate: null }, { pauseEndDate: { gte: today } }],
+    },
+    select: { id: true, pauseStartDate: true, pauseEndDate: true },
+  });
+  for (const plan of starting) {
+    await pausePlan(tp, plan, { pauseStartDate: plan.pauseStartDate!, pauseEndDate: plan.pauseEndDate }, today);
+  }
+
+  const ending = await tp.servicePlan.findMany({
+    where: { status: LifecycleStatus.PAUSED, pauseEndDate: { lt: today } },
+    select: { id: true, propertyId: true },
+  });
+  for (const plan of ending) {
+    await resumePlan(tp, plan, today);
   }
 }
 
@@ -58,22 +82,41 @@ async function generateForTenant(tp: TP, today: Date): Promise<void> {
 // nightly run before it has any visits).
 export async function generateForRound(
   tp: TenantPrismaClient,
-  round: { id: string; frequency: CleaningFrequency | null },
+  round: { id: string; frequency: CleaningFrequency | null; defaultDay?: DayOfWeek | null },
   today: Date
 ): Promise<number> {
   let created = 0;
 
-  const properties = await tp.property.findMany({
-    where: { roundId: round.id, status: LifecycleStatus.ACTIVE },
-    select: {
-      id: true,
-      customerId: true,
-      servicePlans: {
-        where: { status: LifecycleStatus.ACTIVE, nextDueDate: { lte: today } },
-        select: { id: true, price: true, nextDueDate: true, cleaningFrequency: true, serviceId: true },
+  const [properties, roundTechs] = await Promise.all([
+    tp.property.findMany({
+      where: { roundId: round.id, status: LifecycleStatus.ACTIVE },
+      select: {
+        id: true,
+        customerId: true,
+        assignedTechnicianId: true,
+        servicePlans: {
+          where: { status: LifecycleStatus.ACTIVE, nextDueDate: { lte: today } },
+          select: {
+            id: true, price: true, nextDueDate: true, cleaningFrequency: true, serviceId: true,
+            pauseStartDate: true, pauseEndDate: true,
+          },
+        },
       },
-    },
-  });
+    }),
+    tp.roundTechnician.findMany({ where: { roundId: round.id, technician: { active: true } }, select: { technicianId: true } }),
+  ]);
+  const roundTechnicianIds = roundTechs.map((r) => r.technicianId);
+
+  // Availability lookups are per visit date; most plans of a round share one.
+  const unavailableByDate = new Map<number, string[]>();
+  const unavailableOn = async (date: Date): Promise<string[]> => {
+    let ids = unavailableByDate.get(date.getTime());
+    if (!ids) {
+      ids = [...(await technicianIdsUnavailableOn(tp, date))];
+      unavailableByDate.set(date.getTime(), ids);
+    }
+    return ids;
+  };
 
   for (const property of properties) {
     for (const plan of property.servicePlans) {
@@ -91,7 +134,16 @@ export async function generateForRound(
       });
       if (existing) continue;
 
-      const visitDate = snapToWeekday(new Date(plan.nextDueDate));
+      const visitDate = visitDateFor(plan.nextDueDate, round.defaultDay);
+
+      // A4: a future-dated pause keeps the plan ACTIVE until its start date;
+      // don't mint a visit inside the window (the nightly step flips it to
+      // PAUSED, and resume recomputes nextDueDate).
+      if (
+        plan.pauseStartDate && visitDate >= plan.pauseStartDate &&
+        (!plan.pauseEndDate || visitDate <= plan.pauseEndDate)
+      ) continue;
+
       await tp.visit.create({
         data: {
           propertyId:   property.id,
@@ -102,7 +154,14 @@ export async function generateForRound(
           price:        plan.price,
           isOneOff:     false,
           status:       VisitStatus.SCHEDULED,
+          // BUG-02: new visits are never auto-held. A manual hold (debt board /
+          // Pause service) acts on the customer and is enforced by the debt gate.
           paymentHold:  false,
+          technicianId: resolveTechnicianForVisit({
+            assignedTechnicianId: property.assignedTechnicianId,
+            roundTechnicianIds,
+            unavailableTechnicianIds: await unavailableOn(visitDate),
+          }),
         },
       });
       created++;
@@ -113,10 +172,11 @@ export async function generateForRound(
         nextCleanDate: visitDate.toISOString().slice(0, 10),
       }).catch(console.error);
 
-      // Advance nextDueDate by one cycle
+      // Advance nextDueDate by one cycle from the visit just created
+      const next = nextDueAfter(visitDate, freq, round.defaultDay);
       await tp.servicePlan.update({
         where: { id: plan.id },
-        data: { nextDueDate: snapToWeekday(addWeeks(new Date(plan.nextDueDate), FREQ_WEEKS[freq])) },
+        data: { nextDueDate: round.defaultDay ? next : snapToWeekday(next) },
       });
     }
   }

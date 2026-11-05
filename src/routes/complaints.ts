@@ -3,7 +3,7 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
-import { asObject, h, requireString, optString, optId, parsePageParams } from "../lib/http";
+import { asObject, h, requireString, optString, optId, optBool, parsePageParams } from "../lib/http";
 import { createComplaintService, ComplaintCreateInput, ComplaintListFilters } from "../services/complaint.service";
 import { createReportsService } from "../services/reports.service";
 import { ComplaintStatus, Severity } from "../generated/tenant-client";
@@ -145,7 +145,8 @@ complaintsRouter.post(
 );
 
 // ==========================================================================
-// POST /complaints/:id/schedule-revisit
+// POST /complaints/:id/schedule-revisit — books the date and a one-off
+//   revisit visit; response is the complaint plus { visitId }
 // ==========================================================================
 complaintsRouter.post(
   "/:id/schedule-revisit",
@@ -158,7 +159,7 @@ complaintsRouter.post(
 );
 
 // ==========================================================================
-// POST /complaints/:id/resolve
+// POST /complaints/:id/resolve — Body: { notes?, upheld?: boolean }
 // ==========================================================================
 complaintsRouter.post(
   "/:id/resolve",
@@ -167,6 +168,7 @@ complaintsRouter.post(
     const result = await svc(req).resolve(req.params.id, {
       notes: optString(body.notes, "notes"),
       resolvedBy: req.profile?.id ?? null,
+      upheld: optBool(body.upheld, "upheld"),
     });
     queueGhlEvent(req.tenantPrisma!, "complaint.resolved", result.customerId).catch(console.error);
     res.json(result);

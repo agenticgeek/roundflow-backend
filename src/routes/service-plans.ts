@@ -3,7 +3,7 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
-import { asObject, h, requireString, optString, optReqNumber } from "../lib/http";
+import { asObject, h, requireString, optString, optReqNumber, optBool } from "../lib/http";
 import { assertPositive, optPaymentMethod, optCleaningFrequency, parseIsoDate, optIsoDate } from "../lib/validation";
 import { createCustomerService, ServicePlanUpdateInput } from "../services/customer.service";
 
@@ -23,6 +23,10 @@ const svc = (req: Request) => {
 
 // ==========================================================================
 // PATCH /service-plans/:id — price / clean method / payment method / frequency
+// → { servicePlan, movedToRound: { id, name, created } | null }
+// A frequency that differs from the round's moves the property to a matching
+// round (B3); none → 409 NO_MATCHING_ROUND with suggestions, unless
+// createRoundIfMissing is true.
 // ==========================================================================
 servicePlansRouter.patch(
   "/:id",
@@ -34,7 +38,10 @@ servicePlansRouter.patch(
       cleanMethod: optString(body.cleanMethod, "cleanMethod"),
       paymentMethod: optPaymentMethod(body.paymentMethod),
       cleaningFrequency: optCleaningFrequency(body.cleaningFrequency),
+      createRoundIfMissing: optBool(body.createRoundIfMissing, "createRoundIfMissing"),
     };
+    // NoMatchingRoundError's suggestions/proposedName are forwarded by the
+    // central error handler.
     res.json(await svc(req).updateServicePlan(req.params.id, input));
   })
 );

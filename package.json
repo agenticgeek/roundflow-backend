@@ -18,6 +18,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+    "test:diff-coverage": "node scripts/diff-coverage.mjs",
     "test:live": "vitest run --config vitest.live.config.ts"
   },
   "prisma": {

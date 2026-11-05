@@ -1,29 +1,38 @@
 import { PaymentMethod, Prisma, VisitStatus } from "../../generated/tenant-client";
 import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
 import type { CompletionsSummary, MobileVisitRow, RoundSummary } from "../types";
-import { todayRange } from "../../lib/dates";
+import { tenantTodayRange } from "../../services/business-time";
 
-const visitMobileInclude = {
+export const visitMobileInclude = {
   property: {
     select: {
       id: true, addressLine: true, postcode: true, latitude: true, longitude: true,
-      customer: { select: { id: true, name: true, badDebt: true } },
+      customer: { select: { id: true, name: true, badDebt: true, paymentMethod: true } },
       notes: { select: { id: true, type: true, body: true } },
     },
   },
   round: { select: { id: true, name: true } },
   service: { select: { id: true, name: true } },
+  servicePlan: { select: { paymentMethod: true } },
   _count: { select: { issues: true } },
 } satisfies Prisma.VisitInclude;
 
 type VisitMobile = Prisma.VisitGetPayload<{ include: typeof visitMobileInclude }>;
 
-function toRow(v: VisitMobile, position: number | null = null): MobileVisitRow {
+// Mobile readers never show cancelled (paused) visits (A4).
+const NOT_CANCELLED = { not: VisitStatus.CANCELLED };
+
+// Visit override → service plan → customer default (D-9).
+function effectiveMethod(v: VisitMobile): PaymentMethod | null {
+  return v.paymentMethod ?? v.servicePlan?.paymentMethod ?? v.property.customer.paymentMethod ?? null;
+}
+
+export function toRow(v: VisitMobile, position: number | null = null): MobileVisitRow {
   return {
     visitId: v.id,
     status: v.status,
     price: v.price.toNumber(),
-    paymentMethod: v.paymentMethod ?? null,
+    paymentMethod: effectiveMethod(v),
     customerName: v.property.customer.name,
     addressLine: v.property.addressLine,
     postcode: v.property.postcode,
@@ -35,6 +44,8 @@ function toRow(v: VisitMobile, position: number | null = null): MobileVisitRow {
     notes: v.notes,
     issueCount: v._count.issues,
     propertyNotes: v.property.notes.map((n) => ({ type: n.type, body: n.body })),
+    startedAt: v.startedAt,
+    arrivedAt: v.arrivedAt,
     completedAt: v.completedAt ?? null,
     hasDebt: v.property.customer.badDebt,
     position,
@@ -51,11 +62,11 @@ class HomeService {
     });
     if (!tech) return [];
 
-    const { start, end } = todayRange();
+    const { start, end } = await tenantTodayRange(this.prisma);
     const visits = await this.prisma.visit.findMany({
-      where: { technicianId: tech.id, date: { gte: start, lt: end } },
+      where: { technicianId: tech.id, date: { gte: start, lt: end }, status: NOT_CANCELLED },
       include: visitMobileInclude,
-      orderBy: [{ date: "asc" }, { createdAt: "asc" }],
+      orderBy: [{ date: "asc" }, { createdAt: "asc" }, { id: "asc" }],
     });
     const roundCounters = new Map<string, number>();
     return visits.map(v => {
@@ -76,9 +87,9 @@ class HomeService {
     });
     if (!tech) return { revenueToday: 0, revenueByMethod: { cash: 0, directDebit: 0, other: 0 }, revenueChangePercent: null, completedCount: 0, skippedCount: 0, totalCount: 0, roundName: null, visits: [] };
 
-    const { start, end } = todayRange();
+    const { start, end } = await tenantTodayRange(this.prisma);
     const visits = await this.prisma.visit.findMany({
-      where: { technicianId: tech.id, date: { gte: start, lt: end } },
+      where: { technicianId: tech.id, date: { gte: start, lt: end }, status: NOT_CANCELLED },
       include: visitMobileInclude,
       orderBy: { completedAt: "desc" },
     });
@@ -87,12 +98,13 @@ class HomeService {
     const skipped = visits.filter(v => v.status === VisitStatus.SKIPPED);
     const revenueToday = completed.reduce((sum, v) => sum + v.price.toNumber(), 0);
 
-    // Split today's completed revenue by the visit's payment method (Cash vs Direct Debit vs other).
+    // Split today's completed revenue by the effective payment method (Cash vs Direct Debit vs other).
     const revenueByMethod = { cash: 0, directDebit: 0, other: 0 };
     for (const v of completed) {
       const amt = v.price.toNumber();
-      if (v.paymentMethod === PaymentMethod.CASH) revenueByMethod.cash += amt;
-      else if (v.paymentMethod === PaymentMethod.GOCARDLESS) revenueByMethod.directDebit += amt;
+      const method = effectiveMethod(v);
+      if (method === PaymentMethod.CASH) revenueByMethod.cash += amt;
+      else if (method === PaymentMethod.GOCARDLESS) revenueByMethod.directDebit += amt;
       else revenueByMethod.other += amt;
     }
 
@@ -126,9 +138,9 @@ class HomeService {
     });
     if (!tech) return [];
 
-    const { start, end } = todayRange();
+    const { start, end } = await tenantTodayRange(this.prisma);
     const visits = await this.prisma.visit.findMany({
-      where: { technicianId: tech.id, date: { gte: start, lt: end } },
+      where: { technicianId: tech.id, date: { gte: start, lt: end }, status: NOT_CANCELLED },
       select: { roundId: true, date: true, status: true, price: true, round: { select: { name: true } } },
       orderBy: [{ date: "asc" }, { createdAt: "asc" }],
     });

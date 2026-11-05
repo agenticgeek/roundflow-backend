@@ -1,8 +1,19 @@
-import { it, expect, vi } from "vitest";
+import { it, expect, vi, beforeEach } from "vitest";
+
+// resolvedBy names come from the control-plane Profile table.
+const profileFindMany = vi.fn();
+vi.mock("../../lib/prisma", () => ({
+  prisma: { profile: { findMany: (...args: unknown[]) => profileFindMany(...args) } },
+}));
+
 import { createComplaintService } from "../complaint.service";
 
+beforeEach(() => {
+  profileFindMany.mockReset().mockResolvedValue([]);
+});
+
 function makePrisma() {
-  return {
+  const prisma = {
     complaint: {
       create: vi.fn(),
       findUnique: vi.fn(),
@@ -11,10 +22,15 @@ function makePrisma() {
       update: vi.fn(),
     },
     customer: { findUnique: vi.fn() },
-    property: { findUnique: vi.fn() },
+    property: { findUnique: vi.fn(), findUniqueOrThrow: vi.fn() },
     technician: { findUnique: vi.fn(), findFirst: vi.fn() },
+    technicianAvailability: { findMany: vi.fn().mockResolvedValue([]) },
+    visit: { findFirst: vi.fn().mockResolvedValue(null), create: vi.fn(), update: vi.fn() },
     message: { create: vi.fn(), findMany: vi.fn() },
-  } as unknown as Parameters<typeof createComplaintService>[0];
+    $transaction: vi.fn(),
+  };
+  prisma.$transaction.mockImplementation((fn: (tx: typeof prisma) => Promise<unknown>) => fn(prisma));
+  return prisma as unknown as Parameters<typeof createComplaintService>[0];
 }
 
 const baseComplaint = {
@@ -135,20 +151,20 @@ it("logComplaint succeeds when technicianId is given and the technician has acce
   expect(result.technicianId).toBe("t1");
 });
 
-it("logComplaint throws 400 when technician has not accepted their invite", async () => {
+it("logComplaint accepts a pending-invite technician (attribution only, GAP-029)", async () => {
   const prisma = makePrisma();
   (prisma.customer.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1" });
-  (prisma.technician.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
-    id: "t1", profileId: null,
+  (prisma.technician.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "t1" });
+  (prisma.complaint.create as ReturnType<typeof vi.fn>).mockResolvedValue({ ...baseComplaint, technicianId: "t1" });
+
+  const result = await createComplaintService(prisma).logComplaint({
+    customerId: "c1",
+    title: "Missed clean",
+    technicianId: "t1",
   });
 
-  await expect(
-    createComplaintService(prisma).logComplaint({
-      customerId: "c1",
-      title: "Missed clean",
-      technicianId: "t1",
-    })
-  ).rejects.toMatchObject({ statusCode: 400 });
+  expect(result.technicianId).toBe("t1");
+  expect(prisma.technician.findUnique).toHaveBeenCalledWith({ where: { id: "t1" }, select: { id: true } });
 });
 
 it("logComplaint sets severity from input", async () => {
@@ -250,6 +266,18 @@ it("resolve persists the given notes and resolvedBy", async () => {
   const args = (prisma.complaint.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
   expect(args.data.notes).toBe("Revisited and fixed");
   expect(args.data.resolvedBy).toBe("profile-1");
+  expect(args.data.upheld).toBeNull();
+});
+
+it("resolve stores upheld when given", async () => {
+  const prisma = makePrisma();
+  (prisma.complaint.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "cmp1" });
+  (prisma.complaint.update as ReturnType<typeof vi.fn>).mockResolvedValue(baseComplaint);
+
+  await createComplaintService(prisma).resolve("cmp1", { upheld: false });
+
+  const args = (prisma.complaint.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  expect(args.data.upheld).toBe(false);
 });
 
 it("scheduleRevisit throws 404 when complaint does not exist", async () => {
@@ -270,9 +298,18 @@ it("scheduleRevisit throws 400 for invalid date format", async () => {
   ).rejects.toMatchObject({ statusCode: 400 });
 });
 
-it("scheduleRevisit sets status REVISIT_BOOKED and revisitDate", async () => {
+it("scheduleRevisit 400s for a nonexistent calendar date", async () => {
   const prisma = makePrisma();
   (prisma.complaint.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "cmp1" });
+
+  await expect(
+    createComplaintService(prisma).scheduleRevisit("cmp1", "2026-02-30")
+  ).rejects.toMatchObject({ statusCode: 400 });
+});
+
+it("scheduleRevisit sets status REVISIT_BOOKED and revisitDate", async () => {
+  const prisma = makePrisma();
+  (prisma.complaint.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "cmp1", propertyId: null, technicianId: null });
   (prisma.complaint.update as ReturnType<typeof vi.fn>).mockResolvedValue({
     id: "cmp1", status: "REVISIT_BOOKED", severity: "LOW",
     title: "Missed clean", description: null, issueType: null,
@@ -282,11 +319,122 @@ it("scheduleRevisit sets status REVISIT_BOOKED and revisitDate", async () => {
     property: null, technician: null, _count: { messages: 0 },
   });
 
-  await createComplaintService(prisma).scheduleRevisit("cmp1", "2026-09-10");
+  const result = await createComplaintService(prisma).scheduleRevisit("cmp1", "2026-09-10");
 
   const args = (prisma.complaint.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
   expect(args.data.status).toBe("REVISIT_BOOKED");
   expect(args.data.revisitDate).toEqual(new Date("2026-09-10T00:00:00.000Z"));
+  // No property → nothing to visit.
+  expect(result.visitId).toBeNull();
+  expect(prisma.visit.create).not.toHaveBeenCalled();
+});
+
+// ── scheduleRevisit: one-off revisit visit (GAP-029) ────────────────────────
+
+const REVISIT_DATE = new Date("2026-09-10T00:00:00.000Z");
+
+function revisitPrisma(opts: {
+  complaintTechnicianId?: string | null;
+  complaintTech?: { id: string; active: boolean; profileId: string | null } | null;
+  property?: Record<string, unknown>;
+}) {
+  const prisma = makePrisma();
+  (prisma.complaint.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+    id: "cmp1", propertyId: "p1", technicianId: opts.complaintTechnicianId ?? null,
+  });
+  (prisma.complaint.update as ReturnType<typeof vi.fn>).mockResolvedValue({ ...baseComplaint, propertyId: "p1" });
+  (prisma.property.findUniqueOrThrow as ReturnType<typeof vi.fn>).mockResolvedValue(
+    opts.property ?? { roundId: "r1", assignedTechnicianId: null, round: { roundTechnicians: [{ technicianId: "t9" }] } }
+  );
+  (prisma.technician.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(opts.complaintTech ?? null);
+  (prisma.visit.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v-new" });
+  return prisma;
+}
+
+it("scheduleRevisit creates a free one-off visit pinned to the complaint's technician", async () => {
+  const prisma = revisitPrisma({
+    complaintTechnicianId: "t1",
+    complaintTech: { id: "t1", active: true, profileId: "prof-1" },
+  });
+
+  const result = await createComplaintService(prisma).scheduleRevisit("cmp1", "2026-09-10");
+
+  expect(result.visitId).toBe("v-new");
+  expect(prisma.visit.create).toHaveBeenCalledWith({
+    data: {
+      date: REVISIT_DATE,
+      roundId: "r1",
+      technicianId: "t1",
+      technicianOverride: true,
+      propertyId: "p1",
+      complaintId: "cmp1",
+      isOneOff: true,
+      status: "SCHEDULED",
+      price: 0,
+      paymentHold: false,
+    },
+    select: { id: true },
+  });
+  // Pinned technician: no availability lookup needed.
+  expect(prisma.technicianAvailability.findMany).not.toHaveBeenCalled();
+});
+
+it("scheduleRevisit falls back to the round's technician when the complaint has none", async () => {
+  const prisma = revisitPrisma({});
+
+  await createComplaintService(prisma).scheduleRevisit("cmp1", "2026-09-10");
+
+  expect(prisma.technician.findUnique).not.toHaveBeenCalled();
+  const data = (prisma.visit.create as ReturnType<typeof vi.fn>).mock.calls[0][0].data;
+  expect(data).toMatchObject({ technicianId: "t9", technicianOverride: false });
+});
+
+it("scheduleRevisit falls back when the complaint's technician is pending-invite or inactive", async () => {
+  for (const complaintTech of [
+    { id: "t1", active: true, profileId: null },
+    { id: "t1", active: false, profileId: "prof-1" },
+  ]) {
+    const prisma = revisitPrisma({ complaintTechnicianId: "t1", complaintTech });
+    await createComplaintService(prisma).scheduleRevisit("cmp1", "2026-09-10");
+    const data = (prisma.visit.create as ReturnType<typeof vi.fn>).mock.calls[0][0].data;
+    expect(data).toMatchObject({ technicianId: "t9", technicianOverride: false });
+  }
+});
+
+it("scheduleRevisit falls back when the complaint's technician no longer exists", async () => {
+  const prisma = revisitPrisma({ complaintTechnicianId: "gone", complaintTech: null });
+  await createComplaintService(prisma).scheduleRevisit("cmp1", "2026-09-10");
+  const data = (prisma.visit.create as ReturnType<typeof vi.fn>).mock.calls[0][0].data;
+  expect(data.technicianId).toBe("t9");
+});
+
+it("scheduleRevisit leaves a property with no round unassigned", async () => {
+  const prisma = revisitPrisma({ property: { roundId: null, assignedTechnicianId: null, round: null } });
+  await createComplaintService(prisma).scheduleRevisit("cmp1", "2026-09-10");
+  const data = (prisma.visit.create as ReturnType<typeof vi.fn>).mock.calls[0][0].data;
+  expect(data).toMatchObject({ roundId: null, technicianId: null });
+});
+
+it("scheduleRevisit skips a round technician who is unavailable on the date", async () => {
+  const prisma = revisitPrisma({});
+  (prisma.technicianAvailability.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ technicianId: "t9" }]);
+  await createComplaintService(prisma).scheduleRevisit("cmp1", "2026-09-10");
+  const data = (prisma.visit.create as ReturnType<typeof vi.fn>).mock.calls[0][0].data;
+  expect(data.technicianId).toBeNull();
+});
+
+it("scheduleRevisit moves the complaint's open revisit visit instead of creating another", async () => {
+  const prisma = revisitPrisma({});
+  (prisma.visit.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v-old" });
+
+  const result = await createComplaintService(prisma).scheduleRevisit("cmp1", "2026-09-10");
+
+  expect(result.visitId).toBe("v-old");
+  expect(prisma.visit.create).not.toHaveBeenCalled();
+  expect(prisma.visit.update).toHaveBeenCalledWith({
+    where: { id: "v-old" },
+    data: { date: REVISIT_DATE, roundId: "r1", technicianId: "t9", technicianOverride: false },
+  });
 });
 
 it("reopen throws 404 when complaint does not exist", async () => {
@@ -326,6 +474,7 @@ it("reopen clears resolvedAt and resolvedBy", async () => {
   const args = (prisma.complaint.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
   expect(args.data.resolvedAt).toBeNull();
   expect(args.data.resolvedBy).toBeNull();
+  expect(args.data.upheld).toBeNull();
 });
 
 it("assignTechnician throws 404 when complaint does not exist", async () => {
@@ -347,14 +496,15 @@ it("assignTechnician throws 404 when technician does not exist", async () => {
   ).rejects.toMatchObject({ statusCode: 404 });
 });
 
-it("assignTechnician throws 400 when technician has not accepted their invite", async () => {
+it("assignTechnician accepts a pending-invite technician (attribution only, GAP-029)", async () => {
   const prisma = makePrisma();
   (prisma.complaint.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "cmp1" });
-  (prisma.technician.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "t1", profileId: null });
+  (prisma.technician.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "t1" });
+  (prisma.complaint.update as ReturnType<typeof vi.fn>).mockResolvedValue({ ...baseComplaint, technicianId: "t1" });
 
-  await expect(
-    createComplaintService(prisma).assignTechnician("cmp1", "t1")
-  ).rejects.toMatchObject({ statusCode: 400 });
+  const result = await createComplaintService(prisma).assignTechnician("cmp1", "t1");
+
+  expect(result.technicianId).toBe("t1");
 });
 
 it("assignTechnician sets technicianId on the complaint", async () => {
@@ -498,9 +648,44 @@ it("getComplaint maps technicianName, propertyAddress, messageCount, resolvedAt/
     propertyAddress: "12 Market Street",
     messageCount: 3,
     resolvedAt: "2026-02-01T00:00:00.000Z",
-    resolvedBy: "profile-1",
+    resolvedBy: { id: "profile-1", name: null },
     notes: "Revisited and fixed",
   });
+});
+
+it("getComplaint returns resolvedBy as { id, name } joined from Profile, and upheld", async () => {
+  const prisma = makePrisma();
+  profileFindMany.mockResolvedValue([{ id: "profile-1", name: "Mark Admin" }]);
+  (prisma.complaint.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+    ...baseComplaint, status: "RESOLVED", resolvedBy: "profile-1", upheld: true,
+  });
+
+  const result = await createComplaintService(prisma).getComplaint("cmp1");
+
+  expect(result.resolvedBy).toEqual({ id: "profile-1", name: "Mark Admin" });
+  expect(result.upheld).toBe(true);
+  expect(profileFindMany).toHaveBeenCalledWith({ where: { id: { in: ["profile-1"] } }, select: { id: true, name: true } });
+});
+
+it("listComplaints looks up each distinct resolver once for the whole page", async () => {
+  const prisma = makePrisma();
+  profileFindMany.mockResolvedValue([{ id: "profile-1", name: "Mark Admin" }]);
+  (prisma.complaint.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    { ...baseComplaint, id: "a", resolvedBy: "profile-1" },
+    { ...baseComplaint, id: "b", resolvedBy: "profile-1" },
+    { ...baseComplaint, id: "c" },
+  ]);
+
+  const result = await createComplaintService(prisma).listComplaints({});
+
+  expect(profileFindMany).toHaveBeenCalledTimes(1);
+  expect(profileFindMany.mock.calls[0][0].where.id.in).toEqual(["profile-1"]);
+  expect(result.rows.map((r) => r.resolvedBy)).toEqual([
+    { id: "profile-1", name: "Mark Admin" },
+    { id: "profile-1", name: "Mark Admin" },
+    null,
+  ]);
+  expect(result.rows[2].upheld).toBeNull();
 });
 
 it("getComplaint defaults technicianName/propertyAddress/resolvedAt to null when unset", async () => {

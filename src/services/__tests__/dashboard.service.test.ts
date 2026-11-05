@@ -13,10 +13,13 @@ function makePrisma() {
     complaint: {
       groupBy: vi.fn(),
       count: vi.fn(),
+      findMany: vi.fn().mockResolvedValue([]),
     },
     payment: { count: vi.fn() },
     technician: { findMany: vi.fn() },
     issue: { findMany: vi.fn() },
+    technicianIncident: { groupBy: vi.fn().mockResolvedValue([]) },
+    kpiAlert: { findMany: vi.fn().mockResolvedValue([]) },
   } as unknown as Parameters<typeof createDashboardService>[0];
 }
 
@@ -255,64 +258,75 @@ it("getTechnicianKpis is a function", () => {
   expect(typeof createDashboardService(makePrisma()).getTechnicianKpis).toBe("function");
 });
 
-it("getTechnicianKpis: a technician with zero completed visits in the period still appears with zeroed stats", async () => {
+it("getTechnicianKpis: every active technician appears, zeroed (timing null) when they have no data", async () => {
   const prisma = makePrisma();
   (prisma.technician.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
-    { id: "t1", name: "James" },
-    { id: "t2", name: "Priya" },
-  ]);
-  (prisma.visit.groupBy as ReturnType<typeof vi.fn>).mockResolvedValue([
-    { technicianId: "t1", _count: 4, _sum: { price: decimal(200) } },
+    { id: "t1", name: "Sam" },
+    { id: "t2", name: "Alex" },
   ]);
   (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
-    { technicianId: "t1", issues: [{ id: "i1" }] },
+    {
+      technicianId: "t1",
+      price: 30,
+      startedAt: new Date("2026-10-01T09:00:00Z"),
+      completedAt: new Date("2026-10-01T09:30:00Z"),
+      _count: { issues: 1 },
+    },
   ]);
-  (prisma.complaint.groupBy as ReturnType<typeof vi.fn>).mockResolvedValue([
-    { technicianId: "t1", _count: 2 },
-  ]);
-  const result = await createDashboardService(prisma).getTechnicianKpis("monthly");
-  expect(result).toHaveLength(2);
-  const t1 = result.find((r) => r.technicianId === "t1")!;
-  const t2 = result.find((r) => r.technicianId === "t2")!;
-  expect(t1).toMatchObject({ jobsCompleted: 4, valueCompleted: 200, issueCount: 1, openComplaints: 2 });
-  expect(t2).toMatchObject({ jobsCompleted: 0, valueCompleted: 0, issueCount: 0, openComplaints: 0 });
-});
 
-it("getTechnicianKpis: a technician whose groupBy _sum.price is null contributes 0 valueCompleted", async () => {
-  const prisma = makePrisma();
-  (prisma.technician.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ id: "t1", name: "James" }]);
-  (prisma.visit.groupBy as ReturnType<typeof vi.fn>).mockResolvedValue([
-    { technicianId: "t1", _count: 1, _sum: { price: null } },
-  ]);
-  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-  (prisma.complaint.groupBy as ReturnType<typeof vi.fn>).mockResolvedValue([]);
   const result = await createDashboardService(prisma).getTechnicianKpis("monthly");
-  expect(result[0].valueCompleted).toBe(0);
+
+  expect(result).toEqual([
+    {
+      technicianId: "t1", technicianName: "Sam", jobsCompleted: 1, valueCompleted: 30, issueCount: 1,
+      openComplaints: 0, timeOnJobMinutes: 30, revenuePerHour: 60, strikes: 0, damages: 0, upsells: 0, upsellValue: 0,
+    },
+    {
+      technicianId: "t2", technicianName: "Alex", jobsCompleted: 0, valueCompleted: 0, issueCount: 0,
+      openComplaints: 0, timeOnJobMinutes: null, revenuePerHour: null, strikes: 0, damages: 0, upsells: 0, upsellValue: 0,
+    },
+  ]);
 });
 
 it("getTechnicianKpis: yearly period uses Jan 1 - Jan 1 next year boundaries", async () => {
   const prisma = makePrisma();
-  (prisma.technician.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ id: "t1", name: "James" }]);
-  (prisma.visit.groupBy as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  (prisma.technician.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
   (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-  (prisma.complaint.groupBy as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-  const result = await createDashboardService(prisma).getTechnicianKpis("yearly");
-  expect(result).toHaveLength(1);
-  const call = (prisma.visit.groupBy as ReturnType<typeof vi.fn>).mock.calls[0][0];
-  const now = new Date();
-  expect(call.where.date.gte).toEqual(new Date(Date.UTC(now.getUTCFullYear(), 0, 1)));
-  expect(call.where.date.lt).toEqual(new Date(Date.UTC(now.getUTCFullYear() + 1, 0, 1)));
+  await createDashboardService(prisma).getTechnicianKpis("yearly");
+  const where = (prisma.visit.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0].where;
+  const y = new Date().getUTCFullYear();
+  expect(where.date).toEqual({ gte: new Date(Date.UTC(y, 0, 1)), lt: new Date(Date.UTC(y + 1, 0, 1)) });
 });
 
-it("getTechnicianKpis: monthly period uses current-month boundaries", async () => {
+// ── getAlerts ────────────────────────────────────────────────────────────────
+
+it("getAlerts returns the counts plus this month's KPI_THRESHOLD alerts", async () => {
   const prisma = makePrisma();
-  (prisma.technician.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-  (prisma.visit.groupBy as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-  (prisma.complaint.groupBy as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-  await createDashboardService(prisma).getTechnicianKpis("monthly");
-  const call = (prisma.visit.groupBy as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  (prisma.visit.count as ReturnType<typeof vi.fn>).mockResolvedValue(2);
+  (prisma.payment.count as ReturnType<typeof vi.fn>).mockResolvedValue(1);
+  (prisma.complaint.count as ReturnType<typeof vi.fn>).mockResolvedValue(3);
+  const createdAt = new Date();
+  (prisma.kpiAlert.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    {
+      id: "a1", technicianId: "t1", technician: { name: "Sam" }, metric: "strikes",
+      value: 4, threshold: 3, operator: "GT", periodKey: "2026-10", createdAt,
+    },
+  ]);
+
+  const result = await createDashboardService(prisma).getAlerts();
+
+  expect(result).toEqual({
+    skippedNeedingReview: 2,
+    failedPayments: 1,
+    complaintRevisitsDue: 3,
+    kpiAlerts: [
+      {
+        type: "KPI_THRESHOLD", id: "a1", technicianId: "t1", technicianName: "Sam", metric: "strikes",
+        value: 4, threshold: 3, operator: "GT", periodKey: "2026-10", createdAt,
+      },
+    ],
+  });
   const now = new Date();
-  expect(call.where.date.gte).toEqual(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)));
-  expect(call.where.date.lt).toEqual(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)));
+  const key = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+  expect((prisma.kpiAlert.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0].where).toEqual({ periodKey: key });
 });

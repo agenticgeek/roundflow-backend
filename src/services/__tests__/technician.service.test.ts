@@ -185,3 +185,53 @@ it("updateTechnician returns the updated record when the write succeeds", async 
 
   expect(result.email).toBe("new@example.com");
 });
+
+// ---- getPerformance (GAP-030) ----------------------------------------------
+
+it("getPerformance 404s for an unknown technician", async () => {
+  const prisma = makePrisma();
+  (prisma.technician.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+  await expect(
+    createTechnicianService(prisma).getPerformance("x", "thisMonth", new Date())
+  ).rejects.toMatchObject({ statusCode: 404 });
+});
+
+it("getPerformance maps the shared KPI calc for the period (zeroed when no data)", async () => {
+  const now = new Date("2026-10-30T12:00:00Z");
+  const prisma = {
+    ...makePrisma(),
+    technician: { findUnique: vi.fn().mockResolvedValue({ id: "t1" }) },
+    visit: {
+      findMany: vi.fn().mockResolvedValue([
+        {
+          technicianId: "t1", price: 40,
+          startedAt: new Date("2026-10-02T09:00:00Z"), completedAt: new Date("2026-10-02T09:40:00Z"),
+          _count: { issues: 0 },
+        },
+      ]),
+    },
+    technicianIncident: { groupBy: vi.fn().mockResolvedValue([]) },
+    complaint: { findMany: vi.fn().mockResolvedValue([]) },
+  } as unknown as Parameters<typeof createTechnicianService>[0];
+
+  const perf = await createTechnicianService(prisma).getPerformance("t1", "thisMonth", now);
+  expect(perf).toEqual({
+    technicianId: "t1",
+    period: "thisMonth",
+    from: new Date("2026-10-01T00:00:00Z"),
+    to: new Date("2026-11-01T00:00:00Z"),
+    visitsCompleted: 1,
+    revenue: 40,
+    timeOnJobMinutes: 40,
+    revenuePerHour: 60,
+    strikes: 0,
+    damages: 0,
+    upsells: 0,
+    upsellValue: 0,
+    complaints: 0,
+  });
+
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  const empty = await createTechnicianService(prisma).getPerformance("t1", "lastMonth", now);
+  expect(empty).toMatchObject({ visitsCompleted: 0, timeOnJobMinutes: null, revenuePerHour: null });
+});

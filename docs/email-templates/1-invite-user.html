@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<meta name="supported-color-schemes" content="light">
+<title>Welcome to the team 👋</title>
+</head>
+<body style="margin:0;padding:0;background:#F5FFFE;">
+<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">Your team has added you to RoundFlow. Set up your login to see your rounds.</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#F5FFFE" style="background:#F5FFFE;">
+  <tr><td align="center" style="padding:32px 16px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;">
+      <tr><td align="center" style="padding:0 0 20px 0;font-family:'Montserrat','Segoe UI',Helvetica,Arial,sans-serif;font-size:26px;font-weight:800;letter-spacing:-0.5px;color:#029BB6;">
+        <span style="color:#0a0a0a;">Round</span>Flow
+      </td></tr>
+      <tr><td style="background:#ffffff;border:1px solid #e6e6e8;border-radius:16px;overflow:hidden;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+          <tr><td style="height:6px;background:#029BB6;font-size:0;line-height:0;">&nbsp;</td></tr>
+          <tr><td style="padding:36px 36px 12px 36px;">
+            <p style="margin:0 0 10px 0;font-family:'Montserrat','Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:#029BB6;">You’re invited</p>
+            <h1 style="margin:0 0 16px 0;font-family:'Montserrat','Segoe UI',Helvetica,Arial,sans-serif;font-size:24px;line-height:32px;font-weight:700;color:#0a0a0a;">Welcome to the team 👋</h1>
+            <p style="margin:0 0 24px 0;font-family:'Montserrat','Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;line-height:24px;color:#0a0a0a;">Your team has added you to <strong>RoundFlow</strong>, where you’ll find your rounds, jobs and messages from the office. Setting up takes about a minute.</p>
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 28px 0;background:#E8F6F9;border-radius:12px;">
+        <tr><td style="padding:18px 22px;font-family:'Montserrat','Segoe UI',Helvetica,Arial,sans-serif;font-size:14px;line-height:22px;color:#0a0a0a;">
+          <div style="margin:0 0 0 0;"><span style="display:inline-block;width:22px;height:22px;line-height:22px;text-align:center;border-radius:11px;background:#029BB6;color:#ffffff;font-size:12px;font-weight:700;margin-right:10px;">1</span>Tap the button below to open your invite.</div><div style="margin:10px 0 0 0;"><span style="display:inline-block;width:22px;height:22px;line-height:22px;text-align:center;border-radius:11px;background:#029BB6;color:#ffffff;font-size:12px;font-weight:700;margin-right:10px;">2</span>Choose a name and a password.</div><div style="margin:10px 0 0 0;"><span style="display:inline-block;width:22px;height:22px;line-height:22px;text-align:center;border-radius:11px;background:#029BB6;color:#ffffff;font-size:12px;font-weight:700;margin-right:10px;">3</span>Sign in to the RoundFlow app and you’re ready for your first round.</div>
+        </td></tr>
+      </table>
+            <table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 0 28px 0;"><tr><td align="center" bgcolor="#029BB6" style="border-radius:10px;">
+        <a href="{{ .ConfirmationURL }}" target="_blank" style="display:inline-block;padding:14px 32px;font-family:'Montserrat','Segoe UI',Helvetica,Arial,sans-serif;font-size:15px;font-weight:700;color:#ffffff;text-decoration:none;border-radius:10px;">Set up my login</a>
+      </td></tr></table>
+      <p style="margin:0 0 6px 0;font-family:'Montserrat','Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;line-height:18px;color:#6b6b74;">Button not working? Copy and paste this link into your browser:</p>
+      <p style="margin:0 0 24px 0;font-family:'Montserrat','Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;line-height:18px;word-break:break-all;"><a href="{{ .ConfirmationURL }}" style="color:#029BB6;">{{ .ConfirmationURL }}</a></p>
+            <p style="margin:0 0 24px 0;font-family:'Montserrat','Segoe UI',Helvetica,Arial,sans-serif;font-size:13px;line-height:20px;color:#6b6b74;">The link works once. If it has expired or stopped working, ask your manager to resend your invite. If you weren’t expecting this, you can safely ignore this email.</p>
+          </td></tr>
+        </table>
+      </td></tr>
+      <tr><td align="center" style="padding:22px 12px 0 12px;font-family:'Montserrat','Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;line-height:18px;color:#6b6b74;">
+        This email was sent to {{ .Email }} by RoundFlow.<br>
+        Round planning and field service for window cleaning teams.
+      </td></tr>
+    </table>
+  </td></tr>
+</table>
+</body>
+</html>

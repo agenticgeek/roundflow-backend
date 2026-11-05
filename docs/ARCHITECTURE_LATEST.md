@@ -4,8 +4,19 @@
 > that file described a *planned* design before the integration was built; sections of it are now stale
 > (file paths that don't exist, a token-storage location that moved, event types that were never implemented).
 > Everything in this file has been checked against the current code (`src/`, `prisma/tenant/schema.prisma`)
-> and the docs team handoff (`docs/GHL_AUTOMATION_OWNER_HANDOFF.md`) as of 2026-10-23. Keep updating **this**
+> and the docs team handoff (`docs/GHL_AUTOMATION_OWNER_HANDOFF.md`) as of **2026-10-30**. Keep updating **this**
 > file as the GHL/automation work progresses — not `ARCHITECTURE.md`.
+>
+> **2026-10-30 update (Phase 1 audit remediation):** startup and health (§6), mobile role guard (§7), error
+> body (§9), the GHL backlog of §10.4–§10.7, which is now built, BACS/cheque reconciliation (§10.7a), the
+> setup/settings split (§11), three new tenant migrations (§12), and the new domain services, jobs and
+> quality gates (§15–§16). The remediation plan and contracts are in
+> `docs/handoff/backend/2026-10-30-phase1-audit-remediation-plan.md` and
+> `docs/handoff/frontend/2026-10-30-phase1-audit-frontend-handoff.md`.
+>
+> **2026-11-03 update (QA bug batch and chat):** reminders as a list, no automatic debt hold on new visits, round
+> postcode sectors, accepted payment methods, catalogue-priced imports, editable property services, auto-invoice on
+> completion, single-visit assignment, polling-based office chat, and the decisions behind them (§17).
 
 ## 1. Overview
 
@@ -40,29 +51,37 @@ Note: the code already supports **both** a marketplace-style OAuth install flow 
 ```mermaid
 flowchart TD
     REQ([HTTP Request]) --> CORS["CORS<br/>locked to FRONTEND_URL"]
+    CORS --> HOOKS["/webhooks/stripe · gocardless · ghl<br/>express.raw · signature / secret verified"]
     CORS --> JSON["express.json"]
+    JSON --> PRE["405 pre-filter<br/>built from swagger paths<br/>(answers before auth can 401)"]
 
-    JSON --> HEALTH["/health<br/>unauthenticated"]
-    JSON --> AUTH_R["/auth/*<br/>requireAuth only"]
-    JSON --> INV_R["/invites/*<br/>mixed auth"]
-    JSON --> MW1
+    PRE --> HEALTH["/health · /health/ready<br/>unauthenticated<br/>503 'migrating' during boot"]
+    PRE --> GHLCB["/settings/ghl/callback<br/>public, signed state"]
+    PRE --> AUTH_R["/auth/*<br/>requireAuth only"]
+    PRE --> INV_R["/invites/*<br/>mixed auth"]
+    PRE --> MW1
 
     subgraph GUARDED["Protected routes"]
         MW1["requireAuth<br/>verify ES256 JWT → req.user"]
-        MW2["requireTenantAccess<br/>Profile + Tenant → req.profile + req.tenantPrisma"]
+        MW2["requireTenantAccess<br/>Profile + Tenant → req.profile + req.tenantPrisma<br/>403 NO_PROFILE"]
         MW3["requireBusinessAccess<br/>ADMIN / MANAGER / TECHNICIAN gate"]
+        MOB["requireTechnician<br/>+ visit / round ownership"]
 
         MW1 --> MW2
         MW2 --> MW3
+        MW2 --> MOB
 
-        MW3 --> SETUP["/setup/*<br/>12-step wizard"]
+        MW3 --> SETUP["/setup/*<br/>wizard steps 1–12"]
         MW3 --> SETTINGS["/settings/*"]
-        MW3 --> CUSTOMERS["/customers/*"]
-        MW3 --> PROPS["/properties/*"]
+        MW3 --> OPS["/customers · /properties · /rounds · /today<br/>/invoices · /payments · /debt · /complaints<br/>/technicians · /dashboard · /reports · …"]
+        MOB --> MOBILE["/mobile/*<br/>technician app"]
     end
 
-    MW3 --> ERR["Centralised error handler<br/>AppError → status + message<br/>uncaught → 500"]
+    MW3 --> ERR["Centralised error handler (lib/error-handler.ts)<br/>AppError → { error, code?, …extra }<br/>uncaught → 500"]
+    MOBILE --> ERR
 ```
+
+Startup and cron wiring live in `src/server/bootstrap.ts`; `src/index.ts` only calls it (see §6).
 
 ---
 
@@ -176,6 +195,28 @@ flowchart LR
 
 ## 6. Request Lifecycle
 
+### Server startup (GAP-005, `src/server/bootstrap.ts`)
+
+1. `app.listen` first. `GET /health` and `GET /health/ready` answer `503 { status: "migrating" }` from this point.
+2. `migrateAllTenantSchemas()` applies pending tenant migrations (§12). A failure still exits the process with code 1.
+3. When it finishes: `/health` is `200 { status: "ok", timestamp }` and `/health/ready` is `200 { status: "ready" }`.
+4. `registerCronJobs()` starts the jobs. Each run is guarded, so one failure is logged and doesn't stop the schedule:
+
+| Job | Schedule (UTC) | What it does |
+|---|---|---|
+| `visitGen` | 01:00 daily | Generates next-cycle visits (stamped with a technician, §15) and applies due pause/resume transitions |
+| `outbox` | every 30 s | Drains the GHL outbox for GHL-connected tenants (§10.3) |
+| `geocodeBackfill` | every 15 min | Geocodes properties still missing coordinates (§14) |
+| `kpiThresholds` | 02:00 daily | Raises KPI threshold alerts, at most one per technician + metric + month |
+| `idempotencyPurge` | 03:00 daily | Deletes mobile `IdempotencyRecord` rows past their 7-day TTL |
+| `preCleanReminders` | every 15 min | Pre-clean reminders; **only registered when `PRECLEAN_REMINDERS_ENABLED=true`**, so it can't duplicate the GHL workflow |
+
+The startup log also lists missing integration env vars (`listMissingIntegrationEnv()`).
+
+**405 pre-filter:** before the routers, a middleware built from the swagger `paths` answers `405` for a method the spec doesn't list on a known path, so a wrong method never reaches auth and gets a misleading 401. Consequence: **a documented path must list every method the code serves**, and literal paths must precede templated ones (`/invoices/bulk` before `/invoices/{id}`). `src/__tests__/swagger.contract.test.ts` enforces both.
+
+### An authenticated request
+
 A typical authenticated request (e.g. `GET /customers`) flows through:
 
 ```mermaid
@@ -199,7 +240,7 @@ sequenceDiagram
 
     requireTenantAccess->>public.Profile: findUnique(supabaseUserId)
     public.Profile-->>requireTenantAccess: Profile + Tenant (schemaName)
-    requireTenantAccess-->>Client: 403 if no Profile
+    requireTenantAccess-->>Client: 403 NO_PROFILE if no Profile
     requireTenantAccess->>requireBusinessAccess: next() — req.profile + req.tenantPrisma set
 
     requireBusinessAccess->>requireBusinessAccess: check req.profile.role
@@ -244,6 +285,8 @@ Three roles:
 | TECHNICIAN | Read-only (all mutations → 403) |
 
 Role changes take effect on the very next request — no token refresh required, no stale state.
+
+**The `/mobile/*` router is the exception** (Phase 1, A8). It skips `requireBusinessAccess` and uses `requireTechnician` (`src/mobile/ownership.ts`): only TECHNICIAN profiles with a linked `Technician` row get in (`403 TECHNICIAN_ONLY` / `NO_TECHNICIAN`). Each visit action then checks ownership (`403 NOT_YOUR_VISIT`), and chat checks round membership (`403 NOT_YOUR_ROUND`). A signed-in user with no Profile yet gets `403 code: "NO_PROFILE"` from `requireTenantAccess`, which the app uses to show a "finish your invite" screen.
 
 ```mermaid
 flowchart TD
@@ -362,11 +405,23 @@ Every helper throws `AppError(400, ...)` on failure, which the centralised error
 
 ```typescript
 class AppError extends Error {
-  constructor(public statusCode: number, message: string) { ... }
+  constructor(public statusCode: number, message: string, public code?: string) { ... }
 }
 ```
 
-Any service or route can `throw new AppError(404, "Round not found")`. The centralised handler in `src/index.ts` catches it and responds with the correct status + message. Untyped errors (unexpected exceptions) become 500s and are logged.
+Any service or route can `throw new AppError(404, "Round not found")`. The centralised handler (`src/lib/error-handler.ts`, mounted last in `bootstrap.ts`) responds with:
+
+```json
+{ "error": "<message>", "code": "<code, if set>", "...": "any extra own fields of the error" }
+```
+
+Extra own fields are forwarded generically. For example, `AllocationError.fields` (`INVALID_ALLOCATION`) and `NoMatchingRoundError.suggestions` / `proposedName` (`NO_MATCHING_ROUND`) reach the client without hand-written route handlers. `statusCode`, `name` and `stack` are never sent. The handler also maps:
+- an invalid JSON body to `400 "Invalid JSON in request body."`
+- a Prisma foreign-key violation (`P2003`) to `409`
+
+Untyped errors (unexpected exceptions) become 500s and are logged.
+
+**Integration failures are typed too**, so a provider's rejection isn't a 500. A Stripe Connect code exchange that Stripe rejects is `400 STRIPE_CONNECT_FAILED`, with Stripe's reason; a Stripe outage is `502 STRIPE_UNAVAILABLE`. GHL send failures are `502 GHL_SEND_FAILED`, and a missing connection is `409 GHL_NOT_CONNECTED` / `STRIPE_NOT_CONNECTED`.
 
 This means service code never touches `res` — it throws, the route handler propagates via `next(err)`, and the handler decides the HTTP response.
 
@@ -421,8 +476,11 @@ ghlWebhookSecretEncrypted    String?   // gates ?secret= on POST /webhooks/ghl
 | Path | Route | Mechanism |
 |---|---|---|
 | OAuth (marketplace-style) | `GET /settings/ghl/authorize` → `GET /settings/ghl/callback` | `buildGhlAuthUrl` / `exchangeGhlCode` (`src/integrations/ghl/oauth.ts`); stores access + refresh token, auto-refreshes with a 5-minute buffer (`getGhlToken` in `src/integrations/ghl/api.ts`) |
-| Private Integration Token (PIT) | `POST /settings/ghl/connect-private` | Admin pastes a token + locationId directly; no refresh token, never expires from RoundFlow's side |
-| Disconnect | `POST /settings/ghl/disconnect` | Clears all `ghl*` fields on `BusinessSettings` |
+| Private Integration Token (PIT) | `POST /settings/ghl/connect-private` | Admin pastes a token + locationId directly; no refresh token, never expires from RoundFlow's side. The key is verified against GHL before it's stored (a rejection is a 400 with GHL's reason). |
+| Status / test | `GET /settings/ghl/status` · `POST /settings/ghl/test` | `{ connected, method: oauth \| private, locationId, locationName, webhookUrl, connectedAt }` (`locationName` is fetched live; `connectedAt` isn't stored yet, so it's always null). The test call relays `409 GHL_NOT_CONNECTED` or `502 GHL_SEND_FAILED`. |
+| Disconnect | `POST /settings/ghl/disconnect` | Clears all `ghl*` fields on `BusinessSettings` and `Tenant.ghlLocationId` |
+
+**OAuth callback (Phase 1, A5):** `GET /settings/ghl/callback` is **public**. The tenant comes from a signed `state` (HMAC, 10-minute expiry, `src/lib/oauth-state.ts`), not a bearer token, because GHL's redirect can't carry one. `Accept: application/json` gets JSON; otherwise it 302s to `${FRONTEND_URL}/settings/integrations?ghl=connected|error`. `authorize` returns `{ url }` as JSON and takes an optional `redirectUri` on the web origin. All GHL settings routes work **before setup completes**, so the wizard can connect messaging (§11).
 
 ### 10.3 Architecture: Outbox Pattern (built, not just planned)
 
@@ -470,7 +528,7 @@ Schema (`prisma/tenant/schema.prisma`) — real shape, already in code:
 ```
 model IntegrationOutbox {
   id          String   @id @default(cuid())
-  eventType   String   // "customer.synced" | "visit.completed" | "payment.collected" | "debt.overdue" | "complaint.logged"
+  eventType   String   // see the event table below
   payload     Json     // always includes { customerId }
   status      String   @default("pending") // pending | sent | failed | dead
   attempts    Int      @default(0)
@@ -488,19 +546,35 @@ model WebhookEvent {           // inbound dedup — unique constraint rejects re
 }
 ```
 
-Note the `eventType` comment doesn't list `payment.failed` — because it isn't written anywhere yet (§10.4).
+**Outbox event types** (`src/jobs/outboxWorker.ts`):
+
+| `eventType` | Queued by | Worker does |
+|---|---|---|
+| `customer.synced` | customer create/update | create/update the GHL contact |
+| `visit.completed` | web and mobile visit completion | tag `visit-completed`; write `last_clean_date`, `round_name`, `technician_name`, `balance_owed` |
+| `visit.scheduled` | nightly visit generation | write `next_clean_date` |
+| `payment.collected` | shared payment-outcome handler (Stripe, GoCardless, manual) | tag `payment-collected`, remove `debt-overdue` + `payment-failed`; write `balance_owed` |
+| `payment.failed` | the same handler, on FAILED | tag `payment-failed`; write `balance_owed` |
+| `debt.overdue` | debt routes | tag `debt-overdue`; write `balance_owed` |
+| `complaint.logged` / `complaint.resolved` | complaint create / resolve | add / remove `has-open-complaint` |
+| `message.send` | queued sends (e.g. pre-clean reminders) | send the message through GHL |
+| `message.visit_completed` | visit completion (skipped when `Customer.messagesOptOut`) | send the "Visit completed" template |
+
+The worker only lists **GHL-connected tenants** (`Tenant.ghlLocationId`). Rows for a tenant that hasn't connected GHL stay `pending` until it does.
+
+**Direct sends (Phase 1, A5).** User-initiated messages don't wait for the outbox: the payment link, debt reminder, invoice send and `POST /messages/send` call GHL synchronously through `src/services/message.service.ts`. That way the user sees the result: `409 GHL_NOT_CONNECTED`, `400 NO_CONTACT_FOR_CHANNEL`, `502 GHL_SEND_FAILED`, or success. The channel is `AUTO` (SMS if the customer has a mobile, else email), `SMS`, `EMAIL` or `WHATSAPP`. GHL's message id is stored as `Message.externalId`, and an invoice flips to SENT only after GHL accepts the message.
 
 ### 10.4 Tags — what's actually emitted today vs. the handoff doc's spec
 
 | Tag | Added by (code) | Removed by (code) | In automation handoff doc? |
 |---|---|---|---|
-| `visit-completed` | `visit.completed` outbox event (`routes/visits.ts`) | never (removal is a GHL Workflow action, by design) | ✅ yes |
-| `payment-collected` | `payment.collected` outbox event (GoCardless *and* Stripe webhooks) | never | ❌ **not in the handoff doc** — undocumented extra tag |
-| `debt-overdue` | `debt.overdue` outbox event (`routes/debt.ts`) | `payment.collected` handler (same outbox row removes it) | ✅ yes |
-| `has-open-complaint` | `complaint.logged` outbox event (`routes/complaints.ts`) | **never — gap.** `complaint.service.ts` sets `resolvedAt`/`resolvedBy`/`notes` on resolution but never queues a GHL event to remove the tag | ✅ yes (doc says it should be removed "when complaint is resolved") |
-| `payment-failed` | **nothing — gap, and wider than first noted.** Both failure paths update `Payment.status = FAILED` but neither calls `queueGhlEvent`: `gocardlessWebhook.ts`'s `failed` branch (direct debit), **and** `stripeWebhook.ts`'s `handlePaymentFailed` (`payment_intent.payment_failed`, card). | n/a | ✅ yes — Workflow 4 ("Payment Failed Chase") depends entirely on this tag existing |
+| `visit-completed` | `visit.completed` outbox event (web and mobile completion) | never (removal is a GHL Workflow action, by design) | ✅ yes |
+| `payment-collected` | `payment.collected` outbox event (the shared payment-outcome handler: GoCardless, Stripe and manual reconciliation) | never | ❌ **not in the handoff doc** — undocumented extra tag (§10.7) |
+| `debt-overdue` | `debt.overdue` outbox event (`routes/debt.ts`) | `payment.collected` handler | ✅ yes |
+| `has-open-complaint` | `complaint.logged` outbox event (`routes/complaints.ts`) | `complaint.resolved` outbox event (complaint resolve) | ✅ yes |
+| `payment-failed` | `payment.failed` outbox event. GoCardless `failed`, Stripe `payment_intent.payment_failed` and a manual FAILED all go through the shared payment-outcome handler (`services/payment.service.ts`). | `payment.collected` handler (a later successful payment) | ✅ yes — Workflow 4 ("Payment Failed Chase") |
 
-Action items from this table are tracked in §10.7.
+All five tags in the automation handoff are now emitted and cleared as specified.
 
 ### 10.5 Inbound webhook — `POST /webhooks/ghl`
 
@@ -528,11 +602,11 @@ Verified per-tenant via `?tenantId=&secret=` (secret compared with `timingSafeEq
 }
 ```
 
-This payload has **no `type` field**, so it matches none of the `if (type === ...)` branches in `processEvent()` today — it is silently dropped. Building this branch is Phase 1 work (§10.7): look up an existing `Customer` by `ghlContactId` first (idempotency — tag events can re-fire); if none exists, create both a `Customer` (name/phone/email) **and** a `Property` (`address1`→`addressLine`, `postalCode`→`postcode`) in one transaction, since address fields live on `Property`, not `Customer`; store `ghlContactId` on the new `Customer`. Per the master-data decision above, this is **create-only** — it never updates an existing linked customer.
+This payload has **no `type` field**. **It is now handled** (`processEvent()` in `src/routes/ghlWebhook.ts`, branch `!type && contactId`). It first looks up an existing `Customer` by `ghlContactId`, for idempotency, since tag events can re-fire. If none exists, it creates the `Customer` (name/phone/email, with `ghlContactId`) and a `Property` (`address1`→`addressLine`, `postalCode`→`postcode`) in one transaction, because address fields live on `Property`. Per the master-data decision above, this is **create-only**: it never updates an existing linked customer.
 
-### 10.6 Custom fields — promised to the automation owner, not yet built
+### 10.6 Custom fields — built
 
-`GHL_AUTOMATION_OWNER_HANDOFF.md` §1 lists 5 GHL **Contact custom fields** the backend is supposed to populate by key name, and §8 promises the automation owner that "the backend fetches the field IDs automatically via the GHL API" once they're created. **None of this exists in code.** `api.ts` only ever writes `firstName/lastName/phone/email` (contact fields) and tags — there is no custom-fields lookup, cache, or write call anywhere in `src/`.
+`GHL_AUTOMATION_OWNER_HANDOFF.md` §1 lists 5 GHL **Contact custom fields** the backend populates by key name. **This is built.** `src/integrations/ghl/api.ts` lists the location's custom fields (GHL API `Version: v3`), resolves each key to GHL's field id, caching it per location and accepting namespaced keys like `contact.last_clean_date`, and writes them with `{ id, key, fieldValue }`. `applyGhlCustomFields` in `sync.ts` is called from the outbox worker (§10.3). A key the automation owner hasn't created yet in GHL is skipped, not an error.
 
 | Field key | Type | Set when | Used by workflow |
 |---|---|---|---|
@@ -546,14 +620,17 @@ This payload has **no `type` field**, so it matches none of the `if (type === ..
 
 ### 10.7 Known gaps — tracked here, closed via the implementation plan
 
-This is the authoritative "what's left before the automation owner can build/test all 5 GHL workflows" list (superseding anything said earlier in chat before this doc existed):
+The original backlog for "what the backend needs before the automation owner can build/test all 5 GHL workflows" is **closed** (2026-10-30):
 
-1. **Custom-fields adapter** — resolve each of the 5 keys above to a GHL field ID (cache it), add a write path in `api.ts`.
-2. **Wire the 5 custom fields** to their trigger points (job completion, scheduling, invoice/payment events).
-3. **`payment.failed` outbox event** — add in **both** `gocardlessWebhook.ts`'s `failed` branch and `stripeWebhook.ts`'s `handlePaymentFailed`; add a case in `outboxWorker.ts` that applies `payment-failed` (and removes it on a subsequent successful retry, mirroring `debt-overdue`).
-4. **`has-open-complaint` removal on resolve** — `complaint.service.ts`'s resolve path needs to queue a GHL event that removes the tag.
-5. **Lead-handoff webhook branch** (§10.5) — the untyped payload handler that creates `Customer` + `Property`.
-6. *(Open, undocumented)* — decide whether `payment-collected` (emitted today, not in the handoff doc) should be documented/kept, or was a stand-in for `balance_owed` updates before custom fields existed.
+1. ✅ **Custom-fields adapter** — §10.6.
+2. ✅ **The 5 custom fields wired** — `visit.completed`, `visit.scheduled`, and the payment/debt events (§10.3).
+3. ✅ **`payment.failed`** — emitted by the shared payment-outcome handler, cleared by `payment.collected`.
+4. ✅ **`has-open-complaint` removal on resolve** — `complaint.resolved`.
+5. ✅ **Lead-handoff webhook branch** — §10.5.
+
+Still open:
+- *(Decision)* whether `payment-collected` (emitted, not in the handoff doc) should be documented and kept, or retired now that `balance_owed` is written.
+- Live verification against a GHL test sub-account. The regression suite's GAP-017/GAP-034 specs do this once GHL keys are supplied; they were skipped in the 2026-10-30 run.
 
 ### 10.7a Payment status transitions — the full picture (not just GHL)
 
@@ -564,9 +641,9 @@ Separate from GHL, but directly relevant to the `payment-failed` gap above — h
 | `GOCARDLESS` | `gocardlessWebhook.ts` on `payments` resource, `action: "paid"/"confirmed"` | Same webhook, `action: "failed"` | No |
 | `STRIPE` | `stripeWebhook.ts` on `checkout.session.completed` | Same file, `payment_intent.payment_failed` | No |
 | `CASH` | Created as `PAID` directly at visit completion (`routes/visits.ts`, `mobile/routes.ts`) — requires `cashConfirmed: true` in the request, or the completion call is rejected with a 400 | **No FAILED state exists for cash** — it's a binary confirm-at-source gate, not a retroactive status. If cash wasn't collected, the visit simply isn't completed with that method. | N/A by design |
-| `BACS` / `CHEQUE` | Created as `PENDING` at visit completion — **and nothing ever moves it out of PENDING.** No webhook, no cron, no route. | Same — no path to `FAILED` either. | **No — this is a real gap.** There is no `PATCH /payments/:id` or any other endpoint anywhere in `src/routes/` that lets an admin manually mark a BACS/cheque payment as paid or failed. `routes/payments.ts` only has Stripe checkout/setup-session creation. |
+| `BACS` / `CHEQUE` | Created as `PENDING` at visit completion. An admin reconciles it: `PATCH /payments/:id/status { status: "PAID" }`, or `POST /invoices/:id/mark-paid { method, reference?, paidAt?, amount? }`, which also works when no Payment row exists | `PATCH /payments/:id/status { status: "FAILED" }` | **Yes** (Phase 1, GAP-027 / A7). `Payment.reference` stores the bank reference or cheque number, including cheque numbers captured in the technician app. |
 
-So: **GoCardless and Stripe failures are both detected** (webhook-driven), just not yet surfaced to GHL (§10.4/§10.7 item 3). **Cash has no failure concept** by design — confirmed at source instead. **BACS/cheque has no resolution mechanism at all** — no automatic detection and no manual button — independent of GHL. If BACS/cheque is still a live payment method for any tenant, this is worth its own ticket (a manual "mark as paid/failed" action on the debt board or invoice detail), not just a GHL-tagging gap.
+So: every method now has a path to PAID, and every non-cash method has a path to FAILED. Webhooks and `PATCH /payments/:id/status` go through the shared payment-outcome handler (`services/payment.service.ts`). `POST /invoices/:id/mark-paid` has its own transaction but the same side effects: it queues `payment.collected` and lifts a settled customer's payment hold. So GHL tags (§10.4) and the hold behave the same whichever way the payment resolved. **Cash has no failure concept** by design: it is confirmed at source instead.
 
 ### 10.8 Template / Snippet two-way sync — planned, not in the original handoff spec
 
@@ -584,12 +661,17 @@ Separate initiative, requested directly (not part of `GHL_AUTOMATION_OWNER_HANDO
 
 ## 11. Setup Wizard and Post-Setup Split
 
-The backend enforces a strict split between setup-time and runtime operations:
+The backend enforces a split between setup-time and runtime operations:
 
-- `/setup/*` — only callable during setup (`setupCompleted = false`). A `assertSetupIncomplete` guard returns 403 once the wizard is complete.
-- `/customers/*`, `/properties/*`, `/settings/*` — runtime routes, always available post-setup.
+- **`/setup/*` writes** are only callable during setup (`setupCompleted = false`). An `assertSetupIncomplete` guard returns 403 once the wizard is complete. The step **GETs stay open**, so Settings can read back saved values.
+- **`/settings/*` mutations** call `assertSetupComplete`, which returns 403 until setup is done; GETs are always open. **Exception:** the provider-connection routes (Stripe, GoCardless, GHL connect, disconnect, status and test) work **during setup**, so the wizard's Payments and Messages steps can connect providers.
+- `/customers/*`, `/properties/*` and the other operational routes are runtime routes.
 
-This prevents accidental re-configuration of a live tenant through the wizard endpoints and keeps the two concerns (onboarding vs operations) cleanly separated at the route level.
+**Wizard progress (GAP-002).** `GET /setup/status` returns `steps[]` by backend number **and** `wizardSteps: [{ key, step, complete }]` in the web's display order. The web shows the steps in a different order from their backend numbers: Business(1) → Areas(7) → Round Settings(4) → Rounds(8) → Services(3) → Technicians(6) → Payments(2) → Messages(5) → Properties(9) → Activate(11). Steps unlock in **display order**. A step is "complete" once it has been saved at least once (`BusinessSettings.completedSteps`), not by counting rows. Step 10 (assign technicians) is `deferred` and doesn't block completion.
+
+**Activation (GAP-016, X-2).** `GET /setup/step/11/preview` and `POST /setup/step/11` share one planner (`src/services/activation-plan.ts`), so the preview count is exactly what activation generates. Activation also sets each plan's `nextDueDate`; before this, recurrence stopped after the first window.
+
+This prevents accidental re-configuration of a live tenant through the wizard endpoints and keeps onboarding and operations separate at the route level.
 
 ---
 
@@ -625,8 +707,8 @@ Tenant migrations are replayed every time a new tenant schema is provisioned. Th
 earlier version of this doc said otherwise and called it a "Phase 2 concern";
 that's no longer true (`src/lib/tenant-provisioning.ts`). Every tenant schema
 carries its own `"<schema>"."_migrations"` tracking table. On every server
-startup, `migrateAllTenantSchemas()` (called from `src/index.ts` before
-`app.listen`, see §6) lists every row in `public."Tenant"`, and for each one
+startup, `migrateAllTenantSchemas()` (called from `src/server/bootstrap.ts`
+**after** `app.listen`, while `/health` answers 503 `migrating` — see §6) lists every row in `public."Tenant"`, and for each one
 diffs `prisma/tenant/migrations/*` against that tenant's `_migrations` table
 and applies whatever is pending, each migration in its own transaction. A
 tenant provisioned before this tracking existed gets baselined instead —
@@ -675,14 +757,26 @@ it everywhere.
 | `20261022020000_debt_hold_reason` | Adds `Customer.holdReason`/`holdSince`. |
 | `20261022030000_complaint_resolution_fields` | Adds `Complaint.resolvedAt`/`resolvedBy`/`notes`. |
 | `20261029000000_property_geocoding` | Adds `Property.latitude`/`longitude`/`geocodedAt`/`geocodeAttempts`/`geocodeError` — see §14. |
+| `20261030000000_phase1_audit_remediation` | Phase 1 audit (§15): `VisitStatus.CANCELLED` + `Visit.cancelReason`; `PaymentTiming.COLLECT_DAILY_BATCH`; `Property.assignedTechnicianId`; `Visit.technicianOverride`; `Payment.reference`; BusinessSettings address, VAT rate, reminder, clean method, payment defaults and `completedSteps`; new `TechnicianIncident`, `KpiThreshold`, `KpiAlert`, `TechnicianAvailability`, `IdempotencyRecord`. |
+| `20261030010000_phase1_followups` | `Customer.messagesOptOut`, `Message.externalId` (GHL message id), `Round.defaultServiceId`. |
+| `20261030020000_access_issue_photos` | `PhotoType.ACCESS_ISSUE` + nullable `Photo.issueId` (photos attached to an access-issue report from the technician app). |
+| `20261103000000_qa_bugfix_batch` | QA bug batch (§17), additive only. `BusinessSettings.preCleanReminders` (JSONB list) and `acceptedPaymentMethods`; `Round.postcodeSectors`; `Visit.reminderSentTypes`; `ActivityLog.entityId`/`details`; chat: `ChatMessage.senderRole`/`clientMsgId` (unique per round and sender) and a `ChatRead` table; `Message.readAt` (inbound messages older than 30 days are backfilled as read). Applied by hand to long-lived tenants; see the `dist/` caveat in §17.6. |
+
+The three 2026-10-30 migrations are additive (new enum values, nullable columns, new tables). They are paired with idempotent, per-tenant backfill scripts that support `--dry-run`: `scripts/backfill-visit-technicians.ts`, `backfill-next-due-date.ts` and `backfill-completed-steps.ts`, with their logic in `src/jobs/backfills.ts`. Run them after the deploy has migrated the tenants, dry-run first.
 
 ---
 
 ## 13. Status Summary (read this before planning new GHL/automation work)
 
-- ✅ **Built and working:** multi-tenancy, auth/RBAC, outbox pattern, OAuth + PIT GHL connection, outbound contact sync, 4 of 5 tags, inbound `InboundMessage`/`Uninstall` handling, GoCardless native webhook (mandate/payment lifecycle), property geocoding (postcode → lat/long, see §14).
-- 🚧 **Documented (handoff doc) but not built:** custom-fields writer, `payment-failed` tag, lead-handoff webhook branch, complaint-resolved tag removal. See §10.7 for the full list — this is the concrete backlog for "what the backend needs before the automation owner can build/test the 5 GHL workflows."
-- 🆕 **New, undocumented elsewhere, decisions still open:** MessageTemplate ↔ GHL Snippet two-way sync (§10.8) — scope decided (SMS templates), GHL API capability and conflict rule still unverified/undecided.
+- ✅ **Built and working:**
+  - **Platform:** multi-tenancy, auth/RBAC (incl. the technician-only `/mobile` guard), migrate-after-listen startup.
+  - **GHL:** outbox, OAuth + PIT connection with status/test, outbound contact sync, all 5 tags, the 5 custom fields, direct message sends, inbound `InboundMessage`/`Uninstall`/lead-handoff.
+  - **Payments:** GoCardless webhook, Stripe Connect, BACS/cheque reconciliation.
+  - **Phase 1 domain work (§15):** technician stamping and split, recurrence, pause, payment hold, KPIs, idempotent mobile writes.
+  - **Other:** property geocoding (§14).
+- 🧪 **Verified 2026-10-30:** unit/route tests with 100% per-file and diff-coverage gates, the swagger contract test, and an end-to-end regression run against a local stack (§16). GHL and GoCardless live sandboxes are not yet exercised.
+- 🚧 **Open:** the `payment-collected` tag decision (§10.7); a customer-level hold release (holds are per invoice); an endpoint for `Round.defaultServiceId`; storing GHL `connectedAt`; `state` validation on the Stripe callback; moving tenant migrations to a release step.
+- 🆕 **New, decisions still open:** MessageTemplate ↔ GHL Snippet two-way sync (§10.8). Scope is decided (SMS templates); the GHL API capability and the conflict rule are still unverified/undecided.
 
 ---
 
@@ -810,3 +904,211 @@ deliberately not whole-file-gated, for the same reason
 `AUDIT_REMEDIATION_FILES` excludes `round.service.ts`/`customer.service.ts` —
 but every new branch this change introduces in them (geocode
 success/failure/skip, postcode-changed/unchanged) is covered by a test.
+
+---
+
+## 15. Phase 1 Audit Remediation: Domain Services, Jobs and Helpers (2026-10-30)
+
+Added by the Phase 1 audit remediation (plan: `docs/handoff/backend/2026-10-30-phase1-audit-remediation-plan.md`;
+contracts: `docs/handoff/frontend/2026-10-30-phase1-audit-frontend-handoff.md`). Routes stay thin; this logic lives in
+small, separately tested modules. Where a legacy service (`round.service.ts`, `customer.service.ts`,
+`setup.service.ts`) needs it, it calls these rather than growing.
+
+### 15.1 Visit scheduling and technician assignment
+
+| Module | Responsibility |
+|---|---|
+| `src/lib/schedule.ts` | The only place date maths lives (UTC-safe): `frequencyWeeks`, `snapToWeekday`, `nextOccurrenceOfDay`, `initialNextDueDate`, `nextDueAfter`, `enumerateActivationVisits` (end date **exclusive**, which fixes the preview-vs-generated count mismatch). |
+| `src/services/visit-assignment.ts` | `resolveTechnicianForVisit` (the property's assigned technician if still on the round and available, else the only available round technician, else `null`), `autoSplit` (deterministic split by postcode, street and house number; whole streets stay together), `technicianIdsUnavailableOn`, and `restampFutureVisits`. Restamping leaves visits with `Visit.technicianOverride = true` alone, so a manager's manual reassignment is never overwritten. |
+| `src/services/activation-plan.ts` | One planner shared by `GET /setup/step/11/preview` and `POST /setup/step/11`. The preview count can't drift from what activation generates. |
+| `src/services/service-plan-lifecycle.ts` | `pausePlan` and `resumePlan`, the single source of truth for pause and resume, called by the routes **and** the nightly job. Pausing cancels SCHEDULED visits in the window (`status CANCELLED`, `cancelReason "PAUSED"`). A pause starting in the future keeps the plan ACTIVE with the dates stored; the nightly job flips it. Cancelled visits are never restored on resume. |
+
+**Fixes two defects the audit did not report.** Generated visits previously never got a `technicianId`, so the technician
+app showed no jobs. Setup service plans never got a `nextDueDate`, so recurrence stopped after the first window. Visit
+generation (`jobs/visitGeneration.ts`), `POST /rounds/:id/generate-visits` and `activateSystem` now all stamp the
+technician and `paymentHold`, and set `nextDueDate`.
+
+`VisitStatus.CANCELLED` exists now. Every reader of visit lists (planner, today, debt, reports, mobile) excludes it by
+default; Visit History (`GET /customers/:id/visits`) includes it with `cancelReason`.
+
+### 15.2 Money: holds, status, completion, messaging
+
+| Module | Responsibility |
+|---|---|
+| `src/services/payment-hold.ts` | `holdNextVisits`, `releaseHeldVisits`, `releaseHoldIfSettled`. Flagging a hold now sets `Visit.paymentHold` on the customer's next SCHEDULED visit per active property (it previously only set a customer flag). Paying the last open invoice releases it automatically when `debtHoldEnabled` is on. |
+| `src/services/customer-payment-status.ts` | Derives `NONE`, `PAID`, `UNPAID`, `OVERDUE`, `ON_HOLD` or `FAILED` from invoices and payments, with a fixed precedence. `amountDue` is the sum of unpaid SENT invoices. |
+| `src/services/visit-completion.ts` | One transactional completion path shared by `PATCH /visits/:id/complete` and `PATCH /mobile/visits/:id/complete`. Payment input is validated **before** any write; then the status, Payment, cheque activity log, note and outbox rows are written in a single `$transaction`. A failed validation leaves the visit untouched, so a retry works. |
+| `src/services/message-templates.ts` | Template lookup and `{{var}}` rendering (unknown variables render empty), with built-in fallback bodies. |
+| `src/services/message.service.ts` | `send` with channel `SMS`, `EMAIL` or `WHATSAPP` (default SMS if the customer has a mobile, else EMAIL). The `Message` row is written only **after** GHL accepts, and stores `externalId`. Payment links, reminders and invoice sends all use it. |
+
+**The static `pay.roundflow.app` payment-link fallback is gone.** With no Stripe connection the API answers
+`409 STRIPE_NOT_CONNECTED`. Payment links are real Stripe Checkout sessions on the tenant's connected account
+(`integrations/stripe/checkout.ts`), created only after the contact and channel checks pass.
+
+**Invoice numbers** are allocated inside a `$transaction` that first takes
+`pg_advisory_xact_lock(hashtext(current_schema() || ':invoice-number'))`, a per-tenant lock released on commit. Numbers
+are the highest existing suffix plus one, not a row count, so a deletion never re-issues a number. The unique index on
+`invoiceNumber` is the backstop.
+
+### 15.3 Technician KPIs and operations
+
+| Module | Responsibility |
+|---|---|
+| `src/services/technician-kpi.service.ts` | Period parsing and the KPI maths: `timeOnJobMinutes` (sum of `completedAt - startedAt`), `revenuePerHour`, and strike, damage and upsell counts. `null` only means "no data in the period". |
+| `src/services/technician-incident.service.ts` | CRUD for `TechnicianIncident` (`STRIKE`, `DAMAGE`, `UPSELL`). Upheld complaints also count as strikes. |
+| `src/services/kpi-threshold.service.ts` | `GET/PUT /settings/kpi-thresholds` (replace-all). Metric and operator pairs are unique. |
+| `src/services/technician-availability.service.ts` | Availability windows and `replace` (moves a technician's SCHEDULED visits in a window to a replacement, with `technicianOverride = true`, in one transaction). An open-ended window is stored as 2099-12-31 because the column is required. |
+| `src/services/photo-gallery.service.ts` | Paginated photo galleries for properties and technicians, using signed read URLs. |
+
+### 15.4 Storage, security and helper modules
+
+| Module | Responsibility |
+|---|---|
+| `src/lib/signed-read-url.ts` | Batch signed **read** URLs (1 h TTL) for the private `visit-photos` bucket. The only read-URL helper (a duplicate was merged into it). Returns `null` per item if Storage fails; requests still succeed. |
+| `src/mobile/media-urls.ts` | Signs only paths under the caller's own tenant prefix; anything else returns `null`. Used for `avatarSignedUrl`, chat `photoSignedUrls` and visit `photos[].signedUrl`. |
+| `src/lib/settings-dto.ts` | `toBusinessSettingsDto` strips every `*Encrypted` field and secret before BusinessSettings leaves the API, and converts `vatRate` to a number. Used on every `/settings/*` and `/setup/step/1`, `/2`, `/4` response. (Previously the encrypted token ciphertexts were returned.) |
+| `src/lib/oauth-state.ts` | HMAC-SHA256 signed, 10-minute `state` for the GHL OAuth round trip. Carries the tenant and the validated `redirectUri`. The GHL callback is public and resolves the tenant from this state. |
+| `src/integrations/ghl/connection.ts` | `fetchGhlLocation`, webhook and redirect URL builders, and the allowed-origin check for a custom `redirectUri` (must be on a `FRONTEND_URL` origin). |
+| `src/lib/customer-match.ts` | Existing-customer matching for setup: mobile normalised to digits with `+44`, `0044` and `44` treated as `0`, and case-insensitive email. |
+| `src/lib/row-error.ts`, `src/lib/settings-validators.ts` | Per-row bulk-import errors `{ row, field, error }`, and validators for the new settings fields. |
+| `src/lib/env-check.ts` | `listMissingIntegrationEnv()`, logged at startup as a warning. |
+| `src/lib/error-handler.ts` | The central error handler. Forwards extra `AppError` fields generically (`fields`, `suggestions`, `proposedName`), so routes no longer hand-roll them. |
+
+### 15.5 Mobile API hardening (`/mobile/*`)
+
+- **Role and ownership.** Every `/mobile` route requires role `TECHNICIAN` and a linked Technician row (`403 TECHNICIAN_ONLY` or `NO_TECHNICIAN`). Every visit action checks `visit.technicianId === me`, else `403 NOT_YOUR_VISIT` (`src/mobile/ownership.ts`). Chat is limited to the technician's own rounds (`NOT_YOUR_ROUND`).
+- **Idempotency** (`src/mobile/idempotency.ts`). Visit writes accept an optional `X-Idempotency-Key` header (1 to 200 characters). The first 2xx response is stored in `IdempotencyRecord`; a repeat from the same technician on the same method and path replays it with response header `Idempotent-Replay: true`. A key used by another technician is `403 IDEMPOTENCY_KEY_CONFLICT`; the same technician reusing it on a different route is `409 IDEMPOTENCY_KEY_REUSED`. Records are purged after 7 days. This exists because the technician app queues actions offline and replays them. Known limit: two *simultaneous* duplicates both execute.
+- **Payments on completion.** `payment: { method: CASH | CHEQUE | NONE, amount?, chequeNumber? }`. CASH creates a PAID Payment; CHEQUE creates a PENDING one (cleared later by `POST /invoices/:id/mark-paid`) with the number in `Payment.reference`. `cashConfirmed: true` is a deprecated alias for CASH.
+- **Photos.** Types `BEFORE`, `AFTER` and `ACCESS_ISSUE` (linked by `Photo.issueId`). Each path must start with `<tenantId>/visits/<visitId>/`.
+- **Upsells** (`POST /mobile/visits/:id/upsells`, `src/mobile/services/upsell.service.ts`) are stored as `TechnicianIncident` rows of type `UPSELL`.
+
+### 15.6 Background jobs
+
+All registered in `src/server/bootstrap.ts` (`registerCronJobs`); each run is wrapped so one failing tenant is logged and the others continue.
+
+| Job | Schedule (UTC) | What it does |
+|---|---|---|
+| `visitGen` (`jobs/visitGeneration.ts`) | 01:00 daily | Applies pause and resume transitions through `service-plan-lifecycle`, then generates next-cycle visits (technician and hold stamped). Skips tenants with `autoCreateNextVisit = false`. |
+| `outbox` (`jobs/outboxWorker.ts`) | every 30 s | Drains the GHL outbox. Now also handles `message.send` (pre-clean reminders) and `message.visit_completed`. Opted-out customers (`Customer.messagesOptOut`) are skipped. Drains only GHL-connected tenants; other tenants' rows stay pending. |
+| `geocodeBackfill` | every 15 min | Unchanged (section 14). |
+| `kpiThresholds` (`jobs/kpiThresholds.ts`) | 02:00 daily | Evaluates the month's KPIs against thresholds; creates de-duplicated `KpiAlert` rows (unique per technician, metric and `YYYY-MM`) and notifies admins. Surfaces as `kpiAlerts` on `GET /dashboard/alerts`. |
+| `idempotencyPurge` (`jobs/idempotencyPurge.ts`) | 03:00 daily | Deletes idempotency records older than 7 days. |
+| `preCleanReminders` (`jobs/preCleanReminders.ts`) | every 15 min, **only when `PRECLEAN_REMINDERS_ENABLED=true`** | Queues the "Pre-clean reminder" message at the tenant's configured local time (`reminderMode` and `reminderTime`, default Europe/London, BST-safe). Opt-in so it doesn't duplicate the existing GHL workflow. |
+
+### 15.7 Backfills (run once per environment, `--dry-run` first)
+
+`src/jobs/backfills.ts` holds the logic; `scripts/backfill-*.ts` are thin CLIs. All are idempotent and run per tenant.
+
+| Script | Purpose |
+|---|---|
+| `scripts/backfill-visit-technicians.ts` | Stamp technicians on existing future visits (`restampFutureVisits` per active round). |
+| `scripts/backfill-next-due-date.ts` | Set `nextDueDate` on ACTIVE plans where it is null. A computed date in the past falls back to the next round day, so the nightly job doesn't create one past visit per night. |
+| `scripts/backfill-completed-steps.ts` | Rebuild `BusinessSettings.completedSteps` from the old row-count rules, so tenants part-way through setup don't see their progress reset. |
+
+---
+
+## 16. Quality Gates and Contract Enforcement
+
+Three gates run in CI and locally. They exist so this class of problem is caught by a test instead of by an audit.
+
+1. **Per-file 100% coverage** (`vitest.config.ts`). Lists of whole files held at 100% line, branch, function and statement coverage, enforced per file: `PAYMENT_DOMAIN_FILES`, `AUDIT_REMEDIATION_FILES`, `GEOCODING_FILES`, `INVITE_FILES` and `PHASE1_AUDIT_FILES` (every new module in section 15, plus `server/bootstrap.ts`, `jobs/outboxWorker.ts` and `swagger.ts`). Run with `npm run test:coverage`. Large legacy files that only gained a few lines are deliberately not gated whole; the diff gate below covers their changed lines.
+2. **Diff coverage** (`scripts/diff-coverage.mjs`). `npm run test:diff-coverage` fails if any **added or changed line** in `src/` is uncovered. Locally it diffs against `HEAD` plus untracked files; with `CI` set it diffs against `origin/main...HEAD` (or `DIFF_BASE`). It checks lines, and only warns on uncovered branches.
+3. **Swagger contract test** (`src/__tests__/swagger.contract.test.ts`). Walks the real app's registered routes and asserts parity with `openApiDocument.paths` in both directions, and simulates the 405 pre-filter to prove it blocks no route the code serves.
+
+**Why gate 3 matters.** `src/server/bootstrap.ts` builds a 405 pre-filter from the swagger paths: a request whose path matches a documented path but whose method isn't listed is answered `405` **before** it reaches the router. Two consequences:
+
+- A documented path must list **every** method the code serves for it.
+- Matching takes the first hit among paths of the same depth, so literal paths must be ordered **before** templated ones. `/invoices/bulk` must precede `/invoices/{id}`, or `POST /invoices/bulk` is rejected with a 405. This bug was found and fixed during the remediation.
+
+Also: openapi-typescript marks any schema field that has a `default` as *required* in the generated frontend and app types, so optional request fields must not carry a swagger `default` (describe it in the text instead).
+
+**End-to-end regression suite.** `roundflow-e2e/` (a sibling folder, not part of this package) runs one Playwright spec per audit gap against a local Docker Postgres, a locally started backend (port 3100) and web app (port 5173). The integration gaps use real Stripe test-mode, GoCardless sandbox and GHL sandbox credentials. It creates a fresh tenant per run and deletes the test users afterwards. Its first runs found a real defect: `GET /settings/stripe/callback` returned 500 when Stripe rejected a code. It is now `400 STRIPE_CONNECT_FAILED` or `502 STRIPE_UNAVAILABLE` (defect D-11).
+
+---
+
+## 17. QA Bug Batch, Chat and Decision Log (2026-11-03)
+
+Source material: the Agentum AI QA bug report "Setup Wizard & Customer Fixes" (BUG-01 to BUG-08), the client verdict
+summary (`roundflow-e2e/docs/client-verdict-summary.md`) and a follow-up on the office/technician chat. Endpoint
+shapes and error codes are in `docs/BACKEND_CHANGES_2026-11-03.md`; this section records **what was decided and why**.
+Every decision below is in force. "Open" marks the ones still waiting on the client.
+
+### 17.1 Rulings that were put to the client (all taken as the recommended default)
+
+| # | Decision | Why | Consequence |
+|---|---|---|---|
+| D1 | **An invoice is created automatically when a visit is completed** (verdict A1). Idempotent, so it never duplicates the office's "Create invoices for today". Skipped for held visits and held customers. A cash visit that already has a PAID payment gets a PAID invoice (A2). | The agreement says an invoice always exists on completion. Without it nothing is billable, nothing reaches the debt board and nothing is sent. | The manual bulk-invoice step still works and reports `ALREADY_INVOICED`. |
+| D2 | **Generated visits stay pre-assigned** to the round's usual technician (B1, unchanged). | An earlier fix relied on it: visits with no technician never appeared in the technician app. | The usual technician is a default, not a suggestion. The office can unassign (D3). |
+| D3 | **Single-visit assign and unassign**: `PATCH /visits/:id/assign` (B2), SCHEDULED visits only. Unassigning sets the manual-override flag, so later automatic assignment will not re-assign it. | The only tool before was moving a whole day's visits. | The override flag means "the office decided", including when the decision is "nobody". |
+| D4 | **A property that changes round takes its future SCHEDULED visits with it** (B3), set to unassigned, and `nextDueDate` is recomputed. Visit **dates are kept**; only round and technician change. Applies to `updateProperty` and `updateCustomer`. Started and completed visits are never moved. | The agreement says upcoming visits follow the property. The frequency-change path already did this; the round change now shares its approach. | Re-dating to the new round's weekday is not done; the office can still move a day. |
+| D5 | **A deactivated technician is blocked and released** (C1): every `/mobile/*` call returns 403 `TECHNICIAN_INACTIVE`, and their future SCHEDULED visits are unassigned and `Property.assignedTechnicianId` is cleared. `resolveTechnicianForVisit` ignores inactive technicians. | Security (a deactivated technician could still read jobs) and operations (their visits would otherwise silently go unworked). | Released visits show as needing assignment. |
+| D6 | **"Today" follows the tenant `timezone` setting**, default `Europe/London` (EMU-6). | A UK business sees the wrong date between midnight and 1am in summer if it follows UTC or the phone. | Jobs, "Last clean" and the app's date headings use the same helper. |
+| D7 | **Deferred, not built**: weather hold with reschedule, "disputed" debt state, reordering stops in a round, CSV import after setup, scheduled bulk messages, invoice by email, complaints raised from the technician app, office SMS to a technician (separate from chat, §17.4). | Not needed for Phase 1; each needs its own design. | The web labels were made honest (weather hold is "Notify customers"). |
+| D8 | **Deleting a customer's last property also cancels the customer**, and deleted customers drop out of the customer list. **Deleting a property with an unpaid invoice is still allowed. Open.** | Verdict B5 and E2E-030: the property was cancelled but the customer stayed listed. The unpaid-invoice rule is a business call. | The web confirm modal warns about an unpaid balance. |
+| D9 | **Adding a service to a property creates only the next scheduled visit** for the new service. Later visits come from the nightly generator. | Avoids backfilling a whole window of visits on a one-click edit. | See §17.3, BUG-08. |
+| D10 | The migration **marks inbound messages older than 30 days as read**. | Otherwise the new inbox opens with the entire history unread. | Unread counts start from recent messages only. |
+| D11 | **Visits already held by the old rule are not reset.** `scripts/list-generated-held-visits.ts` lists them (read-only) for the PM. | A reset is a customer-facing change and needs a human's confirmation. | Nothing is released automatically. |
+
+### 17.2 Decisions on the setup and settings bugs
+
+- **BUG-02: an unpaid balance never holds a visit automatically.** Generation (`jobs/visitGeneration.ts`) and activation (`activation-plan.ts`) no longer copy `Customer.holdNextClean` into `Visit.paymentHold`. Holding stays a manual admin action (debt board, "Pause service", "Mark payment hold"). The per-plan debt-hold rule, if kept, is off by default and applies only to a customer the admin switches it on for. The wizard and Settings text that claimed an automatic hold was removed.
+- **BUG-01: pre-clean reminders are a list.** `BusinessSettings.preCleanReminders` is a JSON list of `{type: EVENING_BEFORE | MORNING_OF, time}`; an empty list means no reminders. The scheduler (`jobs/preCleanReminders.ts`) sends one message per entry per visit and records what was sent in `Visit.reminderSentTypes`, so the same reminder is never sent twice. The old `reminderMode`/`reminderTime` are still accepted and kept in sync (existing clients keep working); `Visit.reminderSentAt` is still written. The job itself stays opt-in per deployment (`PRECLEAN_REMINDERS_ENABLED`).
+- **BUG-04: round postcode sectors are stored** on `Round.postcodeSectors`, accepted on create and PATCH and on setup step 8, returned by every round read, and checked against the round's service area when it is written.
+- **BUG-05: accepted payment methods.** `BusinessSettings.acceptedPaymentMethods` (list) plus `defaultPaymentMethod`, which must be in the list. A provider need not be connected to accept it: GoCardless and Stripe are selectable before connecting (connecting is a Settings step). New customers, properties and imports default to `defaultPaymentMethod` (also closes verdict A7). The migration backfills the list from the existing default only.
+- **BUG-06: import prices come from the catalogue.** With `serviceIds` the server ignores any client-sent price and creates each plan at that service's own `defaultPrice`; the customer total is the sum. The even-split logic (`splitPrice`) that turned £130 into three plans of £43.33 is removed. Unknown or inactive services are rejected (also verdict C5).
+- **BUG-07: one payment-method vocabulary.** `STRIPE` and `CHEQUE` were already valid in the enum and validators and are covered by round-trip tests. The defect was a hard-coded list in the web's edit modal.
+
+### 17.3 BUG-08: editing a customer's services after setup
+
+`PUT /properties/:id/services` replaces the set of services for a property in one transaction: new services get plans at catalogue price and inherit frequency, payment method, clean method, round and next-due date from the primary plan; removed services' plans are cancelled; **only SCHEDULED visits** of those plans are cancelled or updated; completed visits and sent invoices are never touched; an empty list is a 400; unknown or inactive services are rejected. Every change writes an `ActivityLog` row (`entityId` and `details` hold the old and new service sets, actor and time), readable at `GET /properties/:id/services/history`. Rationale: services live on the plan, there was no write path for them, and the audit trail was a stated requirement.
+
+### 17.4 Chat between the office and technicians: polling only
+
+- **One thread per round.** This is the model the app already used; a round's technicians and the office share it. No per-technician threads in this batch.
+- **Polling, not push-streaming.** The app polls every 15 s while in the foreground (30 s for the unread badge), the web every ~10 s, both with a `since` cursor. No websocket and no SSE; revisit only if polling cost or latency becomes a problem.
+- **Office side is new and admin-only.** `src/routes/chat.ts`: threads with unread counts, messages (`since`/`before`/`limit`), send, mark read, unread count. A technician token gets 403 on all of it.
+- **Idempotent sends.** Both sides send a client-generated `clientMsgId`; a repeated id returns the existing row (200) instead of a duplicate. This is what lets the app queue chat offline and retry safely.
+- **Shape:** `ChatMessage.senderRole` (TECHNICIAN or OFFICE), `isMine` computed server-side, 2000-character cap, photo paths must start with the tenant's `chat/` prefix, read state per profile and round in `ChatRead`. An office send creates an in-app notification for the round's technicians and a push where devices are registered; a notification failure never fails the send.
+- **Inbound customer replies (GHL)** were stored but never shown. `GET /messages/inbox` and `POST /messages/inbox/read` expose them, using `Message.readAt` as the unread marker.
+- **Not chat:** an office SMS to a technician (E2E-086's original idea) is deferred (D7); chat replaces it.
+
+### 17.5 Small corrections made on the way
+
+- **Pause and resume** (`service-plan-lifecycle.ts`): cancelled plans can no longer be paused; pause dates are stored as dates, not date-times (the nightly job used to start and end a day late); end-after-start is checked in the service as well as the route.
+- **Mobile money:** cash now defaults to the VAT-inclusive total and job detail returns `grossTotal`, `vatAmount`, `vatRate` (A3); `lastCompleted` is written on completion (A6); a debt collected in the app sets `paidAt` and releases the hold (A8); closing the day stores a skip reason (B6).
+- **Integrity:** a round from a different service area is rejected with `ROUND_SERVICE_AREA_MISMATCH` on create and update (B4); message-template create, update and replace reject unknown `{{placeholders}}` (C5).
+- **Technician safety:** job detail returns the property's `accessNotes` and `riskNotes` (C2); an access issue sets `Issue.propertyId` and writes a dated property note with the technician's name (C3).
+- **Customer list** shows PAUSED when the customer's plan is paused (E2E-028). **`POST /debt/bulk`** applies remind, hold or bad-debt to many debts with per-id results. **`GET /rounds/:id/properties`** returns `total` and pages past 100.
+
+### 17.6 GHL connection model (decided with the client, not yet fully hardened)
+
+- **Each tenant connects with a Private Integration Token and its Location ID** (`POST /settings/ghl/connect-private`), not through a marketplace OAuth app. The OAuth code (§10.2) exists but is unused. The connect call only reads the location from GHL to validate the pair, then stores the token encrypted and stamps `Tenant.ghlLocationId` (unique).
+- **Workflow 5 (lead handoff) identifies the tenant from `tenantId` and `secret` in the webhook URL, not from the location ID.** The location ID is stored at connect time and used for outbound calls; the workflow does not need it. The URL is built from `PUBLIC_API_URL` and must be edited by hand in GHL (host swapped when tunnelling). Each new client's workflow needs its own `tenantId` and `secret` pasted in; cloning a workflow copies the old ones.
+- **Sending requires a stored token.** A tenant with GHL disconnected cannot send anything, whatever else is queued. Events queued in `IntegrationOutbox` while disconnected will be sent if the tenant is reconnected, so clear the outbox before reconnecting a tenant that has been used for testing.
+- **Known and open** (full list and tasks in `docs/GHL_OAUTH_AND_WORKFLOWS_PLAN.md`): the secret sits in the URL query string and `GET /settings/ghl/status` returns it to any role; reconnecting regenerates it; a failed token refresh silently shows "Not connected"; the `locations/customFields` scope is not requested; a second tenant claiming an already-claimed location fails after partly writing; no `connectedAt` or last-webhook record.
+
+### 17.7 Engineering and operations decisions
+
+- **One migration for the batch**, `20261103000000_qa_bugfix_batch`, additive only (§12). **Operational caveat:** `lib/tenant-provisioning.ts` reads migrations from `dist/prisma-tenant/migrations` when that folder exists, otherwise from `prisma/tenant/migrations`. A stale `dist/` therefore hides new migrations: rebuild (`npm run build`) or copy the folder. A migration whose content changes after a tenant has applied it is **not** re-applied to that tenant (applied versions are tracked by name); long-lived tenants need the SQL run by hand (it is written to be re-runnable).
+- **Test stack.** The local end-to-end stack (`roundflow-e2e`, `npm run stack:up`) is the development environment: its own Postgres, backend on 3100 using `.generated/backend.env`, web on 5173. It never reads `roundflow-backend/.env`. The seeded manual tenant has GHL disconnected on purpose.
+- **Order of work for this batch:** backend first, then a report-only test round against the unchanged web and app, then frontend and app updates against the new contracts, then e2e and emulator re-tests.
+- **Coverage deviation to resolve.** This batch was built to a target of about 90% on changed code. The repository's own gates (§16: per-file 100% on the listed domain files, and diff coverage on every added or changed line) are stricter, so `npm run test:diff-coverage` is expected to flag gaps until they are closed. The reported figure for the 38 changed files was 90.4% statements / 88.6% branches, measured before the last two test files were added.
+- **Frontend and app choices recorded for cross-repo reference:** one shared payment-method list (order GoCardless, Stripe, Bank transfer, Cash, Cheque); "Remember me" defaults on; Cancel property and Cancel customer sit in the property-detail header with an unpaid-balance warning; the app queue caps a run at 90 s and shows "waiting to sync" after 10 s; chat messages and chat photos go through the app's offline queue (photos requested, implementation status to be confirmed); a technician's future work (calendar or week view) is **not yet built** and needs a mobile endpoint that lists visits by date range.
+
+
+### 17.8 Technician schedule (future and past work)
+
+`GET /mobile/schedule?from&to&page&pageSize` lists the **signed-in technician's own** visits over a date range (the query is always filtered by the technician id from the token; there is no way to ask for another technician's). Dates are tenant-local calendar days (`BusinessSettings.timezone`, default Europe/London, the same helper as "today"). Defaults: `from` = today, `to` = from + 13 days; maximum span 62 days inclusive (`400 RANGE_TOO_LARGE`; `400 INVALID_DATE_RANGE` for malformed dates or `from` > `to`). CANCELLED visits are excluded; COMPLETED and SKIPPED are included so past days can be shown. Rows are paged (default 100, max 200) and carry the Today-list fields plus `date`, `paymentHold`, `vatAmount` and `grossTotal`. The response also holds a per-day `summary` (`count`, `completedCount`) for the **whole** range, so the calendar can be drawn without paging. A separate summary endpoint was not added: one call serves both.
+
+
+### 17.9 Test round 1 follow-ups (decisions D12 to D18)
+
+| # | Decision | Why | Consequence |
+|---|---|---|---|
+| D12 | **Message-template placeholders accept both spellings.** snake_case aliases (`{{customer_name}}`, `{{visit_date}}` ...) are normalised to the canonical camelCase token on save; rendering also tolerates aliases already stored; unknown tokens are still a 400 `UNKNOWN_PLACEHOLDER`. Alias table in BACKEND_CHANGES section 18. | The web wizard's own default templates and variable chips used snake_case, so wizard Step 8 could not be saved after the C5 validation. User-approved default. | One stored form going forward. Old rows keep working; `scripts/list-snake-case-templates.ts` lists them (read-only). Nothing is rewritten automatically. |
+| D13 | **`GET /properties/:id`** returns one property with customer summary, plans, round, technician, payment status, pause state (`NONE`/`PAUSED`/`SCHEDULED`) and next visit; `GET /customers/:id` also returns `properties[]`. | The web found properties by scanning `GET /customers`, which has one row per customer, so a second property was "not found". | The web opens any property by id. |
+| D14 | **A customer is never invisible.** `POST /customers` accepts an optional `property` (customer + property + plan in one transaction); `GET /customers` lists customers with no property as rows with `hasNoProperty: true` and null property fields. | A customer created on its own did not appear in the list or search and had no way to reach its record. | List row fields `propertyId`, `addressLine`, `postcode` are now nullable; the web must handle `hasNoProperty`. |
+| D15 | **A pause cannot start in the past** (before today in the tenant time zone): 400 `PAUSE_START_IN_PAST`. Today and later are accepted. A scheduled pause is cancelled by the existing resume endpoints. | A past-dated pause immediately produced an already-expired PAUSED plan. | No new endpoint; the web shows Resume/cancel when `pause.state` is `PAUSED` or `SCHEDULED`. The nightly job, which re-applies stored windows, is not subject to the check. |
+| D16 | **Mobile round position uses one definition everywhere:** the technician's own visits in the round on the visit's day, ordered by creation time then id. | The detail screen counted every technician's visits ordered differently from the Today list, so "stop 13 of 19" disagreed with the list and changed when a visit started. | List, schedule and detail agree and are stable. |
+| D17 | **Property notes returned to the app carry `source` (`TECHNICIAN`/`OFFICE`) and `mine`.** Notes added from the app now store the author profile. Access notes remain only `Property.accessNotes`. | The technician's own "note for office" was shown under ACCESS NOTES because the app treated every non-risk note as one. | The app renders `source: TECHNICIAN` notes in a separate list. Notes written before this change have no author and count as OFFICE. |
+| D18 | **Database connectivity failures answer `503 DATABASE_UNAVAILABLE`** (`Retry-After: 5`) instead of a bare 500: Prisma P1001, P1002, P1017, pool timeout P2024 and client initialisation errors. | A brief Postgres outage surfaced as a raw "Internal Server Error" in the app. | Clients can treat 503 as retryable and show friendly copy. Other unexpected errors remain 500. |

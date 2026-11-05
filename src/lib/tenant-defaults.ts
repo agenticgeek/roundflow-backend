@@ -17,9 +17,10 @@ export const DEFAULT_SERVICES = [
 export const DEFAULT_MESSAGE_TEMPLATES = [
   { name: "Appointment Reminder", channel: "SMS", subject: null, body: "Hi [Customer Name], this is a reminder your clean is scheduled for tomorrow. Reply STOP to opt out." },
   { name: "Missed Visit Notice", channel: "SMS", subject: null, body: "Hi [Customer Name], we were unable to complete your visit today. We'll be in touch to rebook." },
-  { name: "Invoice Ready", channel: "EMAIL", subject: "Your invoice is ready", body: "Hi [Customer Name], your latest invoice is attached. Thank you for your business." },
+  { name: "Invoice Ready", channel: "EMAIL", subject: "Your invoice is ready", body: "Hi [Customer Name], your invoice {{invoiceNumber}} for {{amount}} is ready. Payment is due by {{dueDate}}. Thank you for your business." },
   { name: "Payment Overdue Reminder", channel: "SMS", subject: null, body: "Hi [Customer Name], our records show an overdue balance. Please make payment at your earliest convenience." },
   { name: "Complaint Acknowledgement", channel: "EMAIL", subject: "We've received your message", body: "Hi [Customer Name], we've logged your complaint and will be in touch shortly." },
+  { name: "Visit completed", channel: "SMS", subject: null, body: "Hi [Customer Name], your window clean at {{address}} was completed today. Thank you, {{businessName}}." },
   { name: "Welcome / Service Confirmation", channel: "SMS", subject: null, body: "Hi [Customer Name], welcome to our round! Your first visit is confirmed." },
 ] as const;
 

@@ -8,3 +8,5 @@ process.env.PUBLIC_API_URL ??= "https://api.test.roundflow.example";
 process.env.STRIPE_CLIENT_ID ??= "ca_test_client_id";
 process.env.STRIPE_SECRET_KEY ??= "sk_test_platform_secret";
 process.env.STRIPE_CONNECT_WEBHOOK_SECRET ??= "whsec_test_connect_webhook_secret";
+// src/middleware/requireAuth.ts throws at import time without this; CI has no .env.
+process.env.SUPABASE_ISSUER ??= "https://test-project.supabase.co/auth/v1";

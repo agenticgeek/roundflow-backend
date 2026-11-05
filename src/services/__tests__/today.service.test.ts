@@ -112,6 +112,28 @@ it("getTodaysWork: builds KPI/round/technician aggregates from today's visits", 
   expect(result.technicians).toHaveLength(1);
 });
 
+it("getTodaysWork: rounds carry scheduledValue/completedValue, value = completedValue, etaMinutes null, plus generatedAt (GAP-035)", async () => {
+  const prisma = makePrisma();
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({ lastClosedDate: null });
+  const base = {
+    paymentHold: false, roundId: "r1", round: { id: "r1", name: "Round 1" },
+    technicianId: null, technician: null, _count: { issues: 0 },
+  };
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    { ...base, id: "v1", status: "COMPLETED", price: new Prisma.Decimal(25) },
+    { ...base, id: "v2", status: "SCHEDULED", price: new Prisma.Decimal(12.5) },
+  ]);
+
+  const before = Date.now();
+  const result = await createTodayService(prisma).getTodaysWork();
+
+  expect(result.rounds[0]).toMatchObject({ scheduledValue: 37.5, completedValue: 25, value: 25, etaMinutes: null });
+  expect(Date.parse(result.generatedAt)).toBeGreaterThanOrEqual(before - 1000);
+  // CANCELLED visits (A4) never reach the aggregate.
+  const where = (prisma.visit.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0].where;
+  expect(where.status).toEqual({ not: "CANCELLED" });
+});
+
 it("closeDay() invalidates the cache getTodaysWork() reads, so a later getTodaysWork() sees dayClosed:true immediately", async () => {
   // Regression test for: closeDay() wrote lastClosedDate via `tx.businessSettings
   // .updateMany(...)`, which never invalidated the cache getTodaysWork() reads

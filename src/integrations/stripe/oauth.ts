@@ -1,3 +1,5 @@
+import { AppError } from "../../lib/app-error";
+
 const STRIPE_AUTH_URL  = "https://connect.stripe.com/oauth/authorize";
 const STRIPE_TOKEN_URL = "https://connect.stripe.com/oauth/token";
 
@@ -29,7 +31,23 @@ export async function exchangeStripeCode(code: string): Promise<StripeConnectTok
   });
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`Stripe Connect token exchange failed (${res.status}): ${body}`);
+    console.error(`[stripe/oauth] token exchange failed (${res.status}): ${body}`);
+    // 4xx = the code was bad, used or expired (`invalid_grant`): the admin can retry the
+    // connect, so it's a 400 with Stripe's reason. 5xx = Stripe itself failed: 502.
+    if (res.status >= 500) {
+      throw new AppError(502, "Stripe is unavailable — try connecting again shortly", "STRIPE_UNAVAILABLE");
+    }
+    throw new AppError(400, `Stripe didn't accept the connection: ${stripeReason(body)}`, "STRIPE_CONNECT_FAILED");
   }
   return res.json() as Promise<StripeConnectTokenResponse>;
+}
+
+/** Stripe's `error_description` (or `error`) from an OAuth error body; the raw text otherwise. */
+function stripeReason(body: string): string {
+  try {
+    const parsed = JSON.parse(body) as { error?: string; error_description?: string };
+    return parsed.error_description || parsed.error || body;
+  } catch {
+    return body || "unknown error";
+  }
 }

@@ -1,10 +1,13 @@
-import { CleaningFrequency, DayOfWeek, RoundStatus, VisitStatus, IssueType, Prisma } from "../generated/tenant-client";
+import { CleaningFrequency, DayOfWeek, LifecycleStatus, RoundStatus, VisitStatus, IssueType, Prisma } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 import { getCachedBusinessSettings } from "./settings.service";
-import { todayRange } from "../lib/dates";
+import { tenantTodayRange, tenantToday } from "./business-time";
 import { createMessageService } from "./message.service";
 import { generateForRound } from "../jobs/visitGeneration";
+import { autoSplit, resolveTechnicianForVisit, restampFutureVisits } from "./visit-assignment";
+import { startOfUtcDay } from "../lib/schedule";
+import { assertSectorsInServiceArea } from "../lib/postcode-sectors";
 
 // ---- input types ----------------------------------------------------------
 
@@ -14,6 +17,7 @@ export interface RoundCreateInput {
   serviceAreaId: string;
   defaultDay?: DayOfWeek | null;
   description?: string | null;
+  postcodeSectors?: string[];
 }
 
 export interface RoundUpdateInput {
@@ -23,6 +27,7 @@ export interface RoundUpdateInput {
   defaultDay?: DayOfWeek | null;
   description?: string | null;
   status?: RoundStatus;
+  postcodeSectors?: string[]; // [] = clear
 }
 
 // ---- output types ---------------------------------------------------------
@@ -35,6 +40,7 @@ export interface RoundSummary {
   status: RoundStatus;
   serviceAreaId: string | null;
   serviceAreaName: string | null;
+  postcodeSectors: string[];
   technicianCount: number;
   propertyCount: number;
 }
@@ -54,8 +60,23 @@ export interface RoundDetail {
   status: RoundStatus;
   serviceAreaId: string | null;
   serviceAreaName: string | null;
+  postcodeSectors: string[];
   technicians: TechnicianRef[];
   propertyCount: number;
+}
+
+export interface RoundPropertyPage {
+  rows: Array<{
+    propertyId: string;
+    addressLine: string;
+    postcode: string;
+    status: LifecycleStatus;
+    customerId: string;
+    customerName: string;
+    assignedTechnicianId: string | null;
+    servicePlans: Array<{ servicePlanId: string; serviceName: string | null; price: number; status: LifecycleStatus }>;
+  }>;
+  pagination: { page: number; pageSize: number; total: number; totalPages: number };
 }
 
 // ---- planner output types -------------------------------------------------
@@ -137,15 +158,61 @@ export interface TodayPanel {
 }
 
 export interface ReassignInput {
-  fromTechnicianId: string;
+  date?: Date;                     // visit date to reassign; defaults to today
+  fromTechnicianId: string | null; // null = the date's unassigned visits
   toTechnicianId: string;
-  scope: "remaining" | "all";
+  scope: "REMAINING" | "ALL";
+  permanent?: boolean;             // also move the properties' allocation
   note?: string | null;
   notify: boolean;
 }
 
 export interface ReassignResult {
-  updatedCount: number;
+  updated: number;
+}
+
+// ---- A1 technician split / allocation (GAP-012) ---------------------------
+
+export type SplitMode = "SINGLE" | "AUTO" | "MANUAL";
+
+export interface SplitInput {
+  mode: SplitMode;
+  allocations?: { propertyId: string; technicianId: string }[]; // MANUAL only
+}
+
+export interface AllocationEntry {
+  technicianId: string;
+  name: string | null;
+  propertyIds: string[];
+  stops: number;
+  value: string; // sum of the properties' ACTIVE plan prices, "37.00"
+}
+
+export interface SetTechniciansResult {
+  roundId: string;
+  allocation: AllocationEntry[];
+  visitsUpdated: number;
+}
+
+export interface RoundAllocation {
+  mode: SplitMode;
+  allocation: AllocationEntry[];
+}
+
+// 400 INVALID_ALLOCATION with a per-property reason map; the central error
+// handler forwards `fields` in the body.
+export class AllocationError extends AppError {
+  constructor(public readonly fields: Record<string, string>) {
+    super(400, "Invalid technician allocation", "INVALID_ALLOCATION");
+  }
+}
+
+// Thrown at the end of a dry-run transaction so every write rolls back while
+// the caller still gets the exact result (incl. visitsUpdated).
+class DryRunRollback extends Error {
+  constructor(public readonly result: SetTechniciansResult) {
+    super("dry run");
+  }
 }
 
 export interface PushMissedInput {
@@ -178,6 +245,48 @@ const roundDetailInclude = {
 
 type RoundWithRelations = Prisma.RoundGetPayload<{ include: typeof roundDetailInclude }>;
 
+const allocationPropertySelect = {
+  id: true,
+  postcode: true,
+  addressLine: true,
+  assignedTechnicianId: true,
+  servicePlans: { where: { status: LifecycleStatus.ACTIVE }, select: { price: true } },
+} satisfies Prisma.PropertySelect;
+
+type AllocationProperty = Prisma.PropertyGetPayload<{ select: typeof allocationPropertySelect }>;
+
+// Planner/today readers never show visits cancelled by a pause or round move (A4).
+const NOT_CANCELLED = { not: VisitStatus.CANCELLED };
+
+// autoSplit labels chunks in technicianIds order; sorting makes the split
+// independent of request order, so GET /allocation can recognise it as AUTO.
+function autoAssign(properties: AllocationProperty[], technicianIds: string[]): Map<string, string> {
+  return autoSplit(
+    properties.map((p) => ({ id: p.id, postcode: p.postcode, addressLine1: p.addressLine })),
+    [...technicianIds].sort()
+  );
+}
+
+function buildAllocation(
+  technicians: { id: string; name: string | null }[],
+  properties: AllocationProperty[],
+  assignment: Map<string, string | null>
+): AllocationEntry[] {
+  return technicians.map((t) => {
+    const mine = properties.filter((p) => assignment.get(p.id) === t.id);
+    const value = mine
+      .flatMap((p) => p.servicePlans)
+      .reduce((acc, sp) => acc.add(sp.price), new Prisma.Decimal(0));
+    return {
+      technicianId: t.id,
+      name: t.name,
+      propertyIds: mine.map((p) => p.id),
+      stops: mine.length,
+      value: value.toFixed(2),
+    };
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
@@ -205,6 +314,7 @@ class RoundService {
       status: r.status,
       serviceAreaId: r.serviceAreaId,
       serviceAreaName: r.serviceArea?.name ?? null,
+      postcodeSectors: r.postcodeSectors,
       technicianCount: r._count.roundTechnicians,
       propertyCount: r._count.properties,
     }));
@@ -213,13 +323,15 @@ class RoundService {
   // ---- create ----
 
   async createRound(input: RoundCreateInput): Promise<RoundDetail> {
-    await this.assertServiceAreaExists(input.serviceAreaId);
+    const area = await this.assertServiceAreaExists(input.serviceAreaId);
+    if (input.postcodeSectors) assertSectorsInServiceArea(input.postcodeSectors, area);
 
     const round = await this.prisma.round.create({
       data: {
         name: input.name,
         frequency: input.frequency,
         serviceAreaId: input.serviceAreaId,
+        postcodeSectors: input.postcodeSectors ?? [],
         defaultDay: input.defaultDay ?? null,
         description: input.description ?? null,
         status: RoundStatus.ACTIVE,
@@ -251,7 +363,7 @@ class RoundService {
   // Push Missed must not silently mutate visits after Close Day has run.
   private async assertDayNotClosed(): Promise<void> {
     const settings = await getCachedBusinessSettings(this.prisma);
-    const today = todayRange().start.toISOString().slice(0, 10);
+    const today = (await tenantTodayRange(this.prisma)).start.toISOString().slice(0, 10);
     if (settings?.lastClosedDate === today) {
       throw new AppError(409, "Operational day has already been closed");
     }
@@ -264,7 +376,15 @@ class RoundService {
     input: RoundUpdateInput
   ): Promise<RoundDetail> {
     await this.assertRoundExists(roundId);
-    if (input.serviceAreaId) await this.assertServiceAreaExists(input.serviceAreaId);
+    let area = input.serviceAreaId ? await this.assertServiceAreaExists(input.serviceAreaId) : null;
+    // Sectors are validated against the service area the round will end up in.
+    if (input.postcodeSectors && input.postcodeSectors.length > 0) {
+      if (!area && input.serviceAreaId !== null) {
+        const current = await this.prisma.round.findUnique({ where: { id: roundId }, select: { serviceArea: true } });
+        area = current?.serviceArea ?? null;
+      }
+      assertSectorsInServiceArea(input.postcodeSectors, area);
+    }
 
     const round = await this.prisma.round.update({
       where: { id: roundId },
@@ -272,6 +392,7 @@ class RoundService {
         name: input.name,
         frequency: input.frequency,
         serviceAreaId: input.serviceAreaId,
+        postcodeSectors: input.postcodeSectors,
         defaultDay: input.defaultDay,
         description: input.description,
         status: input.status,
@@ -282,24 +403,86 @@ class RoundService {
     return this.toDetail(round);
   }
 
-  // ---- set technicians (replace semantics) ----
+  // ---- paginated property listing (no 100-row ceiling: page through with total) ----
+
+  async listProperties(
+    roundId: string,
+    page: number,
+    pageSize: number
+  ): Promise<RoundPropertyPage> {
+    await this.assertRoundExists(roundId);
+    const where = { roundId, status: { not: LifecycleStatus.CANCELLED } };
+    const [total, rows] = await Promise.all([
+      this.prisma.property.count({ where }),
+      this.prisma.property.findMany({
+        where,
+        orderBy: [{ addressLine: "asc" }, { id: "asc" }],
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+        select: {
+          id: true,
+          addressLine: true,
+          postcode: true,
+          status: true,
+          assignedTechnicianId: true,
+          customer: { select: { id: true, name: true } },
+          servicePlans: {
+            where: { status: { not: LifecycleStatus.CANCELLED } },
+            select: { id: true, price: true, status: true, service: { select: { name: true } } },
+          },
+        },
+      }),
+    ]);
+    return {
+      rows: rows.map((p) => ({
+        propertyId: p.id,
+        addressLine: p.addressLine,
+        postcode: p.postcode,
+        status: p.status,
+        customerId: p.customer.id,
+        customerName: p.customer.name,
+        assignedTechnicianId: p.assignedTechnicianId,
+        servicePlans: p.servicePlans.map((sp) => ({
+          servicePlanId: sp.id,
+          serviceName: sp.service?.name ?? null,
+          price: Number(sp.price),
+          status: sp.status,
+        })),
+      })),
+      pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) },
+    };
+  }
+
+  // ---- set technicians (replace semantics) + property split (A1) ----
+  // Writes RoundTechnician, every round property's assignedTechnicianId and
+  // restamps future visits in one transaction. `split` omitted = SINGLE for
+  // one technician, AUTO for two or more. dryRun runs the whole transaction
+  // and rolls it back, so the preview is exactly what a save would do.
 
   async setTechnicians(
     roundId: string,
-    technicianIds: string[]
-  ): Promise<RoundDetail> {
+    technicianIds: string[],
+    split?: SplitInput,
+    options: { dryRun?: boolean } = {}
+  ): Promise<SetTechniciansResult> {
     await this.assertRoundExists(roundId);
 
     const uniqueIds = [...new Set(technicianIds)];
+    const mode: SplitMode = split?.mode ?? (uniqueIds.length >= 2 ? "AUTO" : "SINGLE");
+    if (split?.mode === "SINGLE" && uniqueIds.length !== 1) {
+      throw new AppError(400, 'Split mode "SINGLE" requires exactly one technician');
+    }
 
-    // Validate + replace inside one transaction to avoid TOCTOU (a technician
-    // deactivated between pre-check and write would otherwise be silently assigned).
-    const round = await this.prisma.$transaction(async (tx) => {
-      if (uniqueIds.length > 0) {
-        const found = await tx.technician.findMany({
-          where: { id: { in: uniqueIds } },
-          select: { id: true, active: true, profileId: true },
-        });
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        // Validate inside the transaction to avoid TOCTOU (a technician
+        // deactivated between pre-check and write would otherwise be assigned).
+        const found = uniqueIds.length > 0
+          ? await tx.technician.findMany({
+              where: { id: { in: uniqueIds } },
+              select: { id: true, name: true, active: true, profileId: true },
+            })
+          : [];
         if (found.length !== uniqueIds.length) {
           throw new AppError(404, "One or more technicians not found");
         }
@@ -307,7 +490,7 @@ class RoundService {
         if (pending.length > 0) {
           throw new AppError(
             400,
-            `Cannot assign technician(s) with a pending invite: ${pending.map((t) => t.id).join(", ")}`
+            `Cannot assign technician(s) with a pending invite: ${pending.map((t) => t.name ?? t.id).join(", ")}`
           );
         }
         const inactive = found.filter((t) => !t.active);
@@ -317,20 +500,117 @@ class RoundService {
             `Cannot assign inactive technician(s): ${inactive.map((t) => t.id).join(", ")}`
           );
         }
-      }
-      await tx.roundTechnician.deleteMany({ where: { roundId } });
-      if (uniqueIds.length > 0) {
-        await tx.roundTechnician.createMany({
-          data: uniqueIds.map((technicianId) => ({ roundId, technicianId })),
-        });
-      }
-      return tx.round.findUniqueOrThrow({
-        where: { id: roundId },
-        include: roundDetailInclude,
-      });
-    });
 
-    return this.toDetail(round);
+        const properties = await tx.property.findMany({
+          where: { roundId },
+          select: allocationPropertySelect,
+          orderBy: { addressLine: "asc" },
+        });
+        const assignment = this.assignProperties(mode, properties, uniqueIds, split?.allocations ?? []);
+
+        await tx.roundTechnician.deleteMany({ where: { roundId } });
+        if (uniqueIds.length > 0) {
+          await tx.roundTechnician.createMany({
+            data: uniqueIds.map((technicianId) => ({ roundId, technicianId })),
+          });
+        }
+        // One updateMany per target technician (null = unassigned).
+        const byTechnician = new Map<string | null, string[]>();
+        for (const [propertyId, technicianId] of assignment) {
+          byTechnician.set(technicianId, [...(byTechnician.get(technicianId) ?? []), propertyId]);
+        }
+        for (const [technicianId, ids] of byTechnician) {
+          await tx.property.updateMany({ where: { id: { in: ids } }, data: { assignedTechnicianId: technicianId } });
+        }
+        const visitsUpdated = await restampFutureVisits(tx, roundId, new Date());
+
+        const byId = new Map(found.map((t) => [t.id, t]));
+        const result: SetTechniciansResult = {
+          roundId,
+          allocation: buildAllocation(
+            uniqueIds.map((id) => ({ id, name: byId.get(id)!.name })),
+            properties,
+            assignment
+          ),
+          visitsUpdated,
+        };
+        if (options.dryRun) throw new DryRunRollback(result);
+        return result;
+      });
+    } catch (err) {
+      if (err instanceof DryRunRollback) return err.result;
+      throw err;
+    }
+  }
+
+  // propertyId → technicianId (null = unassigned) for every round property.
+  private assignProperties(
+    mode: SplitMode,
+    properties: AllocationProperty[],
+    technicianIds: string[],
+    allocations: { propertyId: string; technicianId: string }[]
+  ): Map<string, string | null> {
+    const assignment = new Map<string, string | null>(properties.map((p) => [p.id, null]));
+
+    if (mode === "MANUAL") {
+      // Properties left out of `allocations` stay unassigned.
+      const fields: Record<string, string> = {};
+      const seen = new Set<string>();
+      for (const a of allocations) {
+        if (!assignment.has(a.propertyId)) fields[a.propertyId] = "Property not in round";
+        else if (seen.has(a.propertyId)) fields[a.propertyId] = "Property allocated more than once";
+        else if (!technicianIds.includes(a.technicianId)) fields[a.propertyId] = "Technician not in technicianIds";
+        seen.add(a.propertyId);
+      }
+      if (Object.keys(fields).length > 0) throw new AllocationError(fields);
+      for (const a of allocations) assignment.set(a.propertyId, a.technicianId);
+    } else if (mode === "AUTO") {
+      for (const [propertyId, technicianId] of autoAssign(properties, technicianIds)) {
+        assignment.set(propertyId, technicianId);
+      }
+    } else if (technicianIds.length === 1) {
+      for (const p of properties) assignment.set(p.id, technicianIds[0]);
+    }
+    return assignment;
+  }
+
+  // ---- current allocation (A1, split screen) ----
+  // Effective allocation as visits would be stamped (property assignment if
+  // still on the round, else the sole technician). Mode is SINGLE for 0–1
+  // technicians, AUTO when the allocation matches the auto split, else MANUAL.
+
+  async getAllocation(roundId: string): Promise<RoundAllocation> {
+    await this.assertRoundExists(roundId);
+
+    const [roundTechs, properties] = await Promise.all([
+      this.prisma.roundTechnician.findMany({
+        where: { roundId },
+        select: { technician: { select: { id: true, name: true } } },
+        orderBy: { assignedAt: "asc" },
+      }),
+      this.prisma.property.findMany({
+        where: { roundId },
+        select: allocationPropertySelect,
+        orderBy: { addressLine: "asc" },
+      }),
+    ]);
+    const technicians = roundTechs.map((rt) => rt.technician);
+    const ids = technicians.map((t) => t.id);
+
+    const assignment = new Map(
+      properties.map((p) => [
+        p.id,
+        resolveTechnicianForVisit({ assignedTechnicianId: p.assignedTechnicianId, roundTechnicianIds: ids }),
+      ])
+    );
+
+    let mode: SplitMode = "SINGLE";
+    if (ids.length >= 2) {
+      const auto = autoAssign(properties, ids);
+      mode = properties.every((p) => auto.get(p.id) === assignment.get(p.id)) ? "AUTO" : "MANUAL";
+    }
+
+    return { mode, allocation: buildAllocation(technicians, properties, assignment) };
   }
 
   // ---- planner — occurrence list (calendar view) ----
@@ -358,6 +638,7 @@ class RoundService {
     const visits = await this.prisma.visit.findMany({
       where: {
         roundId,
+        status: NOT_CANCELLED,
         date: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) },
       },
       select: {
@@ -420,6 +701,7 @@ class RoundService {
     const visits = await this.prisma.visit.findMany({
       where: {
         roundId: { in: roundIds },
+        status: NOT_CANCELLED,
         date: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) },
       },
       select: {
@@ -491,7 +773,7 @@ class RoundService {
     const dayEnd = new Date(dayStart.getTime() + 86_400_000); // exclusive: next midnight
 
     const visits = await this.prisma.visit.findMany({
-      where: { roundId, date: { gte: dayStart, lt: dayEnd } },
+      where: { roundId, status: NOT_CANCELLED, date: { gte: dayStart, lt: dayEnd } },
       include: visitDetailInclude,
       orderBy: { property: { addressLine: "asc" } },
     });
@@ -522,7 +804,7 @@ class RoundService {
     const dayEnd = new Date(dayStart.getTime() + 86_400_000); // exclusive: next midnight
 
     const visits = await this.prisma.visit.findMany({
-      where: { roundId: { in: roundIds }, date: { gte: dayStart, lt: dayEnd } },
+      where: { roundId: { in: roundIds }, status: NOT_CANCELLED, date: { gte: dayStart, lt: dayEnd } },
       include: visitDetailInclude,
       orderBy: { property: { addressLine: "asc" } },
     });
@@ -549,7 +831,7 @@ class RoundService {
   async generateVisitsNow(roundId: string): Promise<GenerateVisitsResult> {
     const round = await this.prisma.round.findUnique({
       where: { id: roundId },
-      select: { id: true, frequency: true, status: true },
+      select: { id: true, frequency: true, defaultDay: true, status: true },
     });
     if (!round) throw new AppError(404, "Round not found");
     if (round.status !== RoundStatus.ACTIVE) {
@@ -575,6 +857,7 @@ class RoundService {
       status: round.status,
       serviceAreaId: round.serviceAreaId,
       serviceAreaName: round.serviceArea?.name ?? null,
+      postcodeSectors: round.postcodeSectors,
       technicians: round.roundTechnicians.map((rt) => ({
         id: rt.technician.id,
         name: rt.technician.name ?? null,
@@ -650,10 +933,10 @@ class RoundService {
     return rest;
   }
 
-  private async assertServiceAreaExists(id: string): Promise<void> {
-    if (!(await this.prisma.serviceArea.findUnique({ where: { id } }))) {
-      throw new AppError(404, `Service area not found: ${id}`);
-    }
+  private async assertServiceAreaExists(id: string) {
+    const area = await this.prisma.serviceArea.findUnique({ where: { id } });
+    if (!area) throw new AppError(404, `Service area not found: ${id}`);
+    return area;
   }
 
   // ---- M4: today panel (Screen 13) ----------------------------------------
@@ -670,7 +953,7 @@ class RoundService {
     const end = new Date(start.getTime() + 86_400_000);
 
     const visits = await this.prisma.visit.findMany({
-      where: { roundId, date: { gte: start, lt: end } },
+      where: { roundId, status: NOT_CANCELLED, date: { gte: start, lt: end } },
       include: {
         property: {
           select: { addressLine: true, latitude: true, longitude: true, customer: { select: { name: true } } },
@@ -727,7 +1010,12 @@ class RoundService {
     };
   }
 
-  // ---- M4: reassign technician (M15) ---------------------------------------
+  // ---- M4: reassign technician (M15, GAP-013) ------------------------------
+  // Moves one date's visits from a technician (or from nobody, when
+  // fromTechnicianId is null) to another. A one-off reassign marks the visits
+  // technicianOverride so restamping leaves them alone; `permanent` instead
+  // moves the properties' allocation (adding the target to the round) and
+  // restamps the round's future visits to match.
 
   async reassignTechnician(
     roundId: string,
@@ -738,7 +1026,12 @@ class RoundService {
     }
 
     await this.assertRoundExists(roundId);
-    await this.assertDayNotClosed();
+
+    const today = await tenantToday(this.prisma);
+    const start = startOfUtcDay(input.date ?? today);
+    if (start < today) throw new AppError(400, '"date" must be today or later');
+    if (start.getTime() === today.getTime()) await this.assertDayNotClosed();
+    const end = new Date(start.getTime() + 86_400_000);
 
     // Validate the target technician is active and has accepted their invite
     const toTech = await this.prisma.technician.findUnique({
@@ -749,26 +1042,39 @@ class RoundService {
     if (toTech.profileId === null) throw new AppError(400, "Target technician has not accepted their invite");
     if (!toTech.active) throw new AppError(400, "Target technician is inactive");
 
-    const start = new Date();
-    start.setUTCHours(0, 0, 0, 0);
-    const end = new Date(start.getTime() + 86_400_000);
-
     const statusFilter: VisitStatus[] =
-      input.scope === "remaining"
+      input.scope === "REMAINING"
         ? [VisitStatus.SCHEDULED, VisitStatus.IN_PROGRESS]
         : [VisitStatus.SCHEDULED, VisitStatus.IN_PROGRESS, VisitStatus.COMPLETED, VisitStatus.SKIPPED];
+    const where: Prisma.VisitWhereInput = {
+      roundId,
+      technicianId: input.fromTechnicianId,
+      date: { gte: start, lt: end },
+      status: { in: statusFilter },
+    };
+    const toTechnicianId = input.toTechnicianId;
 
-    const result = await this.prisma.visit.updateMany({
-      where: {
-        roundId,
-        technicianId: input.fromTechnicianId,
-        date: { gte: start, lt: end },
-        status: { in: statusFilter },
-      },
-      data: { technicianId: input.toTechnicianId },
+    if (!input.permanent) {
+      const result = await this.prisma.visit.updateMany({
+        where,
+        data: { technicianId: toTechnicianId, technicianOverride: true },
+      });
+      return { updated: result.count };
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      const visits = await tx.visit.findMany({ where, select: { id: true, propertyId: true } });
+      const propertyIds = [...new Set(visits.map((v) => v.propertyId))];
+
+      await tx.roundTechnician.createMany({ data: [{ roundId, technicianId: toTechnicianId }], skipDuplicates: true });
+      await tx.property.updateMany({ where: { id: { in: propertyIds } }, data: { assignedTechnicianId: toTechnicianId } });
+      const moved = await tx.visit.updateMany({
+        where: { id: { in: visits.map((v) => v.id) } },
+        data: { technicianId: toTechnicianId, technicianOverride: false },
+      });
+      const restamped = await restampFutureVisits(tx, roundId, today);
+      return { updated: moved.count + restamped };
     });
-
-    return { updatedCount: result.count };
   }
 
   // ---- M4: push missed jobs (M22) ------------------------------------------

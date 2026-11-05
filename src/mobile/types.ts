@@ -26,6 +26,8 @@ export interface MobileVisitRow {
   notes: string | null;
   issueCount: number;
   propertyNotes: { type: string; body: string }[];
+  startedAt: Date | null;
+  arrivedAt: Date | null;
   completedAt: Date | null;
   hasDebt: boolean;
   position: number | null;
@@ -56,9 +58,12 @@ export interface ChatMessageRow {
   id: string;
   roundId: string;
   senderProfileId: string;
+  senderRole: "TECHNICIAN" | "OFFICE";
   body: string | null;
   type: string;
   visitId: string | null;
   photoUrls: string[];
+  clientMsgId: string | null;
   createdAt: Date;
+  isMine: boolean; // sent by the signed-in technician
 }

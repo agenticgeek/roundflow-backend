@@ -15,6 +15,7 @@ vi.mock("../../lib/tenant-prisma-manager", () => ({
 // isolation behavior below is exercised against real cache semantics.
 vi.mock("lru-cache", async (importOriginal) => {
   const actual = await importOriginal<typeof import("lru-cache")>();
+  // eslint-disable-next-line @typescript-eslint/no-empty-object-type
   class RecordingLRUCache<K extends {}, V extends {}> extends actual.LRUCache<K, V> {
     constructor(options: ConstructorParameters<typeof actual.LRUCache<K, V>>[0]) {
       lruCtorCalls.push(options);
@@ -69,6 +70,7 @@ it("negative-cache guard: a 403 (no profile) is never cached — a profile creat
   const res1 = makeRes();
   await requireTenantAccess(makeReq("user1"), res1, vi.fn() as unknown as NextFunction);
   expect(res1.status).toHaveBeenCalledWith(403);
+  expect(res1.json).toHaveBeenCalledWith({ error: "No profile found for this user", code: "NO_PROFILE" });
 
   // Profile now exists (e.g. signup completed on another ECS task).
   findUnique.mockResolvedValueOnce(PROFILE);

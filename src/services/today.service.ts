@@ -1,12 +1,14 @@
 import { VisitStatus, Prisma } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
-import { todayRange } from "../lib/dates";
+import { tenantTodayRange } from "./business-time";
 import { getCachedBusinessSettings, invalidateCachedBusinessSettings } from "./settings.service";
 
 // ---------------------------------------------------------------------------
 // M4 — Today's Work (BE-M4-01, BE-M4-05).
 // ---------------------------------------------------------------------------
+
+export const DEFAULT_CLOSE_DAY_SKIP_REASON = "Not completed - day closed";
 
 // Returns the next Mon–Fri date after `date` (UTC). Skips Sat → Mon, Sun → Mon.
 function nextWorkingDay(date: Date): Date {
@@ -52,8 +54,11 @@ export interface TodayRoundRow {
   skipped: number;
   issueCount: number;
   paymentHolds: number;
+  scheduledValue: number; // every (non-cancelled) stop today
+  completedValue: number; // COMPLETED stops only
+  /** @deprecated same as completedValue; kept for one release (GAP-035). */
   value: number;
-  etaMinutes: number | null;
+  etaMinutes: null;       // no real estimate yet
 }
 
 export interface TodayTechnicianCard {
@@ -68,6 +73,7 @@ export interface TodayTechnicianCard {
 
 export interface TodaysWorkAggregate {
   date: string;
+  generatedAt: string; // ISO timestamp, for "Updated HH:mm"
   dayClosed: boolean;
   kpi: TodayKpi;
   rounds: TodayRoundRow[];
@@ -103,13 +109,13 @@ class TodayService {
   // ---- GET /today (Screen 12 aggregate) ----
 
   async getTodaysWork(): Promise<TodaysWorkAggregate> {
-    const { start, end } = todayRange();
+    const { start, end } = await tenantTodayRange(this.prisma);
     const today = start.toISOString().slice(0, 10);
 
     const [settings, visits] = await Promise.all([
       getCachedBusinessSettings(this.prisma),
       this.prisma.visit.findMany({
-        where: { date: { gte: start, lt: end } },
+        where: { date: { gte: start, lt: end }, status: { not: VisitStatus.CANCELLED } },
         include: visitTodayInclude,
         orderBy: { property: { addressLine: "asc" } },
       }),
@@ -117,6 +123,7 @@ class TodayService {
 
     return {
       date: today,
+      generatedAt: new Date().toISOString(),
       dayClosed: settings?.lastClosedDate === today,
       kpi: this.computeKpi(visits),
       rounds: this.buildRoundRows(visits),
@@ -127,9 +134,10 @@ class TodayService {
   // ---- POST /today/close (M21) ----
 
   async closeDay(
-    unfinishedAction: "push_to_tomorrow" | "mark_as_skipped"
+    unfinishedAction: "push_to_tomorrow" | "mark_as_skipped",
+    skipReason?: string | null
   ): Promise<CloseDaySummary> {
-    const { start, end } = todayRange();
+    const { start, end } = await tenantTodayRange(this.prisma);
 
     const result = await this.prisma.$transaction(async (tx) => {
       const today = start.toISOString().slice(0, 10);
@@ -145,7 +153,7 @@ class TodayService {
       }
 
       const visits = await tx.visit.findMany({
-        where: { date: { gte: start, lt: end } },
+        where: { date: { gte: start, lt: end }, status: { not: VisitStatus.CANCELLED } },
         select: {
           id: true,
           status: true,
@@ -174,7 +182,8 @@ class TodayService {
         } else {
           await tx.visit.updateMany({
             where: { id: { in: unfinishedIds } },
-            data: { status: VisitStatus.SKIPPED },
+            // B6: the close-of-day reason is stored on each visit (default text when none given).
+            data: { status: VisitStatus.SKIPPED, skipReason: skipReason?.trim() || DEFAULT_CLOSE_DAY_SKIP_REASON },
           });
         }
       }
@@ -243,10 +252,9 @@ class TodayService {
       const completed = vs.filter((v) => v.status === VisitStatus.COMPLETED).length;
       const skipped = vs.filter((v) => v.status === VisitStatus.SKIPPED).length;
       const inProgress = vs.filter((v) => v.status === VisitStatus.IN_PROGRESS).length;
-      const remaining = vs.filter(
-        (v) =>
-          v.status === VisitStatus.SCHEDULED || v.status === VisitStatus.IN_PROGRESS
-      ).length;
+      const completedValue = vs
+        .filter((v) => v.status === VisitStatus.COMPLETED)
+        .reduce((acc, v) => acc + v.price.toNumber(), 0);
 
       return {
         roundId,
@@ -259,12 +267,10 @@ class TodayService {
         skipped,
         issueCount: vs.reduce((acc, v) => acc + v._count.issues, 0),
         paymentHolds: vs.filter((v) => v.paymentHold).length,
-        value: completed > 0
-          ? vs
-              .filter((v) => v.status === VisitStatus.COMPLETED)
-              .reduce((acc, v) => acc + v.price.toNumber(), 0)
-          : 0,
-        etaMinutes: remaining > 0 ? remaining * 20 : null,
+        scheduledValue: vs.reduce((acc, v) => acc + v.price.toNumber(), 0),
+        completedValue,
+        value: completedValue,
+        etaMinutes: null,
       };
     });
   }

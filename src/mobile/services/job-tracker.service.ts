@@ -1,4 +1,4 @@
-import { IssueType, VisitStatus } from "../../generated/tenant-client";
+import { IssueType, NoteType, PhotoType, VisitStatus } from "../../generated/tenant-client";
 import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
 import { AppError } from "../../lib/app-error";
 import { evaluateDebtGate } from "./debt-gate";
@@ -43,15 +43,50 @@ class JobTrackerService {
     const visit = await this.prisma.visit.findUnique({ where: { id: visitId } });
     if (!visit) throw new AppError(404, "Visit not found");
     if (visit.status === VisitStatus.COMPLETED) throw new AppError(409, "Cannot skip a completed visit");
+    if (visit.status === VisitStatus.CANCELLED) throw new AppError(409, "Cannot skip a cancelled visit");
     if (visit.status === VisitStatus.SKIPPED) return;
     const skipReason = description ? `${reason}: ${description}` : reason;
     await this.prisma.visit.update({ where: { id: visitId }, data: { status: VisitStatus.SKIPPED, skipReason } });
   }
 
-  async reportAccessIssue(visitId: string, issueType: IssueType, description: string): Promise<void> {
+  // photoPaths: storage paths from POST /photos/upload-url (type ACCESS_ISSUE),
+  // stored as ACCESS_ISSUE Photo rows linked to the issue in the same insert.
+  // C3: the issue is linked to the property (Issue.propertyId) and a dated
+  // PropertyNote "<date> - Access problem (<type>) reported by <technician>: <description>"
+  // is written in the same transaction, so it shows on the property's Notes tab.
+  async reportAccessIssue(
+    visitId: string,
+    issueType: IssueType,
+    description: string,
+    photoPaths: string[] = [],
+    reporter: { technicianName?: string | null; profileId?: string | null } = {}
+  ): Promise<{ id: string }> {
     const visit = await this.prisma.visit.findUnique({ where: { id: visitId } });
     if (!visit) throw new AppError(404, "Visit not found");
-    await this.prisma.issue.create({ data: { visitId, type: issueType, note: description } });
+    const photos = photoPaths.map((url) => ({ url, type: PhotoType.ACCESS_ISSUE, visitId, propertyId: visit.propertyId }));
+    const date = new Date().toISOString().slice(0, 10);
+    const who = reporter.technicianName?.trim() || "technician";
+    const [issue] = await this.prisma.$transaction([
+      this.prisma.issue.create({
+        data: {
+          visitId,
+          propertyId: visit.propertyId,
+          type: issueType,
+          note: description,
+          ...(photos.length ? { photos: { create: photos } } : {}),
+        },
+        select: { id: true },
+      }),
+      this.prisma.propertyNote.create({
+        data: {
+          propertyId: visit.propertyId,
+          type: NoteType.INTERNAL,
+          body: `${date} - Access problem (${issueType}) reported by ${who}: ${description}`,
+          authorProfileId: reporter.profileId ?? null,
+        },
+      }),
+    ]);
+    return { id: issue.id };
   }
 
   async adjustPrice(visitId: string, price: number, reason?: string | null): Promise<void> {

@@ -1,4 +1,5 @@
 import { ServiceCategory, PaymentTiming, MessageChannel, RoundStatus } from "../generated/tenant-client";
+import type { ReminderMode, CleanMethod, PaymentMethod, NoDirectDebitAction } from "../generated/tenant-client";
 import type {
   BusinessSettings,
   Service,
@@ -10,6 +11,16 @@ import type {
 import { Prisma as TenantPrisma } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
+import { assertKnownPlaceholders, normalizePlaceholders } from "./message-templates";
+import { releaseTechnicianWork } from "./visit-assignment";
+import { localDay } from "../lib/dates";
+import {
+  resolveReminderInput,
+  parseStoredReminders,
+  legacyFromReminders,
+  resolvePaymentMethods,
+  type PreCleanReminder,
+} from "../lib/settings-validators";
 import { deriveAppStatus, techInclude, mapServiceAreas } from "./technician.service";
 import type { TechnicianServiceAreaRow } from "./technician.service";
 
@@ -35,12 +46,24 @@ export interface BusinessProfileUpdateInput {
   currency?: string | null;
   defaultWorkingDays?: string[];
   bankDetails?: BankDetails | null;
+  addressLine1?: string | null;
+  addressLine2?: string | null;
+  town?: string | null;
+  postcode?: string | null;
+  vatRate?: number;
 }
 
 export interface RoundSettingsUpdateInput {
   defaultCycleLength?: number | null;
   defaultWorkingDays?: string[];
+  /** @deprecated use reminderMode/reminderTime (B2). Still stored for old clients. */
   preCleanReminderTimings?: string[];
+  /** BUG-01: list of { type, time }; [] = no reminders. Wins over reminderMode/reminderTime. */
+  preCleanReminders?: PreCleanReminder[];
+  reminderMode?: ReminderMode;
+  reminderTime?: string;
+  defaultCleanMethod?: CleanMethod | null;
+  autoCreateNextVisit?: boolean;
 }
 
 export interface ServiceCreateInput {
@@ -96,6 +119,11 @@ export interface PaymentRulesUpdateInput {
   debtHoldEnabled?: boolean;
   debtHoldMaxInvoices?: number | null;
   debtHoldMaxAmount?: number | null;
+  defaultPaymentMethod?: PaymentMethod | null;
+  /** BUG-05: methods the business accepts; defaultPaymentMethod must be one of them. */
+  acceptedPaymentMethods?: PaymentMethod[];
+  invoiceDueDays?: number;
+  noDirectDebitAction?: NoDirectDebitAction;
 }
 
 /** ServiceArea + a derived, read-only summary of Rounds that reference it. */
@@ -183,6 +211,20 @@ type SettingsWritable = {
   stripeConnected?: boolean;
   preCleanReminderTimings?: string[];
   bankDetails?: TenantPrisma.InputJsonValue | typeof TenantPrisma.JsonNull;
+  addressLine1?: string | null;
+  addressLine2?: string | null;
+  town?: string | null;
+  postcode?: string | null;
+  vatRate?: number;
+  reminderMode?: ReminderMode;
+  reminderTime?: string;
+  preCleanReminders?: TenantPrisma.InputJsonValue;
+  defaultCleanMethod?: CleanMethod | null;
+  autoCreateNextVisit?: boolean;
+  defaultPaymentMethod?: PaymentMethod | null;
+  acceptedPaymentMethods?: PaymentMethod[];
+  invoiceDueDays?: number;
+  noDirectDebitAction?: NoDirectDebitAction;
 };
 
 // ---------------------------------------------------------------------------
@@ -314,6 +356,11 @@ class SettingsService {
           : input.bankDetails === null
           ? TenantPrisma.JsonNull
           : (input.bankDetails as unknown as TenantPrisma.InputJsonValue),
+      addressLine1: input.addressLine1,
+      addressLine2: input.addressLine2,
+      town: input.town,
+      postcode: input.postcode,
+      vatRate: input.vatRate,
     });
   }
 
@@ -322,10 +369,22 @@ class SettingsService {
   async updateRoundSettings(
     input: RoundSettingsUpdateInput
   ): Promise<BusinessSettings> {
+    // BUG-01: every reminder shape resolves to the list; the legacy columns
+    // follow its first entry so old clients keep reading something sensible.
+    const current = await this.getSettings();
+    const reminders = resolveReminderInput(
+      input,
+      parseStoredReminders(current?.preCleanReminders, current?.reminderMode, current?.reminderTime)
+    );
     return this.writeSettings({
       defaultCycleLength: input.defaultCycleLength,
       defaultWorkingDays: input.defaultWorkingDays,
       preCleanReminderTimings: input.preCleanReminderTimings,
+      ...(reminders
+        ? { preCleanReminders: reminders as unknown as TenantPrisma.InputJsonValue, ...legacyFromReminders(reminders) }
+        : {}),
+      defaultCleanMethod: input.defaultCleanMethod,
+      autoCreateNextVisit: input.autoCreateNextVisit,
     });
   }
 
@@ -581,6 +640,12 @@ class SettingsService {
       throw err;
     }
 
+    // C1: deactivating releases the technician's upcoming visits.
+    if (input.active === false && existing.active) {
+      const settings = await this.getSettings();
+      await releaseTechnicianWork(this.prisma, id, localDay(settings?.timezone ?? undefined));
+    }
+
     return {
       ...tech,
       displayName: tech.name ?? null,
@@ -607,12 +672,17 @@ class SettingsService {
     input: PaymentRulesUpdateInput
   ): Promise<BusinessSettings> {
     // Rules only — never touches the gocardless/stripe connect booleans.
+    const methods = resolvePaymentMethods(input, await this.getSettings());
     return this.writeSettings({
       paymentRule: input.paymentRule,
       vatInInvoices: input.vatInInvoices,
       debtHoldEnabled: input.debtHoldEnabled,
       debtHoldMaxInvoices: input.debtHoldMaxInvoices,
       debtHoldMaxAmount: input.debtHoldMaxAmount,
+      defaultPaymentMethod: methods.defaultPaymentMethod,
+      acceptedPaymentMethods: methods.acceptedPaymentMethods,
+      invoiceDueDays: input.invoiceDueDays,
+      noDirectDebitAction: input.noDirectDebitAction,
     });
   }
 
@@ -626,12 +696,13 @@ class SettingsService {
   async createMessageTemplate(
     input: MessageTemplateInput
   ): Promise<MessageTemplateView> {
+    assertKnownPlaceholders(input.body, input.subject);
     const row = await this.prisma.messageTemplate.create({
       data: {
         name: input.name,
         channel: input.channel,
-        body: input.body,
-        subject: input.subject ?? null,
+        body: normalizePlaceholders(input.body),
+        subject: normalizePlaceholders(input.subject) ?? null,
       },
     });
     return toTemplateView(row);
@@ -644,13 +715,14 @@ class SettingsService {
     if (!(await this.prisma.messageTemplate.findUnique({ where: { id } }))) {
       throw new AppError(404, "Message template not found");
     }
+    assertKnownPlaceholders(input.body, input.subject);
     const row = await this.prisma.messageTemplate.update({
       where: { id },
       data: {
         name: input.name,
         channel: input.channel,
-        body: input.body,
-        subject: input.subject,
+        body: normalizePlaceholders(input.body),
+        subject: normalizePlaceholders(input.subject),
       },
     });
     return toTemplateView(row);
@@ -666,6 +738,7 @@ class SettingsService {
   async replaceTemplates(
     templates: MessageTemplateInput[]
   ): Promise<MessageTemplateView[]> {
+    for (const t of templates) assertKnownPlaceholders(t.body, t.subject);
     const rows = await this.prisma.$transaction(async (tx) => {
       await tx.messageTemplate.deleteMany();
       if (templates.length === 0) return [];
@@ -673,8 +746,8 @@ class SettingsService {
         data: templates.map((t) => ({
           name: t.name,
           channel: t.channel,
-          body: t.body,
-          subject: t.subject ?? null,
+          body: normalizePlaceholders(t.body),
+          subject: normalizePlaceholders(t.subject) ?? null,
         })),
       });
       return tx.messageTemplate.findMany({ orderBy: { createdAt: "asc" } });

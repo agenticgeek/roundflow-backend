@@ -1,5 +1,5 @@
-import { it, expect, vi, beforeEach } from "vitest";
-import { createRoundService } from "../round.service";
+import { it, expect, vi, beforeEach, describe } from "vitest";
+import { createRoundService, AllocationError } from "../round.service";
 import { CleaningFrequency, RoundStatus } from "../../generated/tenant-client";
 
 const sendMessage = vi.fn();
@@ -7,8 +7,17 @@ vi.mock("../message.service", () => ({
   createMessageService: vi.fn(() => ({ send: sendMessage })),
 }));
 
+// Real resolve/autoSplit; restamping is visit-assignment's own concern
+// (tested there), so it's stubbed to a count here.
+const restampFutureVisits = vi.fn();
+vi.mock("../visit-assignment", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../visit-assignment")>()),
+  restampFutureVisits: (...args: unknown[]) => restampFutureVisits(...args),
+}));
+
 beforeEach(() => {
   sendMessage.mockReset();
+  restampFutureVisits.mockReset().mockResolvedValue(0);
 });
 
 function makePrisma() {
@@ -16,10 +25,11 @@ function makePrisma() {
     round: { findMany: vi.fn(), findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), create: vi.fn(), update: vi.fn(), delete: vi.fn() },
     serviceArea: { findUnique: vi.fn() },
     technician: { findUnique: vi.fn(), findMany: vi.fn() },
-    property: { findMany: vi.fn() },
+    property: { findMany: vi.fn(), updateMany: vi.fn() },
     servicePlan: { update: vi.fn() },
     visit: { findMany: vi.fn(), updateMany: vi.fn(), findFirst: vi.fn(), create: vi.fn() },
-    roundTechnician: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn() },
+    roundTechnician: { findMany: vi.fn().mockResolvedValue([]), deleteMany: vi.fn(), createMany: vi.fn() },
+    technicianAvailability: { findMany: vi.fn().mockResolvedValue([]) },
     // Defaults to "no settings row" (day not closed) so pre-existing tests
     // that don't care about Close Day behave the same as before it existed.
     businessSettings: { findFirst: vi.fn().mockResolvedValue(null) },
@@ -77,7 +87,7 @@ it("reassignTechnician throws 400 when target technician has not accepted their 
     createRoundService(prisma).reassignTechnician("r1", {
       fromTechnicianId: "t1",
       toTechnicianId: "t2",
-      scope: "remaining",
+      scope: "REMAINING",
       notify: false,
     })
   ).rejects.toMatchObject({ statusCode: 400 });
@@ -493,6 +503,8 @@ it("generateVisitsNow creates due visits for the round's ACTIVE properties right
   (prisma.property.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
     {
       id: "p1",
+      assignedTechnicianId: null,
+      customer: { holdNextClean: false },
       servicePlans: [
         { id: "sp1", price: 35, nextDueDate: new Date("2026-01-01T00:00:00.000Z"), cleaningFrequency: "FOUR_WEEKLY", serviceId: null },
       ],
@@ -516,6 +528,8 @@ it("generateVisitsNow skips a plan that already has a future scheduled/in-progre
   (prisma.property.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
     {
       id: "p1",
+      assignedTechnicianId: null,
+      customer: { holdNextClean: false },
       servicePlans: [
         { id: "sp1", price: 35, nextDueDate: new Date("2026-01-01T00:00:00.000Z"), cleaningFrequency: "FOUR_WEEKLY", serviceId: null },
       ],
@@ -533,7 +547,7 @@ it("generateVisitsNow skips a plan with no frequency (neither its own nor the ro
   const prisma = makePrisma();
   (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1", frequency: null, status: RoundStatus.ACTIVE });
   (prisma.property.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
-    { id: "p1", servicePlans: [{ id: "sp1", price: 35, nextDueDate: null, cleaningFrequency: null, serviceId: null }] },
+    { id: "p1", assignedTechnicianId: null, customer: { holdNextClean: false }, servicePlans: [{ id: "sp1", price: 35, nextDueDate: null, cleaningFrequency: null, serviceId: null }] },
   ]);
 
   const result = await createRoundService(prisma).generateVisitsNow("r1");
@@ -548,7 +562,7 @@ it("reassignTechnician throws 400 when fromTechnicianId and toTechnicianId are t
     createRoundService(prisma).reassignTechnician("r1", {
       fromTechnicianId: "t1",
       toTechnicianId: "t1",
-      scope: "remaining",
+      scope: "REMAINING",
       notify: false,
     })
   ).rejects.toMatchObject({ statusCode: 400 });
@@ -566,7 +580,7 @@ it("reassignTechnician throws 409 when the operational day is already closed", a
     createRoundService(prisma).reassignTechnician("r1", {
       fromTechnicianId: "t1",
       toTechnicianId: "t2",
-      scope: "remaining",
+      scope: "REMAINING",
       notify: false,
     })
   ).rejects.toMatchObject({ statusCode: 409 });
@@ -581,10 +595,15 @@ it("reassignTechnician succeeds when the day is not closed", async () => {
   const result = await createRoundService(prisma).reassignTechnician("r1", {
     fromTechnicianId: "t1",
     toTechnicianId: "t2",
-    scope: "all",
+    scope: "ALL",
     notify: false,
   });
-  expect(result).toEqual({ updatedCount: 3 });
+  expect(result).toEqual({ updated: 3 });
+  // A one-off reassign is pinned so restamping leaves it alone.
+  expect(prisma.visit.updateMany).toHaveBeenCalledWith({
+    where: expect.objectContaining({ roundId: "r1", technicianId: "t1" }),
+    data: { technicianId: "t2", technicianOverride: true },
+  });
 });
 
 it("pushMissedJobs throws 409 when the operational day is already closed", async () => {
@@ -696,4 +715,362 @@ it("pushMissedJobs logs and continues when a per-customer send fails (best-effor
   expect(sendMessage).toHaveBeenCalledTimes(2);
   expect(consoleErrorSpy).toHaveBeenCalled();
   consoleErrorSpy.mockRestore();
+});
+
+// ---- A1: setTechnicians split / allocation (GAP-012) ----------------------
+
+const mock = (fn: unknown) => fn as ReturnType<typeof vi.fn>;
+
+function tech(id: string, overrides: Record<string, unknown> = {}) {
+  return { id, name: `Tech ${id}`, active: true, profileId: `prof-${id}`, ...overrides };
+}
+
+function roundProperty(id: string, addressLine: string, prices: number[] = [], assignedTechnicianId: string | null = null) {
+  return { id, postcode: "NE66 1AA", addressLine, assignedTechnicianId, servicePlans: prices.map((price) => ({ price })) };
+}
+
+function splitPrisma(technicians: ReturnType<typeof tech>[], properties: ReturnType<typeof roundProperty>[]) {
+  const prisma = makePrisma();
+  mock(prisma.round.findUnique).mockResolvedValue({ id: "r1" });
+  mock(prisma.technician.findMany).mockResolvedValue(technicians);
+  mock(prisma.property.findMany).mockResolvedValue(properties);
+  return prisma;
+}
+
+// propertyIds per assignedTechnicianId from the property.updateMany calls.
+function propertyWrites(prisma: ReturnType<typeof makePrisma>) {
+  return Object.fromEntries(
+    mock(prisma.property.updateMany).mock.calls.map((c) => [String(c[0].data.assignedTechnicianId), c[0].where.id.in])
+  );
+}
+
+describe("setTechnicians", () => {
+  it("404s when the round does not exist", async () => {
+    const prisma = makePrisma();
+    mock(prisma.round.findUnique).mockResolvedValue(null);
+    await expect(createRoundService(prisma).setTechnicians("missing", [])).rejects.toMatchObject({ statusCode: 404 });
+  });
+
+  it("404s when a technician is unknown", async () => {
+    const prisma = splitPrisma([], []);
+    await expect(createRoundService(prisma).setTechnicians("r1", ["t1"])).rejects.toMatchObject({ statusCode: 404 });
+  });
+
+  it("names pending-invite technicians in the 400 (falling back to id)", async () => {
+    const prisma = splitPrisma([tech("t1", { profileId: null }), tech("t2", { profileId: null, name: null })], []);
+    await expect(createRoundService(prisma).setTechnicians("r1", ["t1", "t2"])).rejects.toMatchObject({
+      statusCode: 400,
+      message: "Cannot assign technician(s) with a pending invite: Tech t1, t2",
+    });
+  });
+
+  it("400s for an inactive technician", async () => {
+    const prisma = splitPrisma([tech("t1", { active: false })], []);
+    await expect(createRoundService(prisma).setTechnicians("r1", ["t1"])).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it("400s when SINGLE is given with other than exactly one technician", async () => {
+    const prisma = splitPrisma([], []);
+    for (const ids of [[], ["t1", "t2"]]) {
+      await expect(
+        createRoundService(prisma).setTechnicians("r1", ids, { mode: "SINGLE" })
+      ).rejects.toMatchObject({ statusCode: 400 });
+    }
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it("defaults to SINGLE for one technician: every property, round technicians replaced, visits restamped", async () => {
+    const prisma = splitPrisma([tech("t1")], [roundProperty("p1", "1 High St", [20, 17]), roundProperty("p2", "2 High St", [15])]);
+    restampFutureVisits.mockResolvedValue(6);
+
+    const result = await createRoundService(prisma).setTechnicians("r1", ["t1", "t1"]);
+
+    expect(result).toEqual({
+      roundId: "r1",
+      allocation: [{ technicianId: "t1", name: "Tech t1", propertyIds: ["p1", "p2"], stops: 2, value: "52.00" }],
+      visitsUpdated: 6,
+    });
+    expect(prisma.roundTechnician.deleteMany).toHaveBeenCalledWith({ where: { roundId: "r1" } });
+    expect(prisma.roundTechnician.createMany).toHaveBeenCalledWith({ data: [{ roundId: "r1", technicianId: "t1" }] });
+    expect(propertyWrites(prisma)).toEqual({ t1: ["p1", "p2"] });
+    expect(restampFutureVisits).toHaveBeenCalledWith(prisma, "r1", expect.any(Date));
+  });
+
+  it("an empty list clears the round and unassigns every property", async () => {
+    const prisma = splitPrisma([], [roundProperty("p1", "1 High St")]);
+
+    const result = await createRoundService(prisma).setTechnicians("r1", []);
+
+    expect(result.allocation).toEqual([]);
+    expect(prisma.technician.findMany).not.toHaveBeenCalled();
+    expect(prisma.roundTechnician.createMany).not.toHaveBeenCalled();
+    expect(propertyWrites(prisma)).toEqual({ null: ["p1"] });
+  });
+
+  it("defaults to AUTO for two or more technicians, keeping streets whole", async () => {
+    const prisma = splitPrisma(
+      [tech("t1"), tech("t2")],
+      [
+        roundProperty("a1", "1 Acre Rd", [10]),
+        roundProperty("a2", "2 Acre Rd", [10]),
+        roundProperty("b1", "1 Bell St", [12]),
+        roundProperty("b2", "2 Bell St", [12]),
+      ]
+    );
+
+    // Request order doesn't matter: the split is labelled by sorted id.
+    const result = await createRoundService(prisma).setTechnicians("r1", ["t2", "t1"]);
+
+    expect(result.allocation).toEqual([
+      { technicianId: "t2", name: "Tech t2", propertyIds: ["b1", "b2"], stops: 2, value: "24.00" },
+      { technicianId: "t1", name: "Tech t1", propertyIds: ["a1", "a2"], stops: 2, value: "20.00" },
+    ]);
+    expect(propertyWrites(prisma)).toEqual({ t1: ["a1", "a2"], t2: ["b1", "b2"] });
+  });
+
+  it("MANUAL writes the given allocation and leaves unlisted properties unassigned", async () => {
+    const prisma = splitPrisma(
+      [tech("t1"), tech("t2")],
+      [roundProperty("p1", "1 High St"), roundProperty("p2", "2 High St"), roundProperty("p3", "3 High St")]
+    );
+
+    const result = await createRoundService(prisma).setTechnicians("r1", ["t1", "t2"], {
+      mode: "MANUAL",
+      allocations: [{ propertyId: "p1", technicianId: "t2" }, { propertyId: "p2", technicianId: "t1" }],
+    });
+
+    expect(result.allocation.map((a) => [a.technicianId, a.propertyIds])).toEqual([["t1", ["p2"]], ["t2", ["p1"]]]);
+    expect(propertyWrites(prisma)).toEqual({ t2: ["p1"], t1: ["p2"], null: ["p3"] });
+  });
+
+  it("MANUAL without allocations unassigns everything", async () => {
+    const prisma = splitPrisma([tech("t1")], [roundProperty("p1", "1 High St")]);
+    await createRoundService(prisma).setTechnicians("r1", ["t1"], { mode: "MANUAL" });
+    expect(propertyWrites(prisma)).toEqual({ null: ["p1"] });
+  });
+
+  it("MANUAL 400s with INVALID_ALLOCATION and a per-property reason map, writing nothing", async () => {
+    const prisma = splitPrisma([tech("t1")], [roundProperty("p1", "1 High St"), roundProperty("p2", "2 High St")]);
+
+    const err = await createRoundService(prisma)
+      .setTechnicians("r1", ["t1"], {
+        mode: "MANUAL",
+        allocations: [
+          { propertyId: "p9", technicianId: "t1" },
+          { propertyId: "p1", technicianId: "t1" },
+          { propertyId: "p1", technicianId: "t1" },
+          { propertyId: "p2", technicianId: "t7" },
+        ],
+      })
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(AllocationError);
+    expect(err).toMatchObject({
+      statusCode: 400,
+      code: "INVALID_ALLOCATION",
+      fields: {
+        p9: "Property not in round",
+        p1: "Property allocated more than once",
+        p2: "Technician not in technicianIds",
+      },
+    });
+    expect(prisma.roundTechnician.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("dryRun returns the same result but rolls the transaction back", async () => {
+    const prisma = splitPrisma([tech("t1")], [roundProperty("p1", "1 High St", [20])]);
+    let rejected: unknown;
+    mock(prisma.$transaction).mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) => {
+      try {
+        return await fn(prisma);
+      } catch (e) {
+        rejected = e; // a real interactive transaction rolls back here
+        throw e;
+      }
+    });
+    restampFutureVisits.mockResolvedValue(3);
+
+    const result = await createRoundService(prisma).setTechnicians("r1", ["t1"], undefined, { dryRun: true });
+
+    expect(result).toEqual({
+      roundId: "r1",
+      allocation: [{ technicianId: "t1", name: "Tech t1", propertyIds: ["p1"], stops: 1, value: "20.00" }],
+      visitsUpdated: 3,
+    });
+    expect(rejected).toBeInstanceOf(Error);
+  });
+
+  it("propagates a restamp failure (the transaction rolls back)", async () => {
+    const prisma = splitPrisma([tech("t1")], []);
+    restampFutureVisits.mockRejectedValue(new Error("db down"));
+    await expect(createRoundService(prisma).setTechnicians("r1", ["t1"])).rejects.toThrow("db down");
+  });
+});
+
+describe("getAllocation", () => {
+  function allocationPrisma(techIds: string[], properties: ReturnType<typeof roundProperty>[]) {
+    const prisma = makePrisma();
+    mock(prisma.round.findUnique).mockResolvedValue({ id: "r1" });
+    mock(prisma.roundTechnician.findMany).mockResolvedValue(
+      techIds.map((id) => ({ technician: { id, name: `Tech ${id}` } }))
+    );
+    mock(prisma.property.findMany).mockResolvedValue(properties);
+    return prisma;
+  }
+
+  it("404s when the round does not exist", async () => {
+    const prisma = makePrisma();
+    mock(prisma.round.findUnique).mockResolvedValue(null);
+    await expect(createRoundService(prisma).getAllocation("missing")).rejects.toMatchObject({ statusCode: 404 });
+  });
+
+  it("SINGLE: the sole technician gets every property, assigned or not", async () => {
+    const prisma = allocationPrisma(["t1"], [roundProperty("p1", "1 High St", [10]), roundProperty("p2", "2 High St", [], "gone")]);
+
+    const result = await createRoundService(prisma).getAllocation("r1");
+
+    expect(result).toEqual({
+      mode: "SINGLE",
+      allocation: [{ technicianId: "t1", name: "Tech t1", propertyIds: ["p1", "p2"], stops: 2, value: "10.00" }],
+    });
+  });
+
+  it("no technicians: SINGLE with an empty allocation", async () => {
+    const prisma = allocationPrisma([], [roundProperty("p1", "1 High St")]);
+    expect(await createRoundService(prisma).getAllocation("r1")).toEqual({ mode: "SINGLE", allocation: [] });
+  });
+
+  it("AUTO when the stored allocation matches the auto split", async () => {
+    const prisma = allocationPrisma(["t2", "t1"], [
+      roundProperty("a1", "1 Acre Rd", [], "t1"),
+      roundProperty("b1", "1 Bell St", [], "t2"),
+    ]);
+    const result = await createRoundService(prisma).getAllocation("r1");
+    expect(result.mode).toBe("AUTO");
+    expect(result.allocation.map((a) => [a.technicianId, a.propertyIds])).toEqual([["t2", ["b1"]], ["t1", ["a1"]]]);
+  });
+
+  it("MANUAL when it doesn't", async () => {
+    const prisma = allocationPrisma(["t1", "t2"], [
+      roundProperty("a1", "1 Acre Rd", [], "t2"),
+      roundProperty("b1", "1 Bell St", [], "t1"),
+    ]);
+    expect((await createRoundService(prisma).getAllocation("r1")).mode).toBe("MANUAL");
+  });
+});
+
+// ---- reassign (GAP-013) ----------------------------------------------------
+
+describe("reassignTechnician (date / unassigned / permanent)", () => {
+  function reassignPrisma() {
+    const prisma = makePrisma();
+    mock(prisma.round.findUnique).mockResolvedValue({ id: "r1" });
+    mock(prisma.technician.findUnique).mockResolvedValue({ id: "t2", active: true, profileId: "p2" });
+    mock(prisma.visit.updateMany).mockResolvedValue({ count: 2 });
+    return prisma;
+  }
+  const futureDate = () => {
+    const d = new Date(Date.now() + 7 * 86_400_000);
+    d.setUTCHours(0, 0, 0, 0);
+    return d;
+  };
+
+  it("moves the date's unassigned visits when fromTechnicianId is null", async () => {
+    const prisma = reassignPrisma();
+    const date = futureDate();
+
+    const result = await createRoundService(prisma).reassignTechnician("r1", {
+      date, fromTechnicianId: null, toTechnicianId: "t2", scope: "REMAINING", notify: false,
+    });
+
+    expect(result).toEqual({ updated: 2 });
+    expect(prisma.visit.updateMany).toHaveBeenCalledWith({
+      where: {
+        roundId: "r1",
+        technicianId: null,
+        date: { gte: date, lt: new Date(date.getTime() + 86_400_000) },
+        status: { in: ["SCHEDULED", "IN_PROGRESS"] },
+      },
+      data: { technicianId: "t2", technicianOverride: true },
+    });
+  });
+
+  it("does not check Close Day for a future date", async () => {
+    const prisma = reassignPrisma();
+    mock(prisma.businessSettings.findFirst).mockResolvedValue({ lastClosedDate: new Date().toISOString().slice(0, 10) });
+    await expect(
+      createRoundService(prisma).reassignTechnician("r1", {
+        date: futureDate(), fromTechnicianId: "t1", toTechnicianId: "t2", scope: "ALL", notify: false,
+      })
+    ).resolves.toEqual({ updated: 2 });
+  });
+
+  it("400s for a past date", async () => {
+    const prisma = reassignPrisma();
+    await expect(
+      createRoundService(prisma).reassignTechnician("r1", {
+        date: new Date("2020-01-01T00:00:00.000Z"), fromTechnicianId: null, toTechnicianId: "t2", scope: "ALL", notify: false,
+      })
+    ).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it("404s when the target technician is missing, 400s when inactive", async () => {
+    const prisma = reassignPrisma();
+    const input = { fromTechnicianId: null, toTechnicianId: "t2", scope: "ALL" as const, notify: false };
+    mock(prisma.technician.findUnique).mockResolvedValueOnce(null);
+    await expect(createRoundService(prisma).reassignTechnician("r1", input)).rejects.toMatchObject({ statusCode: 404 });
+    mock(prisma.technician.findUnique).mockResolvedValueOnce({ id: "t2", active: false, profileId: "p2" });
+    await expect(createRoundService(prisma).reassignTechnician("r1", input)).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it("permanent: moves the properties' allocation, adds the target to the round and restamps", async () => {
+    const prisma = reassignPrisma();
+    mock(prisma.visit.findMany).mockResolvedValue([
+      { id: "v1", propertyId: "p1" },
+      { id: "v2", propertyId: "p1" },
+      { id: "v3", propertyId: "p2" },
+    ]);
+    mock(prisma.visit.updateMany).mockResolvedValue({ count: 3 });
+    restampFutureVisits.mockResolvedValue(5);
+
+    const result = await createRoundService(prisma).reassignTechnician("r1", {
+      fromTechnicianId: "t1", toTechnicianId: "t2", scope: "REMAINING", permanent: true, notify: false,
+    });
+
+    expect(result).toEqual({ updated: 8 });
+    expect(prisma.roundTechnician.createMany).toHaveBeenCalledWith({
+      data: [{ roundId: "r1", technicianId: "t2" }],
+      skipDuplicates: true,
+    });
+    expect(prisma.property.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ["p1", "p2"] } },
+      data: { assignedTechnicianId: "t2" },
+    });
+    expect(prisma.visit.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ["v1", "v2", "v3"] } },
+      data: { technicianId: "t2", technicianOverride: false },
+    });
+    expect(restampFutureVisits).toHaveBeenCalledWith(prisma, "r1", expect.any(Date));
+  });
+});
+
+// ---- A4: planner/today readers exclude CANCELLED ---------------------------
+
+it("planner and today-panel queries exclude CANCELLED visits", async () => {
+  const prisma = makePrisma();
+  mock(prisma.round.findUnique).mockResolvedValue({ id: "r1", name: "Round 1" });
+  mock(prisma.visit.findMany).mockResolvedValue([]);
+  const svc = createRoundService(prisma);
+  const from = new Date("2026-01-01T00:00:00.000Z");
+
+  await svc.listOccurrences("r1", from);
+  await svc.listOccurrencesForRounds(["r1"], from);
+  await svc.getOccurrence("r1", "2026-01-01");
+  await svc.listDayStopsForRounds(["r1"], "2026-01-01");
+  await svc.getTodayPanel("r1");
+
+  for (const call of mock(prisma.visit.findMany).mock.calls) {
+    expect(call[0].where.status).toEqual({ not: "CANCELLED" });
+  }
+  expect(mock(prisma.visit.findMany).mock.calls).toHaveLength(5);
 });

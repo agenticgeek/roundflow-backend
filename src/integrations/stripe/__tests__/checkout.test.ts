@@ -1,5 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
-import { createOneTimeSession, createSetupSession } from "../checkout";
+const getStripeClientMock = vi.fn();
+vi.mock("../client", () => ({ getStripeClient: (...a: unknown[]) => getStripeClientMock(...a) }));
+import { createOneTimeSession, createSetupSession, getInvoiceCheckoutLink } from "../checkout";
+import { encrypt } from "../../../lib/crypto";
 import type Stripe from "stripe";
 import type { TenantPrismaClient } from "../../../lib/tenant-prisma-manager";
 
@@ -180,5 +183,65 @@ describe("createSetupSession", () => {
     });
 
     expect(result.expiresAt).toBeNull();
+  });
+});
+
+describe("getInvoiceCheckoutLink", () => {
+  const input = {
+    tenantId: "t1", invoiceId: "inv-1", customerId: "cust-1", invoiceNumber: "INV-1",
+    amount: { toString: () => "33.5", valueOf: () => 33.5 } as never,
+  };
+
+  function linkPrisma(bs: Record<string, unknown> | null, existing: Record<string, unknown> | null = null) {
+    return {
+      businessSettings: { findFirst: vi.fn().mockResolvedValue(bs) },
+      stripeSession: { findFirst: vi.fn().mockResolvedValue(existing), create: vi.fn().mockResolvedValue({}) },
+      customer: {
+        findUniqueOrThrow: vi.fn().mockResolvedValue({ id: "cust-1", name: "J", email: null, phone: null, stripeCustomerId: "cus_1" }),
+        update: vi.fn(),
+      },
+    } as unknown as TenantPrismaClient;
+  }
+
+  it("409 STRIPE_NOT_CONNECTED when Stripe isn't connected (no static fallback)", async () => {
+    await expect(getInvoiceCheckoutLink(linkPrisma(null), input)).rejects.toMatchObject({ statusCode: 409, code: "STRIPE_NOT_CONNECTED" });
+    await expect(getInvoiceCheckoutLink(linkPrisma({ stripeConnected: true, stripeSecretKeyEncrypted: null }), input))
+      .rejects.toMatchObject({ code: "STRIPE_NOT_CONNECTED" });
+  });
+
+  it("reuses a still-open PENDING session", async () => {
+    const expiresAt = new Date(Date.now() + 60_000);
+    const tp = linkPrisma({ stripeConnected: true, stripeSecretKeyEncrypted: encrypt("sk_test") }, { url: "https://old", expiresAt });
+    await expect(getInvoiceCheckoutLink(tp, input)).resolves.toEqual({ url: "https://old", expiresAt });
+    expect(tp.stripeSession.create).not.toHaveBeenCalled();
+  });
+
+  it("creates a session on the connected account and records it", async () => {
+    const stripe = makeStripe();
+    getStripeClientMock.mockReturnValue(stripe);
+    const tp = linkPrisma({ stripeConnected: true, stripeSecretKeyEncrypted: encrypt("sk_conn") });
+    const result = await getInvoiceCheckoutLink(tp, input);
+    expect(getStripeClientMock).toHaveBeenCalledWith("sk_conn");
+    expect(stripe.checkout.sessions.create).toHaveBeenCalledWith(expect.objectContaining({
+      success_url: expect.stringMatching(/\/invoices\/inv-1\?payment=success$/),
+      line_items: [expect.objectContaining({ price_data: expect.objectContaining({ unit_amount: 3350 }) })],
+    }));
+    expect(tp.stripeSession.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ stripeSessionId: "cs_test_123", type: "ONE_TIME", invoiceId: "inv-1", customerId: "cust-1" }),
+    });
+    expect(result.url).toBe("https://checkout.stripe.com/pay/cs_test_123");
+  });
+
+  it("falls back to an empty frontend URL when FRONTEND_URL is unset", async () => {
+    const original = process.env.FRONTEND_URL;
+    delete process.env.FRONTEND_URL;
+    try {
+      const stripe = makeStripe();
+      getStripeClientMock.mockReturnValue(stripe);
+      await getInvoiceCheckoutLink(linkPrisma({ stripeConnected: true, stripeSecretKeyEncrypted: encrypt("k") }), input);
+      expect(stripe.checkout.sessions.create).toHaveBeenCalledWith(expect.objectContaining({ success_url: "/invoices/inv-1?payment=success" }));
+    } finally {
+      process.env.FRONTEND_URL = original;
+    }
   });
 });

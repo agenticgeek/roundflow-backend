@@ -39,6 +39,11 @@ vi.mock("../../lib/tenant-prisma-manager", () => ({
   getTenantPrismaForSchema: (...args: unknown[]) => getTenantPrismaForSchema(...args),
 }));
 
+const releaseHoldIfSettled = vi.fn().mockResolvedValue(false);
+vi.mock("../../services/payment-hold", () => ({
+  releaseHoldIfSettled: (...args: unknown[]) => releaseHoldIfSettled(...args),
+}));
+
 import { stripeWebhookRouter } from "../stripeWebhook";
 
 function makeApp() {
@@ -60,14 +65,18 @@ beforeEach(() => {
 });
 
 describe("POST /webhooks/stripe — config and signature", () => {
-  it("500s when STRIPE_CONNECT_WEBHOOK_SECRET is not configured", async () => {
+  it("503 WEBHOOK_NOT_CONFIGURED (and logs) when STRIPE_CONNECT_WEBHOOK_SECRET is not configured", async () => {
     const original = process.env.STRIPE_CONNECT_WEBHOOK_SECRET;
     delete process.env.STRIPE_CONNECT_WEBHOOK_SECRET;
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       const res = await send(makeApp());
-      expect(res.status).toBe(500);
+      expect(res.status).toBe(503);
+      expect(res.body).toEqual({ error: "Stripe webhook is not configured", code: "WEBHOOK_NOT_CONFIGURED" });
+      expect(err).toHaveBeenCalledWith(expect.stringContaining("STRIPE_CONNECT_WEBHOOK_SECRET"));
     } finally {
       process.env.STRIPE_CONNECT_WEBHOOK_SECRET = original;
+      err.mockRestore();
     }
   });
 
@@ -197,8 +206,10 @@ describe("POST /webhooks/stripe — checkout.session.completed (ONE_TIME)", () =
         data: expect.objectContaining({ customerId: "cust-1", visitId: "visit-1", amount: 35, stripeId: "pi_123" }),
       })
     );
-    expect(tp.invoice.update).toHaveBeenCalledWith({ where: { id: "inv-1" }, data: { status: "PAID" } });
+    expect(tp.invoice.update).toHaveBeenCalledWith({ where: { id: "inv-1" }, data: { status: "PAID", paidAt: expect.any(Date) } });
     await vi.waitFor(() => expect(queueGhlEvent).toHaveBeenCalledWith(tp, "payment.collected", "cust-1"));
+    // A3: settling the invoice runs the hold auto-release.
+    await vi.waitFor(() => expect(releaseHoldIfSettled).toHaveBeenCalledWith(tp, "cust-1"));
   });
 
   it("resolves the PaymentIntent id from an expanded object instead of a string", async () => {
