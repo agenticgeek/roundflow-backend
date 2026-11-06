@@ -5,12 +5,14 @@ import type { ActivityLogEntry, OutstandingInvoice } from "../types";
 import { evaluateDebtGate } from "./debt-gate";
 import { getCachedBusinessSettings } from "../../services/settings.service";
 import { releaseHoldIfSettled } from "../../services/payment-hold";
+import { notifyInvoicePaid } from "../../services/notify";
+import { isLocationApproximate } from "../../integrations/geocoding/client";
 import { vatOn, vatRateOf, grossOf } from "../../lib/vat";
 
 const visitDetailInclude = {
   property: {
     select: {
-      id: true, addressLine: true, postcode: true, latitude: true, longitude: true,
+      id: true, addressLine: true, postcode: true, latitude: true, longitude: true, geocodePrecision: true,
       // C2: the gate code / risk warning typed on the customer & property forms.
       accessNotes: true, riskNotes: true,
       customer: {
@@ -57,7 +59,7 @@ export type VisitNote = {
 };
 
 export interface VisitDetail extends Omit<VisitDetailBase, "property"> {
-  property: Omit<VisitDetailBase["property"], "notes"> & { notes: VisitNote[] };
+  property: Omit<VisitDetailBase["property"], "notes"> & { notes: VisitNote[]; locationApproximate: boolean };
   lastClean: Date | null;
   roundPosition: { position: number; total: number } | null;
   activityLog: ActivityLogEntry[];
@@ -144,7 +146,7 @@ class JobDetailService {
       mine: !!viewerProfileId && n.authorProfileId === viewerProfileId,
     }));
 
-    return { ...visit, property: { ...visit.property, notes }, paymentMethod, vatAmount, vatRate, grossTotal: grossOf(net, settings), lastClean: lastVisit?.completedAt ?? null, roundPosition, activityLog, outstandingInvoices, debtAmount, canStart: gate.canStart, blockReason: gate.blockReason };
+    return { ...visit, property: { ...visit.property, notes, locationApproximate: isLocationApproximate(visit.property.geocodePrecision, visit.property.latitude) }, paymentMethod, vatAmount, vatRate, grossTotal: grossOf(net, settings), lastClean: lastVisit?.completedAt ?? null, roundPosition, activityLog, outstandingInvoices, debtAmount, canStart: gate.canStart, blockReason: gate.blockReason };
   }
 
   // On-site debt collection. CASH clears the outstanding invoices immediately.
@@ -163,7 +165,7 @@ class JobDetailService {
     const customerId = visit.property.customer.id;
     const invoices = await this.prisma.invoice.findMany({
       where: { customerId, status: { in: [InvoiceStatus.DRAFT, InvoiceStatus.SENT] } },
-      select: { id: true, amount: true },
+      select: { id: true, invoiceNumber: true, amount: true },
     });
 
     const totalAmount = invoices.reduce((sum, inv) => sum + inv.amount.toNumber(), 0);
@@ -211,6 +213,10 @@ class JobDetailService {
       }),
     ]);
     await releaseHoldIfSettled(this.prisma, customerId); // A8: same release rule as every other paid path
+    // The office hears about cash taken on site like any other paid invoice (best effort, never throws).
+    for (const inv of invoices) {
+      await notifyInvoicePaid(this.prisma, { id: inv.id, invoiceNumber: inv.invoiceNumber, customerId });
+    }
 
     return { cleared: true, amountPaid: totalAmount, amountPending: 0, method: "CASH" };
   }

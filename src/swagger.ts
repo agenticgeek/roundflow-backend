@@ -91,8 +91,23 @@ const ERR = {
   404: { $ref: "#/components/responses/NotFound" },
   409: { $ref: "#/components/responses/Conflict" },
   410: { $ref: "#/components/responses/Gone" },
+  413: { $ref: "#/components/responses/PayloadTooLarge" },
+  429: { $ref: "#/components/responses/TooManyRequests" },
   500: { $ref: "#/components/responses/ServerError" },
 } as const;
+
+/** Optional `Idempotency-Key` header on admin writes (BE-17). */
+const IDEMPOTENCY_KEY_PARAM: OpenAPIV3.ParameterObject = {
+  name: "Idempotency-Key",
+  in: "header",
+  required: false,
+  schema: { type: "string", minLength: 1, maxLength: 200 },
+  description:
+    "Optional (X-Idempotency-Key is accepted too). The key is claimed atomically before the handler runs, scoped to the signed-in user: " +
+    "a repeat with the same key and the same route replays the stored 2xx response (`Idempotent-Replay: true`) without running again; " +
+    "a concurrent duplicate gets 409 `IDEMPOTENCY_IN_PROGRESS` with `Retry-After: 1`; the same key on another route is 409 `IDEMPOTENCY_KEY_REUSED`. " +
+    "Failed (non-2xx) responses are not stored, so a corrected request may reuse the key. Keys are kept 7 days.",
+};
 
 // Technician app (/mobile) 403s — role/ownership codes (D-3, A8).
 const MOBILE_ERR_403: OpenAPIV3.ResponseObject = {
@@ -125,7 +140,11 @@ const enumSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     "TWELVE_WEEKLY",
   ]),
   VisitStatus: stringEnum(["SCHEDULED", "IN_PROGRESS", "COMPLETED", "SKIPPED", "CANCELLED"], "CANCELLED visits carry `cancelReason` (e.g. \"PAUSED\" when a plan pause cancels them) and are excluded from today/planner counts."),
-  PaymentStatus: stringEnum(["NOT_DUE", "PENDING", "PAID", "FAILED", "OVERDUE", "CANCELLED"]),
+  PaymentStatus: stringEnum(
+    ["NOT_DUE", "PENDING", "PAID", "FAILED", "OVERDUE", "CANCELLED", "PROCESSING", "REFUNDED", "DISPUTED"],
+    "State machine (Wave 2B-1): PENDING/NOT_DUE/OVERDUE -> PROCESSING (direct debit accepted, being collected: NOT paid) | PAID | FAILED | CANCELLED; FAILED -> PAID (retry); PAID is terminal except REFUNDED and DISPUTED; DISPUTED -> PAID (won) | REFUNDED. " +
+    "OVERDUE is written by the nightly sweep for unpaid non-direct-debit payments past the invoice due date. GoCardless direct debits that are PENDING/PROCESSING are not counted as debt."
+  ),
   PaymentMethod: stringEnum(["GOCARDLESS", "CASH", "CHEQUE", "BACS", "STRIPE"]),
   MessageChannel: stringEnum(["SMS", "WHATSAPP", "EMAIL"]),
   MessageDirection: stringEnum(["OUTBOUND", "INBOUND"]),
@@ -183,11 +202,24 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       error: { type: "string" },
       code: {
         type: "string",
-        description: "Machine-readable reason, present on some errors (e.g. INVITE_ACCEPTED, INVITE_EXPIRED, NO_MATCHING_ROUND). See the API description for the full list.",
+        description: "Machine-readable reason, present on some errors (e.g. INVITE_ACCEPTED, INVITE_EXPIRED, NO_MATCHING_ROUND, ADMIN_ONLY, RATE_LIMITED, PAYLOAD_TOO_LARGE, IDEMPOTENCY_IN_PROGRESS, INVALID_PAYMENT_TRANSITION). See the API description for the full list.",
+      },
+      requestId: {
+        type: "string",
+        description: "Echo of the `X-Request-Id` response header (every response carries one). Quote it when reporting a problem.",
+      },
+      fields: {
+        type: "array",
+        description: "Optional per-field detail on validation errors (`code: VALIDATION_FAILED` and newer validators): one entry per problem. Older endpoints may still return a differently shaped `fields` (e.g. INVALID_ALLOCATION).",
+        items: {
+          type: "object",
+          required: ["path", "code", "message"],
+          properties: { path: { type: "string", example: "email" }, code: { type: "string", example: "INVALID_EMAIL" }, message: { type: "string" } },
+        },
       },
     },
     additionalProperties: true,
-    description: "Typed errors may carry extra fields, forwarded as-is by the central error handler (e.g. `fields` on INVALID_ALLOCATION, `suggestions` + `proposedName` on NO_MATCHING_ROUND).",
+    description: "Typed errors may carry extra fields, forwarded as-is by the central error handler (e.g. `fields` on INVALID_ALLOCATION, `suggestions` + `proposedName` on NO_MATCHING_ROUND). `requestId` is always present on errors produced by the central handler and on 413/429.",
     example: { error: "Unauthorized" },
   },
 
@@ -279,6 +311,22 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       defaultPaymentMethod: nullableRef("PaymentMethod"),
       acceptedPaymentMethods: { type: "array", items: ref("PaymentMethod"), description: "BUG-05: methods the business accepts (no provider connection needed). defaultPaymentMethod must be one of them; new customers/properties/imports default to it." },
       invoiceDueDays: { type: "integer", minimum: 1, maximum: 90, example: 7 },
+      invoiceFooter: { type: "string", nullable: true, maxLength: 500, description: "GHL-10: free text printed at the bottom of invoices." },
+      emailSenderName: { type: "string", nullable: true, description: "Wave 2B-2: display name customers see on emails (defaults to the business name)." },
+      emailReplyTo: { type: "string", nullable: true },
+      emailSenderDomain: { type: "string", nullable: true },
+      emailSenderLocalPart: { type: "string", nullable: true },
+      emailDomainStatus: { type: "string", enum: ["NONE", "PENDING", "VERIFIED", "FAILED"] },
+      emailDkimRecords: { type: "array", nullable: true, items: { type: "object", additionalProperties: true } },
+      emailDomainVerifiedAt: { type: "string", format: "date-time", nullable: true },
+      emailEnabled: { type: "boolean" },
+      emailDailyLimit: { type: "integer", nullable: true },
+      emailPausedReason: { type: "string", nullable: true },
+      emailPausedAt: { type: "string", format: "date-time", nullable: true },
+      logoPath: { type: "string", nullable: true },
+      logoAltText: { type: "string", nullable: true },
+      brandColour: { type: "string", nullable: true, example: "#00758C" },
+      paymentTerms: { type: "string", nullable: true, maxLength: 200, description: "GHL-10: free-text payment terms; replaces \"Payment due within N days\" on the invoice." },
       noDirectDebitAction: ref("NoDirectDebitAction"),
       completedSteps: { type: "array", items: { type: "integer" }, description: "Setup wizard steps saved at least once (drives GET /setup/status)." },
       updatedAt: dateTime,
@@ -911,8 +959,10 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       propertyId: { type: "string" },
       addressLine: { type: "string", example: "12 Market Street" },
       postcode: { type: "string", example: "NE66 1SS" },
-      latitude: { type: "number", nullable: true, example: 55.4042, description: "Null until the next geocoding backfill tick picks up the new postcode." },
+      latitude: { type: "number", nullable: true, example: 55.4042, description: "Null until the property is geocoded (on create/address change, or the backfill)." },
       longitude: { type: "number", nullable: true, example: -1.7073 },
+      geocodePrecision: { type: "string", nullable: true, enum: ["ROOFTOP", "RANGE_INTERPOLATED", "GEOMETRIC_CENTER", "APPROXIMATE", "POSTCODE_FALLBACK"], description: "ACT-10: how precise latitude/longitude are. null = not geocoded yet, or a legacy postcode-centre result." },
+      locationApproximate: { type: "boolean", description: "ACT-10: true when the pin is only approximate (POSTCODE_FALLBACK, APPROXIMATE or legacy postcode centre). Show \"approximate location\"." },
       customerId: { type: "string" },
       customerName: { type: "string", example: "John Smith" },
       roundId: { type: "string", nullable: true },
@@ -1030,8 +1080,12 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       propertyName: { type: "string", nullable: true },
       addressLine: { type: "string" },
       postcode: { type: "string" },
-      latitude: { type: "number", nullable: true, description: "Null until the next geocoding backfill tick picks up the new postcode." },
+      latitude: { type: "number", nullable: true, description: "Null until the property is geocoded (on create/address change, or the backfill)." },
       longitude: { type: "number", nullable: true },
+      geocodePrecision: { type: "string", nullable: true, enum: ["ROOFTOP", "RANGE_INTERPOLATED", "GEOMETRIC_CENTER", "APPROXIMATE", "POSTCODE_FALLBACK"], description: "ACT-10: how precise latitude/longitude are. null = not geocoded yet, or a legacy postcode-centre result." },
+      locationApproximate: { type: "boolean", description: "ACT-10: true when the pin is only approximate (POSTCODE_FALLBACK, APPROXIMATE or legacy postcode centre). Show \"approximate location\"." },
+      carriedOver: { type: "boolean", description: "ACT-02..04: true when the visit was carried over from an earlier day." },
+      carriedOverFromDate: { type: "string", format: "date", nullable: true, description: "The day it was last due before being carried over." },
       customerName: { type: "string", nullable: true },
       price: { type: "number" },
       status: ref("VisitStatus"),
@@ -1103,8 +1157,12 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       visitId: { type: "string" },
       customerName: { type: "string", nullable: true },
       addressLine: { type: "string" },
-      latitude: { type: "number", nullable: true, description: "Null until the next geocoding backfill tick picks up the new postcode." },
+      latitude: { type: "number", nullable: true, description: "Null until the property is geocoded (on create/address change, or the backfill)." },
       longitude: { type: "number", nullable: true },
+      geocodePrecision: { type: "string", nullable: true, enum: ["ROOFTOP", "RANGE_INTERPOLATED", "GEOMETRIC_CENTER", "APPROXIMATE", "POSTCODE_FALLBACK"], description: "ACT-10: how precise latitude/longitude are. null = not geocoded yet, or a legacy postcode-centre result." },
+      locationApproximate: { type: "boolean", description: "ACT-10: true when the pin is only approximate (POSTCODE_FALLBACK, APPROXIMATE or legacy postcode centre). Show \"approximate location\"." },
+      carriedOver: { type: "boolean", description: "ACT-02..04: true when the visit was carried over from an earlier day." },
+      carriedOverFromDate: { type: "string", format: "date", nullable: true, description: "The day it was last due before being carried over." },
       status: ref("VisitStatus"),
       paymentHold: { type: "boolean" },
       hasIssue: { type: "boolean" },
@@ -1156,13 +1214,16 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
 
   SetTechniciansResult: {
     type: "object",
-    required: ["roundId", "allocation", "visitsUpdated"],
+    required: ["roundId", "allocation", "visitsUpdated", "visitsGenerated", "overriddenVisits", "nextVisitDate"],
     properties: {
       roundId: { type: "string" },
       allocation: { type: "array", items: ref("AllocationEntry") },
       visitsUpdated: { type: "integer", description: "Future SCHEDULED visits restamped (or that would be, on a dry run)." },
+      visitsGenerated: { type: "integer", description: "Due visits created for this round right after the assignment (FLOW-01). Always 0 on a dry run (nothing is written) and for a round that is not ACTIVE." },
+      overriddenVisits: { type: "integer", description: "Future SCHEDULED visits skipped by the restamp because a manager hand-assigned them (`technicianOverride`) (FLOW-04)." },
+      nextVisitDate: { type: "string", format: "date", nullable: true, description: "YYYY-MM-DD of the earliest SCHEDULED visit on or after today (tenant-local) for the round, after generation. null = the round has no upcoming visits, so nothing will show in the technician's app yet (FLOW-02)." },
     },
-    example: { roundId: "rnd_1", allocation: [{ technicianId: "t1", name: "James", propertyIds: ["p1", "p2"], stops: 2, value: "37.00" }], visitsUpdated: 6 },
+    example: { roundId: "rnd_1", allocation: [{ technicianId: "t1", name: "James", propertyIds: ["p1", "p2"], stops: 2, value: "37.00" }], visitsUpdated: 6, visitsGenerated: 2, overriddenVisits: 1, nextVisitDate: "2026-11-09" },
   },
 
   RoundAllocation: {
@@ -1183,7 +1244,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
   // ---- Today's Work (GET /today, POST /today/close) ----
   TodayKpi: {
     type: "object",
-    required: ["totalStops", "inProgress", "completed", "skipped", "issues", "paymentHolds", "valueCompleted"],
+    required: ["totalStops", "inProgress", "completed", "skipped", "issues", "paymentHolds", "carriedOver", "valueCompleted"],
     properties: {
       totalStops: { type: "integer" },
       inProgress: { type: "integer" },
@@ -1191,6 +1252,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       skipped: { type: "integer" },
       issues: { type: "integer", description: "Visits today with ≥ 1 issue." },
       paymentHolds: { type: "integer" },
+      carriedOver: { type: "integer", description: "Visits today that were carried over from an earlier day." },
       valueCompleted: { type: "number" },
     },
   },
@@ -1209,6 +1271,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       skipped: { type: "integer" },
       issueCount: { type: "integer" },
       paymentHolds: { type: "integer" },
+      carriedOver: { type: "integer", description: "Visits on this round today that were carried over from an earlier day." },
       scheduledValue: { type: "number", description: "Sum of every non-cancelled stop's price today (GAP-035)." },
       completedValue: { type: "number", description: "Sum of COMPLETED stops' prices today." },
       value: { type: "number", deprecated: true, description: "Same as completedValue; kept for one release (GAP-035)." },
@@ -1255,6 +1318,9 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       issues: { type: "integer" },
       paymentHolds: { type: "integer" },
       revenue: { type: "number", description: "Sum of completed-visit prices for the day." },
+      carriedToDate: { type: "string", format: "date", nullable: true, description: "ACT-02..04: the day the unfinished visits were carried to (push_to_tomorrow); null otherwise." },
+      notifiedCustomers: { type: "integer", description: "Customers messaged about the carryover (notifyCustomers); 0 otherwise." },
+      customerNotificationError: { type: "string", description: "Set when notifyCustomers was requested but messaging failed; the close itself succeeded." },
     },
   },
 
@@ -1358,22 +1424,93 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     properties: {
       customerId: { type: "string" },
       customerName: { type: "string" },
-      status: { type: "string", enum: ["sent", "scheduled", "skipped_opted_out", "skipped_no_contact", "failed"] },
+      status: { type: "string", enum: ["sent", "scheduled", "skipped_opted_out", "skipped_no_contact", "skipped_no_channel", "failed"] },
+      reason: { type: "string", enum: ["CUSTOMER_OPTED_OUT", "NO_AVAILABLE_CHANNEL"], description: "Machine-readable skip reason." },
       channel: { type: "string", enum: ["SMS", "EMAIL", "WHATSAPP"], description: "The channel used / queued (absent when skipped for opt-out)." },
       error: { type: "string", description: "Why the recipient was skipped (no contact detail) or failed." },
+    },
+  },
+
+  Channels: {
+    type: "object",
+    required: ["email", "sms", "whatsapp", "calls"],
+    properties: {
+      email: { type: "boolean", description: "SES configured, email switched on for the tenant and not paused." },
+      sms: { type: "boolean", description: "GoHighLevel connected." },
+      whatsapp: { type: "boolean", description: "GoHighLevel connected." },
+      calls: { type: "boolean", description: "tel: links; always true." },
+    },
+  },
+  EmailDomain: {
+    type: "object",
+    required: ["domain", "localPart", "status", "records", "verifiedAt", "tier", "sendingAddress"],
+    properties: {
+      domain: { type: "string", nullable: true },
+      localPart: { type: "string", nullable: true, description: "Local part of the tenant sending address; default `accounts`." },
+      status: { type: "string", enum: ["NONE", "PENDING", "VERIFIED", "FAILED"] },
+      records: {
+        type: "array",
+        description: "The 3 DKIM CNAME records to add at the DNS provider (Easy DKIM).",
+        items: { type: "object", required: ["type", "name", "value"], properties: { type: { type: "string", enum: ["CNAME"] }, name: { type: "string" }, value: { type: "string" } } },
+      },
+      verifiedAt: { type: "string", format: "date-time", nullable: true },
+      tier: { type: "integer", enum: [1, 2], description: "1 = shared RoundFlow address with the tenant name; 2 = the tenant's verified domain." },
+      sendingAddress: { type: "string", nullable: true },
+    },
+  },
+  BrandColourCheck: {
+    type: "object",
+    required: ["colour", "textColour", "buttonContrast", "warning"],
+    properties: {
+      colour: { type: "string", example: "#00758C" },
+      textColour: { type: "string", enum: ["#000000", "#FFFFFF"], description: "Automatic text colour for a button filled with the brand colour (>= 4.5:1)." },
+      buttonContrast: { type: "number" },
+      warning: {
+        type: "object",
+        nullable: true,
+        description: "Set when the colour fails 4.5:1 as text on white; the colour is still saved, links and accents use `safeAccentColour`.",
+        properties: { code: { type: "string", enum: ["LOW_CONTRAST_ON_WHITE"] }, message: { type: "string" }, textColour: { type: "string" }, safeAccentColour: { type: "string" } },
+      },
+    },
+  },
+  EmailSettings: {
+    type: "object",
+    additionalProperties: true,
+    description: "Settings > Email and branding view.",
+    properties: {
+      configured: { type: "boolean" },
+      enabled: { type: "boolean" },
+      paused: { type: "boolean" },
+      pausedReason: { type: "string", nullable: true },
+      pausedAt: { type: "string", format: "date-time", nullable: true },
+      senderName: { type: "string", nullable: true },
+      replyTo: { type: "string", nullable: true },
+      dailyLimit: { type: "integer", nullable: true },
+      sentToday: { type: "integer" },
+      brandColour: { type: "string", nullable: true },
+      brandColourCheck: { ...nullableRef("BrandColourCheck") },
+      logoPath: { type: "string", nullable: true },
+      logoUrl: { type: "string", nullable: true, description: "Short-lived signed read URL." },
+      logoAltText: { type: "string", nullable: true },
+      sender: { type: "object", nullable: true, additionalProperties: true, description: "{ tier, from, fromAddress, displayName, replyTo }: what customers see right now." },
+      health: { type: "object", additionalProperties: true, description: "{ sampleSize, delivered, bounced, complaints, bounceRate, complaintRate } over the last 100 emails." },
+      domain: ref("EmailDomain"),
+      channels: ref("Channels"),
+      warning: { ...nullableRef("BrandColourCheck") },
     },
   },
 
   MessageBulkResult: {
     type: "object",
     description: "Per-recipient outcome of a round broadcast (POST /messages/bulk) or of the customer notification in a weather hold.",
-    required: ["queued", "sent", "scheduled", "skippedOptedOut", "skippedNoContact", "failed", "scheduledFor", "recipients"],
+    required: ["queued", "sent", "scheduled", "skippedOptedOut", "skippedNoContact", "skippedNoChannel", "failed", "scheduledFor", "recipients"],
     properties: {
       queued: { type: "integer", description: "sent + scheduled (older clients read only this)." },
       sent: { type: "integer", description: "Delivered to GoHighLevel now; a Message row was recorded for each." },
       scheduled: { type: "integer", description: "Queued on the outbox for `scheduledFor`; the Message row is recorded when it is actually sent." },
       skippedOptedOut: { type: "integer", description: "Customers with messagesOptOut — never contacted." },
-      skippedNoContact: { type: "integer", description: "No mobile / email on file for the channel." },
+      skippedNoContact: { type: "integer", description: "No mobile / email on file for the explicitly chosen channel." },
+      skippedNoChannel: { type: "integer", description: "No usable channel for the customer (e.g. only a mobile and GoHighLevel is not connected, or the email bounced)." },
       failed: { type: "integer", description: "GHL rejected the send or it could not be queued." },
       scheduledFor: { type: "string", format: "date-time", nullable: true },
       recipients: { type: "array", items: ref("BroadcastRecipient") },
@@ -1398,6 +1535,152 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       total: { type: "integer" },
       reachable: { type: "integer", description: "Recipients with status ok." },
       recipients: { type: "array", items: ref("BulkRecipient") },
+    },
+  },
+
+  CarryoverOption: {
+    type: "object",
+    required: ["key", "date", "label", "default"],
+    properties: {
+      key: { type: "string", enum: ["NEXT_WORKING_DAY", "SATURDAY", "MONDAY"] },
+      date: { type: "string", format: "date" },
+      label: { type: "string", example: "Monday 9 Nov" },
+      default: { type: "boolean" },
+    },
+  },
+
+  CarryoverOptions: {
+    type: "object",
+    description: "On a Friday the options are ALWAYS Saturday and Monday (Sunday is never offered; Monday is the default unless Monday is not a working day and Saturday is). Any other day: just the next working day per BusinessSettings.defaultWorkingDays (Mon–Fri when unset).",
+    required: ["date", "options"],
+    properties: { date: { type: "string", format: "date" }, options: { type: "array", items: ref("CarryoverOption") } },
+  },
+
+  CarryoverInput: {
+    type: "object",
+    required: ["date", "target"],
+    properties: {
+      date: { type: "string", format: "date", description: "The day whose unfinished visits are carried." },
+      target: { type: "string", enum: ["NEXT_WORKING_DAY", "SATURDAY", "MONDAY"], description: "One of the keys offered by GET /visits/carryover/options for `date`." },
+      visitIds: { type: "array", maxItems: 500, items: { type: "string" }, description: "Default: every SCHEDULED/IN_PROGRESS visit on `date`." },
+      notifyCustomers: { type: "boolean", default: false, description: "Message the affected customers through GHL (skips opted-out; best effort, never fails the carryover)." },
+      dryRun: { type: "boolean", default: false, description: "Report what would move and the conflicts; write and notify nothing." },
+    },
+    example: { date: "2026-11-06", target: "MONDAY", notifyCustomers: false, dryRun: true },
+  },
+
+  CarryoverResult: {
+    type: "object",
+    required: ["moved", "targetDate", "conflicts", "notifiedTechnicians", "notifiedCustomers", "skipped", "dryRun"],
+    properties: {
+      moved: { type: "integer" },
+      targetDate: { type: "string", format: "date" },
+      conflicts: {
+        type: "array",
+        description: "Visits moved onto a day when their technician is unavailable or deactivated; reassign them.",
+        items: {
+          type: "object",
+          required: ["visitId", "technicianId", "reason"],
+          properties: { visitId: { type: "string" }, technicianId: { type: "string" }, reason: { type: "string", enum: ["TECHNICIAN_UNAVAILABLE", "TECHNICIAN_INACTIVE"] } },
+        },
+      },
+      notifiedTechnicians: { type: "integer" },
+      notifiedCustomers: { type: "integer" },
+      skipped: {
+        type: "array",
+        items: { type: "object", required: ["visitId", "reason"], properties: { visitId: { type: "string" }, reason: { type: "string", enum: ["NOT_FOUND", "NOT_ON_DATE", "NOT_UNFINISHED"] } } },
+      },
+      dryRun: { type: "boolean" },
+      customerNotificationError: { type: "string", description: "Present when notifyCustomers failed; the carryover itself is done." },
+    },
+  },
+
+  InvoiceBulkSendInput: {
+    type: "object",
+    description: "Select by `ids` (max 500) or by `status` (default DRAFT, oldest first, first 500). `filters` narrows a status selection to the current view.",
+    properties: {
+      ids: { type: "array", maxItems: 500, items: { type: "string" } },
+      status: stringEnum(["DRAFT", "SENT", "PAID", "VOID", "OVERDUE"]),
+      filters: {
+        type: "object",
+        properties: { customerId: { type: "string" }, q: { type: "string" }, from: { type: "string", format: "date" }, to: { type: "string", format: "date" } },
+      },
+      channel: { type: "string", enum: ["AUTO", "SMS", "EMAIL", "WHATSAPP"], description: "Default AUTO: SMS when the customer has a mobile, else email (through GHL today; native email in Wave 2B)." },
+      resend: { type: "boolean", default: false, description: "Allow invoices already SENT." },
+    },
+    example: { status: "DRAFT", resend: false },
+  },
+
+  InvoiceBulkSendPreview: {
+    type: "object",
+    required: ["total", "willSend", "byChannel", "skipped", "truncated", "totalMatching", "invoices"],
+    properties: {
+      total: { type: "integer" },
+      willSend: { type: "integer" },
+      byChannel: { type: "object", additionalProperties: { type: "integer" }, example: { EMAIL: 12, SMS: 3 } },
+      skipped: {
+        type: "object",
+        additionalProperties: { type: "integer" },
+        description: "Counts by reason: NOT_DRAFT, PAID, VOID, NO_CONTACT_FOR_CHANNEL, CUSTOMER_OPTED_OUT, NO_AVAILABLE_CHANNEL, NOT_FOUND.",
+        example: { CUSTOMER_OPTED_OUT: 1, NO_CONTACT_FOR_CHANNEL: 2 },
+      },
+      truncated: { type: "boolean", description: "More than 500 invoices match; only the first 500 are included." },
+      totalMatching: { type: "integer" },
+      invoices: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            id: { type: "string" }, invoiceNumber: { type: "string" }, customerName: { type: "string" },
+            channel: { type: "string", nullable: true }, skip: { type: "string", nullable: true },
+          },
+        },
+      },
+    },
+  },
+
+  InvoiceBulkSendQueued: {
+    type: "object",
+    required: ["batchId", "queued", "skipped"],
+    properties: {
+      batchId: { type: "string" },
+      queued: { type: "integer" },
+      skipped: {
+        type: "array",
+        items: {
+          type: "object",
+          required: ["id", "reason"],
+          properties: {
+            id: { type: "string" },
+            reason: { type: "string", enum: ["NOT_FOUND", "NOT_DRAFT", "PAID", "VOID", "NO_CONTACT_FOR_CHANNEL", "CUSTOMER_OPTED_OUT", "NO_AVAILABLE_CHANNEL", "ALREADY_QUEUED"] },
+          },
+        },
+      },
+      truncated: { type: "boolean", description: "Present (true) when more than 500 matched; run it again for the rest." },
+    },
+  },
+
+  InvoiceBulkSendBatch: {
+    type: "object",
+    required: ["batchId", "total", "done", "counts", "results"],
+    properties: {
+      batchId: { type: "string" },
+      total: { type: "integer" },
+      done: { type: "boolean", description: "No row is QUEUED any more." },
+      counts: { type: "object", properties: { QUEUED: { type: "integer" }, SENT: { type: "integer" }, FAILED: { type: "integer" }, SKIPPED: { type: "integer" } } },
+      results: {
+        type: "array",
+        items: {
+          type: "object",
+          required: ["id", "status"],
+          properties: {
+            id: { type: "string", description: "Invoice id." },
+            status: { type: "string", enum: ["QUEUED", "SENT", "FAILED", "SKIPPED"] },
+            error: { type: "string" },
+            code: { type: "string", description: "e.g. NO_CONTACT_FOR_CHANNEL, GHL_SEND_FAILED, OPTED_OUT, INVOICE_ALREADY_SENT, INVOICE_NOT_SENDABLE." },
+          },
+        },
+      },
     },
   },
 
@@ -1469,6 +1752,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     type: "object",
     description: "Raw Customer row, as created by Setup step 9 (not the transformed CustomerListRow/CustomerDetail shapes used elsewhere).",
     properties: {
+      emailInvalidAt: { type: "string", format: "date-time", nullable: true, description: "Set by a hard bounce or complaint: email is not used for this customer until the address is edited." },
       id: { type: "string" },
       name: { type: "string" },
       phone: { type: "string", nullable: true },
@@ -1888,6 +2172,35 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     },
   },
 
+  InvoiceBusiness: {
+    type: "object",
+    description: "GHL-10: the supplier block printed on the invoice PDF.",
+    required: ["name", "email", "phone", "address", "vatNumber", "companyNumber", "bank", "paymentTerms", "invoiceFooter"],
+    properties: {
+      name: { type: "string", nullable: true },
+      email: { type: "string", nullable: true },
+      phone: { type: "string", nullable: true },
+      address: {
+        type: "object",
+        nullable: true,
+        properties: {
+          line1: { type: "string", nullable: true }, line2: { type: "string", nullable: true },
+          town: { type: "string", nullable: true }, postcode: { type: "string", nullable: true },
+        },
+      },
+      vatNumber: { type: "string", nullable: true, description: "BusinessSettings.vatRegistration." },
+      companyNumber: { type: "string", nullable: true },
+      bank: {
+        type: "object",
+        nullable: true,
+        description: "From BusinessSettings.bankDetails; null unless account name, number and sort code are all set.",
+        properties: { accountName: { type: "string" }, bankName: { type: "string", nullable: true }, sortCode: { type: "string" }, accountNumber: { type: "string" } },
+      },
+      paymentTerms: { type: "string", description: "BusinessSettings.paymentTerms when set, else \"Payment due within N days\" (invoiceDueDays)." },
+      invoiceFooter: { type: "string", nullable: true },
+    },
+  },
+
   InvoicePreview: {
     type: "object",
     description: "GET /invoices/preview and /invoices/preview/pdf — a not-yet-saved invoice computed live from a visit. 409 if the visit already has an invoice.",
@@ -1914,13 +2227,8 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       total: { type: "number" },
       amount: { type: "number", description: "Alias of total, for convenience." },
       currency: { type: "string", description: "Business currency symbol, e.g. \"£\".", example: "£" },
-      business: {
-        type: "object",
-        properties: {
-          name: { type: "string", nullable: true },
-          email: { type: "string", nullable: true },
-        },
-      },
+      business: ref("InvoiceBusiness"),
+      paymentReference: { type: "string", description: "GHL-10: what the customer quotes when paying (the invoice number)." },
     },
   },
 
@@ -2024,9 +2332,11 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
   CompletionPaymentInput: {
     type: "object",
     required: ["method"],
-    description: "What the technician collected on site. CASH → PAID payment; CHEQUE → PENDING payment with the cheque number on Payment.reference; NONE → fall back to the effective method.",
+    description: "What the technician collected on site. CASH → PAID payment; CHEQUE → PENDING payment with the cheque number on Payment.reference; BACS / GOCARDLESS / STRIPE → no cash is taken, the normal flow follows (PENDING BACS payment, GoCardless charge on an active mandate, or nothing for STRIPE) and the invoice is left DRAFT/SENT; NONE → fall back to the effective method. The chosen method is recorded on Visit.collectedVia and in the activity log (PAYMENT_METHOD_RECORDED).",
     properties: {
-      method: { type: "string", enum: ["CASH", "CHEQUE", "NONE"] },
+      method: { type: "string", enum: ["CASH", "CHEQUE", "BACS", "GOCARDLESS", "STRIPE", "NONE"] },
+      collectVia: { type: "string", enum: ["CASH", "CHEQUE", "BACS", "GOCARDLESS", "STRIPE"], description: "App extra: the method the technician picked when `method` is NONE. Ignored when `method` is a real method." },
+      updateCustomerDefault: { type: "boolean", description: "Also make the chosen method the customer's usual payment method." },
       amount: { type: "number", exclusiveMinimum: true, minimum: 0, maximum: 9999.99, description: "Defaults to the visit price." },
       chequeNumber: { type: "string", maxLength: 50, description: "Required for CHEQUE (400 CHEQUE_NUMBER_REQUIRED)." },
     },
@@ -2138,7 +2448,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
 
   MobileNotification: {
     type: "object",
-    required: ["id", "profileId", "type", "title", "body", "read", "createdAt"],
+    required: ["id", "profileId", "type", "title", "body", "read", "data", "createdAt"],
     properties: {
       id: { type: "string" },
       profileId: { type: "string" },
@@ -2146,7 +2456,46 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       title: { type: "string" },
       body: { type: "string", nullable: true },
       read: { type: "boolean" },
+      data: ref("NotificationData"),
       createdAt: dateTime,
+    },
+  },
+
+  NotificationData: {
+    type: "object",
+    nullable: true,
+    description: "Deep-link payload; null on notifications created before Wave 1 or without a target. Keys present depend on the event.",
+    properties: {
+      visitId: { type: "string" },
+      roundId: { type: "string" },
+      customerId: { type: "string" },
+      invoiceId: { type: "string" },
+      propertyId: { type: "string" },
+      date: { type: "string", format: "date", description: "YYYY-MM-DD" },
+    },
+  },
+
+  AdminNotification: {
+    type: "object",
+    required: ["id", "type", "title", "body", "read", "createdAt", "data"],
+    properties: {
+      id: { type: "string" },
+      type: { type: "string", enum: ["SCHEDULE", "ROUND_UPDATE", "CHAT", "PAYMENT", "COMPLAINT", "ACCESS_ISSUE", "DAY_CLOSED", "INVITE", "KPI_ALERT"], description: "Open string in the database; these are the values the backend produces." },
+      title: { type: "string" },
+      body: { type: "string", nullable: true },
+      read: { type: "boolean" },
+      createdAt: dateTime,
+      data: ref("NotificationData"),
+    },
+  },
+
+  AdminNotificationPage: {
+    type: "object",
+    required: ["notifications", "unreadCount", "nextCursor"],
+    properties: {
+      notifications: { type: "array", items: ref("AdminNotification"), description: "The caller's own rows, newest first, 30 per page." },
+      unreadCount: { type: "integer", description: "All of the caller's unread rows, not just this page." },
+      nextCursor: { type: "string", nullable: true, description: "Pass as `?cursor=` for the next page; null on the last page." },
     },
   },
 
@@ -2174,17 +2523,22 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
 
   MobileVisitRow: {
     type: "object",
-    required: ["visitId", "status", "price", "paymentMethod", "customerName", "addressLine", "postcode", "latitude", "longitude", "roundId", "roundName", "serviceName", "notes", "issueCount", "propertyNotes", "startedAt", "arrivedAt", "completedAt", "hasDebt", "position"],
+    required: ["visitId", "status", "price", "paymentMethod", "paymentStatus", "customerName", "addressLine", "postcode", "latitude", "longitude", "geocodePrecision", "locationApproximate", "carriedOver", "carriedOverFromDate", "roundId", "roundName", "serviceName", "notes", "issueCount", "propertyNotes", "startedAt", "arrivedAt", "completedAt", "hasDebt", "position"],
     properties: {
       visitId: { type: "string" },
       status: ref("VisitStatus"),
       price: { type: "number" },
       paymentMethod: { ...nullableRef("PaymentMethod"), description: "Effective method: visit override → service plan → customer default; null only when none of those is set." },
+      paymentStatus: { type: "string", nullable: true, description: "Status of the visit's Payment (PENDING, PROCESSING, PAID, FAILED, OVERDUE, REFUNDED, DISPUTED...); null when no payment exists yet. Also on schedule and completions rows." },
       customerName: { type: "string" },
       addressLine: { type: "string" },
       postcode: { type: "string" },
       latitude: { type: "number", nullable: true },
       longitude: { type: "number", nullable: true },
+      geocodePrecision: { type: "string", nullable: true, enum: ["ROOFTOP", "RANGE_INTERPOLATED", "GEOMETRIC_CENTER", "APPROXIMATE", "POSTCODE_FALLBACK"], description: "ACT-10: how precise latitude/longitude are. null = not geocoded yet, or a legacy postcode-centre result." },
+      locationApproximate: { type: "boolean", description: "ACT-10: true when the pin is only approximate (POSTCODE_FALLBACK, APPROXIMATE or legacy postcode centre). Show \"approximate location\"." },
+      carriedOver: { type: "boolean", description: "ACT-02..04: true when the visit was carried over from an earlier day." },
+      carriedOverFromDate: { type: "string", format: "date", nullable: true, description: "The day it was last due before being carried over." },
       roundId: { type: "string", nullable: true },
       roundName: { type: "string", nullable: true },
       serviceName: { type: "string", nullable: true },
@@ -2463,6 +2817,8 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       defaultPaymentMethod: nullableRef("PaymentMethod"),
       acceptedPaymentMethods: { type: "array", items: ref("PaymentMethod"), description: "BUG-05: accepted methods; defaultPaymentMethod must be one of them (400)." },
       invoiceDueDays: { type: "integer", minimum: 1, maximum: 90 },
+      invoiceFooter: { type: "string", nullable: true, maxLength: 500, description: "GHL-10. Blank or null clears." },
+      paymentTerms: { type: "string", nullable: true, maxLength: 200, description: "GHL-10. Blank or null clears." },
       noDirectDebitAction: ref("NoDirectDebitAction"),
     },
     example: { paymentRule: "COLLECT_AFTER_VISIT", debtHoldEnabled: true, vatInInvoices: true },
@@ -2661,6 +3017,8 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       defaultPaymentMethod: nullableRef("PaymentMethod"),
       acceptedPaymentMethods: { type: "array", items: ref("PaymentMethod"), description: "BUG-05: accepted methods; defaultPaymentMethod must be one of them (400). Setting only a default seeds an empty list with it." },
       invoiceDueDays: { type: "integer", minimum: 1, maximum: 90 },
+      invoiceFooter: { type: "string", nullable: true, maxLength: 500 },
+      paymentTerms: { type: "string", nullable: true, maxLength: 200 },
       noDirectDebitAction: ref("NoDirectDebitAction"),
     },
     example: { paymentRule: "COLLECT_AFTER_VISIT", vatInInvoices: true, invoiceDueDays: 14 },
@@ -2675,8 +3033,10 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       propertyName: { type: "string", nullable: true },
       addressLine: { type: "string" },
       postcode: { type: "string" },
-      latitude: { type: "number", nullable: true, description: "Geocoded from postcode; null until the next geocoding backfill tick." },
+      latitude: { type: "number", nullable: true, description: "Geocoded from the full address (Google, ACT-10); null until geocoded." },
       longitude: { type: "number", nullable: true },
+      geocodePrecision: { type: "string", nullable: true, enum: ["ROOFTOP", "RANGE_INTERPOLATED", "GEOMETRIC_CENTER", "APPROXIMATE", "POSTCODE_FALLBACK"], description: "ACT-10: how precise latitude/longitude are. null = not geocoded yet, or a legacy postcode-centre result." },
+      locationApproximate: { type: "boolean", description: "ACT-10: true when the pin is only approximate (POSTCODE_FALLBACK, APPROXIMATE or legacy postcode centre). Show \"approximate location\"." },
       serviceAreaId: { type: "string", nullable: true },
       propertyType: { type: "string", nullable: true },
       accessNotes: { type: "string", nullable: true },
@@ -2727,8 +3087,10 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       propertyId: { type: "string", nullable: true },
       addressLine: { type: "string", nullable: true },
       postcode: { type: "string", nullable: true },
-      latitude: { type: "number", nullable: true, description: "Null until the next geocoding backfill tick picks up the new postcode." },
+      latitude: { type: "number", nullable: true, description: "Null until the property is geocoded (on create/address change, or the backfill)." },
       longitude: { type: "number", nullable: true },
+      geocodePrecision: { type: "string", nullable: true, enum: ["ROOFTOP", "RANGE_INTERPOLATED", "GEOMETRIC_CENTER", "APPROXIMATE", "POSTCODE_FALLBACK"], description: "ACT-10: how precise latitude/longitude are. null = not geocoded yet, or a legacy postcode-centre result." },
+      locationApproximate: { type: "boolean", description: "ACT-10: true when the pin is only approximate (POSTCODE_FALLBACK, APPROXIMATE or legacy postcode centre). Show \"approximate location\"." },
       roundId: { type: "string", nullable: true },
       roundName: { type: "string", nullable: true },
       frequency: nullableRef("CleaningFrequency"),
@@ -2836,8 +3198,10 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
         nullable: true,
         properties: {
           id: { type: "string" }, addressLine: { type: "string" }, postcode: { type: "string" },
-          latitude: { type: "number", nullable: true, description: "Null until the next geocoding backfill tick picks up the new postcode." },
+          latitude: { type: "number", nullable: true, description: "Null until the property is geocoded (on create/address change, or the backfill)." },
           longitude: { type: "number", nullable: true },
+          geocodePrecision: { type: "string", nullable: true, enum: ["ROOFTOP", "RANGE_INTERPOLATED", "GEOMETRIC_CENTER", "APPROXIMATE", "POSTCODE_FALLBACK"], description: "ACT-10: how precise latitude/longitude are. null = not geocoded yet, or a legacy postcode-centre result." },
+          locationApproximate: { type: "boolean", description: "ACT-10: true when the pin is only approximate (POSTCODE_FALLBACK, APPROXIMATE or legacy postcode centre). Show \"approximate location\"." },
           propertyType: { type: "string", nullable: true }, accessNotes: { type: "string", nullable: true },
           riskNotes: { type: "string", nullable: true }, status: ref("LifecycleStatus"),
           roundId: { type: "string", nullable: true }, roundName: { type: "string", nullable: true },
@@ -3390,8 +3754,15 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
         enum: ["push_to_tomorrow", "mark_as_skipped"],
         description: "What to do with today's still-SCHEDULED/IN_PROGRESS visits.",
       },
+      skipReason: { type: "string", maxLength: 255, description: "mark_as_skipped only." },
+      target: {
+        type: "string",
+        enum: ["NEXT_WORKING_DAY", "SATURDAY", "MONDAY"],
+        description: "ACT-02..04, push_to_tomorrow only: which carryover option to use (see GET /visits/carryover/options). Omitted = the option flagged `default`. A key that is not offered for today is 400 `INVALID_CARRYOVER_TARGET`.",
+      },
+      notifyCustomers: { type: "boolean", default: false, description: "push_to_tomorrow only: also message the customers of the carried visits (best effort, same service as POST /visits/carryover)." },
     },
-    example: { unfinishedAction: "push_to_tomorrow" },
+    example: { unfinishedAction: "push_to_tomorrow", target: "MONDAY" },
   },
 
   // ---- Invoices ----
@@ -3402,7 +3773,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       visitId: { type: "string", description: "The visit must not already have an invoice (409 if it does)." },
       notes: { type: "string", nullable: true },
       dueDate: { type: "string", format: "date", nullable: true },
-      sendEmail: { type: "boolean", default: false, description: "Accepted but ignored — no delivery is performed (invoice email delivery is not implemented)." },
+      sendEmail: { type: "boolean", description: "`true` creates the invoice and then emails it (PDF attached when Gotenberg is up). The invoice flips to SENT only after SES accepted the email. If the email cannot be sent the invoice is still created (201) and the response carries `emailSent: false` and `emailError`." },
     },
     example: { visitId: "vis_example", dueDate: "2026-10-15" },
   },
@@ -3441,13 +3812,14 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
   // ---- Phase 1: invoices / payments ----
   InvoiceListRow: {
     type: "object",
-    required: ["id", "invoiceNumber", "customer", "total", "status", "issuedAt", "dueDate", "paidAt", "paymentMethod", "visitId"],
+    required: ["id", "invoiceNumber", "customer", "total", "status", "overdue", "issuedAt", "dueDate", "paidAt", "paymentMethod", "visitId"],
     properties: {
       id: { type: "string" },
       invoiceNumber: { type: "string" },
       customer: { type: "object", properties: { id: { type: "string" }, name: { type: "string" } } },
       total: { type: "number" },
       status: ref("InvoiceStatus"),
+      overdue: { type: "boolean", description: "ACT-01: SENT with a due date before today (the filter `status=OVERDUE`)." },
       issuedAt: dateTime,
       dueDate: { ...dateTime, nullable: true },
       paidAt: { ...dateTime, nullable: true },
@@ -3950,10 +4322,25 @@ const reusableResponses: Record<string, OpenAPIV3.ResponseObject> = {
   ),
   Unauthorized: errorResponse("Missing, invalid, or expired Bearer token.", "Unauthorized"),
   Forbidden: errorResponse(
-    "Caller's role is not allowed (admin routers need ADMIN/MANAGER), no Profile exists for the user (`code: NO_PROFILE`), or a setup-state lock applies: a wizard mutation after setup is complete, or a Settings mutation before it is.",
+    "Caller's role is not allowed (admin routers need ADMIN/MANAGER; the ADMIN-only actions answer `code: ADMIN_ONLY` to a MANAGER: inviting an ADMIN, connecting/disconnecting Stripe/GoCardless/GHL, payment/bank/VAT settings, deleting technicians, the integration dead-letter queue), no Profile exists for the user (`code: NO_PROFILE`), or a setup-state lock applies: a wizard mutation after setup is complete, or a Settings mutation before it is.",
     "Setup is already complete; wizard endpoints are locked."
   ),
   NotFound: errorResponse("Resource not found.", "Service not found"),
+  PayloadTooLarge: jsonResponse("JSON body larger than the limit (default 100 kb, env JSON_BODY_LIMIT). `code: PAYLOAD_TOO_LARGE`.", {
+    allOf: [ref("Error")],
+    example: { error: "Request body is too large.", code: "PAYLOAD_TOO_LARGE", requestId: "3f2c1a6e-0000-4000-8000-000000000000" },
+  }),
+  TooManyRequests: {
+    description:
+      "Rate limit hit. `code: RATE_LIMITED`; the `Retry-After` header says how many seconds to wait. Limits (per IP, env-configurable): 600/min global, 10/hour on POST /auth/signup, 20/min on the public invite lookup/accept, 300/min per webhook source.",
+    headers: { "Retry-After": { description: "Seconds until the limit resets.", schema: { type: "integer" } } },
+    content: {
+      "application/json": {
+        schema: { $ref: "#/components/schemas/Error" },
+        example: { error: "Too many requests. Please slow down and try again shortly.", code: "RATE_LIMITED" },
+      },
+    },
+  },
   Conflict: errorResponse(
     "POST /setup/complete when setup is already complete.",
     "Setup is already complete."
@@ -3987,11 +4374,15 @@ const paths: OpenAPIV3.PathsObject = {
     get: {
       tags: ["Health"],
       summary: "Readiness probe",
-      description: "Unauthenticated. 503 `{ status: \"migrating\" }` until tenant migrations finish, then 200 `{ status: \"ready\" }`. A migration failure exits the process.",
+      description: "Unauthenticated. 503 `{ status: \"migrating\" }` until tenant migrations finish; then the database is pinged (503 `{ status: \"database_unavailable\" }` when it does not answer in 3 s). 200 `{ status: \"ready\"|\"degraded\", failedTenantMigrations }`: `degraded` means at least one tenant schema failed its startup migration (the count is reported, the names are in the server log). A global migration failure exits the process.",
       security: [],
       responses: {
-        "200": jsonResponse("Ready.", { type: "object", required: ["status"], properties: { status: { type: "string", enum: ["ready"] } } }),
-        "503": jsonResponse("Tenant migrations still running.", ref("HealthMigrating")),
+        "200": jsonResponse("Ready (or degraded).", {
+          type: "object",
+          required: ["status", "failedTenantMigrations"],
+          properties: { status: { type: "string", enum: ["ready", "degraded"] }, failedTenantMigrations: { type: "integer", minimum: 0 } },
+        }),
+        "503": jsonResponse("Migrating, or the database is unreachable.", { type: "object", required: ["status"], properties: { status: { type: "string", enum: ["migrating", "database_unavailable"] } } }),
       },
     },
   },
@@ -4094,6 +4485,7 @@ const paths: OpenAPIV3.PathsObject = {
         "`companyName` is accepted but not persisted here; it is collected by Setup Wizard step 1.",
       requestBody: jsonBody(ref("SignupInput")),
       responses: {
+        "429": ERR[429],
         "201": jsonResponse("Profile + tenantId created.", ref("SignupResponse")),
         "200": jsonResponse("Profile already existed (idempotent).", ref("SignupResponse")),
         "400": ERR[400],
@@ -4175,6 +4567,7 @@ const paths: OpenAPIV3.PathsObject = {
         "Returns 410 if the token is expired or has already been accepted.",
       security: [],
       responses: {
+        "429": ERR[429],
         "200": jsonResponse("Token is valid.", ref("InviteTokenInfo")),
         "404": ERR[404],
         "410": ERR[410],
@@ -4209,16 +4602,18 @@ const paths: OpenAPIV3.PathsObject = {
         "**Idempotent** — returns the existing Profile with 200 if it was already created.",
       requestBody: jsonBody(ref("InviteAcceptInput")),
       responses: {
+        "429": ERR[429],
         "201": jsonResponse("Profile created and invite accepted.", {
           type: "object",
           required: ["profile"],
           properties: { profile: ref("Profile") },
         }),
-        "200": jsonResponse("Profile already existed (idempotent).", {
+        "200": jsonResponse("Profile already existed, or a simultaneous accept of the same invite won the race (idempotent: the winner's profile is returned).", {
           type: "object",
           required: ["profile"],
           properties: { profile: ref("Profile") },
         }),
+        "409": errorResponse("The signed-in account already belongs to another organisation (code PROFILE_EXISTS).", "This account already belongs to another organisation"),
         "400": ERR[400],
         "401": ERR[401],
         "403": errorResponse(
@@ -4255,7 +4650,7 @@ const paths: OpenAPIV3.PathsObject = {
       description:
         "Returns the BusinessSettings singleton (or null if not yet created). Open after setup completes — the Settings screens reuse it.",
       responses: {
-        "200": jsonResponse("BusinessSettings (or null).", nullableRef("BusinessSettings")),
+        "200": jsonResponse("BusinessSettings (or null) plus `channels`: what can be sent right now (email native via SES; sms/whatsapp only with GoHighLevel connected; calls = tel: links, always true).", { type: "object", additionalProperties: true, properties: { channels: ref("Channels") } }),
         "401": ERR[401],
       },
     },
@@ -4398,6 +4793,7 @@ const paths: OpenAPIV3.PathsObject = {
         "REPLACES all invite-pending technicians (profileId = null) with the posted list — send the full list you want to keep (re-posting is safe; it does not append duplicates). Technicians who have accepted an invite (real profileId) are never affected. Each created technician is invite-pending (profileId = null).",
       requestBody: jsonBody(arrayOrWrapped("TechnicianInput", "technicians")),
       responses: {
+        "409": errorResponse("Two technicians share an email, or a technician being replaced is still in use (code TECHNICIAN_IN_USE).", "A technician being replaced is still in use. Remove them from rounds and visits first."),
         "200": jsonResponse("All technicians.", { type: "array", items: ref("Technician") }),
         "400": ERR[400],
         "401": ERR[401],
@@ -4993,6 +5389,7 @@ const paths: OpenAPIV3.PathsObject = {
   // =====================================================================
   "/customers": {
     post: {
+      parameters: [IDEMPOTENCY_KEY_PARAM],
       tags: ["Customers"],
       summary: "Create a customer, optionally with its first property and plan",
       description: "Without `property`: a Customer with no property (it is still listed by GET /customers as a `hasNoProperty` row). With `property` (same fields as POST /customers/{id}/properties): customer + property + first plan in ONE transaction; the response then also carries `propertyId`, `servicePlanId`, `assigned`. 400/404 as for the property endpoints (ROUND_SERVICE_AREA_MISMATCH, SERVICE_INACTIVE).",
@@ -5025,7 +5422,7 @@ const paths: OpenAPIV3.PathsObject = {
         { name: "roundId", in: "query", required: false, schema: { type: "string" } },
         { name: "status", in: "query", required: false, schema: { type: "string", enum: ["ACTIVE", "PAUSED", "CANCELLED", "HOLD"] } },
         { name: "page", in: "query", required: false, schema: { type: "integer", minimum: 1, default: 1 } },
-        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } },
+        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } , description: "Values above the maximum are clamped to it (no error)." },
       ],
       responses: {
         "200": jsonResponse("List + summary.", ref("CustomerListResult")),
@@ -5070,11 +5467,13 @@ const paths: OpenAPIV3.PathsObject = {
     delete: {
       tags: ["Customers"],
       summary: "Soft-delete customer (status → CANCELLED, cascades to properties)",
+      description: "B5: 409 `UNPAID_INVOICES` (with `count` and `total` of the SENT invoices) while the customer has unpaid invoices; allowed once they are paid or void.",
       responses: {
         "204": { description: "Deleted." },
         "401": ERR[401],
         "403": ERR[403],
         "404": ERR[404],
+        "409": errorResponse("UNPAID_INVOICES: the customer has unpaid invoices. Body also carries `count` and `total`.", "This customer has 2 unpaid invoices (85.50). Mark them paid or void them first."),
       },
     },
   },
@@ -5100,7 +5499,7 @@ const paths: OpenAPIV3.PathsObject = {
       description: "Newest first; includes CANCELLED visits with `cancelReason` (the detail aggregate's visitHistory tab excludes them). `page`/`pageSize` default 1/50, max 100.",
       parameters: [
         { name: "page", in: "query", required: false, schema: { type: "integer", minimum: 1, default: 1 } },
-        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } },
+        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } , description: "Values above the maximum are clamped to it (no error)." },
       ],
       responses: {
         "200": jsonResponse("Visit history page.", ref("CustomerVisitsPage")),
@@ -5261,11 +5660,13 @@ const paths: OpenAPIV3.PathsObject = {
     delete: {
       tags: ["Properties"],
       summary: "Soft-delete property (status → CANCELLED, cancels service plan)",
+      description: "B5: 409 `UNPAID_INVOICES` (with `count` and `total`) while a visit of the property has an unpaid (SENT) invoice.",
       responses: {
         "204": { description: "Deleted." },
         "401": ERR[401],
         "403": ERR[403],
         "404": ERR[404],
+        "409": errorResponse("UNPAID_INVOICES: the property has unpaid invoices. Body also carries `count` and `total`.", "This property has 1 unpaid invoice (35.00). Mark them paid or void them first."),
       },
     },
   },
@@ -5343,7 +5744,7 @@ const paths: OpenAPIV3.PathsObject = {
       parameters: [
         { name: "type", in: "query", required: false, schema: ref("PhotoType") },
         { name: "page", in: "query", required: false, schema: { type: "integer", minimum: 1, default: 1 } },
-        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 24 } },
+        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 24 } , description: "Values above the maximum are clamped to it (no error)." },
       ],
       responses: {
         "200": jsonResponse("Photo page.", ref("PhotoPage")),
@@ -5369,7 +5770,7 @@ const paths: OpenAPIV3.PathsObject = {
         { name: "assignedTo", in: "query", required: false, schema: { type: "string", enum: ["me"] }, description: "Pass `me` to return only complaints assigned to the calling user's technician record." },
         { name: "technicianId", in: "query", required: false, schema: { type: "string" }, description: "Filter by specific technician ID. Ignored when `assignedTo=me`." },
         { name: "page", in: "query", required: false, schema: { type: "integer", minimum: 1, default: 1 } },
-        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } },
+        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } , description: "Values above the maximum are clamped to it (no error)." },
       ],
       responses: {
         "200": jsonResponse("Paginated complaint list.", ref("ComplaintsListResult")),
@@ -5931,11 +6332,13 @@ const paths: OpenAPIV3.PathsObject = {
       description:
         "Full replace semantics — send the complete list you want to keep (empty array clears). Every id must reference an active, invite-accepted technician (400 otherwise); unknown ids 404. " +
         "`split.mode`: SINGLE (exactly one technician, 400 otherwise), AUTO (balanced by plan value), MANUAL (`allocations` of `{ propertyId, technicianId }`). Omitted = SINGLE for one technician, AUTO for more. " +
-        "Future SCHEDULED visits are restamped (except manually-overridden ones). `?dryRun=true` returns the same response without saving anything. " +
-        "BREAKING: the response is `{ roundId, allocation, visitsUpdated }` (was the RoundDetail). An invalid MANUAL allocation is 400 `INVALID_ALLOCATION` with a per-property `fields` map.",
+        "Future SCHEDULED visits are restamped (except manually-overridden ones), then any due visits for the (ACTIVE) round are generated now and stamped with the new technicians (FLOW-01); the response reports `visitsGenerated`, `overriddenVisits` and `nextVisitDate`. " +
+        "Newly assigned technicians get a SCHEDULE notification (\"N visits assigned to you\") and removed ones a ROUND_UPDATE notification, best-effort, only on a real save. `?dryRun=true` returns the same response without saving or generating anything (and sends no notifications). " +
+        "BREAKING: the response is `{ roundId, allocation, visitsUpdated, visitsGenerated, overriddenVisits, nextVisitDate }` (was the RoundDetail). An invalid MANUAL allocation is 400 `INVALID_ALLOCATION` with a per-property `fields` map.",
       parameters: [{ name: "dryRun", in: "query", required: false, schema: { type: "string", enum: ["true", "false"] }, description: "\"true\" = compute and return, roll everything back." }],
       requestBody: jsonBody(ref("SetRoundTechniciansInput")),
       responses: {
+        "409": errorResponse("Another save of the same round technicians happened at the same time (code ROUND_TECHNICIANS_CONFLICT); reload and retry.", "Another change to this round's technicians was saved at the same time. Reload and try again."),
         "200": jsonResponse("Allocation result.", ref("SetTechniciansResult")),
         "400": jsonResponse("Validation error, or code INVALID_ALLOCATION with `fields` (propertyId → reason).", {
           allOf: [ref("Error")],
@@ -6167,7 +6570,7 @@ const paths: OpenAPIV3.PathsObject = {
         { name: "search", in: "query", required: false, schema: { type: "string", maxLength: 100 }, description: "Customer name, address / postcode, job ref (`JOB-000123`) or visit id." },
         { name: "reviewStatus", in: "query", required: false, schema: ref("PhotoReviewStatus") },
         { name: "page", in: "query", required: false, schema: { type: "integer", minimum: 1, default: 1 } },
-        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 24 } },
+        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 24 } , description: "Values above the maximum are clamped to it (no error)." },
       ],
       responses: {
         "200": jsonResponse("Photo page.", ref("PhotoPage")),
@@ -6243,7 +6646,7 @@ const paths: OpenAPIV3.PathsObject = {
         { name: "from", in: "query", required: false, schema: { type: "string", format: "date" } },
         { name: "to", in: "query", required: false, schema: { type: "string", format: "date" }, description: "Inclusive; must not be before `from`." },
         { name: "page", in: "query", required: false, schema: { type: "integer", minimum: 1, default: 1 } },
-        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } },
+        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } , description: "Values above the maximum are clamped to it (no error)." },
       ],
       responses: {
         "200": jsonResponse("Incident page, newest first.", {
@@ -6386,6 +6789,7 @@ const paths: OpenAPIV3.PathsObject = {
   // =====================================================================
   "/messages/send": {
     post: {
+      parameters: [IDEMPOTENCY_KEY_PARAM],
       tags: ["Messages"],
       summary: "Send one message to a single customer",
       description:
@@ -6398,8 +6802,8 @@ const paths: OpenAPIV3.PathsObject = {
         "401": ERR[401],
         "403": ERR[403],
         "404": errorResponse("Property or customer not found.", "Customer not found"),
-        "409": errorResponse("GoHighLevel is not connected (code GHL_NOT_CONNECTED).", "GoHighLevel is not connected"),
-        "502": errorResponse("GHL rejected the message (code GHL_SEND_FAILED).", "GoHighLevel could not send the message: timeout"),
+        "409": errorResponse("CHANNEL_UNAVAILABLE with `reason`: GHL_NOT_CONNECTED (SMS/WhatsApp need GoHighLevel), EMAIL_NOT_CONFIGURED, EMAIL_TURNED_OFF, EMAIL_PAUSED, EMAIL_DAILY_LIMIT, EMAIL_ADDRESS_INVALID or NO_AVAILABLE_CHANNEL; or CUSTOMER_OPTED_OUT.", "SMS and WhatsApp need GoHighLevel to be connected"),
+        "502": errorResponse("GHL rejected the message (code GHL_SEND_FAILED) or the email provider failed (code EMAIL_SEND_FAILED).", "GoHighLevel could not send the message: timeout"),
       },
     },
   },
@@ -6427,6 +6831,7 @@ const paths: OpenAPIV3.PathsObject = {
 
   "/messages/bulk": {
     post: {
+      parameters: [IDEMPOTENCY_KEY_PARAM],
       tags: ["Messages"],
       summary: "Broadcast one message to every customer in a round",
       description:
@@ -6602,7 +7007,7 @@ const paths: OpenAPIV3.PathsObject = {
         { name: "paymentMethod", in: "query", required: false, schema: ref("PaymentMethod") },
         { name: "search", in: "query", required: false, schema: { type: "string" }, description: "Case-insensitive search on customer name or property address." },
         { name: "page", in: "query", required: false, schema: { type: "integer", minimum: 1, default: 1 } },
-        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } },
+        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } , description: "Values above the maximum are clamped to it (no error)." },
       ],
       responses: {
         "200": jsonResponse("Paginated debt board rows.", ref("DebtBoardResult")),
@@ -6661,8 +7066,8 @@ const paths: OpenAPIV3.PathsObject = {
         "401": ERR[401],
         "403": ERR[403],
         "404": ERR[404],
-        "409": errorResponse("GHL is not connected (code GHL_NOT_CONNECTED).", "GoHighLevel is not connected"),
-        "502": errorResponse("GHL rejected the message (code GHL_SEND_FAILED).", "GoHighLevel could not send the message: timeout"),
+        "409": errorResponse("CHANNEL_UNAVAILABLE with `reason` (GHL_NOT_CONNECTED for SMS/WhatsApp, EMAIL_* for email, NO_AVAILABLE_CHANNEL) or CUSTOMER_OPTED_OUT.", "SMS and WhatsApp need GoHighLevel to be connected"),
+        "502": errorResponse("GHL rejected the message (GHL_SEND_FAILED) or the email provider failed (EMAIL_SEND_FAILED).", "GoHighLevel could not send the message: timeout"),
       },
     },
   },
@@ -6682,7 +7087,7 @@ const paths: OpenAPIV3.PathsObject = {
         "401": ERR[401],
         "403": ERR[403],
         "404": ERR[404],
-        "409": errorResponse("STRIPE_NOT_CONNECTED, GHL_NOT_CONNECTED, or INVOICE_NOT_PAYABLE (PAID/VOID).", "Stripe is not connected. Connect Stripe in Settings › Payments to send payment links."),
+        "409": errorResponse("STRIPE_NOT_CONNECTED, CHANNEL_UNAVAILABLE (see `reason`), or INVOICE_NOT_PAYABLE (PAID/VOID).", "Stripe is not connected. Connect Stripe in Settings › Payments to send payment links."),
         "502": errorResponse("GHL rejected the message (code GHL_SEND_FAILED).", "GoHighLevel could not send the message: timeout"),
       },
     },
@@ -6735,7 +7140,7 @@ const paths: OpenAPIV3.PathsObject = {
         { name: "from", in: "query", required: false, schema: { type: "string", format: "date" } },
         { name: "to", in: "query", required: false, schema: { type: "string", format: "date" } },
         { name: "page", in: "query", required: false, schema: { type: "integer", minimum: 1, default: 1 } },
-        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } },
+        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } , description: "Values above the maximum are clamped to it (no error)." },
       ],
       responses: {
         "200": jsonResponse("Paginated activity log.", ref("ReportsActivityResult")),
@@ -6753,7 +7158,7 @@ const paths: OpenAPIV3.PathsObject = {
         { name: "period", in: "query", required: false, schema: { type: "string", enum: ["today", "last7", "last30", "last90", "thisMonth", "lastMonth", "thisYear"], default: "last30" }, description: "Unknown values fall back to last30. CANCELLED visits are excluded unless filtered for explicitly." },
         { name: "status", in: "query", required: false, schema: ref("VisitStatus") },
         { name: "page", in: "query", required: false, schema: { type: "integer", minimum: 1, default: 1 } },
-        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } },
+        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } , description: "Values above the maximum are clamped to it (no error)." },
       ],
       responses: {
         "200": jsonResponse("Paginated visit rows.", ref("ReportsVisitsResult")),
@@ -6770,7 +7175,7 @@ const paths: OpenAPIV3.PathsObject = {
       parameters: [
         { name: "period", in: "query", required: false, schema: { type: "string", enum: ["today", "last7", "last30", "last90", "thisMonth", "lastMonth", "thisYear"], default: "last30" }, description: "Unknown values fall back to last30. CANCELLED visits are excluded unless filtered for explicitly." },
         { name: "page", in: "query", required: false, schema: { type: "integer", minimum: 1, default: 1 } },
-        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } },
+        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } , description: "Values above the maximum are clamped to it (no error)." },
       ],
       responses: {
         "200": jsonResponse("Paginated technician rows.", ref("ReportsTechniciansResult")),
@@ -6816,7 +7221,7 @@ const paths: OpenAPIV3.PathsObject = {
       tags: ["Reports"],
       summary: "CSV export",
       description:
-        "Unlike /reports/visits and /reports/technicians, this always exports the FULL (unpaginated) result set for the period — every row, not just the UI's current page — as `text/csv`. `type=revenue` exports the same rows as GET /reports/revenue.",
+        "String cells that start with `=`, `+`, `-`, `@`, tab or CR are prefixed with a single quote so spreadsheets do not evaluate them (CSV formula injection). `type` outside the enum is 400 `INVALID_EXPORT_TYPE`. Unlike /reports/visits and /reports/technicians, this always exports the FULL (unpaginated) result set for the period — every row, not just the UI's current page — as `text/csv`. `type=revenue` exports the same rows as GET /reports/revenue.",
       parameters: [
         { name: "type", in: "query", required: false, schema: { type: "string", enum: ["visits", "technicians", "revenue"], default: "visits" } },
         { name: "period", in: "query", required: false, schema: { type: "string", enum: ["today", "last7", "last30", "last90", "thisMonth", "lastMonth", "thisYear"], default: "last30" }, description: "Unknown values fall back to last30. CANCELLED visits are excluded unless filtered for explicitly." },
@@ -6827,6 +7232,7 @@ const paths: OpenAPIV3.PathsObject = {
           description: "CSV file. `Content-Disposition: attachment; filename=\"{type}-{period}.csv\"`.",
           content: { "text/csv": { schema: { type: "string" } } },
         },
+        "400": errorResponse("Unknown `type` (code `INVALID_EXPORT_TYPE`).", "\"type\" must be one of: visits, technicians, revenue."),
         "401": ERR[401],
         "403": ERR[403],
       },
@@ -6855,7 +7261,7 @@ const paths: OpenAPIV3.PathsObject = {
       tags: ["Today"],
       summary: "Close Operational Day (M21)",
       description:
-        "`unfinishedAction: \"push_to_tomorrow\"` moves every still-SCHEDULED/IN_PROGRESS visit to the next working day (Mon–Fri, skipping weekends) and resets IN_PROGRESS back to SCHEDULED; `\"mark_as_skipped\"` marks them SKIPPED in place. 409 if the day is already closed, or if BusinessSettings hasn't been configured yet.",
+        "`unfinishedAction: \"push_to_tomorrow\"` carries every still-SCHEDULED/IN_PROGRESS visit to the next working day (BusinessSettings.defaultWorkingDays, Mon–Fri when unset; on a Friday pass `target` SATURDAY or MONDAY, default Monday) through the same service as POST /visits/carryover (back to SCHEDULED, start/arrival and reminder markers reset, queued reminders cancelled, carriedOverFromDate/carryoverCount recorded, technicians notified); `\"mark_as_skipped\"` marks them SKIPPED in place. 409 if the day is already closed, or if BusinessSettings hasn't been configured yet.",
       requestBody: jsonBody(ref("CloseDayInput")),
       responses: {
         "200": jsonResponse("Close-of-day summary.", ref("CloseDaySummary")),
@@ -6943,13 +7349,13 @@ const paths: OpenAPIV3.PathsObject = {
       summary: "List invoices (GAP-028) — paginated, newest first",
       description: "Filters: `status`, `from`/`to` (issue date, YYYY-MM-DD, `to` inclusive), `customerId`, `q` (invoice number or customer name, contains). `paymentMethod` = the visit payment's method, else the visit's, else the customer's.",
       parameters: [
-        { name: "status", in: "query", required: false, schema: ref("InvoiceStatus") },
+        { name: "status", in: "query", required: false, schema: stringEnum(["DRAFT", "SENT", "PAID", "VOID", "OVERDUE"], "OVERDUE = SENT with a due date before today.") },
         { name: "from", in: "query", required: false, schema: { type: "string", format: "date" } },
         { name: "to", in: "query", required: false, schema: { type: "string", format: "date" } },
         { name: "customerId", in: "query", required: false, schema: { type: "string" } },
         { name: "q", in: "query", required: false, schema: { type: "string" } },
         { name: "page", in: "query", required: false, schema: { type: "integer", minimum: 1, default: 1 } },
-        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } },
+        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } , description: "Values above the maximum are clamped to it (no error)." },
       ],
       responses: {
         "200": jsonResponse("Invoice page.", {
@@ -6963,6 +7369,7 @@ const paths: OpenAPIV3.PathsObject = {
       },
     },
     post: {
+      parameters: [IDEMPOTENCY_KEY_PARAM],
       tags: ["Invoices"],
       summary: "Create (save) an invoice for a visit",
       description: "409 `ALREADY_INVOICED` if the visit already has an invoice; 409 `VISIT_NOT_COMPLETED` unless the visit is COMPLETED. The due date defaults to today + BusinessSettings.invoiceDueDays.",
@@ -6984,7 +7391,7 @@ const paths: OpenAPIV3.PathsObject = {
       summary: "Export invoices as CSV",
       description: "Same filters as GET /invoices, every matching row. Columns: invoiceNumber, customerId, customerName, total, status, issuedAt, dueDate, paidAt, paymentMethod.",
       parameters: [
-        { name: "status", in: "query", required: false, schema: ref("InvoiceStatus") },
+        { name: "status", in: "query", required: false, schema: stringEnum(["DRAFT", "SENT", "PAID", "VOID", "OVERDUE"], "OVERDUE = SENT with a due date before today (same as GET /invoices).") },
         { name: "from", in: "query", required: false, schema: { type: "string", format: "date" } },
         { name: "to", in: "query", required: false, schema: { type: "string", format: "date" } },
         { name: "customerId", in: "query", required: false, schema: { type: "string" } },
@@ -7042,6 +7449,32 @@ const paths: OpenAPIV3.PathsObject = {
     },
   },
 
+  "/invoices/bulk-send/preview": {
+    post: {
+      tags: ["Invoices"],
+      summary: "Preview \"Send all\" (ACT-01)",
+      description: "What a bulk send would do: counts by channel and by skip reason. Nothing is queued. Default selection: DRAFT invoices. 400 `INVALID_BATCH_SIZE` for more than 500 ids.",
+      requestBody: jsonBody(ref("InvoiceBulkSendInput")),
+      responses: { "200": jsonResponse("Preview.", ref("InvoiceBulkSendPreview")), "400": ERR[400], "401": ERR[401], "403": ERR[403] },
+    },
+  },
+  "/invoices/bulk-send": {
+    post: {
+      tags: ["Invoices"],
+      summary: "Send many invoices (ACT-01) — queued, not sent in the request",
+      description: "Queues one `invoice.send` outbox row per sendable invoice (idempotent per invoice: a double click queues once, the repeat is skipped as ALREADY_QUEUED). The worker sends through GHL; an invoice flips to SENT only after the provider accepts. Poll GET /invoices/bulk-send/{batchId}. Max 500 per batch.",
+      requestBody: jsonBody(ref("InvoiceBulkSendInput")),
+      responses: { "202": jsonResponse("Queued.", ref("InvoiceBulkSendQueued")), "400": ERR[400], "401": ERR[401], "403": ERR[403] },
+    },
+  },
+  "/invoices/bulk-send/{batchId}": {
+    parameters: [{ name: "batchId", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Invoices"],
+      summary: "Per-invoice results of a bulk send (ACT-01)",
+      responses: { "200": jsonResponse("Batch results.", ref("InvoiceBulkSendBatch")), "401": ERR[401], "403": ERR[403], "404": ERR[404] },
+    },
+  },
   "/invoices/{id}/send": {
     parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
     post: {
@@ -7063,7 +7496,7 @@ const paths: OpenAPIV3.PathsObject = {
         "401": ERR[401],
         "403": ERR[403],
         "404": ERR[404],
-        "409": errorResponse("INVOICE_ALREADY_SENT (send again with resend: true), INVOICE_NOT_SENDABLE (PAID/VOID), or GHL_NOT_CONNECTED.", "Invoice has already been sent"),
+        "409": errorResponse("INVOICE_ALREADY_SENT (send again with resend: true), INVOICE_NOT_SENDABLE (PAID/VOID), or CHANNEL_UNAVAILABLE (see `reason`).", "Invoice has already been sent"),
         "502": errorResponse("GHL rejected the message (code GHL_SEND_FAILED); the invoice stays unsent.", "GoHighLevel could not send the message: timeout"),
       },
     },
@@ -7114,7 +7547,7 @@ const paths: OpenAPIV3.PathsObject = {
         { name: "from", in: "query", required: false, schema: { type: "string", format: "date" } },
         { name: "to", in: "query", required: false, schema: { type: "string", format: "date" } },
         { name: "page", in: "query", required: false, schema: { type: "integer", minimum: 1, default: 1 } },
-        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } },
+        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } , description: "Values above the maximum are clamped to it (no error)." },
       ],
       responses: {
         "200": jsonResponse("Payment page.", {
@@ -7151,10 +7584,11 @@ const paths: OpenAPIV3.PathsObject = {
 
   "/payments/stripe/checkout": {
     post: {
+      parameters: [IDEMPOTENCY_KEY_PARAM],
       tags: ["Payments"],
       summary: "Create a one-time Stripe Checkout session for an invoice",
       description:
-        "Returns the existing PENDING session's URL (200) instead of creating a duplicate if one already exists for this invoice; otherwise creates a new one (201). 400 if Stripe isn't connected. 409 if the invoice is already PAID or VOID.",
+        "Returns the existing PENDING session's URL (200) instead of creating a duplicate if a still-open session exists for this invoice (a PENDING session whose `expiresAt` has passed is skipped and a new one is created, 201). The Stripe request carries an idempotency key (the caller's `Idempotency-Key`, else invoice + amount + attempt) so a retry cannot mint a second session. 400 if Stripe isn't connected. 409 if the invoice is already PAID or VOID.",
       requestBody: jsonBody(ref("StripeCheckoutInput")),
       responses: {
         "201": jsonResponse("New checkout session.", ref("StripeSessionResult")),
@@ -7431,7 +7865,7 @@ const paths: OpenAPIV3.PathsObject = {
         { name: "from", in: "query", required: false, schema: { type: "string", format: "date" } },
         { name: "to", in: "query", required: false, schema: { type: "string", format: "date" } },
         { name: "page", in: "query", required: false, schema: { type: "integer", minimum: 1 } },
-        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 200 } },
+        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 200 } , description: "Values above the maximum are clamped to it (no error)." },
       ],
       responses: {
         "200": jsonResponse("Schedule page.", { type: "object", properties: { from: { type: "string" }, to: { type: "string" }, timeZone: { type: "string" }, rows: { type: "array", items: { type: "object", additionalProperties: true, description: "MobileVisitRow plus date (YYYY-MM-DD), paymentHold, vatAmount, grossTotal." } }, summary: { type: "array", items: { type: "object", properties: { date: { type: "string" }, count: { type: "integer" }, completedCount: { type: "integer" } } } }, pagination: { type: "object", additionalProperties: true } } }),
@@ -7588,7 +8022,7 @@ const paths: OpenAPIV3.PathsObject = {
       tags: ["Mobile"],
       summary: "Complete a visit and create its Payment",
       description:
-        "Same shared completion service as PATCH /visits/{id}/complete (D-2): `payment` { method: CASH | CHEQUE | NONE, amount?, chequeNumber? } is validated before anything is written, then visit + Payment + events are written in one transaction. " +
+        "Same shared completion service as PATCH /visits/{id}/complete (D-2): `payment` { method: CASH | CHEQUE | BACS | GOCARDLESS | STRIPE | NONE, amount?, chequeNumber?, collectVia?, updateCustomerDefault? } is validated before anything is written, then visit + Payment + events are written in one transaction. " +
         "CHEQUE stores `chequeNumber` on Payment.reference (PENDING). Optional `note` (≤2000 chars) is saved on the visit. Queues GHL `visit.completed` and (unless opted out) the visit-completed customer message. Already-COMPLETED returns `payment: null`; SKIPPED/CANCELLED → 409.",
       requestBody: jsonBody({
         allOf: [ref("VisitCompleteInput"), { type: "object", properties: { note: { type: "string", maxLength: 2000 } } }],
@@ -7656,10 +8090,11 @@ const paths: OpenAPIV3.PathsObject = {
     post: {
       tags: ["Mobile"],
       summary: "Record an uploaded photo",
+      description: "`url` (or its alias `path`) must be a storage path from `POST /mobile/visits/{id}/photos/upload-url`, i.e. start with `<tenantId>/visits/<visitId>/` and contain no `..`. Anything else is 400 `INVALID_PHOTO_PATH`.",
       requestBody: jsonBody(ref("MobilePhotoInput")),
       responses: {
         "201": jsonResponse("Recorded.", { type: "object", required: ["recorded"], properties: { recorded: { type: "boolean", enum: [true] } } }),
-        "400": ERR[400],
+        "400": errorResponse("Invalid body, or `INVALID_PHOTO_PATH` (path is not this visit's).", "url must be a storage path returned by this visit's photos/upload-url"),
         "401": ERR[401],
         "403": MOBILE_ERR_403,
         "404": ERR[404],
@@ -7768,7 +8203,7 @@ const paths: OpenAPIV3.PathsObject = {
       description: "`{ rows: [{ id, changedAt, actorId, actorRole, oldServices, newServices, added, removed }], pagination }`.",
       parameters: [
         { name: "page", in: "query", schema: { type: "integer", minimum: 1 } },
-        { name: "pageSize", in: "query", schema: { type: "integer", minimum: 1, maximum: 100 } },
+        { name: "pageSize", in: "query", schema: { type: "integer", minimum: 1, maximum: 100 } , description: "Values above the maximum are clamped to it (no error)." },
       ],
       responses: {
         "200": jsonResponse("History page.", { type: "object", additionalProperties: true }),
@@ -7786,7 +8221,7 @@ const paths: OpenAPIV3.PathsObject = {
       description: "`{ rows: [{ propertyId, addressLine, postcode, status, customerId, customerName, assignedTechnicianId, servicePlans }], pagination: { page, pageSize, total, totalPages } }`.",
       parameters: [
         { name: "page", in: "query", schema: { type: "integer", minimum: 1 } },
-        { name: "pageSize", in: "query", schema: { type: "integer", minimum: 1, maximum: 100 } },
+        { name: "pageSize", in: "query", schema: { type: "integer", minimum: 1, maximum: 100 } , description: "Values above the maximum are clamped to it (no error)." },
       ],
       responses: {
         "200": jsonResponse("Properties page.", { type: "object", additionalProperties: true }),
@@ -7810,6 +8245,37 @@ const paths: OpenAPIV3.PathsObject = {
         "401": ERR[401],
         "403": ERR[403],
         "404": ERR[404],
+        "409": ERR[409],
+      },
+    },
+  },
+  "/visits/carryover/options": {
+    get: {
+      tags: ["Visits"],
+      summary: "Carryover options for a day (ACT-02..04)",
+      description: "Where the unfinished visits of `date` can go. Friday: always Saturday and Monday (Monday default). Other days: the next working day (BusinessSettings.defaultWorkingDays; Mon–Fri when unset).",
+      parameters: [{ name: "date", in: "query", required: true, schema: { type: "string", format: "date" } }],
+      responses: {
+        "200": jsonResponse("Options.", ref("CarryoverOptions")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+  "/visits/carryover": {
+    post: {
+      tags: ["Visits"],
+      summary: "Carry unfinished visits to a later working day (ACT-02..04)",
+      description:
+        "Moves the SCHEDULED/IN_PROGRESS visits of `date` (or `visitIds`) to the `target` day: back to SCHEDULED, startedAt/arrivedAt cleared, reminder markers reset, queued pre-clean messages for the old date cancelled, `carriedOverFromDate`/`carryoverCount` recorded, VISITS_CARRIED_OVER activity logged, technicians notified (SCHEDULE notification). `dryRun` previews moves and technician conflicts. " +
+        "400 `INVALID_CARRYOVER_TARGET` (key not offered for `date`) or `CARRYOVER_TARGET_IN_PAST`; 409 `CARRYOVER_TARGET_CLOSED` (the target day was already closed).",
+      requestBody: jsonBody(ref("CarryoverInput")),
+      responses: {
+        "200": jsonResponse("Carryover result.", ref("CarryoverResult")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
         "409": ERR[409],
       },
     },
@@ -7856,18 +8322,111 @@ const paths: OpenAPIV3.PathsObject = {
         { name: "customerId", in: "query", schema: { type: "string" } },
         { name: "unreadOnly", in: "query", schema: { type: "boolean" } },
         { name: "page", in: "query", schema: { type: "integer", minimum: 1 } },
-        { name: "pageSize", in: "query", schema: { type: "integer", minimum: 1, maximum: 100 } },
+        { name: "pageSize", in: "query", schema: { type: "integer", minimum: 1, maximum: 100 } , description: "Values above the maximum are clamped to it (no error)." },
       ],
       responses: { "200": jsonResponse("Inbox page.", { type: "object", additionalProperties: true }), "400": ERR[400], "401": ERR[401], "403": ERR[403] },
     },
   },
   "/messages/inbox/read": {
     post: {
+      parameters: [IDEMPOTENCY_KEY_PARAM],
       tags: ["Messages"],
       summary: "Mark inbound replies read",
       description: "By `ids` and/or `customerId` (all that customer's unread replies). 400 when neither is sent. -> `{ updated }`.",
       requestBody: jsonBody({ type: "object", properties: { ids: { type: "array", items: { type: "string" } }, customerId: { type: "string" } } }),
       responses: { "200": jsonResponse("Rows updated.", { type: "object", properties: { updated: { type: "integer" } } }), "400": ERR[400], "401": ERR[401], "403": ERR[403] },
+    },
+  },
+  "/notifications": {
+    get: {
+      tags: ["Notifications"],
+      summary: "Admin/manager notification feed (NOTIF-02)",
+      description: "The signed-in ADMIN/MANAGER's own notifications, newest first, 30 per page (`?cursor=` = the previous `nextCursor`). Same table as `/mobile/notifications`; rows are never shared between profiles.",
+      parameters: [{ name: "cursor", in: "query", required: false, schema: { type: "string" } }],
+      responses: { "200": jsonResponse("A page of notifications.", ref("AdminNotificationPage")), "401": ERR[401], "403": ERR[403] },
+    },
+  },
+  "/notifications/unread-count": {
+    get: {
+      tags: ["Notifications"],
+      summary: "Unread notification count (header bell)",
+      responses: { "200": jsonResponse("Count.", { type: "object", required: ["unreadCount"], properties: { unreadCount: { type: "integer" } } }), "401": ERR[401], "403": ERR[403] },
+    },
+  },
+  "/integrations/outbox": {
+    get: {
+      tags: ["Integrations"],
+      summary: "List dead or failed integration outbox rows",
+      description:
+        "ADMIN only (a MANAGER gets 403 `ADMIN_ONLY`). `?status=dead` (default) or `failed`, newest first, `page`/`pageSize` (default 1/50, max 100). " +
+        "Rows go `dead` after 6 failed attempts (retries back off 30 s, 2 min, 10 min, 1 h, 6 h) or immediately for an unknown event type; the office is notified (type INTEGRATION). The payload is never returned (it can hold message text); `customerId` is.",
+      parameters: [
+        { name: "status", in: "query", required: false, schema: { type: "string", enum: ["dead", "failed"], default: "dead" } },
+        { name: "page", in: "query", required: false, schema: { type: "integer", minimum: 1, default: 1 } },
+        { name: "pageSize", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100, default: 50 } , description: "Values above the maximum are clamped to it (no error)." },
+      ],
+      responses: {
+        "200": jsonResponse("Page of rows.", {
+          type: "object",
+          required: ["rows", "pagination"],
+          properties: {
+            rows: {
+              type: "array",
+              items: {
+                type: "object",
+                required: ["id", "eventType", "status", "attempts", "createdAt"],
+                properties: {
+                  id: { type: "string" },
+                  eventType: { type: "string", example: "message.send" },
+                  status: { type: "string", enum: ["dead", "failed"] },
+                  attempts: { type: "integer" },
+                  lastError: { type: "string", nullable: true },
+                  customerId: { type: "string", nullable: true },
+                  batchId: { type: "string", nullable: true },
+                  createdAt: { type: "string", format: "date-time" },
+                  processedAt: { type: "string", format: "date-time", nullable: true },
+                },
+              },
+            },
+            pagination: { $ref: "#/components/schemas/Pagination" },
+          },
+        }),
+        "400": errorResponse("`status` is not dead or failed (code INVALID_STATUS).", "status must be dead or failed"),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+  "/integrations/outbox/{id}/replay": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    post: {
+      tags: ["Integrations"],
+      summary: "Replay a dead or failed outbox row",
+      description:
+        "ADMIN only. Resets the row to `pending` with a fresh attempt budget; the next worker run (every 30 s, GHL-connected tenants) retries it. Logged as OUTBOX_REPLAYED. 404 `OUTBOX_NOT_FOUND`; 409 `OUTBOX_NOT_REPLAYABLE` when the row is not dead/failed.",
+      responses: {
+        "200": jsonResponse("Re-queued.", { type: "object", required: ["id", "status"], properties: { id: { type: "string" }, status: { type: "string", enum: ["pending"] } } }),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": errorResponse("Unknown row (code OUTBOX_NOT_FOUND).", "Outbox row not found"),
+        "409": errorResponse("Row is not dead/failed (code OUTBOX_NOT_REPLAYABLE).", "A sent row cannot be replayed"),
+      },
+    },
+  },
+  "/notifications/read-all": {
+    post: {
+      tags: ["Notifications"],
+      summary: "Mark all of the caller's notifications read",
+      responses: { "200": jsonResponse("Done.", { type: "object", required: ["ok"], properties: { ok: { type: "boolean", enum: [true] } } }), "401": ERR[401], "403": ERR[403] },
+    },
+  },
+  "/notifications/{id}/read": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    post: {
+      tags: ["Notifications"],
+      summary: "Mark one notification read",
+      description: "Scoped to the caller's own rows; an unknown or someone else's id is a silent no-op (still 200).",
+      responses: { "200": jsonResponse("Done.", { type: "object", required: ["ok"], properties: { ok: { type: "boolean", enum: [true] } } }), "401": ERR[401], "403": ERR[403] },
     },
   },
   "/chat/threads": {
@@ -7951,6 +8510,7 @@ const paths: OpenAPIV3.PathsObject = {
       parameters: [{ name: "Stripe-Signature", in: "header", required: true, schema: { type: "string" } }],
       requestBody: jsonBody({ type: "object", additionalProperties: true, description: "Raw Stripe Event JSON." }),
       responses: {
+        "429": ERR[429],
         "200": { description: "Acknowledged (also for replays, non-Connect events and unknown accounts)." },
         "400": errorResponse("Signature verification failed.", "Webhook signature verification failed"),
         "500": { description: "The event could not be recorded or processed (Stripe will retry)." },
@@ -7976,6 +8536,7 @@ const paths: OpenAPIV3.PathsObject = {
       ],
       requestBody: jsonBody({ type: "object", additionalProperties: true, description: "Raw GoCardless `{ events: [...] }` JSON." }),
       responses: {
+        "429": ERR[429],
         "200": { description: "Acknowledged (or silently ignored)." },
         "400": errorResponse("tenantId/secret missing, or malformed body.", "Missing tenantId or secret"),
         "401": errorResponse("Invalid webhook signature.", "Invalid webhook signature"),
@@ -7996,9 +8557,102 @@ const paths: OpenAPIV3.PathsObject = {
       ],
       requestBody: jsonBody({ type: "object", additionalProperties: true, description: "Raw GHL event JSON." }),
       responses: {
+        "429": ERR[429],
         "200": { description: "Acknowledged." },
         "400": errorResponse("Body is not valid JSON.", "Malformed JSON"),
         "401": { description: "tenantId/secret missing, unknown tenant, GHL not connected, or secret mismatch." },
+      },
+    },
+  },
+  "/settings/email": {
+    get: {
+      tags: ["Settings"],
+      summary: "Email and branding settings",
+      description: "ADMIN or MANAGER. Sender identity, reply-to, on/off and pause state, daily cap, brand colour (+ contrast check), logo (signed URL + alt text), health counters over the last 100 emails, the current sender preview, the sending-domain state and the channel capabilities.",
+      responses: { "200": jsonResponse("Email settings.", ref("EmailSettings")), "401": ERR[401], "403": ERR[403] },
+    },
+    patch: {
+      tags: ["Settings"],
+      summary: "Update email identity and branding (ADMIN only)",
+      description:
+        "Any of `emailSenderName`, `emailReplyTo`, `emailSenderLocalPart`, `emailEnabled`, `emailDailyLimit` (1-100000 or null), `brandColour` (#RRGGBB or null), `logoAltText`, `emailPaused` (false resumes email after an automatic pause). Names and addresses are validated against header injection (no line breaks, quotes, < > ; @, 70 chars). " +
+        "A brand colour that fails 4.5:1 as text on white is saved and returned with a `warning` plus safe `textColour`/`safeAccentColour`. 400 codes: INVALID_EMAIL_SENDER_NAME, INVALID_EMAIL_ADDRESS, INVALID_EMAIL_LOCAL_PART, INVALID_BRAND_COLOUR, INVALID_EMAIL_DAILY_LIMIT, VALIDATION_FAILED.",
+      requestBody: jsonBody({ type: "object", additionalProperties: false, properties: { emailSenderName: { type: "string", nullable: true }, emailReplyTo: { type: "string", nullable: true }, emailSenderLocalPart: { type: "string", nullable: true }, emailEnabled: { type: "boolean" }, emailDailyLimit: { type: "integer", nullable: true }, brandColour: { type: "string", nullable: true }, logoAltText: { type: "string", nullable: true }, emailPaused: { type: "boolean" } } }),
+      responses: { "200": jsonResponse("Updated view.", ref("EmailSettings")), "400": errorResponse("Validation failed (see code).", "emailSenderName must be 1-70 characters"), "401": ERR[401], "403": ERR[403] },
+    },
+  },
+  "/settings/email/test": {
+    post: {
+      tags: ["Settings"],
+      summary: "Send a test email to myself (ADMIN only)",
+      description: "Sends a branded test email from the tenant's current sender to the signed-in admin's address.",
+      responses: {
+        "200": jsonResponse("Sent.", { type: "object", required: ["sent", "from", "tier"], properties: { sent: { type: "boolean", enum: [true] }, from: { type: "string" }, tier: { type: "integer", enum: [1, 2] } } }),
+        "401": ERR[401], "403": ERR[403],
+        "409": errorResponse("CHANNEL_UNAVAILABLE (email not configured, turned off, paused or at its daily cap).", "Email sending is not set up on this server."),
+        "502": errorResponse("Email provider failed (code EMAIL_SEND_FAILED).", "The email provider could not send the message. Try again shortly."),
+      },
+    },
+  },
+  "/settings/email/domain": {
+    get: {
+      tags: ["Settings"],
+      summary: "Sending-domain status (ADMIN only)",
+      description: "Polls SES for the tenant's sending domain and updates the stored status (NONE, PENDING, VERIFIED, FAILED). A nightly job re-checks every domain.",
+      responses: { "200": jsonResponse("Domain state.", ref("EmailDomain")), "401": ERR[401], "403": ERR[403], "409": errorResponse("CHANNEL_UNAVAILABLE (SES not configured).", "Email sending is not set up on this server."), "502": errorResponse("SES failed (code EMAIL_DOMAIN_FAILED).", "Amazon SES could not complete the domain request. Try again shortly.") },
+    },
+    post: {
+      tags: ["Settings"],
+      summary: "Start sending-domain verification (ADMIN only)",
+      description: "Creates an SES email identity with Easy DKIM and returns the 3 DKIM CNAME records to add to DNS. Until the status is VERIFIED the tenant keeps sending from the shared address (tier 1). Refused: free-mail domains (400 FREE_MAIL_DOMAIN), RoundFlow/AWS domains (RESERVED_EMAIL_DOMAIN), malformed names (INVALID_EMAIL_DOMAIN), bad local part (INVALID_EMAIL_LOCAL_PART). 409 EMAIL_DOMAIN_IN_USE when another business registered it.",
+      requestBody: jsonBody({ type: "object", required: ["domain"], properties: { domain: { type: "string", example: "sparkle-windows.co.uk" }, localPart: { type: "string", nullable: true, example: "accounts" } } }),
+      responses: { "200": jsonResponse("Domain state with DNS records.", ref("EmailDomain")), "400": errorResponse("FREE_MAIL_DOMAIN, RESERVED_EMAIL_DOMAIN, INVALID_EMAIL_DOMAIN or INVALID_EMAIL_LOCAL_PART.", "Free mailbox domains cannot be used to send email."), "401": ERR[401], "403": ERR[403], "409": errorResponse("EMAIL_DOMAIN_IN_USE, or CHANNEL_UNAVAILABLE when SES is not configured.", "That domain is already registered by another business."), "502": errorResponse("SES failed (code EMAIL_DOMAIN_FAILED).", "Amazon SES could not complete the domain request. Try again shortly.") },
+    },
+    delete: {
+      tags: ["Settings"],
+      summary: "Remove the sending domain (ADMIN only)",
+      description: "Deletes the SES identity and returns the tenant to the shared sender (tier 1).",
+      responses: { "200": jsonResponse("Cleared domain state.", ref("EmailDomain")), "401": ERR[401], "403": ERR[403], "502": errorResponse("SES failed (code EMAIL_DOMAIN_FAILED).", "Amazon SES could not complete the domain request. Try again shortly.") },
+    },
+  },
+  "/settings/email/logo/upload-url": {
+    post: {
+      tags: ["Settings"],
+      summary: "Signed upload URL for the logo (ADMIN only)",
+      description: "PNG, JPEG or WebP only (no SVG). Upload the file with the returned URL, then attach it with PUT /settings/email/logo. Stored in the private bucket under `<tenantId>/branding/`.",
+      requestBody: jsonBody({ type: "object", required: ["mimeType"], properties: { mimeType: { type: "string", enum: ["image/png", "image/jpeg", "image/webp"] } } }),
+      responses: { "200": jsonResponse("Upload target.", { type: "object", required: ["signedUrl", "token", "path"], properties: { signedUrl: { type: "string" }, token: { type: "string" }, path: { type: "string" } } }), "400": errorResponse("INVALID_LOGO_TYPE.", "Logo must be one of: image/png, image/jpeg, image/webp"), "401": ERR[401], "403": ERR[403] },
+    },
+  },
+  "/settings/email/logo": {
+    put: {
+      tags: ["Settings"],
+      summary: "Attach the uploaded logo (ADMIN only)",
+      description: "`path` must be inside this tenant's `branding/` folder (400 INVALID_LOGO_PATH). `altText` (max 125 chars) is used as the image alt text in emails and PDFs.",
+      requestBody: jsonBody({ type: "object", required: ["path"], properties: { path: { type: "string" }, altText: { type: "string", nullable: true } } }),
+      responses: { "200": jsonResponse("Updated view.", ref("EmailSettings")), "400": errorResponse("INVALID_LOGO_PATH or VALIDATION_FAILED.", "path must be an uploaded logo inside your branding folder"), "401": ERR[401], "403": ERR[403] },
+    },
+    delete: {
+      tags: ["Settings"],
+      summary: "Remove the logo (ADMIN only)",
+      responses: { "200": jsonResponse("Updated view.", ref("EmailSettings")), "401": ERR[401], "403": ERR[403] },
+    },
+  },
+  "/webhooks/ses": {
+    post: {
+      tags: ["Webhooks"],
+      summary: "Amazon SNS delivery of SES events",
+      description:
+        "SES configuration set -> SNS topic -> this URL (HTTPS subscription, raw message delivery OFF). Every message is authenticated by its SNS signature (certificate must be on sns.<region>.amazonaws.com); `SES_SNS_TOPIC_ARN` optionally pins the topic. " +
+        "SubscriptionConfirmation is confirmed automatically. Notifications map the `tenantId` message tag to the tenant: Delivery -> DELIVERED, Bounce -> BOUNCED (Permanent flags the customer email invalid; only hard bounces count towards pausing), Complaint -> COMPLAINED (flags the email invalid); with 100+ sends in the window, complaints above 0.3% or hard bounces above 5% (or 3 complaints / 10 hard bounces within 7 days at any volume) pause the tenant's email is paused and the admins notified. Idempotent through the WebhookEvent status machine; a failed effect answers 500 so SNS redelivers.",
+      security: [],
+      requestBody: jsonBody({ type: "object", additionalProperties: true, description: "Raw SNS message JSON (sent as text/plain)." }),
+      responses: {
+        "429": ERR[429],
+        "200": { description: "Acknowledged (also for events that cannot be attributed to a tenant)." },
+        "400": errorResponse("Body is not valid JSON.", "Malformed JSON"),
+        "403": { description: "SNS signature invalid, certificate URL untrusted, or wrong topic." },
+        "500": { description: "Processing failed; SNS will redeliver." },
       },
     },
   },
@@ -8095,7 +8749,7 @@ export const openApiDocument: OpenAPIV3.Document = {
       "request is routed to the caller's tenant schema, and BusinessSettings is one row per tenant.",
       "",
       "**Errors** are `{ error, code? }` plus any extra fields the error carries (e.g. `fields`, `suggestions`, `proposedName`). Codes added in the Phase 1 audit pass:",
-      "FIELD_REMOVED, INVALID_STATE, GHL_NOT_CONNECTED, GHL_SEND_FAILED, NO_CONTACT_FOR_CHANNEL, STRIPE_NOT_CONNECTED, INVOICE_NOT_PAYABLE, INVOICE_NOT_SENDABLE,",
+      "FIELD_REMOVED, INVALID_STATE, GHL_NOT_CONNECTED (GHL settings only), GHL_SEND_FAILED, CHANNEL_UNAVAILABLE (+ reason), CUSTOMER_OPTED_OUT, EMAIL_SEND_FAILED, FREE_MAIL_DOMAIN, RESERVED_EMAIL_DOMAIN, INVALID_EMAIL_DOMAIN, EMAIL_DOMAIN_IN_USE, EMAIL_DOMAIN_FAILED, INVALID_EMAIL_SENDER_NAME, INVALID_EMAIL_ADDRESS, INVALID_BRAND_COLOUR, INVALID_LOGO_TYPE, INVALID_LOGO_PATH, NO_CONTACT_FOR_CHANNEL, STRIPE_NOT_CONNECTED, INVOICE_NOT_PAYABLE, INVOICE_NOT_SENDABLE,",
       "INVOICE_ALREADY_SENT, INVOICE_ALREADY_PAID, INVOICE_VOID, AMOUNT_MISMATCH, ALREADY_INVOICED, VISIT_NOT_COMPLETED, INVALID_ALLOCATION, NO_MATCHING_ROUND,",
       "INVALID_PAYMENT, CHEQUE_NUMBER_REQUIRED, PAYMENT_CONFIRMATION_REQUIRED, TECHNICIAN_ONLY, NO_TECHNICIAN, NOT_YOUR_VISIT, NOT_YOUR_ROUND,",
       "INVALID_IDEMPOTENCY_KEY, IDEMPOTENCY_KEY_CONFLICT, IDEMPOTENCY_KEY_REUSED, WEBHOOK_NOT_CONFIGURED.",
@@ -8119,6 +8773,8 @@ export const openApiDocument: OpenAPIV3.Document = {
     { name: "Complaints", description: "Customer service complaint queue — log, review, schedule revisits, resolve, reopen. All mutations: ADMIN/MANAGER only." },
     { name: "Dashboard", description: "Dashboard screen data — KPI cards, alert counts, today's rounds, technician performance, and chart series. ADMIN/MANAGER only." },
     { name: "Emergencies", description: "Technician emergency reporting and reassignment flow — report, list, inspect, pick a replacement, and confirm reassignment." },
+    { name: "Integrations", description: "Integration outbox dead-letter queue (GHL sends, invoice.send): list and replay. ADMIN only." },
+    { name: "Notifications", description: "Admin/manager notification feed (list, unread count, mark read). Technicians use /mobile/notifications. ADMIN/MANAGER only." },
     { name: "Rounds", description: "Round CRUD, the planner (calendar + list/map views, including batched multi-round variants), the Today panel, reassign, push-missed, weather hold (preview + apply), and on-demand visit generation. ADMIN/MANAGER only." },
     { name: "Technicians", description: "Technician directory — list/detail/create/update with round names and today's job stats. Distinct from Settings → /settings/technicians, which is the invite-pending-only editor. ADMIN/MANAGER only." },
     { name: "Messages", description: "Direct GoHighLevel-backed messaging — send to a single customer, or broadcast to every customer in a round. ADMIN/MANAGER only." },

@@ -14,6 +14,9 @@ export async function queueGhlEvent(
   customerId: string,
   extra: Record<string, unknown> = {},
 ): Promise<void> {
+  // GHL is an optional add-on: tenants that have not connected it queue nothing (the worker would only drop it).
+  const bs = await tp.businessSettings.findFirst({ select: { ghlConnected: true } });
+  if (!bs?.ghlConnected) return;
   await tp.integrationOutbox.create({ data: { eventType, payload: { customerId, ...extra } } });
 }
 

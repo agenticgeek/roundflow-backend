@@ -1,3 +1,5 @@
+import { outboundSignal } from "../../lib/outbound";
+
 const GHL_AUTH_URL   = "https://marketplace.gohighlevel.com/oauth/chooselocation";
 const GHL_TOKEN_URL  = "https://services.leadconnectorhq.com/oauth/token";
 
@@ -32,6 +34,7 @@ export interface GhlTokenResponse {
 
 export async function exchangeGhlCode(code: string, redirectUri: string): Promise<GhlTokenResponse> {
   const res = await fetch(GHL_TOKEN_URL, {
+    signal: outboundSignal(),
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -51,6 +54,7 @@ export async function exchangeGhlCode(code: string, redirectUri: string): Promis
 
 export async function refreshGhlToken(refreshToken: string): Promise<GhlTokenResponse> {
   const res = await fetch(GHL_TOKEN_URL, {
+    signal: outboundSignal(),
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({

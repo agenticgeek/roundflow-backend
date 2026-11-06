@@ -2,6 +2,7 @@ import { VisitStatus } from "../../generated/tenant-client";
 import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
 import { AppError } from "../../lib/app-error";
 import { tenantTodayRange } from "../../services/business-time";
+import { notifyAdmins } from "../../services/notify";
 
 // Technician end-of-day sign-off. Separate from the office's POST /today/close
 // (BusinessSettings.lastClosedDate, which closes the whole business day and
@@ -98,6 +99,14 @@ class DayCloseService {
     try {
       const row = await this.prisma.technicianDayClose.create({
         data: { technicianId, date: key, completedCount: day.completedCount, skippedCount: day.skippedCount },
+      });
+      // NOTIF-03: the office knows this technician is done. Only on the first close. Best effort.
+      const tech = await this.prisma.technician.findUnique({ where: { id: technicianId }, select: { name: true } });
+      await notifyAdmins(this.prisma, {
+        type: "DAY_CLOSED",
+        title: `${tech?.name ?? "A technician"} finished the day`,
+        body: `${day.completedCount} completed, ${day.skippedCount} skipped.`,
+        data: { date: key },
       });
       return { ok: true, alreadyClosed: false, day: { ...day, closed: true, closedAt: row.closedAt } };
     } catch (err) {

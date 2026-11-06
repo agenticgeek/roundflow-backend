@@ -10,6 +10,8 @@ import { h, asObject, requireString, optString } from "../lib/http";
 import { sendInviteEmail } from "../lib/email";
 import { assertNoActiveInvite, buildInviteUrl, newInviteExpiry } from "../lib/invites";
 import { isValidEmail } from "../lib/validation";
+import { notifyTenantAdmins } from "../services/notify";
+import { assertCanInviteRole } from "../lib/permissions";
 
 export const invitesRouter = Router();
 
@@ -68,6 +70,7 @@ invitesRouter.post(
       throw new AppError(400, `role must be one of: ${Object.values(UserRole).join(", ")}`);
     }
     const role = roleRaw as UserRole;
+    assertCanInviteRole(profile, role); // BE-01: only an ADMIN can invite an ADMIN
 
     const technicianId = optString(body.technicianId, "technicianId") ?? null;
     if (technicianId) {
@@ -212,21 +215,34 @@ invitesRouter.post(
     // requireString already rejects blank/whitespace-only names.
     const name = requireString(body.name, "name").trim();
 
-    const profile = await prisma.$transaction(async (tx) => {
-      const p = await tx.profile.create({
-        data: {
-          supabaseUserId: req.user!.supabaseUserId,
-          tenantId: invite.tenantId,
-          role: invite.role,
-          name,
-        },
+    let profile;
+    try {
+      profile = await prisma.$transaction(async (tx) => {
+        const p = await tx.profile.create({
+          data: {
+            supabaseUserId: req.user!.supabaseUserId,
+            tenantId: invite.tenantId,
+            role: invite.role,
+            name,
+          },
+        });
+        await tx.tenantInvite.update({
+          where: { id: invite.id },
+          data: { acceptedAt: new Date() },
+        });
+        return p;
       });
-      await tx.tenantInvite.update({
-        where: { id: invite.id },
-        data: { acceptedAt: new Date() },
-      });
-      return p;
-    });
+    } catch (err) {
+      // BUG-005: two simultaneous accepts: the loser hits the unique supabaseUserId. Same organisation = the winner's
+      // result (idempotent); a profile in another organisation is a clean conflict. Never a 500.
+      if ((err as { code?: string }).code !== "P2002") throw err;
+      const winner = await prisma.profile.findUnique({ where: { supabaseUserId: req.user!.supabaseUserId } });
+      if (!winner) throw err;
+      if (winner.tenantId !== invite.tenantId) {
+        throw new AppError(409, "This account already belongs to another organisation", "PROFILE_EXISTS");
+      }
+      return res.json({ profile: winner });
+    }
 
     if (invite.technicianId) {
       const tenant = await prisma.tenant.findUnique({ where: { id: invite.tenantId } });
@@ -247,6 +263,14 @@ invitesRouter.post(
         }
       }
     }
+
+    // NOTIF-03: the office hears that the invitee joined. Best effort.
+    await notifyTenantAdmins(invite.tenantId, {
+      type: "INVITE",
+      title: "Invite accepted",
+      body: `${name} (${invite.role}) accepted their invite.`,
+      excludeProfileIds: [profile.id],
+    });
 
     return res.status(201).json({ profile });
   })

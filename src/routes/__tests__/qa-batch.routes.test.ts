@@ -101,11 +101,27 @@ it("round create/update accept and validate postcodeSectors", async () => {
   expect((await request(makeApp()).patch("/rounds/r1").send({ postcodeSectors: "CH41" })).status).toBe(400);
 });
 
+it("POST /today/close passes an undefined role when the profile has none", async () => {
+  closeDay.mockResolvedValue({});
+  const app = express();
+  app.use(express.json());
+  app.use((req: any, _res, next) => { req.tenantPrisma = {}; req.profile = { id: "prof1", role: null }; next(); });
+  app.use("/today", todayRouter);
+  app.use(errorHandler);
+  await request(app).post("/today/close").send({ unfinishedAction: "mark_as_skipped" });
+  expect(closeDay).toHaveBeenLastCalledWith("mark_as_skipped", undefined, undefined, { id: "prof1", role: undefined }, { notifyCustomers: false });
+});
+
 it("POST /today/close forwards skipReason", async () => {
   closeDay.mockResolvedValue({});
   await request(makeApp()).post("/today/close").send({ unfinishedAction: "mark_as_skipped", skipReason: "Rain" });
-  expect(closeDay).toHaveBeenLastCalledWith("mark_as_skipped", "Rain");
+  expect(closeDay).toHaveBeenLastCalledWith("mark_as_skipped", "Rain", undefined, expect.any(Object), { notifyCustomers: false });
   await request(makeApp()).post("/today/close").send({ unfinishedAction: "push_to_tomorrow" });
-  expect(closeDay).toHaveBeenLastCalledWith("push_to_tomorrow", undefined);
+  expect(closeDay).toHaveBeenLastCalledWith("push_to_tomorrow", undefined, undefined, expect.any(Object), { notifyCustomers: false });
+  await request(makeApp()).post("/today/close").send({ unfinishedAction: "push_to_tomorrow", target: "SATURDAY" });
+  expect(closeDay).toHaveBeenLastCalledWith("push_to_tomorrow", undefined, "SATURDAY", expect.any(Object), { notifyCustomers: false });
+  await request(makeApp()).post("/today/close").send({ unfinishedAction: "push_to_tomorrow", notifyCustomers: true });
+  expect(closeDay).toHaveBeenLastCalledWith("push_to_tomorrow", undefined, undefined, expect.any(Object), { notifyCustomers: true });
+  expect((await request(makeApp()).post("/today/close").send({ unfinishedAction: "push_to_tomorrow", notifyCustomers: "yes" })).status).toBe(400);
   expect((await request(makeApp()).post("/today/close").send({ unfinishedAction: "x" })).status).toBe(400);
 });

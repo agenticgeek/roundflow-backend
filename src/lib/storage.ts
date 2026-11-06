@@ -1,3 +1,5 @@
+import { outboundSignal } from "./outbound";
+
 export const ALLOWED_PHOTO_MIME_TYPES = [
   "image/jpeg",
   "image/png",
@@ -36,6 +38,15 @@ export function buildChatAttachmentPath(tenantId: string, roundId: string, mimeT
   return `${tenantId}/chat/${roundId}/${Date.now()}.${ext}`;
 }
 
+// Tenant branding (logo for emails and invoices): <tenantId>/branding/logo-<ts>.<ext>. SVG is deliberately not allowed
+// (scriptable); HEIC is not renderable in email clients.
+export const LOGO_MIME_TYPES = ["image/png", "image/jpeg", "image/webp"] as const;
+
+export function buildBrandingLogoPath(tenantId: string, mimeType: string): string {
+  const ext = MIME_TO_EXT[mimeType] ?? "png";
+  return `${tenantId}/branding/logo-${Date.now()}.${ext}`;
+}
+
 const BUCKET = process.env.VISIT_PHOTOS_BUCKET ?? "visit-photos";
 
 export async function createSignedUploadUrl(
@@ -46,6 +57,7 @@ export async function createSignedUploadUrl(
   if (!url || !key) throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set");
 
   const res = await fetch(`${url}/storage/v1/object/upload/sign/${BUCKET}/${path}`, {
+    signal: outboundSignal(),
     method: "POST",
     headers: { apikey: key, Authorization: `Bearer ${key}` },
   });

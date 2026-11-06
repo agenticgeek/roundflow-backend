@@ -5,9 +5,11 @@ import { getCachedBusinessSettings } from "./settings.service";
 import { tenantTodayRange, tenantToday } from "./business-time";
 import { createMessageService } from "./message.service";
 import { generateForRound } from "../jobs/visitGeneration";
-import { autoSplit, resolveTechnicianForVisit, restampFutureVisits } from "./visit-assignment";
+import { notifyEvent } from "./notify";
+import { autoSplit, resolveTechnicianForVisit, restampFutureVisits, type TenantDb } from "./visit-assignment";
 import { startOfUtcDay } from "../lib/schedule";
 import { assertSectorsInServiceArea } from "../lib/postcode-sectors";
+import { isLocationApproximate } from "../integrations/geocoding/client";
 
 // ---- input types ----------------------------------------------------------
 
@@ -106,6 +108,10 @@ export interface PlannerStop {
   postcode: string;
   latitude: number | null;
   longitude: number | null;
+  geocodePrecision: string | null;
+  locationApproximate: boolean;
+  carriedOver: boolean;
+  carriedOverFromDate: string | null;
   customerName: string;
   price: number;
   status: VisitStatus;
@@ -141,6 +147,10 @@ export interface TodayPanelStop {
   addressLine: string;
   latitude: number | null;
   longitude: number | null;
+  geocodePrecision: string | null;
+  locationApproximate: boolean;
+  carriedOver: boolean;
+  carriedOverFromDate: string | null;
   status: VisitStatus;
   paymentHold: boolean;
   hasIssue: boolean;
@@ -192,6 +202,12 @@ export interface SetTechniciansResult {
   roundId: string;
   allocation: AllocationEntry[];
   visitsUpdated: number;
+  /** Due visits created right after a real (non-dryRun) assignment (FLOW-01). */
+  visitsGenerated: number;
+  /** Future SCHEDULED visits the restamp skipped because they were hand-assigned (FLOW-04). */
+  overriddenVisits: number;
+  /** YYYY-MM-DD of the earliest SCHEDULED visit from today on, null when none (FLOW-02). */
+  nextVisitDate: string | null;
 }
 
 export interface RoundAllocation {
@@ -353,9 +369,24 @@ class RoundService {
     return this.toDetail(round);
   }
 
-  private async assertRoundExists(roundId: string): Promise<void> {
-    const r = await this.prisma.round.findUnique({ where: { id: roundId }, select: { id: true } });
+  private async assertRoundExists(roundId: string) {
+    const r = await this.prisma.round.findUnique({
+      where: { id: roundId },
+      select: { id: true, name: true, frequency: true, defaultDay: true, status: true },
+    });
     if (!r) throw new AppError(404, "Round not found");
+    return r;
+  }
+
+  // FLOW-02 / FLOW-04: what the user needs to judge an assignment — how many
+  // upcoming visits were skipped as hand-assigned, and when work next appears.
+  private async upcomingVisitSummary(db: TenantDb, roundId: string, from: Date) {
+    const upcoming = { roundId, status: VisitStatus.SCHEDULED, date: { gte: from } };
+    const [overriddenVisits, next] = await Promise.all([
+      db.visit.count({ where: { ...upcoming, technicianOverride: true } }),
+      db.visit.findFirst({ where: upcoming, orderBy: { date: "asc" }, select: { date: true } }),
+    ]);
+    return { overriddenVisits, nextVisitDate: next ? next.date.toISOString().slice(0, 10) : null };
   }
 
   // The operational day is closed once BusinessSettings.lastClosedDate equals
@@ -465,7 +496,8 @@ class RoundService {
     split?: SplitInput,
     options: { dryRun?: boolean } = {}
   ): Promise<SetTechniciansResult> {
-    await this.assertRoundExists(roundId);
+    const round = await this.assertRoundExists(roundId);
+    const today = await tenantToday(this.prisma);
 
     const uniqueIds = [...new Set(technicianIds)];
     const mode: SplitMode = split?.mode ?? (uniqueIds.length >= 2 ? "AUTO" : "SINGLE");
@@ -473,8 +505,10 @@ class RoundService {
       throw new AppError(400, 'Split mode "SINGLE" requires exactly one technician');
     }
 
+    let previousIds: string[] = [];
+    let result: SetTechniciansResult;
     try {
-      return await this.prisma.$transaction(async (tx) => {
+      result = await this.prisma.$transaction(async (tx) => {
         // Validate inside the transaction to avoid TOCTOU (a technician
         // deactivated between pre-check and write would otherwise be assigned).
         const found = uniqueIds.length > 0
@@ -508,10 +542,14 @@ class RoundService {
         });
         const assignment = this.assignProperties(mode, properties, uniqueIds, split?.allocations ?? []);
 
+        previousIds = (await tx.roundTechnician.findMany({ where: { roundId }, select: { technicianId: true } })).map(
+          (r) => r.technicianId
+        );
         await tx.roundTechnician.deleteMany({ where: { roundId } });
         if (uniqueIds.length > 0) {
           await tx.roundTechnician.createMany({
             data: uniqueIds.map((technicianId) => ({ roundId, technicianId })),
+            skipDuplicates: true,
           });
         }
         // One updateMany per target technician (null = unassigned).
@@ -522,10 +560,11 @@ class RoundService {
         for (const [technicianId, ids] of byTechnician) {
           await tx.property.updateMany({ where: { id: { in: ids } }, data: { assignedTechnicianId: technicianId } });
         }
-        const visitsUpdated = await restampFutureVisits(tx, roundId, new Date());
+        const visitsUpdated = await restampFutureVisits(tx, roundId, today);
+        const summary = await this.upcomingVisitSummary(tx, roundId, today);
 
         const byId = new Map(found.map((t) => [t.id, t]));
-        const result: SetTechniciansResult = {
+        const txResult: SetTechniciansResult = {
           roundId,
           allocation: buildAllocation(
             uniqueIds.map((id) => ({ id, name: byId.get(id)!.name })),
@@ -533,13 +572,93 @@ class RoundService {
             assignment
           ),
           visitsUpdated,
+          visitsGenerated: 0,
+          ...summary,
         };
-        if (options.dryRun) throw new DryRunRollback(result);
-        return result;
+        if (options.dryRun) throw new DryRunRollback(txResult);
+        return txResult;
       });
     } catch (err) {
       if (err instanceof DryRunRollback) return err.result;
+      // BUG-011: two simultaneous saves of one round collide on RoundTechnician (roundId, technicianId).
+      if ((err as { code?: string }).code === "P2002") {
+        throw new AppError(409, "Another change to this round's technicians was saved at the same time. Reload and try again.", "ROUND_TECHNICIANS_CONFLICT");
+      }
       throw err;
+    }
+
+    // Committed. FLOW-01: a freshly created round has no visits until the
+    // nightly job, so create the due ones now. generateForRound stamps each
+    // new visit from the committed allocation (same resolver as the restamp).
+    if (round.status === RoundStatus.ACTIVE && uniqueIds.length > 0) {
+      result.visitsGenerated = await generateForRound(this.prisma, round, today);
+      if (result.visitsGenerated > 0) {
+        result.nextVisitDate = (await this.upcomingVisitSummary(this.prisma, roundId, today)).nextVisitDate;
+      }
+    }
+
+    await this.notifyAssignmentChange(round.name, roundId, today, previousIds, uniqueIds, result.visitsUpdated);
+    return result;
+  }
+
+  // FLOW-03: best effort (notifyEvent never throws). Added technicians hear
+  // how many visits they got; removed ones that they are off; retained ones
+  // only when their visits actually changed.
+  private async notifyAssignmentChange(
+    roundName: string,
+    roundId: string,
+    today: Date,
+    previousIds: string[],
+    currentIds: string[],
+    visitsUpdated: number
+  ): Promise<void> {
+    const added = currentIds.filter((id) => !previousIds.includes(id));
+    const removed = previousIds.filter((id) => !currentIds.includes(id));
+    const retained = currentIds.filter((id) => previousIds.includes(id));
+
+    if (added.length > 0) {
+      const visits = await this.prisma.visit.findMany({
+        where: { roundId, status: VisitStatus.SCHEDULED, date: { gte: today }, technicianId: { in: added } },
+        select: { technicianId: true, date: true },
+      });
+      for (const technicianId of added) {
+        const dates = visits.filter((v) => v.technicianId === technicianId).map((v) => v.date.toISOString().slice(0, 10)).sort();
+        if (dates.length > 0) {
+          await notifyEvent(this.prisma, {
+            type: "SCHEDULE",
+            title: `${dates.length} ${dates.length === 1 ? "visit" : "visits"} assigned to you`,
+            body: `${roundName}: first visit ${dates[0]}.`,
+            data: { roundId, date: dates[0] },
+            to: { technicianIds: [technicianId] },
+          });
+        } else {
+          await notifyEvent(this.prisma, {
+            type: "ROUND_UPDATE",
+            title: "You have been added to a round",
+            body: `${roundName}: no visits are scheduled yet.`,
+            data: { roundId },
+            to: { technicianIds: [technicianId] },
+          });
+        }
+      }
+    }
+    if (removed.length > 0) {
+      await notifyEvent(this.prisma, {
+        type: "ROUND_UPDATE",
+        title: "You have been removed from a round",
+        body: `${roundName}: its visits are no longer on your schedule.`,
+        data: { roundId },
+        to: { technicianIds: removed },
+      });
+    }
+    if (retained.length > 0 && visitsUpdated > 0) {
+      await notifyEvent(this.prisma, {
+        type: "ROUND_UPDATE",
+        title: "Your schedule on a round changed",
+        body: `${roundName}: some of your visits were updated.`,
+        data: { roundId },
+        to: { technicianIds: retained },
+      });
     }
   }
 
@@ -876,6 +995,10 @@ class RoundService {
       postcode: v.property.postcode,
       latitude: v.property.latitude,
       longitude: v.property.longitude,
+      geocodePrecision: v.property.geocodePrecision,
+      locationApproximate: isLocationApproximate(v.property.geocodePrecision, v.property.latitude),
+      carriedOver: v.carriedOverFromDate != null,
+      carriedOverFromDate: v.carriedOverFromDate?.toISOString().slice(0, 10) ?? null,
       customerName: v.property.customer?.name ?? null,
       price: v.price.toNumber(),
       status: v.status,
@@ -956,7 +1079,7 @@ class RoundService {
       where: { roundId, status: NOT_CANCELLED, date: { gte: start, lt: end } },
       include: {
         property: {
-          select: { addressLine: true, latitude: true, longitude: true, customer: { select: { name: true } } },
+          select: { addressLine: true, latitude: true, longitude: true, geocodePrecision: true, customer: { select: { name: true } } },
         },
         technician: { select: { id: true, name: true } },
         issues: { select: { id: true, note: true }, take: 1 },
@@ -1002,6 +1125,10 @@ class RoundService {
         addressLine: v.property.addressLine,
         latitude: v.property.latitude,
         longitude: v.property.longitude,
+        geocodePrecision: v.property.geocodePrecision,
+        locationApproximate: isLocationApproximate(v.property.geocodePrecision, v.property.latitude),
+        carriedOver: v.carriedOverFromDate != null,
+        carriedOverFromDate: v.carriedOverFromDate?.toISOString().slice(0, 10) ?? null,
         status: v.status,
         paymentHold: v.paymentHold,
         hasIssue: v.issues.length > 0,
@@ -1025,7 +1152,7 @@ class RoundService {
       throw new AppError(400, '"fromTechnicianId" and "toTechnicianId" must be different');
     }
 
-    await this.assertRoundExists(roundId);
+    const round = await this.assertRoundExists(roundId);
 
     const today = await tenantToday(this.prisma);
     const start = startOfUtcDay(input.date ?? today);
@@ -1059,10 +1186,11 @@ class RoundService {
         where,
         data: { technicianId: toTechnicianId, technicianOverride: true },
       });
+      await this.notifyReassigned(round.name, roundId, start, input, result.count);
       return { updated: result.count };
     }
 
-    return this.prisma.$transaction(async (tx) => {
+    const { moved, restamped } = await this.prisma.$transaction(async (tx) => {
       const visits = await tx.visit.findMany({ where, select: { id: true, propertyId: true } });
       const propertyIds = [...new Set(visits.map((v) => v.propertyId))];
 
@@ -1073,8 +1201,41 @@ class RoundService {
         data: { technicianId: toTechnicianId, technicianOverride: false },
       });
       const restamped = await restampFutureVisits(tx, roundId, today);
-      return { updated: moved.count + restamped };
+      return { moved: moved.count, restamped };
     });
+    await this.notifyReassigned(round.name, roundId, start, input, moved);
+    return { updated: moved + restamped };
+  }
+
+  // FLOW-03: the receiving technician (and the releasing one, when the visits
+  // came from a technician) hear about the move. Nothing is sent when no
+  // visit moved. Best effort.
+  private async notifyReassigned(
+    roundName: string,
+    roundId: string,
+    day: Date,
+    input: ReassignInput,
+    moved: number
+  ): Promise<void> {
+    if (moved === 0) return;
+    const date = day.toISOString().slice(0, 10);
+    const count = `${moved} ${moved === 1 ? "visit" : "visits"}`;
+    await notifyEvent(this.prisma, {
+      type: "SCHEDULE",
+      title: `${count} assigned to you`,
+      body: `${roundName}: reassigned to you for ${date}.`,
+      data: { roundId, date },
+      to: { technicianIds: [input.toTechnicianId] },
+    });
+    if (input.fromTechnicianId) {
+      await notifyEvent(this.prisma, {
+        type: "SCHEDULE",
+        title: `${count} moved off your schedule`,
+        body: `${roundName}: reassigned to another technician for ${date}.`,
+        data: { roundId, date },
+        to: { technicianIds: [input.fromTechnicianId] },
+      });
+    }
   }
 
   // ---- M4: push missed jobs (M22) ------------------------------------------

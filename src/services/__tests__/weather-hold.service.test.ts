@@ -1,20 +1,25 @@
 import { it, expect, vi, describe, beforeEach } from "vitest";
 
-const assertGhlConnected = vi.fn();
+const assertAnyChannelAvailable = vi.fn();
 const broadcast = vi.fn();
 vi.mock("../message.service", () => ({
-  createMessageService: vi.fn(() => ({ assertGhlConnected, broadcast })),
+  createMessageService: vi.fn(() => ({ assertAnyChannelAvailable, broadcast })),
 }));
 const tenantToday = vi.fn();
 const tenantTodayRange = vi.fn();
+const tenantWorkingDays = vi.fn();
 vi.mock("../business-time", () => ({
+  tenantWorkingDays: (...a: unknown[]) => tenantWorkingDays(...a),
   tenantToday: (...a: unknown[]) => tenantToday(...a),
   tenantTodayRange: (...a: unknown[]) => tenantTodayRange(...a),
 }));
 const getCachedBusinessSettings = vi.fn();
 vi.mock("../settings.service", () => ({ getCachedBusinessSettings: (...a: unknown[]) => getCachedBusinessSettings(...a) }));
 
+vi.mock("../notify", async () => (await import("../../test/notify-mock.js")).notifyMockModule());
+
 import { createWeatherHoldService, WEATHER_CONDITIONS } from "../weather-hold.service";
+import { notifyVisitTechnicians } from "../notify";
 import { CleaningFrequency, DayOfWeek } from "../../generated/tenant-client";
 
 const TODAY = new Date("2026-11-03T00:00:00.000Z"); // Tuesday
@@ -54,9 +59,10 @@ const BROADCAST = { queued: 1, sent: 1, scheduled: 0, skippedOptedOut: 0, skippe
 beforeEach(() => {
   vi.clearAllMocks();
   tenantToday.mockResolvedValue(TODAY);
+  tenantWorkingDays.mockResolvedValue([]);
   tenantTodayRange.mockResolvedValue({ start: TODAY, end: new Date(TODAY.getTime() + 86_400_000) });
   getCachedBusinessSettings.mockResolvedValue({ lastClosedDate: null });
-  assertGhlConnected.mockResolvedValue(undefined);
+  assertAnyChannelAvailable.mockResolvedValue(undefined);
   broadcast.mockResolvedValue(BROADCAST);
 });
 
@@ -116,6 +122,38 @@ describe("preview", () => {
   });
 });
 
+describe("apply: technician notifications (FLOW-03)", () => {
+  const techVisit = (id: string, technicianId: string | null) => ({ ...visit(id), technicianId, roundId: "r1" });
+
+  it("tells the technicians on the held visits, independent of notifyCustomers", async () => {
+    const { prisma } = makePrisma([techVisit("v1", "t1"), techVisit("v2", "t1"), techVisit("v3", null)]);
+    await createWeatherHoldService(prisma).apply("r1", { ...input, notifyCustomers: false });
+
+    const call = vi.mocked(notifyVisitTechnicians).mock.calls[0];
+    expect(call[1]).toEqual([
+      { id: "v1", technicianId: "t1", roundId: "r1", date: THU },
+      { id: "v2", technicianId: "t1", roundId: "r1", date: THU },
+      { id: "v3", technicianId: null, roundId: "r1", date: THU },
+    ]);
+    expect(call[2]({ count: 2, first: "2026-11-05" })).toEqual({
+      type: "SCHEDULE",
+      title: "Weather hold: 2 visits postponed",
+      body: "Heavy rain on 2026-11-05. Moved to 2026-11-06.",
+    });
+  });
+
+  it("manual holds tell the technician the office will rebook", async () => {
+    const { prisma } = makePrisma([techVisit("v1", "t1")]);
+    await createWeatherHoldService(prisma).apply("r1", { ...input, rescheduling: "manual", notifyCustomers: false });
+    const wording = vi.mocked(notifyVisitTechnicians).mock.calls[0][2]({ count: 1, first: "2026-11-05" });
+    expect(wording).toEqual({
+      type: "SCHEDULE",
+      title: "Weather hold: 1 visit postponed",
+      body: "Heavy rain on 2026-11-05. The office will rebook these visits.",
+    });
+  });
+});
+
 describe("apply", () => {
   it("next-available: moves visits to the next working day, clears reminder markers, logs the hold and notifies", async () => {
     const { prisma, tx } = makePrisma([visit("v1"), visit("v2", customer("c2"))]);
@@ -131,7 +169,7 @@ describe("apply", () => {
         details: expect.objectContaining({ date: "2026-11-05", condition: "heavy-rain", rescheduling: "next-available", newDate: "2026-11-06", visitIds: ["v1", "v2"] }),
       }),
     });
-    expect(assertGhlConnected).toHaveBeenCalled();
+    expect(assertAnyChannelAvailable).toHaveBeenCalled();
     expect(broadcast).toHaveBeenCalledTimes(1);
     const [targets, opts] = broadcast.mock.calls[0];
     expect(targets.map((t: { customer: { id: string } }) => t.customer.id)).toEqual(["c1", "c2"]);
@@ -150,17 +188,26 @@ describe("apply", () => {
     }));
   });
 
+  it("honours the business working days: a Mon-Sat business moves Friday visits to Saturday", async () => {
+    tenantWorkingDays.mockResolvedValue(["MON", "TUE", "WED", "THU", "FRI", "SAT"]);
+    const { prisma, tx } = makePrisma([visit("v1")]);
+    await createWeatherHoldService(prisma).apply("r1", { ...input, date: FRI, notifyCustomers: false });
+    expect(tx.visit.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ date: new Date("2026-11-07T00:00:00.000Z") }),
+    }));
+  });
+
   it("does not notify, nor require GHL, when notifyCustomers is false", async () => {
     const { prisma } = makePrisma([visit("v1")]);
     const res = await createWeatherHoldService(prisma).apply("r1", { ...input, notifyCustomers: false });
-    expect(assertGhlConnected).not.toHaveBeenCalled();
+    expect(assertAnyChannelAvailable).not.toHaveBeenCalled();
     expect(broadcast).not.toHaveBeenCalled();
     expect(res.notification).toBeNull();
     expect(res.held).toBe(1);
   });
 
   it("changes nothing when GHL is required but not connected", async () => {
-    assertGhlConnected.mockRejectedValue(Object.assign(new Error("GoHighLevel is not connected"), { statusCode: 409 }));
+    assertAnyChannelAvailable.mockRejectedValue(Object.assign(new Error("GoHighLevel is not connected"), { statusCode: 409 }));
     const { prisma, raw } = makePrisma([visit("v1")]);
     await expect(createWeatherHoldService(prisma).apply("r1", { ...input, notifyCustomers: true })).rejects.toMatchObject({ statusCode: 409 });
     expect(raw.$transaction).not.toHaveBeenCalled();

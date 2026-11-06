@@ -185,6 +185,31 @@ it("GET /emergencies?status=ACTIVE filters correctly", async () => {
   expect(Array.isArray(res.body)).toBe(true);
 });
 
+// BUG-006/008: bad values used to reach Prisma ("Argument technician is missing") or be stored.
+it.each([
+  ["text stops", { remainingStops: "lots" }],
+  ["negative stops", { remainingStops: -2 }],
+  ["fractional stops", { remainingStops: 1.5 }],
+  ["bad window", { remainingStops: 2, scheduledWindowEnd: "not a date" }],
+  ["impossible window", { remainingStops: 2, scheduledWindowEnd: "2026-02-30" }],
+  ["technician not a string", { technicianId: { id: "x" }, remainingStops: 2 }],
+  ["round not a string", { roundId: 5, remainingStops: 2 }],
+  ["notes not a string", { remainingStops: 2, notes: 7 }],
+])("POST /emergencies 400 for %s (never 500)", async (_n, over) => {
+  const res = await request(makeApp()).post("/emergencies").send({ technicianId: "t1", roundId: "r1", ...over });
+  expect(res.status).toBe(400);
+});
+
+it("POST /emergencies accepts zero stops, numeric-string stops and a valid window", async () => {
+  const res = await request(makeApp()).post("/emergencies").send({ technicianId: "t1", roundId: "r1", remainingStops: "0", scheduledWindowEnd: "2026-11-07T17:00:00Z" });
+  expect(res.status).toBe(201);
+});
+
+it("GET /emergencies with an unknown status filter is a 400", async () => {
+  expect((await request(makeApp()).get("/emergencies?status=BANANAS")).status).toBe(400);
+  expect((await request(makeApp()).get("/emergencies?status=ACTIVE")).status).toBe(200);
+});
+
 it("POST /emergencies 400 when required fields missing", async () => {
   const app = makeApp();
   const res = await request(app).post("/emergencies").send({ technicianId: "t1" });

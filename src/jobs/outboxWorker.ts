@@ -1,12 +1,15 @@
 import { prisma } from "../lib/prisma";
-import { getTenantPrismaForSchema, type TenantPrismaClient } from "../lib/tenant-prisma-manager";
+import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
+import { forEachTenant } from "../lib/tenant-jobs";
 import { syncCustomerToGhl, applyGhlTags, applyGhlCustomFields } from "../integrations/ghl/sync";
 import { computeBalanceOwed } from "../services/payment.service";
 import { createMessageService } from "../services/message.service";
 import { FALLBACK_BODIES, TEMPLATE_NAMES, loadTemplate, renderTemplate } from "../services/message-templates";
 import { VisitStatus } from "../generated/tenant-client";
+import { INVOICE_SEND_EVENT, processInvoiceSendRow } from "../services/invoice-send-batch.service";
+import { OUTBOX_MAX_ATTEMPTS, outboxBackoffMs } from "../lib/outbox-backoff";
+import { notifyIntegrationDead } from "../services/notify";
 
-const MAX_ATTEMPTS = 5;
 const BATCH = 20;
 
 type Payload = {
@@ -54,24 +57,27 @@ async function isOptedOut(tp: TenantPrismaClient, customerId: string): Promise<b
 
 // Pre-rendered message (pre-clean reminders). A reminder whose visit was
 // cancelled/skipped/completed before the drain is dropped.
-async function sendQueuedMessage(tp: TenantPrismaClient, customerId: string, payload: Payload): Promise<void> {
+// The producer's channel is a preference: if it cannot be used now (e.g. SMS but GHL was disconnected) the best
+// available channel is used, and a customer who cannot be reached is skipped with a reason (status "skipped").
+async function sendQueuedMessage(tp: TenantPrismaClient, customerId: string, payload: Payload): Promise<string | void> {
   if (!payload.body) throw new Error("payload missing body");
   if (await isOptedOut(tp, customerId)) return;
   if (payload.visitId) {
     const visit = await tp.visit.findUnique({ where: { id: payload.visitId }, select: { status: true } });
     if (!visit || visit.status !== VisitStatus.SCHEDULED) return;
   }
-  await createMessageService(tp).send({
+  const res = await createMessageService(tp).sendBest({
     customerId,
-    channel: payload.channel,
+    preferred: payload.channel,
     body: payload.body,
     templateId: payload.templateId ?? null,
   });
+  if (res.status === "skipped") return res.reason;
 }
 
 // "Visit completed" message (A5): rendered here from the tenant template so
 // edits to the template apply to messages still in the queue.
-async function sendVisitCompletedMessage(tp: TenantPrismaClient, customerId: string, payload: Payload): Promise<void> {
+async function sendVisitCompletedMessage(tp: TenantPrismaClient, customerId: string, payload: Payload): Promise<string | void> {
   if (await isOptedOut(tp, customerId)) return;
   const visit = payload.visitId
     ? await tp.visit.findUnique({
@@ -103,24 +109,27 @@ async function sendVisitCompletedMessage(tp: TenantPrismaClient, customerId: str
     technicianName: visit.technician?.name ?? "",
     businessName: bs?.businessName ?? "",
   });
-  await createMessageService(tp).send({ customerId, body, templateId: template.id });
+  const res = await createMessageService(tp).sendBest({ customerId, body, templateId: template.id });
+  if (res.status === "skipped") return res.reason;
 }
 
-// Only GHL-connected tenants are drained: every handler below (tags, custom
-// fields and the message.* sends) goes through GHL. Rows queued for a tenant
-// that has not connected GHL stay pending until it does.
+// Wave 2B-2 (GHL-05): GHL is optional. Every tenant is drained because message.send / message.visit_completed /
+// invoice.send are delivered by the native mailer (or GHL for SMS, decided per customer by the channel router).
+// The CRM events below only make sense with GHL; for a tenant that is not connected they are DROPPED (status
+// "dropped": not retried, not dead, no admin alert).
+const GHL_ONLY_EVENTS = new Set([
+  "customer.synced", "visit.completed", "visit.scheduled", "payment.collected", "payment.failed", "debt.overdue",
+  "complaint.logged", "complaint.resolved",
+]);
+
 export async function runOutboxWorker(): Promise<void> {
-  const tenants = await prisma.tenant.findMany({
-    where: { ghlLocationId: { not: null } },
-    select: { schemaName: true },
-  });
+  const tenants = await prisma.tenant.findMany({ select: { schemaName: true } });
 
-  await Promise.allSettled(tenants.map((t) => processTenant(t.schemaName)));
+  // BUG-010: bounded concurrency through the shared client cache (never one client per tenant at once).
+  await forEachTenant(tenants, (tp) => processTenant(tp));
 }
 
-async function processTenant(schemaName: string): Promise<void> {
-  const tp = getTenantPrismaForSchema(schemaName);
-
+async function processTenant(tp: TenantPrismaClient): Promise<void> {
   const rows = await tp.integrationOutbox.findMany({
     // runAfter = delayed sends (scheduled round messages): not drained before their time.
     where: { status: "pending", OR: [{ runAfter: null }, { runAfter: { lte: new Date() } }] },
@@ -128,9 +137,26 @@ async function processTenant(schemaName: string): Promise<void> {
     take: BATCH,
   });
 
+  if (rows.length === 0) return;
+  const ghlConnected = (await tp.businessSettings.findFirst({ select: { ghlConnected: true } }))?.ghlConnected === true;
+
   for (const row of rows) {
+    if (!ghlConnected && GHL_ONLY_EVENTS.has(row.eventType)) {
+      await tp.integrationOutbox.update({
+        where: { id: row.id },
+        data: { status: "dropped", lastError: "GoHighLevel is not connected", processedAt: new Date() },
+      });
+      continue;
+    }
+    // ACT-01: invoice.send has its own atomic claim, retry and result handling.
+    if (row.eventType === INVOICE_SEND_EVENT) {
+      await processInvoiceSendRow(tp, row);
+      continue;
+    }
     const payload = row.payload as Payload;
     const customerId = payload.customerId;
+    let unknownType = false;
+    let skipReason: string | void = undefined;
 
     try {
       if (!customerId) throw new Error("payload missing customerId");
@@ -167,33 +193,50 @@ async function processTenant(schemaName: string): Promise<void> {
           await applyGhlTags(tp, customerId, [], ["has-open-complaint"]);
           break;
         case "message.send":
-          await sendQueuedMessage(tp, customerId, payload);
+          skipReason = await sendQueuedMessage(tp, customerId, payload);
           break;
         case "message.visit_completed":
-          await sendVisitCompletedMessage(tp, customerId, payload);
+          skipReason = await sendVisitCompletedMessage(tp, customerId, payload);
           break;
         default:
-          console.warn(`[outbox] unknown eventType: ${row.eventType}`);
+          unknownType = true;
+      }
+
+      if (unknownType) {
+        // BE-12: an event type nothing handles is a bug, not a success: park it as dead (visible, replayable) and
+        // tell the office, instead of silently marking it sent.
+        console.warn(`[outbox] unknown eventType: ${row.eventType}`);
+        await tp.integrationOutbox.update({
+          where: { id: row.id },
+          data: { status: "dead", lastError: `Unknown event type: ${row.eventType}`, processedAt: new Date() },
+        });
+        await notifyIntegrationDead(tp, { id: row.id, eventType: row.eventType, lastError: `Unknown event type: ${row.eventType}` });
+        continue;
       }
 
       await tp.integrationOutbox.update({
         where: { id: row.id },
-        data: { status: "sent", processedAt: new Date() },
+        data: skipReason
+          ? { status: "skipped", lastError: skipReason, processedAt: new Date() }
+          : { status: "sent", processedAt: new Date() },
       });
     } catch (err) {
       const attempts = row.attempts + 1;
-      const dead = attempts >= MAX_ATTEMPTS;
+      const dead = attempts >= OUTBOX_MAX_ATTEMPTS;
       await tp.integrationOutbox.update({
         where: { id: row.id },
         data: {
           attempts,
           lastError: String(err),
           status: dead ? "dead" : "pending",
+          // BE-12: exponential back-off (30 s, 2 min, 10 min, 1 h, 6 h) through runAfter instead of retrying every drain.
+          runAfter: dead ? null : new Date(Date.now() + outboxBackoffMs(attempts)),
           ...(dead ? { processedAt: new Date() } : {}),
         },
       });
       if (dead) {
-        console.error(`[outbox] row ${row.id} (${row.eventType}) dead after ${MAX_ATTEMPTS} attempts:`, err);
+        console.error(`[outbox] row ${row.id} (${row.eventType}) dead after ${OUTBOX_MAX_ATTEMPTS} attempts:`, err);
+        await notifyIntegrationDead(tp, { id: row.id, eventType: row.eventType, lastError: String(err) });
       }
     }
   }

@@ -1,5 +1,9 @@
 import { describe, it, expect, vi } from "vitest";
+import { NOT_COLLECTING_INVOICE } from "../direct-debit";
 import { holdNextVisits, releaseHeldVisits, releaseHoldIfSettled } from "../payment-hold";
+
+// Notification wording is asserted in notification-producers.test.ts.
+vi.mock("../notify", async () => (await import("../../test/notify-mock.js")).notifyMockModule());
 
 function makeTp() {
   return {
@@ -8,6 +12,7 @@ function makeTp() {
       findFirst: vi.fn().mockResolvedValue(null),
       update: vi.fn().mockResolvedValue({}),
       updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+      findMany: vi.fn().mockResolvedValue([]),
     },
     businessSettings: { findFirst: vi.fn().mockResolvedValue({ debtHoldEnabled: true }) },
     customer: {
@@ -37,7 +42,7 @@ describe("holdNextVisits", () => {
     expect(tp.visit.findFirst).toHaveBeenCalledWith({
       where: { propertyId: "p1", status: "SCHEDULED", date: { gte: TODAY } },
       orderBy: { date: "asc" },
-      select: { id: true },
+      select: { id: true, technicianId: true, date: true, roundId: true, propertyId: true },
     });
     expect(tp.visit.update).toHaveBeenCalledWith({ where: { id: "v1" }, data: { paymentHold: true } });
     expect(tp.visit.update).toHaveBeenCalledWith({ where: { id: "v3" }, data: { paymentHold: true } });
@@ -89,7 +94,7 @@ describe("releaseHoldIfSettled", () => {
     const tp = makeTp();
     tp.invoice.count.mockResolvedValue(1);
     await expect(releaseHoldIfSettled(tp as never, "c1")).resolves.toBe(false);
-    expect(tp.invoice.count).toHaveBeenCalledWith({ where: { customerId: "c1", status: "SENT" } });
+    expect(tp.invoice.count).toHaveBeenCalledWith({ where: { customerId: "c1", status: "SENT", ...NOT_COLLECTING_INVOICE } });
     expect(tp.customer.update).not.toHaveBeenCalled();
   });
 

@@ -82,4 +82,17 @@ describe("OpenAPI contract", () => {
     expect(resolveServers({ RAILWAY_PUBLIC_DOMAIN: "rf.up.railway.app" })[0].url).toBe("https://rf.up.railway.app");
     expect(resolveServers({})).toEqual([local]);
   });
+
+  // BUG-004: list endpoints clamp pageSize to their maximum instead of answering 400; the spec says so.
+  it("every pageSize parameter documents that values above the maximum are clamped", () => {
+    const missing: string[] = [];
+    for (const [path, item] of Object.entries(paths)) {
+      for (const [method, op] of Object.entries(item as Record<string, { parameters?: Array<{ name?: string; description?: string }> }>)) {
+        for (const prm of op?.parameters ?? []) {
+          if (prm.name === "pageSize" && !/clamp/i.test(prm.description ?? "")) missing.push(`${method.toUpperCase()} ${path}`);
+        }
+      }
+    }
+    expect(missing).toEqual([]);
+  });
 });

@@ -1,6 +1,7 @@
 import { Client } from "pg";
 import fs from "fs";
 import path from "path";
+import { assertSchemaName, quoteSchema } from "./schema-name";
 
 // ---------------------------------------------------------------------------
 // Migration tracking — every tenant schema carries a "_migrations" table that
@@ -60,7 +61,7 @@ async function tableExists(
 
 async function createMigrationsTable(client: Client, schemaName: string): Promise<void> {
   await client.query(`
-    CREATE TABLE IF NOT EXISTS "${schemaName}"."_migrations" (
+    CREATE TABLE IF NOT EXISTS ${quoteSchema(schemaName)}."_migrations" (
       name TEXT PRIMARY KEY,
       "appliedAt" TIMESTAMPTZ NOT NULL DEFAULT now()
     )
@@ -69,7 +70,7 @@ async function createMigrationsTable(client: Client, schemaName: string): Promis
 
 async function getAppliedMigrations(client: Client, schemaName: string): Promise<Set<string>> {
   const result = await client.query<{ name: string }>(
-    `SELECT name FROM "${schemaName}"."_migrations"`
+    `SELECT name FROM ${quoteSchema(schemaName)}."_migrations"`
   );
   return new Set(result.rows.map((r) => r.name));
 }
@@ -83,9 +84,9 @@ async function applyMigration(
 ): Promise<void> {
   await client.query("BEGIN");
   try {
-    await client.query(`SET LOCAL search_path TO "${schemaName}"`);
+    await client.query(`SET LOCAL search_path TO ${quoteSchema(schemaName)}`);
     await client.query(migration.sql);
-    await client.query(`INSERT INTO "${schemaName}"."_migrations" (name) VALUES ($1)`, [
+    await client.query(`INSERT INTO ${quoteSchema(schemaName)}."_migrations" (name) VALUES ($1)`, [
       migration.name,
     ]);
     await client.query("COMMIT");
@@ -110,7 +111,7 @@ async function baselineMigrations(
     await createMigrationsTable(client, schemaName);
     for (const m of migrations) {
       await client.query(
-        `INSERT INTO "${schemaName}"."_migrations" (name) VALUES ($1) ON CONFLICT DO NOTHING`,
+        `INSERT INTO ${quoteSchema(schemaName)}."_migrations" (name) VALUES ($1) ON CONFLICT DO NOTHING`,
         [m.name]
       );
     }
@@ -132,6 +133,7 @@ async function baselineMigrations(
 // Idempotent: if BusinessSettings already exists the schema is fully
 // provisioned and the call returns immediately.
 export async function provisionTenantSchema(schemaName: string): Promise<void> {
+  assertSchemaName(schemaName);
   const migrations = collectMigrations();
   const client = dbClient();
   await client.connect();
@@ -146,12 +148,12 @@ export async function provisionTenantSchema(schemaName: string): Promise<void> {
     );
     if (Number(tableCount.rows[0].count) > 0) {
       throw new Error(
-        `Schema "${schemaName}" has tables but is not fully provisioned. Manual intervention required.`
+        `Schema ${quoteSchema(schemaName)} has tables but is not fully provisioned. Manual intervention required.`
       );
     }
 
-    await client.query(`DROP SCHEMA IF EXISTS "${schemaName}" CASCADE`);
-    await client.query(`CREATE SCHEMA "${schemaName}"`);
+    await client.query(`DROP SCHEMA IF EXISTS ${quoteSchema(schemaName)} CASCADE`);
+    await client.query(`CREATE SCHEMA ${quoteSchema(schemaName)}`);
 
     // Create tracking table first so every migration is recorded as it lands.
     await createMigrationsTable(client, schemaName);
@@ -173,7 +175,7 @@ export async function provisionTenantSchema(schemaName: string): Promise<void> {
 //
 // Individual tenant failures are logged but do not abort the loop so that
 // one broken schema cannot prevent the rest of the app from starting.
-export async function migrateAllTenantSchemas(): Promise<void> {
+export async function migrateAllTenantSchemas(): Promise<{ failed: string[] }> {
   const migrations = collectMigrations();
 
   // Pull the list of tenant schemas from the public schema.
@@ -190,9 +192,10 @@ export async function migrateAllTenantSchemas(): Promise<void> {
     await listClient.end();
   }
 
+  const failed: string[] = [];
   if (schemas.length === 0) {
     console.log("[migration] no tenant schemas found — skipping");
-    return;
+    return { failed };
   }
 
   console.log(`[migration] checking ${schemas.length} tenant schema(s)…`);
@@ -221,9 +224,12 @@ export async function migrateAllTenantSchemas(): Promise<void> {
         await applyMigration(client, schemaName, m);
       }
     } catch (err) {
+      // BE-18: reported by /health/ready so a broken tenant schema is visible, not just in the log.
+      failed.push(schemaName);
       console.error(`[migration] ${schemaName}: FAILED —`, err);
     } finally {
       await client.end();
     }
   }
+  return { failed };
 }

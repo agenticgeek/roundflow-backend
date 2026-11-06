@@ -1,4 +1,5 @@
 import { AppError } from "../../lib/app-error";
+import { outboundSignal } from "../../lib/outbound";
 
 const STRIPE_AUTH_URL  = "https://connect.stripe.com/oauth/authorize";
 const STRIPE_TOKEN_URL = "https://connect.stripe.com/oauth/token";
@@ -22,6 +23,7 @@ export interface StripeConnectTokenResponse {
 
 export async function exchangeStripeCode(code: string): Promise<StripeConnectTokenResponse> {
   const res = await fetch(STRIPE_TOKEN_URL, {
+    signal: outboundSignal(),
     method: "POST",
     headers: {
       "Content-Type":  "application/x-www-form-urlencoded",

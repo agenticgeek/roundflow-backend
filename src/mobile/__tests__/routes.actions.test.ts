@@ -69,7 +69,7 @@ function makeTp() {
     technician: { findUnique: vi.fn().mockResolvedValue({ id: "tech-1", active: true }) },
     visit: { findUnique: vi.fn().mockResolvedValue({ technicianId: "tech-1" }), findFirst: vi.fn().mockResolvedValue(null) },
     roundTechnician: { findFirst: vi.fn().mockResolvedValue({ roundId: "r1" }) },
-    idempotencyRecord: { findUnique: vi.fn().mockResolvedValue(null), create: vi.fn().mockResolvedValue({}) },
+    idempotencyRecord: { findUnique: vi.fn().mockResolvedValue(null), create: vi.fn().mockResolvedValue({}), update: vi.fn().mockResolvedValue({}), deleteMany: vi.fn().mockResolvedValue({ count: 0 }) },
     technicianIncident: { create: vi.fn() },
   };
 }
@@ -103,7 +103,7 @@ const VISIT_ACTIONS: [string, string, Record<string, unknown>][] = [
   ["post", "/mobile/visits/v1/access-issues", { type: "GATE_LOCKED", description: "locked" }],
   ["post", "/mobile/visits/v1/notes", { text: "hi" }],
   ["post", "/mobile/visits/v1/photos/upload-url", { type: "BEFORE" }],
-  ["post", "/mobile/visits/v1/photos", { type: "BEFORE", url: "https://x" }],
+  ["post", "/mobile/visits/v1/photos", { type: "BEFORE", url: "tenant-1/visits/v1/b.jpg" }],
   ["post", "/mobile/visits/v1/debt-payment", { method: "CASH" }],
   ["patch", "/mobile/visits/v1/complete", {}],
   ["post", "/mobile/visits/v1/upsells", { description: "Gutters", amount: 15 }],
@@ -152,8 +152,9 @@ describe("A8 ownership", () => {
 
 describe("idempotency on visit writes", () => {
   it("replays a stored response without re-running the action", async () => {
+    tp.idempotencyRecord.create.mockRejectedValue(new Prisma.PrismaClientKnownRequestError("dup", { code: "P2002", clientVersion: "x" }));
     tp.idempotencyRecord.findUnique.mockResolvedValue({
-      key: "k1", technicianId: "tech-1", route: "PATCH /mobile/visits/v1/complete", responseStatus: 200,
+      key: "k1", technicianId: "tech-1", state: "DONE", route: "PATCH /mobile/visits/v1/complete", responseStatus: 200,
       responseBody: { id: "v1", status: "COMPLETED", payment: null },
     });
     const res = await request(makeApp()).patch("/mobile/visits/v1/complete").set("X-Idempotency-Key", "k1").send({});
@@ -165,12 +166,17 @@ describe("idempotency on visit writes", () => {
   it("stores the first response for the key", async () => {
     await request(makeApp()).patch("/mobile/visits/v1/start").set("X-Idempotency-Key", "k2");
     expect(tp.idempotencyRecord.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({ key: "k2", technicianId: "tech-1", route: "PATCH /mobile/visits/v1/start", responseStatus: 200 }),
+      data: expect.objectContaining({ key: "k2", technicianId: "tech-1", route: "PATCH /mobile/visits/v1/start", state: "IN_PROGRESS" }),
+    });
+    expect(tp.idempotencyRecord.update).toHaveBeenCalledWith({
+      where: { key: "k2" },
+      data: expect.objectContaining({ state: "DONE", responseStatus: 200 }),
     });
   });
 
   it("403 IDEMPOTENCY_KEY_CONFLICT for another technician's key", async () => {
-    tp.idempotencyRecord.findUnique.mockResolvedValue({ key: "k1", technicianId: "tech-9", route: "x", responseStatus: 200, responseBody: {} });
+    tp.idempotencyRecord.create.mockRejectedValue(new Prisma.PrismaClientKnownRequestError("dup", { code: "P2002", clientVersion: "x" }));
+    tp.idempotencyRecord.findUnique.mockResolvedValue({ key: "k1", technicianId: "tech-9", state: "DONE", route: "x", responseStatus: 200, responseBody: {} });
     const res = await request(makeApp()).patch("/mobile/visits/v1/start").set("X-Idempotency-Key", "k1");
     expect(res.status).toBe(403);
     expect(res.body.code).toBe("IDEMPOTENCY_KEY_CONFLICT");
@@ -299,8 +305,41 @@ describe("signed read urls", () => {
 
 describe("POST /mobile/visits/:id/photos", () => {
   it("accepts `path` as an alias for `url`", async () => {
-    await request(makeApp()).post("/mobile/visits/v1/photos").send({ type: "AFTER", path: "t/visits/v1/after.jpg" });
-    expect(media.addVisitPhoto).toHaveBeenCalledWith("v1", "t/visits/v1/after.jpg", "AFTER");
+    await request(makeApp()).post("/mobile/visits/v1/photos").send({ type: "AFTER", path: "tenant-1/visits/v1/after.jpg" });
+    expect(media.addVisitPhoto).toHaveBeenCalledWith("v1", "tenant-1/visits/v1/after.jpg", "AFTER");
+  });
+
+  it("BE-16: 400 INVALID_PHOTO_PATH for another tenant, another visit, a URL or a traversal", async () => {
+    media.addVisitPhoto.mockClear();
+    for (const bad of [
+      "tenant-2/visits/v1/a.jpg",
+      "tenant-1/visits/v2/a.jpg",
+      "https://evil.example/a.jpg",
+      "tenant-1/visits/v1/../v2/a.jpg",
+    ]) {
+      const res = await request(makeApp()).post("/mobile/visits/v1/photos").send({ type: "AFTER", url: bad });
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe("INVALID_PHOTO_PATH");
+    }
+    expect(media.addVisitPhoto).not.toHaveBeenCalled();
+  });
+
+  it("GAP-019 / E2E-050: the signed upload URL of this visit's own object is accepted and stored as its object path", async () => {
+    media.addVisitPhoto.mockClear();
+    const signed = "https://proj.supabase.co/storage/v1/object/sign/visit-photos/tenant-1/visits/v1/before-1.jpg?token=abc";
+    const res = await request(makeApp()).post("/mobile/visits/v1/photos").send({ type: "BEFORE", url: signed });
+    expect(res.status).toBe(201);
+    expect(media.addVisitPhoto).toHaveBeenCalledWith("v1", "tenant-1/visits/v1/before-1.jpg", "BEFORE");
+    // another visit's object, another bucket, or a non-storage URL stay refused
+    for (const bad of [
+      "https://proj.supabase.co/storage/v1/object/sign/visit-photos/tenant-1/visits/v2/a.jpg?token=abc",
+      "https://proj.supabase.co/storage/v1/object/sign/other-bucket/tenant-1/visits/v1/a.jpg",
+      "https://example.invalid/e2e050/before.png",
+    ]) {
+      const refused = await request(makeApp()).post("/mobile/visits/v1/photos").send({ type: "BEFORE", url: bad });
+      expect(refused.status).toBe(400);
+      expect(refused.body.code).toBe("INVALID_PHOTO_PATH");
+    }
   });
 
   it("400 when neither url nor path is sent", async () => {
@@ -352,17 +391,17 @@ describe("chat scoping (A8) and sender id (D-4)", () => {
 
   it("POST TEXT stores the Profile id as sender", async () => {
     await request(makeApp()).post("/mobile/chat/messages").send({ roundId: "r1", text: "hi" });
-    expect(chat.send).toHaveBeenCalledWith("r1", "profile-1", { type: "TEXT", text: "hi", clientMsgId: null });
+    expect(chat.send).toHaveBeenCalledWith("r1", "profile-1", { type: "TEXT", text: "hi", clientMsgId: null }, "Sam");
   });
 
   it("POST PHOTOS stores the Profile id as sender", async () => {
     await request(makeApp()).post("/mobile/chat/messages").send({ roundId: "r1", type: "PHOTOS", photoUrls: ["tenant-1/chat/r1/a.jpg"] });
-    expect(chat.send).toHaveBeenCalledWith("r1", "profile-1", { type: "PHOTOS", photoUrls: ["tenant-1/chat/r1/a.jpg"], text: null, clientMsgId: null });
+    expect(chat.send).toHaveBeenCalledWith("r1", "profile-1", { type: "PHOTOS", photoUrls: ["tenant-1/chat/r1/a.jpg"], text: null, clientMsgId: null }, "Sam");
   });
 
   it("POST WORK_PHOTOS requires owning the visit", async () => {
     await request(makeApp()).post("/mobile/chat/messages").send({ roundId: "r1", type: "WORK_PHOTOS", visitId: "v1" });
-    expect(chat.send).toHaveBeenCalledWith("r1", "profile-1", { type: "WORK_PHOTOS", visitId: "v1", clientMsgId: null });
+    expect(chat.send).toHaveBeenCalledWith("r1", "profile-1", { type: "WORK_PHOTOS", visitId: "v1", clientMsgId: null }, "Sam");
 
     tp.visit.findUnique.mockResolvedValue({ technicianId: "tech-2" });
     const res = await request(makeApp()).post("/mobile/chat/messages").send({ roundId: "r1", type: "WORK_PHOTOS", visitId: "v1" });
@@ -399,7 +438,7 @@ describe("chat additions (limit/before, clientMsgId, caps, unread, read)", () =>
     chat.send.mockResolvedValueOnce({ row: { id: "m1" }, duplicate: true });
     const res = await request(makeApp()).post("/mobile/chat/messages").send({ roundId: "r1", text: "hi", clientMsgId: "c1" });
     expect(res.status).toBe(200);
-    expect(chat.send).toHaveBeenLastCalledWith("r1", "profile-1", { type: "TEXT", text: "hi", clientMsgId: "c1" });
+    expect(chat.send).toHaveBeenLastCalledWith("r1", "profile-1", { type: "TEXT", text: "hi", clientMsgId: "c1" }, "Sam");
   });
 
   it("POST rejects text over 2000 chars, empty text, bad photo paths, unknown types", async () => {
@@ -414,7 +453,7 @@ describe("chat additions (limit/before, clientMsgId, caps, unread, read)", () =>
     expect((await post({ type: "PHOTOS", photoUrls: ["tenant-1/chat/r2/a.jpg"] })).status).toBe(400);
     const withText = await post({ type: "PHOTOS", photoUrls: ["tenant-1/chat/r1/a.jpg"], text: " look " });
     expect(withText.status).toBe(201);
-    expect(chat.send).toHaveBeenLastCalledWith("r1", "profile-1", { type: "PHOTOS", photoUrls: ["tenant-1/chat/r1/a.jpg"], text: "look", clientMsgId: null });
+    expect(chat.send).toHaveBeenLastCalledWith("r1", "profile-1", { type: "PHOTOS", photoUrls: ["tenant-1/chat/r1/a.jpg"], text: "look", clientMsgId: null }, "Sam");
     expect((await post({ type: "VIDEO" })).status).toBe(400);
   });
 

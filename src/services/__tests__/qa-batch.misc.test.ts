@@ -6,8 +6,11 @@ import { createSettingsService } from "../settings.service";
 import { createTodayService, DEFAULT_CLOSE_DAY_SKIP_REASON } from "../today.service";
 import { createRoundService } from "../round.service";
 import { localDay, todayRange, resolveTimeZone, localDateTime } from "../../lib/dates";
-import { tenantTimeZone, tenantTodayRange, tenantToday } from "../business-time";
+import { tenantTimeZone, tenantTodayRange, tenantToday, tenantWorkingDays } from "../business-time";
 import { moveFutureVisitsToRound, pausePlan } from "../service-plan-lifecycle";
+
+// Notification producers are covered by notify.test.ts and the notification-producers tests.
+vi.mock("../notify", async () => (await import("../../test/notify-mock.js")).notifyMockModule());
 
 beforeEach(() => vi.clearAllMocks());
 
@@ -47,7 +50,7 @@ it("B2: rejects unknown visit / technician, non-SCHEDULED visits, inactive and u
 
 it("C1: releaseTechnicianWork frees future SCHEDULED visits and clears property allocations", async () => {
   const tp: any = {
-    visit: { updateMany: vi.fn().mockResolvedValue({ count: 3 }) },
+    visit: { findMany: vi.fn().mockResolvedValue([]), updateMany: vi.fn().mockResolvedValue({ count: 3 }) },
     property: { updateMany: vi.fn().mockResolvedValue({ count: 2 }) },
   };
   const out = await releaseTechnicianWork(tp, "t1", new Date("2026-11-03T15:00:00Z"));
@@ -70,7 +73,7 @@ it("C1: deactivating a technician (TechnicianService) releases their upcoming wo
       findUnique: vi.fn().mockResolvedValue({ id: "t1", active: true }),
       update: vi.fn().mockResolvedValue({ id: "t1", name: "Sam", active: false, profileId: "p", serviceAreas: [] }),
     },
-    visit: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    visit: { findMany: vi.fn().mockResolvedValue([]), updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
     property: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
   };
   const prisma: any = { $transaction: vi.fn((cb: any) => cb(tx)), businessSettings: { findFirst: vi.fn().mockResolvedValue(null) } };
@@ -90,7 +93,7 @@ it("C1: deactivating via Settings releases work after the update succeeds", asyn
       findUnique: vi.fn().mockResolvedValue({ id: "t1", active: true }),
       update: vi.fn().mockResolvedValue({ id: "t1", name: "Sam", active: false, profileId: "p", serviceAreas: [] }),
     },
-    visit: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    visit: { findMany: vi.fn().mockResolvedValue([]), updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
     property: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
     businessSettings: { findFirst: vi.fn().mockResolvedValue({ timezone: "Europe/London" }) },
   };
@@ -133,6 +136,15 @@ it("EMU-6: tenant time zone comes from settings, falls back to London on missing
   expect(await tenantToday(broken, now)).toEqual(new Date("2026-08-01T00:00:00Z"));
 });
 
+it("ACT-02..04: tenantWorkingDays reads the stored days and falls back to [] when missing or unreadable", async () => {
+  const ok: any = { businessSettings: { findFirst: vi.fn().mockResolvedValue({ defaultWorkingDays: ["MON", "SAT"] }) } };
+  expect(await tenantWorkingDays(ok)).toEqual(["MON", "SAT"]);
+  const none: any = { businessSettings: { findFirst: vi.fn().mockResolvedValue(null) } };
+  expect(await tenantWorkingDays(none)).toEqual([]);
+  const broken: any = { businessSettings: { findFirst: vi.fn().mockRejectedValue(new Error("db")) } };
+  expect(await tenantWorkingDays(broken)).toEqual([]);
+});
+
 // ---- B6 ---------------------------------------------------------------------
 
 function todayPrisma() {
@@ -162,7 +174,7 @@ it("B6: closing the day with mark_as_skipped stores a skip reason (given or defa
 
 it("pausePlan rejects an end date on or before the start and stores date-only values", async () => {
   const tx: any = {
-    visit: { updateMany: vi.fn().mockResolvedValue({ count: 0 }) },
+    visit: { findMany: vi.fn().mockResolvedValue([]), updateMany: vi.fn().mockResolvedValue({ count: 0 }) },
     servicePlan: { update: vi.fn().mockImplementation(({ data }: any) => Promise.resolve({ id: "sp1", ...data })) },
   };
   const tp: any = { $transaction: vi.fn((cb: any) => cb(tx)) };
@@ -179,7 +191,7 @@ it("pausePlan rejects an end date on or before the start and stores date-only va
 
 it("moveFutureVisitsToRound uses the plan's own frequency, else the round's, else leaves nextDueDate alone", async () => {
   const tx: any = {
-    visit: { updateMany: vi.fn().mockResolvedValue({ count: 4 }) },
+    visit: { findMany: vi.fn().mockResolvedValue([]), updateMany: vi.fn().mockResolvedValue({ count: 4 }) },
     servicePlan: {
       findMany: vi.fn().mockResolvedValue([
         { id: "a", lastCompleted: new Date("2026-10-01T00:00:00Z"), cleaningFrequency: "FOUR_WEEKLY" },

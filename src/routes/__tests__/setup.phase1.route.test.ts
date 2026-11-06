@@ -27,7 +27,7 @@ const replaceTemplates = vi.fn().mockResolvedValue([{ id: "t1" }]);
 vi.mock("../../services/setup.service", () => ({ createSetupService: vi.fn(() => svc) }));
 vi.mock("../../services/settings.service", () => ({ createSettingsService: vi.fn(() => ({ replaceTemplates })) }));
 vi.mock("../../middleware/requireAuth", () => ({ requireAuth: (_q: any, _s: any, n: any) => n() }));
-vi.mock("../../middleware/requireTenantAccess", () => ({ requireTenantAccess: (_q: any, _s: any, n: any) => n() }));
+vi.mock("../../middleware/requireTenantAccess", () => ({ requireTenantAccess: (q: any, _s: any, n: any) => { q.profile = { role: "ADMIN" }; n(); } }));
 vi.mock("../../middleware/requireRole", () => ({
   requireRole: () => (_q: any, _s: any, n: any) => n(),
   requireBusinessAccess: () => (_q: any, _s: any, n: any) => n(),

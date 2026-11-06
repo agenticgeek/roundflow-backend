@@ -1,6 +1,7 @@
 import { encrypt, decrypt } from "../../lib/crypto";
 import { refreshGhlToken } from "./oauth";
 import { invalidateCachedBusinessSettings } from "../../services/settings.service";
+import { outboundSignal } from "../../lib/outbound";
 
 const GHL_API = "https://services.leadconnectorhq.com";
 const REFRESH_BUFFER_MS = 5 * 60 * 1000;
@@ -78,6 +79,7 @@ export async function createGhlContact(
 ): Promise<string> {
   const { firstName, lastName } = splitName(customer.name);
   const res = await fetch(`${GHL_API}/contacts/`, {
+    signal: outboundSignal(),
     method: "POST",
     headers: ghlHeaders(ctx.accessToken),
     body: JSON.stringify({ locationId: ctx.locationId, firstName, lastName, phone: customer.phone ?? undefined, email: customer.email ?? undefined }),
@@ -94,6 +96,7 @@ export async function updateGhlContact(
 ): Promise<void> {
   const { firstName, lastName } = splitName(customer.name);
   const res = await fetch(`${GHL_API}/contacts/${contactId}`, {
+    signal: outboundSignal(),
     method: "PUT",
     headers: ghlHeaders(ctx.accessToken),
     body: JSON.stringify({ firstName, lastName, phone: customer.phone ?? undefined, email: customer.email ?? undefined }),
@@ -103,6 +106,7 @@ export async function updateGhlContact(
 
 export async function addGhlTags(ctx: GhlTokenContext, contactId: string, tags: string[]): Promise<void> {
   const res = await fetch(`${GHL_API}/contacts/${contactId}/tags`, {
+    signal: outboundSignal(),
     method: "POST",
     headers: ghlHeaders(ctx.accessToken),
     body: JSON.stringify({ tags }),
@@ -112,6 +116,7 @@ export async function addGhlTags(ctx: GhlTokenContext, contactId: string, tags: 
 
 export async function removeGhlTags(ctx: GhlTokenContext, contactId: string, tags: string[]): Promise<void> {
   const res = await fetch(`${GHL_API}/contacts/${contactId}/tags`, {
+    signal: outboundSignal(),
     method: "DELETE",
     headers: ghlHeaders(ctx.accessToken),
     body: JSON.stringify({ tags }),
@@ -136,6 +141,7 @@ export async function sendGhlMessage(
 ): Promise<string | null> {
   const type = CHANNEL_TYPE_MAP[channel] ?? "Email";
   const res = await fetch(`${GHL_API}/conversations/messages`, {
+    signal: outboundSignal(),
     method: "POST",
     headers: ghlHeaders(ctx.accessToken, "2021-04-15"),
     body: JSON.stringify({ type, contactId, message: messageBody }),
@@ -182,6 +188,7 @@ async function getLocationCustomFields(ctx: GhlTokenContext): Promise<Map<string
   if (cached && cached.expiresAt > Date.now()) return cached.fields;
 
   const res = await fetch(`${GHL_API}/locations/${ctx.locationId}/customFields`, {
+    signal: outboundSignal(),
     headers: ghlHeaders(ctx.accessToken, "v3"),
   });
   await assertGhlOk(res, "getCustomFields");
@@ -219,6 +226,7 @@ export async function setGhlContactCustomFields(
   if (customFields.length === 0) return;
 
   const res = await fetch(`${GHL_API}/contacts/${contactId}`, {
+    signal: outboundSignal(),
     method: "PUT",
     headers: ghlHeaders(ctx.accessToken, "v3"),
     body: JSON.stringify({ customFields }),

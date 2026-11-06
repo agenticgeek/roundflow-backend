@@ -1,6 +1,9 @@
 import { PaymentMethod, VisitStatus } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
+import { notifyVisitTechnicians } from "./notify";
+import { isLocationApproximate } from "../integrations/geocoding/client";
+import { assertCalendarDate } from "../lib/validation";
 
 export interface VisitCreateInput {
   propertyId: string;
@@ -26,6 +29,8 @@ export interface VisitDetail {
   postcode: string;
   latitude: number | null;
   longitude: number | null;
+  geocodePrecision: string | null;
+  locationApproximate: boolean;
   customerId: string;
   customerName: string;
   roundId: string | null;
@@ -36,7 +41,6 @@ export interface VisitDetail {
   technicianName: string | null;
 }
 
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 export interface VisitAssignment {
   id: string;
@@ -53,7 +57,10 @@ class VisitService {
   // manual decision, so technicianOverride is set (also when unassigning) and
   // later restamps (round technician / allocation changes) leave the visit alone.
   async assignVisit(visitId: string, technicianId: string | null): Promise<VisitAssignment> {
-    const visit = await this.prisma.visit.findUnique({ where: { id: visitId }, select: { id: true, status: true } });
+    const visit = await this.prisma.visit.findUnique({
+      where: { id: visitId },
+      select: { id: true, status: true, technicianId: true, date: true, roundId: true, propertyId: true },
+    });
     if (!visit) throw new AppError(404, "Visit not found");
     if (visit.status !== VisitStatus.SCHEDULED) {
       throw new AppError(409, `Only SCHEDULED visits can be assigned or unassigned (this visit is ${visit.status})`, "VISIT_NOT_SCHEDULED");
@@ -72,6 +79,23 @@ class VisitService {
       data: { technicianId, technicianOverride: true },
       include: { technician: { select: { name: true } } },
     });
+    // FLOW-03: tell the technician who gained the visit and the one who lost it. Best effort.
+    if (visit.technicianId !== technicianId) {
+      if (technicianId) {
+        await notifyVisitTechnicians(
+          this.prisma,
+          [{ ...visit, technicianId }],
+          ({ first }) => ({ type: "SCHEDULE", title: "1 visit assigned to you", body: `Visit on ${first}.` })
+        );
+      }
+      if (visit.technicianId) {
+        await notifyVisitTechnicians(
+          this.prisma,
+          [visit],
+          ({ first }) => ({ type: "SCHEDULE", title: "1 visit moved off your schedule", body: `Visit on ${first} was reassigned.` })
+        );
+      }
+    }
     return {
       id: updated.id,
       status: updated.status,
@@ -82,9 +106,7 @@ class VisitService {
   }
 
   async createVisit(input: VisitCreateInput): Promise<VisitDetail> {
-    if (!DATE_RE.test(input.date)) {
-      throw new AppError(400, `"date" must be in YYYY-MM-DD format`);
-    }
+    assertCalendarDate(input.date, "date"); // BUG-007: 2026-02-30 used to roll over to 2026-03-02
     if (input.price <= 0 || input.price > 9999.99) {
       throw new AppError(400, `"price" must be > 0 and ≤ 9999.99`);
     }
@@ -150,6 +172,8 @@ class VisitService {
       postcode: visit.property.postcode,
       latitude: visit.property.latitude,
       longitude: visit.property.longitude,
+      geocodePrecision: visit.property.geocodePrecision,
+      locationApproximate: isLocationApproximate(visit.property.geocodePrecision, visit.property.latitude),
       customerId: visit.property.customer.id,
       customerName: visit.property.customer.name,
       roundId: visit.roundId,

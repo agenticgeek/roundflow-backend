@@ -9,9 +9,12 @@ import {
 import { AppError } from "../../lib/app-error";
 import { LifecycleStatus, RoundStatus, VisitStatus } from "../../generated/tenant-client";
 
+// Notification producers are asserted in notification-producers.test.ts.
+vi.mock("../notify", async () => (await import("../../test/notify-mock.js")).notifyMockModule());
+
 function makeTx() {
   return {
-    visit: { updateMany: vi.fn().mockResolvedValue({ count: 3 }) },
+    visit: { findMany: vi.fn().mockResolvedValue([]), updateMany: vi.fn().mockResolvedValue({ count: 3 }) },
     servicePlan: { update: vi.fn().mockImplementation(({ data }: any) => Promise.resolve({ id: "sp1", ...data })) },
     property: { update: vi.fn().mockResolvedValue({}) },
     round: { create: vi.fn().mockResolvedValue({ id: "rNew", name: "Alnwick Fri 6wk", defaultDay: "FRI" }) },
@@ -25,6 +28,7 @@ function makeTp(tx = makeTx()) {
     tp: {
       servicePlan: { findUnique: vi.fn(), update: vi.fn().mockResolvedValue({ id: "sp1" }) },
       property: { findUnique: vi.fn() },
+      businessSettings: { findFirst: vi.fn().mockResolvedValue(null) },
       round: { findMany: vi.fn() },
       $transaction: vi.fn((cb: any) => cb(tx)),
     } as any,
@@ -88,6 +92,14 @@ it("resumePlan without a round day uses today snapped to a weekday", async () =>
   tp.property.findUnique.mockResolvedValue({ round: null });
   await resumePlan(tp, { id: "sp1", propertyId: "p1" }, new Date("2026-10-31T10:00:00Z")); // Saturday
   expect(tp.servicePlan.update.mock.calls[0][0].data.nextDueDate).toEqual(day("2026-11-02"));
+});
+
+it("resumePlan without a round day honours the business working days", async () => {
+  const { tp } = makeTp();
+  tp.property.findUnique.mockResolvedValue({ round: null });
+  tp.businessSettings.findFirst.mockResolvedValue({ defaultWorkingDays: ["SAT", "SUN"] });
+  await resumePlan(tp, { id: "sp1", propertyId: "p1" }, new Date("2026-10-31T10:00:00Z")); // Saturday
+  expect(tp.servicePlan.update.mock.calls[0][0].data.nextDueDate).toEqual(day("2026-10-31"));
 });
 
 // ── updatePlan (B3) ─────────────────────────────────────────────────────────

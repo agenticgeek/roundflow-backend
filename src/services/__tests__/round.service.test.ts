@@ -10,6 +10,8 @@ vi.mock("../message.service", () => ({
 // Real resolve/autoSplit; restamping is visit-assignment's own concern
 // (tested there), so it's stubbed to a count here.
 const restampFutureVisits = vi.fn();
+// Notification producers are covered in round.service.assign-flow.test.ts.
+vi.mock("../notify", async () => (await import("../../test/notify-mock.js")).notifyMockModule());
 vi.mock("../visit-assignment", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../visit-assignment")>()),
   restampFutureVisits: (...args: unknown[]) => restampFutureVisits(...args),
@@ -27,7 +29,7 @@ function makePrisma() {
     technician: { findUnique: vi.fn(), findMany: vi.fn() },
     property: { findMany: vi.fn(), updateMany: vi.fn() },
     servicePlan: { update: vi.fn() },
-    visit: { findMany: vi.fn(), updateMany: vi.fn(), findFirst: vi.fn(), create: vi.fn() },
+    visit: { findMany: vi.fn(), updateMany: vi.fn(), findFirst: vi.fn().mockResolvedValue(null), create: vi.fn(), count: vi.fn().mockResolvedValue(0) },
     roundTechnician: { findMany: vi.fn().mockResolvedValue([]), deleteMany: vi.fn(), createMany: vi.fn() },
     technicianAvailability: { findMany: vi.fn().mockResolvedValue([]) },
     // Defaults to "no settings row" (day not closed) so pre-existing tests
@@ -734,6 +736,7 @@ function splitPrisma(technicians: ReturnType<typeof tech>[], properties: ReturnT
   mock(prisma.round.findUnique).mockResolvedValue({ id: "r1" });
   mock(prisma.technician.findMany).mockResolvedValue(technicians);
   mock(prisma.property.findMany).mockResolvedValue(properties);
+  mock(prisma.visit.findMany).mockResolvedValue([]);
   return prisma;
 }
 
@@ -789,9 +792,12 @@ describe("setTechnicians", () => {
       roundId: "r1",
       allocation: [{ technicianId: "t1", name: "Tech t1", propertyIds: ["p1", "p2"], stops: 2, value: "52.00" }],
       visitsUpdated: 6,
+      visitsGenerated: 0,
+      overriddenVisits: 0,
+      nextVisitDate: null,
     });
     expect(prisma.roundTechnician.deleteMany).toHaveBeenCalledWith({ where: { roundId: "r1" } });
-    expect(prisma.roundTechnician.createMany).toHaveBeenCalledWith({ data: [{ roundId: "r1", technicianId: "t1" }] });
+    expect(prisma.roundTechnician.createMany).toHaveBeenCalledWith({ data: [{ roundId: "r1", technicianId: "t1" }], skipDuplicates: true });
     expect(propertyWrites(prisma)).toEqual({ t1: ["p1", "p2"] });
     expect(restampFutureVisits).toHaveBeenCalledWith(prisma, "r1", expect.any(Date));
   });
@@ -896,6 +902,9 @@ describe("setTechnicians", () => {
       roundId: "r1",
       allocation: [{ technicianId: "t1", name: "Tech t1", propertyIds: ["p1"], stops: 1, value: "20.00" }],
       visitsUpdated: 3,
+      visitsGenerated: 0,
+      overriddenVisits: 0,
+      nextVisitDate: null,
     });
     expect(rejected).toBeInstanceOf(Error);
   });

@@ -22,7 +22,8 @@ import { UserRole } from "@prisma/client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 import { getCachedBusinessSettings } from "./settings.service";
-import { geocodePostcode } from "../integrations/geocoding/client";
+import { isLocationApproximate } from "../integrations/geocoding/client";
+import { geocodeProperty, addressChanged, GEOCODE_RESET } from "./property-geocoding";
 import { initialNextDueDate, startOfUtcDay } from "../lib/schedule";
 import { tenantToday } from "./business-time";
 import {
@@ -39,31 +40,6 @@ import {
   type PauseResult,
   type PlanUpdateResult,
 } from "./service-plan-lifecycle";
-
-// Fire-and-forget: geocodes `postcode` and writes the result onto the
-// property. Never thrown by the caller — always chained with
-// `.catch(console.error)` so a slow/broken geocoding provider never delays
-// or fails the request that created/edited the property. A failed or
-// not-found lookup just bumps `geocodeAttempts`; `geocodeBackfill.ts` retries
-// it later. Called with `this.prisma` (never a transaction client) and only
-// after the triggering transaction has committed.
-async function triggerGeocode(tp: TenantPrismaClient, propertyId: string, postcode: string): Promise<void> {
-  let coords: { latitude: number; longitude: number } | null = null;
-  let error: string | null = null;
-  try {
-    coords = await geocodePostcode(postcode);
-    if (!coords) error = "postcode not found";
-  } catch (err) {
-    error = String(err);
-  }
-
-  await tp.property.update({
-    where: { id: propertyId },
-    data: coords
-      ? { latitude: coords.latitude, longitude: coords.longitude, geocodedAt: new Date(), geocodeError: null }
-      : { geocodeAttempts: { increment: 1 }, geocodeError: error },
-  });
-}
 
 // B4: the API must refuse what the form already prevents — a property in a
 // round that belongs to a different service area. Rounds/properties without
@@ -220,6 +196,8 @@ export interface CustomerListRow {
   postcode: string | null;
   latitude: number | null;
   longitude: number | null;
+  geocodePrecision: string | null;
+  locationApproximate: boolean;
   roundId: string | null;
   roundName: string | null;
   frequency: CleaningFrequency | null;
@@ -322,6 +300,8 @@ export interface PropertyDetail {
   postcode: string;
   latitude: number | null;
   longitude: number | null;
+  geocodePrecision: string | null;
+  locationApproximate: boolean;
   propertyType: string | null;
   status: LifecycleStatus;
   accessNotes: string | null;
@@ -376,6 +356,8 @@ export interface CustomerDetail {
     postcode: string;
     latitude: number | null;
     longitude: number | null;
+    geocodePrecision: string | null;
+    locationApproximate: boolean;
     propertyType: string | null;
     accessNotes: string | null;
     riskNotes: string | null;
@@ -405,6 +387,8 @@ export interface CustomerDetail {
       postcode: string;
       latitude: number | null;
       longitude: number | null;
+      geocodePrecision: string | null;
+      locationApproximate: boolean;
       propertyType: string | null;
       accessNotes: string | null;
       riskNotes: string | null;
@@ -449,6 +433,14 @@ export interface VisitHistoryPage {
 const SEARCH_LIMIT = 10;
 
 const OPEN_VISIT: VisitStatus[] = [VisitStatus.SCHEDULED, VisitStatus.IN_PROGRESS];
+
+/** B5: 409 UNPAID_INVOICES with the number and total of the SENT invoices that block a delete. */
+export class UnpaidInvoicesError extends AppError {
+  constructor(subject: string, public readonly count: number, public readonly total: number) {
+    super(409, `This ${subject} has ${count} unpaid invoice${count === 1 ? "" : "s"} (${total.toFixed(2)}). Mark them paid or void them first.`, "UNPAID_INVOICES");
+    this.name = "UnpaidInvoicesError";
+  }
+}
 
 class CustomerService {
   constructor(private readonly prisma: TenantPrismaClient) {}
@@ -578,6 +570,8 @@ class CustomerService {
           postcode: null,
           latitude: null,
           longitude: null,
+          geocodePrecision: null,
+          locationApproximate: false,
           roundId: null,
           roundName: null,
           frequency: null,
@@ -625,6 +619,8 @@ class CustomerService {
         postcode: property.postcode,
         latitude: property.latitude,
         longitude: property.longitude,
+        geocodePrecision: property.geocodePrecision,
+        locationApproximate: isLocationApproximate(property.geocodePrecision, property.latitude),
         roundId: property.roundId,
         roundName: property.round?.name ?? null,
         frequency: plan?.cleaningFrequency ?? property.round?.frequency ?? null,
@@ -716,6 +712,15 @@ class CustomerService {
       getCachedBusinessSettings(this.prisma),
     ]);
     if (!customer) throw new AppError(404, "Customer not found");
+    // BUG-009: a deleted (CANCELLED) customer with no history is gone; one with history stays readable.
+    if (
+      customer.status === LifecycleStatus.CANCELLED &&
+      customer.invoices.length === 0 &&
+      customer.payments.length === 0 &&
+      customer.properties.every((p) => p.visits.length === 0)
+    ) {
+      throw new AppError(404, "Customer not found");
+    }
 
     // Phase 1: one active property per customer.
     const property =
@@ -791,6 +796,8 @@ class CustomerService {
             postcode: property.postcode,
             latitude: property.latitude,
             longitude: property.longitude,
+            geocodePrecision: property.geocodePrecision,
+            locationApproximate: isLocationApproximate(property.geocodePrecision, property.latitude),
             propertyType: property.propertyType,
             accessNotes: property.accessNotes,
             riskNotes: property.riskNotes,
@@ -842,6 +849,8 @@ class CustomerService {
               postcode: property.postcode,
               latitude: property.latitude,
               longitude: property.longitude,
+              geocodePrecision: property.geocodePrecision,
+              locationApproximate: isLocationApproximate(property.geocodePrecision, property.latitude),
               propertyType: property.propertyType,
               accessNotes: property.accessNotes,
               riskNotes: property.riskNotes,
@@ -934,6 +943,8 @@ class CustomerService {
       postcode: property.postcode,
       latitude: property.latitude,
       longitude: property.longitude,
+      geocodePrecision: property.geocodePrecision,
+      locationApproximate: isLocationApproximate(property.geocodePrecision, property.latitude),
       propertyType: property.propertyType,
       status: property.status,
       accessNotes: property.accessNotes,
@@ -1029,7 +1040,7 @@ class CustomerService {
       return { customer, property: { propertyId, servicePlanId, assigned: prop.roundId != null } };
     });
     if (result.property) {
-      triggerGeocode(this.prisma, result.property.propertyId, prop!.postcode).catch(console.error);
+      geocodeProperty(this.prisma, result.property.propertyId, { addressLine: prop!.addressLine, postcode: prop!.postcode }).catch(console.error);
     }
     return result;
   }
@@ -1085,15 +1096,23 @@ class CustomerService {
       if (input.name !== undefined) customerData.name = input.name;
       if (input.phone !== undefined) customerData.phone = input.phone;
       if (input.landline !== undefined) customerData.landline = input.landline;
-      if (input.email !== undefined) customerData.email = input.email;
+      if (input.email !== undefined) {
+        customerData.email = input.email;
+        // A bounced / complained address is retried once someone edits it to a different address.
+        const norm = (v: string | null | undefined) => (v ?? "").trim().toLowerCase();
+        if (norm(input.email) !== norm(customer.email)) customerData.emailInvalidAt = null;
+      }
       if (input.messagesOptOut !== undefined) customerData.messagesOptOut = input.messagesOptOut;
       if (Object.keys(customerData).length > 0) {
         await tx.customer.update({ where: { id: customer.id }, data: customerData });
       }
 
-      // Coordinates are keyed on postcode alone (see updateProperty) — only
-      // reset/re-geocode when the postcode itself actually changes.
-      const postcodeChanged = property != null && input.postcode !== undefined && input.postcode !== property.postcode;
+      // Coordinates are keyed on the full address (hash) — only reset/re-geocode
+      // when the address inputs actually change.
+      const newAddress = property
+        ? { addressLine: input.addressLine ?? property.addressLine, postcode: input.postcode ?? property.postcode }
+        : null;
+      const postcodeChanged = property != null && addressChanged(property, newAddress!);
 
       if (property) {
         const propertyData: Partial<Prisma.PropertyUpdateInput> = {};
@@ -1108,13 +1127,7 @@ class CustomerService {
             : { connect: { id: input.roundId } };
         }
         if (moveTarget) propertyData.assignedTechnician = { disconnect: true };
-        if (postcodeChanged) {
-          propertyData.latitude = null;
-          propertyData.longitude = null;
-          propertyData.geocodedAt = null;
-          propertyData.geocodeAttempts = 0;
-          propertyData.geocodeError = null;
-        }
+        if (postcodeChanged) Object.assign(propertyData, GEOCODE_RESET);
         if (Object.keys(propertyData).length > 0) {
           await tx.property.update({ where: { id: property.id }, data: propertyData });
         }
@@ -1139,22 +1152,31 @@ class CustomerService {
         propertyId: property?.id ?? null,
         servicePlanId: plan?.id ?? null,
         postcodeChanged,
-        newPostcode: input.postcode,
+        newAddress,
       };
-    }).then(({ postcodeChanged, newPostcode, ...result }) => {
-      if (postcodeChanged && result.propertyId && newPostcode) {
-        triggerGeocode(this.prisma, result.propertyId, newPostcode).catch(console.error);
+    }).then(({ postcodeChanged, newAddress, ...result }) => {
+      if (postcodeChanged && result.propertyId && newAddress) {
+        geocodeProperty(this.prisma, result.propertyId, newAddress).catch(console.error);
       }
       return result;
     });
   }
 
+  // B5: a customer or property with an unpaid (SENT) invoice cannot be deleted until it is paid or voided.
+  private async assertNoUnpaidInvoices(where: Prisma.InvoiceWhereInput, subject: "customer" | "property"): Promise<void> {
+    const agg = await this.prisma.invoice.aggregate({ where, _count: { _all: true }, _sum: { amount: true } });
+    if (agg._count._all > 0) {
+      throw new UnpaidInvoicesError(subject, agg._count._all, Number(agg._sum.amount ?? 0));
+    }
+  }
+
   // ---- soft-delete customer (CANCELLED + cascades to properties + plans) ----
 
   async deleteCustomer(customerId: string): Promise<void> {
+    const exists = await this.prisma.customer.findUnique({ where: { id: customerId }, select: { id: true } });
+    if (!exists) throw new AppError(404, "Customer not found");
+    await this.assertNoUnpaidInvoices({ customerId, status: InvoiceStatus.SENT }, "customer");
     await this.prisma.$transaction(async (tx) => {
-      const c = await tx.customer.findUnique({ where: { id: customerId }, select: { id: true } });
-      if (!c) throw new AppError(404, "Customer not found");
       const propertyIds = (
         await tx.property.findMany({ where: { customerId }, select: { id: true } })
       ).map((p) => p.id);
@@ -1287,7 +1309,7 @@ class CustomerService {
       );
       return { customerId: customer.id, propertyId, servicePlanId, assigned: input.roundId != null };
     });
-    triggerGeocode(this.prisma, result.propertyId, input.postcode).catch(console.error);
+    geocodeProperty(this.prisma, result.propertyId, { addressLine: input.addressLine, postcode: input.postcode }).catch(console.error);
     return result;
   }
 
@@ -1314,7 +1336,7 @@ class CustomerService {
       );
       return { propertyId, servicePlanId, assigned: input.roundId != null };
     });
-    triggerGeocode(this.prisma, result.propertyId, input.postcode).catch(console.error);
+    geocodeProperty(this.prisma, result.propertyId, { addressLine: input.addressLine, postcode: input.postcode }).catch(console.error);
     return result;
   }
 
@@ -1322,6 +1344,7 @@ class CustomerService {
 
   async deleteProperty(propertyId: string): Promise<void> {
     await this.assertPropertyExists(propertyId);
+    await this.assertNoUnpaidInvoices({ status: InvoiceStatus.SENT, visit: { propertyId } }, "property");
     await this.prisma.$transaction(async (tx) => {
       await tx.visit.updateMany({
         where: { propertyId, status: { in: [...OPEN_VISIT] } },
@@ -1370,10 +1393,13 @@ class CustomerService {
 
     if (input.serviceAreaId) await this.assertServiceAreaExists(input.serviceAreaId);
 
-    // Coordinates are keyed on postcode alone — an addressLine-only edit
-    // (e.g. a unit number) doesn't invalidate them, so only reset/re-geocode
-    // when the postcode itself actually changes.
-    const postcodeChanged = input.postcode !== undefined && input.postcode !== existing.postcode;
+    // Coordinates come from the full address; reset/re-geocode only when the
+    // address inputs (hash) change, never on unrelated edits.
+    const newAddress = {
+      addressLine: input.addressLine ?? existing.addressLine,
+      postcode: input.postcode ?? existing.postcode,
+    };
+    const postcodeChanged = addressChanged(existing, newAddress);
 
     let targetRoundId: string | null = existing.roundId;
     let newFrequency: CleaningFrequency | null | undefined = undefined; // undefined = no plan update
@@ -1439,13 +1465,13 @@ class CustomerService {
           riskNotes: input.riskNotes,
           roundId: targetRoundId,
           ...(moveTarget || movedToRound ? { assignedTechnicianId: null } : {}),
-          ...(postcodeChanged
-            ? { latitude: null, longitude: null, geocodedAt: null, geocodeAttempts: 0, geocodeError: null }
-            : {}),
+          ...(postcodeChanged ? GEOCODE_RESET : {}),
         },
       });
     }).then((updated) => {
-      if (postcodeChanged) triggerGeocode(this.prisma, updated.id, updated.postcode).catch(console.error);
+      if (postcodeChanged) {
+        geocodeProperty(this.prisma, updated.id, { addressLine: updated.addressLine, postcode: updated.postcode }).catch(console.error);
+      }
       return { ...updated, movedToRound };
     });
   }

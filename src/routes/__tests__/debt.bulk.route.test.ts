@@ -50,7 +50,7 @@ it("POST /debt/bulk remind: runs the per-debt reminder for each id, reports fail
   expect(res.body).toMatchObject({ action: "remind", total: 4, succeeded: 1, failed: 3 });
   expect(res.body.results).toEqual([
     { id: "i1", ok: true },
-    { id: "i2", ok: false, error: "No mobile number", code: "NO_CONTACT_FOR_CHANNEL" },
+    { id: "i2", ok: false, error: "No mobile number", code: "NO_CONTACT_FOR_CHANNEL", skipped: true, reason: "NO_AVAILABLE_CHANNEL" },
     { id: "i3", ok: false, error: "boom" },
     { id: "i4", ok: false, error: "string failure" },
   ]);

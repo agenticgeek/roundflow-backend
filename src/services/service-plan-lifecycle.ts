@@ -10,6 +10,7 @@ import {
 import type { ServicePlan } from "../generated/tenant-client";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
+import { notifyVisitTechnicians, visitCount, type VisitRef } from "./notify";
 import {
   frequencyWeeks,
   initialNextDueDate,
@@ -55,13 +56,19 @@ export async function pausePlan(
   const end = endDay ? new Date(endDay.getTime() + DAY_MS) : null;
   const startsNow = start <= today;
 
-  return tp.$transaction(async (tx) => {
+  let affected: VisitRef[] = [];
+  const result = await tp.$transaction(async (tx) => {
+    const window = {
+      servicePlanId: plan.id,
+      status: VisitStatus.SCHEDULED,
+      date: end ? { gte: start, lt: end } : { gte: start },
+    };
+    affected = await tx.visit.findMany({
+      where: window,
+      select: { id: true, technicianId: true, date: true, roundId: true, propertyId: true },
+    });
     const cancelled = await tx.visit.updateMany({
-      where: {
-        servicePlanId: plan.id,
-        status: VisitStatus.SCHEDULED,
-        date: end ? { gte: start, lt: end } : { gte: start },
-      },
+      where: window,
       data: { status: VisitStatus.CANCELLED, cancelReason: CANCEL_REASON_PAUSED },
     });
     const updated = await tx.servicePlan.update({
@@ -77,6 +84,17 @@ export async function pausePlan(
     });
     return { ...updated, cancelledVisits: cancelled.count, pauseScheduled: !startsNow };
   });
+  await notifyVisitsCancelled(tp, affected, "The customer's service was paused.");
+  return result;
+}
+
+// FLOW-03: technicians whose visits were cancelled hear about it. Best effort.
+async function notifyVisitsCancelled(tp: TenantPrismaClient, visits: VisitRef[], reason: string): Promise<void> {
+  await notifyVisitTechnicians(tp, visits, ({ count, first }) => ({
+    type: "SCHEDULE",
+    title: `${visitCount(count)} cancelled`,
+    body: `${reason} First affected visit: ${first}.`,
+  }));
 }
 
 // Resume a plan (manual, or the nightly job at pauseEndDate). The plan goes
@@ -95,7 +113,8 @@ export async function resumePlan(
   });
   const today = startOfUtcDay(now);
   const defaultDay = property?.round?.defaultDay ?? null;
-  const nextDueDate = defaultDay ? nextOccurrenceOfDay(today, defaultDay) : snapToWeekday(today);
+  const workingDays = defaultDay ? [] : (await tp.businessSettings.findFirst({ select: { defaultWorkingDays: true } }))?.defaultWorkingDays ?? [];
+  const nextDueDate = defaultDay ? nextOccurrenceOfDay(today, defaultDay) : snapToWeekday(today, workingDays);
   return tp.servicePlan.update({
     where: { id: plan.id },
     data: { status: LifecycleStatus.ACTIVE, pauseStartDate: null, pauseEndDate: null, nextDueDate },
@@ -259,7 +278,8 @@ export async function updatePlan(
   }
 
   const today = startOfUtcDay(now);
-  return tp.$transaction(async (tx) => {
+  let cancelled: VisitRef[] = [];
+  const outcome = await tp.$transaction(async (tx) => {
     let target = match;
     const created = target === null;
     if (target === null) {
@@ -280,13 +300,18 @@ export async function updatePlan(
       }
     }
 
+    const future = {
+      propertyId: plan.propertyId,
+      roundId: round.id,
+      status: VisitStatus.SCHEDULED,
+      date: { gte: today },
+    };
+    cancelled = await tx.visit.findMany({
+      where: future,
+      select: { id: true, technicianId: true, date: true, roundId: true, propertyId: true },
+    });
     await tx.visit.updateMany({
-      where: {
-        propertyId: plan.propertyId,
-        roundId: round.id,
-        status: VisitStatus.SCHEDULED,
-        date: { gte: today },
-      },
+      where: future,
       data: { status: VisitStatus.CANCELLED, cancelReason: CANCEL_REASON_FREQUENCY_CHANGED },
     });
     await tx.property.update({
@@ -307,4 +332,6 @@ export async function updatePlan(
     });
     return { servicePlan, movedToRound: { id: target.id, name: target.name, created } };
   });
+  await notifyVisitsCancelled(tp, cancelled, "The cleaning frequency changed.");
+  return outcome;
 }

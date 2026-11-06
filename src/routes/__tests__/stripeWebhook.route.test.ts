@@ -13,35 +13,27 @@ vi.mock("../../integrations/stripe/client", () => ({
   getStripeClient: vi.fn(() => ({ webhooks: { constructEvent: (...args: unknown[]) => constructEvent(...args) } })),
 }));
 
-const queueGhlEvent = vi.fn().mockResolvedValue(undefined);
-vi.mock("../../integrations/ghl/sync", () => ({
-  queueGhlEvent: (...args: unknown[]) => queueGhlEvent(...args),
+const transition = vi.fn().mockResolvedValue({ changed: true });
+vi.mock("../../services/payment.service", () => ({
+  createPaymentService: () => ({ transition: (...args: unknown[]) => transition(...args) }),
 }));
+const notifyPaymentEvent = vi.fn().mockResolvedValue(undefined);
+vi.mock("../../services/notify", () => ({ notifyPaymentEvent: (...a: unknown[]) => notifyPaymentEvent(...a) }));
 
 function makeTenantPrisma() {
   return {
-    webhookEvent: { create: vi.fn().mockResolvedValue({}) },
+    webhookEvent: { create: vi.fn().mockResolvedValue({}), findUnique: vi.fn(), updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
     stripeSession: { findUnique: vi.fn(), update: vi.fn().mockResolvedValue({}), updateMany: vi.fn().mockResolvedValue({}) },
     customer: { update: vi.fn().mockResolvedValue({}) },
-    invoice: { findUnique: vi.fn(), update: vi.fn().mockResolvedValue({}), updateMany: vi.fn().mockResolvedValue({}) },
-    payment: {
-      create: vi.fn().mockResolvedValue({}),
-      update: vi.fn().mockResolvedValue({}),
-      findFirst: vi.fn(),
-      findUnique: vi.fn(),
-    },
-    $transaction: vi.fn((ops: Promise<unknown>[]) => Promise.all(ops)),
+    invoice: { findUnique: vi.fn(), updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    payment: { create: vi.fn().mockResolvedValue({}), update: vi.fn().mockResolvedValue({}), findUnique: vi.fn() },
+    activityLog: { create: vi.fn().mockResolvedValue({}) },
   };
 }
 
 const getTenantPrismaForSchema = vi.fn();
 vi.mock("../../lib/tenant-prisma-manager", () => ({
   getTenantPrismaForSchema: (...args: unknown[]) => getTenantPrismaForSchema(...args),
-}));
-
-const releaseHoldIfSettled = vi.fn().mockResolvedValue(false);
-vi.mock("../../services/payment-hold", () => ({
-  releaseHoldIfSettled: (...args: unknown[]) => releaseHoldIfSettled(...args),
 }));
 
 import { stripeWebhookRouter } from "../stripeWebhook";
@@ -105,334 +97,359 @@ describe("POST /webhooks/stripe — config and signature", () => {
   });
 });
 
-describe("POST /webhooks/stripe — idempotency", () => {
-  it("200s without processing when the event was already recorded (unique constraint)", async () => {
-    constructEvent.mockReturnValue({ id: "evt_1", account: "acct_1", type: "checkout.session.completed" });
-    tenantFindUnique.mockResolvedValue({ id: "tenant-1", schemaName: "tenant_1" });
-    const tp = makeTenantPrisma();
-    tp.webhookEvent.create.mockRejectedValue(
-      new Prisma.PrismaClientKnownRequestError("duplicate", { code: "P2002", clientVersion: "6.19.3" })
-    );
-    getTenantPrismaForSchema.mockReturnValue(tp);
+const dupError = () => new Prisma.PrismaClientKnownRequestError("duplicate", { code: "P2002", clientVersion: "6.19.3" });
 
-    const res = await send(makeApp());
+function ready(tp = makeTenantPrisma()) {
+  tenantFindUnique.mockResolvedValue({ id: "tenant-1", schemaName: "tenant_1" });
+  getTenantPrismaForSchema.mockReturnValue(tp);
+  return tp;
+}
+const ev = (type: string, object: unknown, id = "evt_1") => ({ id, account: "acct_1", type, data: { object } });
+const deliver = (event: unknown) => {
+  constructEvent.mockReturnValue(event);
+  return send(makeApp());
+};
+
+describe("POST /webhooks/stripe — process-then-ack (BE-03)", () => {
+  it("records the event RECEIVED with its payload, runs the effect, marks DONE, answers 200", async () => {
+    const tp = ready();
+    const event = ev("checkout.session.expired", { id: "cs_1" });
+    const res = await deliver(event);
+    expect(res.status).toBe(200);
+    expect(tp.webhookEvent.create).toHaveBeenCalledWith({
+      data: { source: "stripe", externalId: "evt_1", status: "RECEIVED", payload: event },
+    });
+    expect(tp.stripeSession.updateMany).toHaveBeenCalledWith({ where: { stripeSessionId: "cs_1" }, data: { status: "EXPIRED" } });
+    expect(tp.webhookEvent.updateMany).toHaveBeenLastCalledWith({
+      where: { source: "stripe", externalId: "evt_1" },
+      data: expect.objectContaining({ status: "DONE" }),
+    });
+  });
+
+  it("200s without processing when the event is already DONE", async () => {
+    const tp = ready();
+    tp.webhookEvent.create.mockRejectedValue(dupError());
+    tp.webhookEvent.findUnique.mockResolvedValue({ status: "DONE" });
+    const res = await deliver(ev("checkout.session.completed", { id: "cs_1" }));
     expect(res.status).toBe(200);
     expect(tp.stripeSession.findUnique).not.toHaveBeenCalled();
   });
 
-  it("500s and logs when recording the event fails for a non-duplicate reason", async () => {
+  it("500s (and logs) when the event cannot be recorded, so Stripe retries", async () => {
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    constructEvent.mockReturnValue({ id: "evt_1", account: "acct_1", type: "checkout.session.completed" });
-    tenantFindUnique.mockResolvedValue({ id: "tenant-1", schemaName: "tenant_1" });
-    const tp = makeTenantPrisma();
+    const tp = ready();
     tp.webhookEvent.create.mockRejectedValue(new Error("connection reset"));
-    getTenantPrismaForSchema.mockReturnValue(tp);
-
-    const res = await send(makeApp());
+    const res = await deliver(ev("checkout.session.completed", { id: "cs_1" }));
     expect(res.status).toBe(500);
-    expect(consoleSpy).toHaveBeenCalledWith(
-      expect.stringContaining("failed to record webhook event"),
-      expect.any(Error)
+    expect(tp.stripeSession.findUnique).not.toHaveBeenCalled();
+    consoleSpy.mockRestore();
+  });
+
+  it("a failed effect leaves the event FAILED and answers 500; Stripe's redelivery then reconciles it", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const tp = ready();
+    tp.stripeSession.findUnique.mockResolvedValue({ id: "ss1", type: "ONE_TIME", invoiceId: "inv1", customerId: "c1", amountTotal: 50 });
+    tp.invoice.findUnique.mockResolvedValue({ id: "inv1", customerId: "c1", visitId: "v1", amount: 50, status: "SENT" });
+    tp.payment.findUnique.mockResolvedValue({ id: "pay-1", stripeId: "pi_1" });
+    transition.mockRejectedValueOnce(new Error("transient"));
+    const completed = ev("checkout.session.completed", { id: "cs_1", payment_intent: "pi_1" });
+
+    const first = await deliver(completed);
+    expect(first.status).toBe(500);
+    expect(tp.webhookEvent.updateMany).toHaveBeenLastCalledWith({
+      where: { source: "stripe", externalId: "evt_1" },
+      data: expect.objectContaining({ status: "FAILED", attempts: { increment: 1 } }),
+    });
+
+    tp.webhookEvent.create.mockRejectedValue(dupError());
+    tp.webhookEvent.findUnique.mockImplementation(async (args: { where: { source_externalId?: unknown } }) =>
+      args.where.source_externalId ? { status: "FAILED" } : { id: "pay-1", stripeId: "pi_1" }
     );
+    tp.stripeSession.findUnique.mockResolvedValue({ id: "ss1", type: "ONE_TIME", invoiceId: "inv1", customerId: "c1", amountTotal: 50 });
+    const second = await deliver(completed);
+    expect(second.status).toBe(200);
+    expect(transition).toHaveBeenCalledTimes(2);
+    expect(transition).toHaveBeenLastCalledWith("pay-1", "PAID", { invoiceId: "inv1", note: "Stripe checkout completed" });
     consoleSpy.mockRestore();
   });
 });
 
 describe("POST /webhooks/stripe — checkout.session.completed (ONE_TIME)", () => {
-  function setup() {
-    constructEvent.mockReturnValue({
-      id: "evt_1",
-      account: "acct_1",
-      type: "checkout.session.completed",
-      data: { object: { id: "cs_1", payment_intent: "pi_123" } },
-    });
-    tenantFindUnique.mockResolvedValue({ id: "tenant-1", schemaName: "tenant_1" });
-    const tp = makeTenantPrisma();
-    getTenantPrismaForSchema.mockReturnValue(tp);
-    return tp;
-  }
+  const stripeSession = { id: "ss1", type: "ONE_TIME", invoiceId: "inv1", customerId: "c1", amountTotal: 50 };
+  const invoice = { id: "inv1", customerId: "c1", visitId: "v1", amount: 50, status: "SENT" };
+  const completed = (extra: Record<string, unknown> = {}) => ev("checkout.session.completed", { id: "cs_1", payment_intent: "pi_1", ...extra });
 
   it("does nothing when no matching StripeSession is found", async () => {
-    const tp = setup();
+    const tp = ready();
     tp.stripeSession.findUnique.mockResolvedValue(null);
-
-    const res = await send(makeApp());
-    expect(res.status).toBe(200);
-    await vi.waitFor(() => expect(tp.stripeSession.findUnique).toHaveBeenCalled());
+    await deliver(completed());
     expect(tp.stripeSession.update).not.toHaveBeenCalled();
+    expect(transition).not.toHaveBeenCalled();
   });
 
-  it("does nothing when the session has no linked invoice", async () => {
-    const tp = setup();
-    tp.stripeSession.findUnique.mockResolvedValue({ id: "sess-1", type: "ONE_TIME", invoiceId: null });
-
-    await send(makeApp());
-    await vi.waitFor(() => expect(tp.stripeSession.update).toHaveBeenCalled());
-    expect(tp.invoice.findUnique).not.toHaveBeenCalled();
-  });
-
-  it("does nothing when the invoice is already PAID", async () => {
-    const tp = setup();
-    tp.stripeSession.findUnique.mockResolvedValue({ id: "sess-1", type: "ONE_TIME", invoiceId: "inv-1" });
-    tp.invoice.findUnique.mockResolvedValue({ id: "inv-1", status: "PAID" });
-
-    await send(makeApp());
-    await vi.waitFor(() => expect(tp.invoice.findUnique).toHaveBeenCalled());
+  it("marks the session COMPLETE and settles the existing payment (found by stripeId) through the state machine", async () => {
+    const tp = ready();
+    tp.stripeSession.findUnique.mockResolvedValue(stripeSession);
+    tp.invoice.findUnique.mockResolvedValue(invoice);
+    tp.payment.findUnique.mockResolvedValue({ id: "pay-1", stripeId: "pi_1" });
+    await deliver(completed());
+    expect(tp.stripeSession.update).toHaveBeenCalledWith({
+      where: { id: "ss1" },
+      data: { status: "COMPLETE", completedAt: expect.any(Date) },
+    });
+    expect(tp.payment.findUnique).toHaveBeenCalledWith({ where: { stripeId: "pi_1" } });
     expect(tp.payment.create).not.toHaveBeenCalled();
+    expect(transition).toHaveBeenCalledWith("pay-1", "PAID", { invoiceId: "inv1", note: "Stripe checkout completed" });
+    expect(tp.invoice.updateMany).not.toHaveBeenCalled();
   });
 
-  it("does nothing when the invoice no longer exists", async () => {
-    const tp = setup();
-    tp.stripeSession.findUnique.mockResolvedValue({ id: "sess-1", type: "ONE_TIME", invoiceId: "inv-1" });
+  it("reuses the visit's Payment (visitId is unique) and stamps the stripeId on it", async () => {
+    const tp = ready();
+    tp.stripeSession.findUnique.mockResolvedValue(stripeSession);
+    tp.invoice.findUnique.mockResolvedValue(invoice);
+    tp.payment.findUnique.mockImplementation(async (args: { where: { stripeId?: string; visitId?: string } }) =>
+      args.where.visitId ? { id: "pay-v", stripeId: null } : null
+    );
+    tp.payment.update.mockResolvedValue({ id: "pay-v", stripeId: "pi_1" });
+    await deliver(completed());
+    expect(tp.payment.update).toHaveBeenCalledWith({ where: { id: "pay-v" }, data: { stripeId: "pi_1" } });
+    expect(transition).toHaveBeenCalledWith("pay-v", "PAID", expect.anything());
+  });
+
+  it("creates a PENDING payment (with the stripeId) when none exists, then settles it", async () => {
+    const tp = ready();
+    tp.stripeSession.findUnique.mockResolvedValue({ ...stripeSession, amountTotal: null });
+    tp.invoice.findUnique.mockResolvedValue({ ...invoice, visitId: null });
+    tp.payment.findUnique.mockResolvedValue(null);
+    tp.payment.create.mockResolvedValue({ id: "pay-new" });
+    await deliver(completed({ payment_intent: { id: "pi_obj" } }));
+    expect(tp.payment.create).toHaveBeenCalledWith({
+      data: { customerId: "c1", visitId: undefined, amount: 50, method: "STRIPE", status: "PENDING", stripeId: "pi_obj" },
+    });
+    expect(transition).toHaveBeenCalledWith("pay-new", "PAID", expect.anything());
+  });
+
+  it("a session without a payment intent creates the payment without a stripeId and without a stripeId lookup", async () => {
+    const tp = ready();
+    tp.stripeSession.findUnique.mockResolvedValue(stripeSession);
+    tp.invoice.findUnique.mockResolvedValue({ ...invoice, visitId: null });
+    tp.payment.create.mockResolvedValue({ id: "pay-new" });
+    await deliver(completed({ payment_intent: null }));
+    expect(tp.payment.findUnique).not.toHaveBeenCalled();
+    expect(tp.payment.create).toHaveBeenCalledWith({ data: expect.objectContaining({ stripeId: null }) });
+  });
+
+  it("a concurrent create (unique stripeId) is re-read instead of failing", async () => {
+    const tp = ready();
+    tp.stripeSession.findUnique.mockResolvedValue(stripeSession);
+    tp.invoice.findUnique.mockResolvedValue({ ...invoice, visitId: null });
+    tp.payment.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce({ id: "pay-raced", stripeId: "pi_1" });
+    tp.payment.create.mockRejectedValue(dupError());
+    await deliver(completed());
+    expect(transition).toHaveBeenCalledWith("pay-raced", "PAID", expect.anything());
+  });
+
+  it("a unique violation with nothing to re-read, or any other create error, fails the event (500)", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const a = ready();
+    a.stripeSession.findUnique.mockResolvedValue(stripeSession);
+    a.invoice.findUnique.mockResolvedValue({ ...invoice, visitId: null });
+    a.payment.findUnique.mockResolvedValue(null);
+    a.payment.create.mockRejectedValue(dupError());
+    expect((await deliver(completed())).status).toBe(500);
+
+    const b = ready();
+    b.stripeSession.findUnique.mockResolvedValue(stripeSession);
+    b.invoice.findUnique.mockResolvedValue({ ...invoice, visitId: null });
+    b.payment.findUnique.mockResolvedValue(null);
+    b.payment.create.mockRejectedValue(new Error("db"));
+    expect((await deliver(completed({ payment_intent: null }))).status).toBe(500);
+    consoleSpy.mockRestore();
+  });
+
+  it("when the payment was already PAID but the invoice is not, the invoice is settled directly", async () => {
+    const tp = ready();
+    tp.stripeSession.findUnique.mockResolvedValue(stripeSession);
+    tp.invoice.findUnique.mockResolvedValue(invoice);
+    tp.payment.findUnique.mockResolvedValue({ id: "pay-1", stripeId: "pi_1" });
+    transition.mockResolvedValueOnce({ changed: false });
+    await deliver(completed());
+    expect(tp.invoice.updateMany).toHaveBeenCalledWith({
+      where: { id: "inv1", status: { in: ["DRAFT", "SENT"] } },
+      data: { status: "PAID", paidAt: expect.any(Date) },
+    });
+  });
+
+  it("an unchanged payment on an already-PAID invoice is a no-op (replayed event)", async () => {
+    const tp = ready();
+    tp.stripeSession.findUnique.mockResolvedValue(stripeSession);
+    tp.invoice.findUnique.mockResolvedValue({ ...invoice, status: "PAID" });
+    tp.payment.findUnique.mockResolvedValue({ id: "pay-1", stripeId: "pi_1" });
+    transition.mockResolvedValueOnce({ changed: false });
+    await deliver(completed());
+    expect(tp.invoice.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("does nothing more when the session has no invoice, or the invoice is gone", async () => {
+    const tp = ready();
+    tp.stripeSession.findUnique.mockResolvedValue({ ...stripeSession, invoiceId: null });
+    await deliver(completed());
+    tp.stripeSession.findUnique.mockResolvedValue(stripeSession);
     tp.invoice.findUnique.mockResolvedValue(null);
-
-    await send(makeApp());
-    await vi.waitFor(() => expect(tp.invoice.findUnique).toHaveBeenCalled());
-    expect(tp.payment.create).not.toHaveBeenCalled();
-  });
-
-  it("creates a PAID Payment, marks the Invoice PAID, and queues a GHL event on the happy path", async () => {
-    const tp = setup();
-    tp.stripeSession.findUnique.mockResolvedValue({
-      id: "sess-1", type: "ONE_TIME", invoiceId: "inv-1", amountTotal: 35, customerId: "cust-1",
-    });
-    tp.invoice.findUnique.mockResolvedValue({ id: "inv-1", status: "DRAFT", customerId: "cust-1", visitId: "visit-1", amount: 35 });
-
-    await send(makeApp());
-
-    await vi.waitFor(() => expect(tp.payment.create).toHaveBeenCalled());
-    expect(tp.payment.create).toHaveBeenCalledWith(
-      expect.objectContaining({
-        data: expect.objectContaining({ customerId: "cust-1", visitId: "visit-1", amount: 35, stripeId: "pi_123" }),
-      })
-    );
-    expect(tp.invoice.update).toHaveBeenCalledWith({ where: { id: "inv-1" }, data: { status: "PAID", paidAt: expect.any(Date) } });
-    await vi.waitFor(() => expect(queueGhlEvent).toHaveBeenCalledWith(tp, "payment.collected", "cust-1"));
-    // A3: settling the invoice runs the hold auto-release.
-    await vi.waitFor(() => expect(releaseHoldIfSettled).toHaveBeenCalledWith(tp, "cust-1"));
-  });
-
-  it("resolves the PaymentIntent id from an expanded object instead of a string", async () => {
-    constructEvent.mockReturnValue({
-      id: "evt_1",
-      account: "acct_1",
-      type: "checkout.session.completed",
-      data: { object: { id: "cs_1", payment_intent: { id: "pi_expanded" } } },
-    });
-    tenantFindUnique.mockResolvedValue({ id: "tenant-1", schemaName: "tenant_1" });
-    const tp = makeTenantPrisma();
-    getTenantPrismaForSchema.mockReturnValue(tp);
-    tp.stripeSession.findUnique.mockResolvedValue({ id: "sess-1", type: "ONE_TIME", invoiceId: "inv-1", amountTotal: null, customerId: "cust-1" });
-    tp.invoice.findUnique.mockResolvedValue({ id: "inv-1", status: "DRAFT", customerId: "cust-1", visitId: null, amount: 35 });
-
-    await send(makeApp());
-
-    await vi.waitFor(() => expect(tp.payment.create).toHaveBeenCalled());
-    expect(tp.payment.create).toHaveBeenCalledWith(
-      expect.objectContaining({ data: expect.objectContaining({ stripeId: "pi_expanded", amount: 35, visitId: undefined }) })
-    );
-  });
-
-  it("falls back to a null PaymentIntent id when payment_intent is absent", async () => {
-    constructEvent.mockReturnValue({
-      id: "evt_1",
-      account: "acct_1",
-      type: "checkout.session.completed",
-      data: { object: { id: "cs_1", payment_intent: null } },
-    });
-    tenantFindUnique.mockResolvedValue({ id: "tenant-1", schemaName: "tenant_1" });
-    const tp = makeTenantPrisma();
-    getTenantPrismaForSchema.mockReturnValue(tp);
-    tp.stripeSession.findUnique.mockResolvedValue({ id: "sess-1", type: "ONE_TIME", invoiceId: "inv-1", amountTotal: 35, customerId: "cust-1" });
-    tp.invoice.findUnique.mockResolvedValue({ id: "inv-1", status: "DRAFT", customerId: "cust-1", visitId: null, amount: 35 });
-
-    await send(makeApp());
-
-    await vi.waitFor(() => expect(tp.payment.create).toHaveBeenCalled());
-    expect(tp.payment.create).toHaveBeenCalledWith(
-      expect.objectContaining({ data: expect.objectContaining({ stripeId: null }) })
-    );
+    await deliver(completed());
+    expect(transition).not.toHaveBeenCalled();
   });
 });
 
 describe("POST /webhooks/stripe — checkout.session.completed (SETUP)", () => {
-  function setup(setupIntent: unknown) {
-    constructEvent.mockReturnValue({
-      id: "evt_1",
-      account: "acct_1",
-      type: "checkout.session.completed",
-      data: { object: { id: "cs_1", setup_intent: setupIntent } },
-    });
-    tenantFindUnique.mockResolvedValue({ id: "tenant-1", schemaName: "tenant_1" });
-    const tp = makeTenantPrisma();
-    tp.stripeSession.findUnique.mockResolvedValue({ id: "sess-1", type: "SETUP", customerId: "cust-1" });
-    getTenantPrismaForSchema.mockReturnValue(tp);
+  const setupSession = { id: "ss2", type: "SETUP", customerId: "c1" };
+  const run = async (session: Record<string, unknown>) => {
+    const tp = ready();
+    tp.stripeSession.findUnique.mockResolvedValue(setupSession);
+    await deliver(ev("checkout.session.completed", { id: "cs_2", ...session }));
     return tp;
-  }
+  };
 
-  it("saves setup_intent itself as the default payment method id when it's a plain (unexpanded) string", async () => {
-    const tp = setup("seti_123");
-    await send(makeApp());
-    await vi.waitFor(() => expect(tp.customer.update).toHaveBeenCalledWith({
-      where: { id: "cust-1" },
-      data: { stripeDefaultPaymentMethodId: "seti_123" },
-    }));
+  it("saves the default payment method (setup_intent object)", async () => {
+    const tp = await run({ setup_intent: { payment_method: "pm_1" } });
+    expect(tp.customer.update).toHaveBeenCalledWith({ where: { id: "c1" }, data: { stripeDefaultPaymentMethodId: "pm_1" } });
+    expect(transition).not.toHaveBeenCalled();
   });
 
-  it("saves the default payment method from an expanded setup_intent object", async () => {
-    const tp = setup({ payment_method: "pm_123" });
-    await send(makeApp());
-    await vi.waitFor(() => expect(tp.customer.update).toHaveBeenCalled());
-    expect(tp.customer.update).toHaveBeenCalledWith({
-      where: { id: "cust-1" },
-      data: { stripeDefaultPaymentMethodId: "pm_123" },
+  it("a bare (unexpanded) setup_intent string is saved as-is (existing behaviour); no setup_intent saves nothing", async () => {
+    expect((await run({ setup_intent: "seti_1" })).customer.update).toHaveBeenCalledWith({
+      where: { id: "c1" },
+      data: { stripeDefaultPaymentMethodId: "seti_1" },
     });
-  });
-
-  it("does nothing when setup_intent is absent", async () => {
-    const tp = setup(null);
-    await send(makeApp());
-    await vi.waitFor(() => expect(tp.stripeSession.update).toHaveBeenCalled());
-    expect(tp.customer.update).not.toHaveBeenCalled();
-  });
-
-  it("does nothing when the expanded setup_intent has no payment_method", async () => {
-    const tp = setup({ payment_method: null });
-    await send(makeApp());
-    await vi.waitFor(() => expect(tp.stripeSession.update).toHaveBeenCalled());
-    expect(tp.customer.update).not.toHaveBeenCalled();
-  });
-});
-
-describe("POST /webhooks/stripe — checkout.session.expired", () => {
-  it("marks the StripeSession EXPIRED", async () => {
-    constructEvent.mockReturnValue({
-      id: "evt_1",
-      account: "acct_1",
-      type: "checkout.session.expired",
-      data: { object: { id: "cs_1" } },
-    });
-    tenantFindUnique.mockResolvedValue({ id: "tenant-1", schemaName: "tenant_1" });
-    const tp = makeTenantPrisma();
-    getTenantPrismaForSchema.mockReturnValue(tp);
-
-    await send(makeApp());
-
-    await vi.waitFor(() => expect(tp.stripeSession.updateMany).toHaveBeenCalledWith({
-      where: { stripeSessionId: "cs_1" },
-      data: { status: "EXPIRED" },
-    }));
+    expect((await run({ setup_intent: null })).customer.update).not.toHaveBeenCalled();
+    expect((await run({ setup_intent: { payment_method: null } })).customer.update).not.toHaveBeenCalled();
   });
 });
 
 describe("POST /webhooks/stripe — payment_intent.payment_failed", () => {
-  function setup(piOverrides: Record<string, unknown> = {}) {
-    constructEvent.mockReturnValue({
-      id: "evt_1",
-      account: "acct_1",
-      type: "payment_intent.payment_failed",
-      data: { object: { id: "pi_1", metadata: { invoiceId: "inv-1" }, ...piOverrides } },
-    });
-    tenantFindUnique.mockResolvedValue({ id: "tenant-1", schemaName: "tenant_1" });
-    const tp = makeTenantPrisma();
-    getTenantPrismaForSchema.mockReturnValue(tp);
-    return tp;
-  }
+  const failed = (metadata: Record<string, string> | undefined = { invoiceId: "inv1" }) => ev("payment_intent.payment_failed", { id: "pi_1", metadata });
+  const invoice = { id: "inv1", customerId: "c1", visitId: "v1", amount: 50 };
 
-  it("does nothing when metadata has no invoiceId", async () => {
-    constructEvent.mockReturnValue({
-      id: "evt_1",
-      account: "acct_1",
-      type: "payment_intent.payment_failed",
-      data: { object: { id: "pi_1", metadata: {} } },
-    });
-    tenantFindUnique.mockResolvedValue({ id: "tenant-1", schemaName: "tenant_1" });
-    const tp = makeTenantPrisma();
-    getTenantPrismaForSchema.mockReturnValue(tp);
-
-    const res = await send(makeApp());
-    expect(res.status).toBe(200);
-    await vi.waitFor(() => expect(res.status).toBe(200));
-    expect(tp.invoice.findUnique).not.toHaveBeenCalled();
-  });
-
-  it("does nothing when the invoice no longer exists", async () => {
-    const tp = setup();
+  it("ignores an intent without invoice metadata, or with an unknown invoice", async () => {
+    const tp = ready();
+    await deliver(failed(undefined));
+    await deliver(failed({}));
     tp.invoice.findUnique.mockResolvedValue(null);
-    await send(makeApp());
-    await vi.waitFor(() => expect(tp.invoice.findUnique).toHaveBeenCalled());
-    expect(tp.payment.findFirst).not.toHaveBeenCalled();
+    await deliver(failed());
+    expect(transition).not.toHaveBeenCalled();
   });
 
-  it("updates an existing Payment row to FAILED and queues a GHL event", async () => {
-    const tp = setup();
-    tp.invoice.findUnique.mockResolvedValue({ id: "inv-1", customerId: "cust-1", visitId: "visit-1", amount: 35 });
-    const row = { id: "pay-1", customerId: "cust-1", visitId: "visit-1", paidAt: null };
-    tp.payment.findFirst.mockResolvedValue(row);
-    tp.payment.findUnique.mockResolvedValue(row);
-
-    await send(makeApp());
-
-    await vi.waitFor(() => expect(tp.payment.update).toHaveBeenCalledWith({
-      where: { id: "pay-1" },
-      data: { status: "FAILED", paidAt: null },
-    }));
-    await vi.waitFor(() => expect(queueGhlEvent).toHaveBeenCalledWith(tp, "payment.failed", "cust-1"));
+  it("moves the existing payment to FAILED via the state machine (a late FAILED cannot beat PAID there)", async () => {
+    const tp = ready();
+    tp.invoice.findUnique.mockResolvedValue(invoice);
+    tp.payment.findUnique.mockResolvedValue({ id: "pay-1", stripeId: "pi_1" });
+    await deliver(failed());
+    expect(transition).toHaveBeenCalledWith("pay-1", "FAILED");
+    expect(tp.payment.create).not.toHaveBeenCalled();
   });
 
-  it("creates a new Payment row and queues a GHL event when none exists yet", async () => {
-    const tp = setup();
-    tp.invoice.findUnique.mockResolvedValue({ id: "inv-1", customerId: "cust-1", visitId: null, amount: 35 });
-    tp.payment.findFirst.mockResolvedValue(null);
-    const created = { id: "pay-new", customerId: "cust-1", visitId: null, paidAt: null };
-    tp.payment.create.mockResolvedValue(created);
-    tp.payment.findUnique.mockResolvedValue(created);
-
-    await send(makeApp());
-
-    await vi.waitFor(() => expect(tp.payment.create).toHaveBeenCalledWith(
-      expect.objectContaining({
-        data: expect.objectContaining({ customerId: "cust-1", visitId: undefined, amount: 35, stripeId: "pi_1" }),
-      })
-    ));
-    await vi.waitFor(() => expect(tp.payment.update).toHaveBeenCalledWith({
-      where: { id: "pay-new" },
-      data: { status: "FAILED", paidAt: null },
-    }));
-    await vi.waitFor(() => expect(queueGhlEvent).toHaveBeenCalledWith(tp, "payment.failed", "cust-1"));
+  it("creates the payment first when none exists", async () => {
+    const tp = ready();
+    tp.invoice.findUnique.mockResolvedValue(invoice);
+    tp.payment.findUnique.mockResolvedValue(null);
+    tp.payment.create.mockResolvedValue({ id: "pay-new" });
+    await deliver(failed());
+    expect(tp.payment.create).toHaveBeenCalledWith({
+      data: { customerId: "c1", visitId: "v1", amount: 50, method: "STRIPE", status: "PENDING", stripeId: "pi_1" },
+    });
+    expect(transition).toHaveBeenCalledWith("pay-new", "FAILED");
   });
 });
 
-describe("POST /webhooks/stripe — unhandled event types and async failures", () => {
-  it("200s and takes no action for an event type with no handler", async () => {
-    constructEvent.mockReturnValue({ id: "evt_1", account: "acct_1", type: "customer.created", data: { object: {} } });
-    tenantFindUnique.mockResolvedValue({ id: "tenant-1", schemaName: "tenant_1" });
-    const tp = makeTenantPrisma();
-    getTenantPrismaForSchema.mockReturnValue(tp);
+describe("POST /webhooks/stripe — refunds and disputes (BE-08)", () => {
+  const withPayment = () => {
+    const tp = ready();
+    tp.payment.findUnique.mockResolvedValue({ id: "pay-1", customerId: "c1", stripeId: "pi_1" });
+    return tp;
+  };
 
-    const res = await send(makeApp());
-    expect(res.status).toBe(200);
+  it("charge.refunded (full) -> REFUNDED", async () => {
+    withPayment();
+    await deliver(ev("charge.refunded", { payment_intent: "pi_1", refunded: true, amount: 5000, amount_refunded: 5000 }));
+    expect(transition).toHaveBeenCalledWith("pay-1", "REFUNDED", { note: "Stripe charge.refunded" });
   });
 
-  it("logs, rather than crashes, when async event handling throws", async () => {
-    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    constructEvent.mockReturnValue({
-      id: "evt_1",
-      account: "acct_1",
-      type: "checkout.session.expired",
-      data: { object: { id: "cs_1" } },
+  it("charge.refunded (partial) changes no state: it is logged and the office is told to reconcile", async () => {
+    const tp = withPayment();
+    await deliver(ev("charge.refunded", { payment_intent: { id: "pi_1" }, refunded: false, amount: 5000, amount_refunded: 1250 }));
+    expect(transition).not.toHaveBeenCalled();
+    expect(tp.activityLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        type: "PAYMENT_PARTIAL_REFUND",
+        message: "Partial refund of GBP 12.50 (charge GBP 50.00): reconcile manually",
+        entityId: "pay-1",
+      }),
     });
-    tenantFindUnique.mockResolvedValue({ id: "tenant-1", schemaName: "tenant_1" });
-    const tp = makeTenantPrisma();
-    tp.stripeSession.updateMany.mockRejectedValue(new Error("db down"));
-    getTenantPrismaForSchema.mockReturnValue(tp);
+    expect(notifyPaymentEvent).toHaveBeenCalledWith(tp, {
+      customerId: "c1",
+      title: "Partial refund recorded",
+      body: "Partial refund of GBP 12.50 (charge GBP 50.00): reconcile manually",
+    });
+  });
+
+  it("charge.refunded for an unknown or missing payment intent is ignored", async () => {
+    const tp = ready();
+    tp.payment.findUnique.mockResolvedValue(null);
+    await deliver(ev("charge.refunded", { payment_intent: "pi_x", refunded: true }));
+    await deliver(ev("charge.refunded", { payment_intent: null, refunded: true }));
+    expect(transition).not.toHaveBeenCalled();
+    expect(tp.activityLog.create).not.toHaveBeenCalled();
+  });
+
+  it("charge.dispute.created -> DISPUTED with the reason", async () => {
+    withPayment();
+    await deliver(ev("charge.dispute.created", { payment_intent: "pi_1", reason: "fraudulent" }));
+    expect(transition).toHaveBeenCalledWith("pay-1", "DISPUTED", { note: "Stripe dispute: fraudulent" });
+  });
+
+  it("charge.dispute.closed: won -> PAID again; lost -> recorded + office told, state unchanged; other statuses ignored", async () => {
+    const tp = withPayment();
+    await deliver(ev("charge.dispute.closed", { payment_intent: "pi_1", status: "won" }, "e1"));
+    expect(transition).toHaveBeenCalledWith("pay-1", "PAID", { note: "Stripe dispute won" });
+
+    transition.mockClear();
+    await deliver(ev("charge.dispute.closed", { payment_intent: "pi_1", status: "lost" }, "e2"));
+    expect(transition).not.toHaveBeenCalled();
+    expect(tp.activityLog.create).toHaveBeenCalledWith({ data: expect.objectContaining({ type: "PAYMENT_DISPUTE_LOST", entityId: "pay-1" }) });
+    expect(notifyPaymentEvent).toHaveBeenCalledWith(tp, expect.objectContaining({ customerId: "c1", title: "Payment dispute lost" }));
+
+    tp.activityLog.create.mockClear();
+    await deliver(ev("charge.dispute.closed", { payment_intent: "pi_1", status: "warning_closed" }, "e3"));
+    expect(tp.activityLog.create).not.toHaveBeenCalled();
+  });
+
+  it("a dispute for an unknown payment is ignored", async () => {
+    const tp = ready();
+    tp.payment.findUnique.mockResolvedValue(null);
+    await deliver(ev("charge.dispute.created", { payment_intent: null }));
+    await deliver(ev("charge.dispute.created", { payment_intent: "pi_x" }));
+    expect(transition).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /webhooks/stripe — other event types", () => {
+  it("200s and takes no action for an event type with no handler", async () => {
+    const tp = ready();
+    const res = await deliver(ev("customer.created", {}));
+    expect(res.status).toBe(200);
+    expect(tp.stripeSession.findUnique).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /webhooks/stripe — BE-02 crash safety", () => {
+  it("500s (and never crashes) when the tenant lookup throws", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    constructEvent.mockReturnValue({ id: "evt_1", account: "acct_1", type: "checkout.session.completed" });
+    tenantFindUnique.mockRejectedValue(new Error("db down"));
 
     const res = await send(makeApp());
-    expect(res.status).toBe(200);
-    await vi.waitFor(() => expect(consoleSpy).toHaveBeenCalledWith(
-      expect.stringContaining("event evt_1 failed"),
-      expect.any(Error)
-    ));
+    expect(res.status).toBe(500);
+    expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("stripeWebhook"), expect.any(Error));
     consoleSpy.mockRestore();
   });
 });

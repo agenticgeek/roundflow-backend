@@ -4,10 +4,13 @@ import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { createReportsService } from "../services/reports.service";
 import { toCsv } from "../lib/csv";
+import { AppError } from "../lib/app-error";
 import { parsePageParams } from "../lib/http";
 import { parseOptionalDateOnly } from "../lib/validation";
 
 export const reportsRouter = Router();
+
+const EXPORT_TYPES = new Set(["visits", "technicians", "revenue"]);
 
 reportsRouter.use(requireAuth, requireTenantAccess, requireBusinessAccess());
 
@@ -72,13 +75,19 @@ reportsRouter.get("/export", async (req, res, next) => {
     const { type = "visits", period = "last30", status } = req.query as {
       type?: string; period?: string; status?: string;
     };
+    // BE-14: whitelist `type` (it also feeds the filename) and reject the rest.
+    if (!EXPORT_TYPES.has(type)) {
+      throw new AppError(400, `"type" must be one of: ${[...EXPORT_TYPES].join(", ")}.`, "INVALID_EXPORT_TYPE");
+    }
     const svc = createReportsService(req.tenantPrisma!);
     const csv =
       type === "technicians" ? toCsv(await svc.getTechniciansExport(period)) :
       type === "revenue"     ? toCsv(await svc.getRevenue(period)) :
                                toCsv(await svc.getVisitsExport(period, status));
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
-    res.setHeader("Content-Disposition", `attachment; filename="${type}-${period}.csv"`);
+    // `period` is free text from the query string: keep only filename-safe characters.
+    const safePeriod = period.replace(/[^A-Za-z0-9_-]/g, "_");
+    res.setHeader("Content-Disposition", `attachment; filename="${type}-${safePeriod}.csv"`);
     res.send(csv);
   } catch (err) { next(err); }
 });

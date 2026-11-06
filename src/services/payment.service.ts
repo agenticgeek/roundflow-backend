@@ -3,8 +3,16 @@ import { AppError } from "../lib/app-error";
 import { InvoiceStatus, PaymentMethod, PaymentStatus, Prisma } from "../generated/tenant-client";
 import { queueGhlEvent } from "../integrations/ghl/sync";
 import { releaseHoldIfSettled } from "./payment-hold";
+import { notifyInvoicePaid, notifyPaymentEvent, notifyPaymentFailed } from "./notify";
+import { canTransition } from "./payment-state";
 
 export type PaymentOutcome = "PAID" | "FAILED";
+
+const PAYMENT_EVENT_TITLES: Partial<Record<PaymentStatus, string>> = {
+  [PaymentStatus.REFUNDED]: "Payment refunded",
+  [PaymentStatus.DISPUTED]: "Payment disputed",
+  [PaymentStatus.PAID]: "Payment dispute won",
+};
 
 // "Owed" = sum of invoices actually sent to the customer and not yet settled
 // (DRAFT isn't owed yet; PAID/VOID aren't owed anymore). Never stored — always
@@ -61,41 +69,133 @@ function toPaymentRow(p: PaymentListRow) {
   };
 }
 
-// Single place for "what happens once a payment is known to be settled or
-// failed" — regardless of whether that came from the GoCardless webhook, the
-// Stripe webhook, or a manual reconciliation action (BACS/cheque). Updates
-// the Payment row, flips the linked Invoice to PAID on success, and queues
-// the matching GHL outbox event so the tag always follows the status.
+export type PaymentTarget = PaymentStatus;
+
+export interface TransitionOptions {
+  /** Manual actions: an illegal transition throws 409 INVALID_PAYMENT_TRANSITION instead of being ignored. */
+  strict?: boolean;
+  /** Short reason shown in the activity log / office notification (e.g. "Stripe charge.refunded"). */
+  note?: string;
+  /** The invoice to follow when the payment has no visit (invoices without a visit are matched by id). */
+  invoiceId?: string;
+}
+
+export interface TransitionResult {
+  payment: Prisma.PaymentGetPayload<object>;
+  changed: boolean;
+  from: PaymentStatus;
+  /** The invoice whose status this transition flipped, if any. */
+  invoice: { id: string; invoiceNumber: string; customerId: string } | null;
+}
+
+type Tx = Prisma.TransactionClient;
+
+// Invoice follows the payment (same visit): PAID settles it; a dispute reopens it (the money was taken back);
+// a refund voids it (the customer has their money back; credit notes / part payments are deferred, BE-08).
+async function followInvoice(
+  tx: Tx,
+  payment: { visitId: string | null },
+  target: PaymentStatus,
+  paidAt: Date | null,
+  invoiceId?: string
+) {
+  const where = payment.visitId ? { visitId: payment.visitId } : invoiceId ? { id: invoiceId } : null;
+  if (!where) return null;
+  let count = 0;
+  if (target === PaymentStatus.PAID) {
+    count = (
+      await tx.invoice.updateMany({
+        where: { ...where, status: { in: [InvoiceStatus.DRAFT, InvoiceStatus.SENT] } },
+        data: { status: InvoiceStatus.PAID, paidAt },
+      })
+    ).count;
+  } else if (target === PaymentStatus.DISPUTED) {
+    count = (await tx.invoice.updateMany({ where: { ...where, status: InvoiceStatus.PAID }, data: { status: InvoiceStatus.SENT, paidAt: null } })).count;
+  } else if (target === PaymentStatus.REFUNDED) {
+    count = (
+      await tx.invoice.updateMany({
+        where: { ...where, status: { in: [InvoiceStatus.PAID, InvoiceStatus.SENT] } },
+        data: { status: InvoiceStatus.VOID },
+      })
+    ).count;
+  }
+  if (count === 0) return null;
+  return tx.invoice.findFirst({ where, select: { id: true, invoiceNumber: true, customerId: true } });
+}
+
+const AUDITED: Partial<Record<PaymentStatus, { type: string; label: string }>> = {
+  [PaymentStatus.REFUNDED]: { type: "PAYMENT_REFUNDED", label: "refunded" },
+  [PaymentStatus.DISPUTED]: { type: "PAYMENT_DISPUTED", label: "disputed" },
+};
+
+// Single place for "what happens once a payment changes state" — regardless of whether that came from the
+// GoCardless webhook, the Stripe webhook, or a manual reconciliation action (BACS/cheque). The status change, the
+// invoice change and the audit row commit together in ONE transaction using a conditional update
+// (`where: { id, status: <what we read> }`), so two concurrent webhooks cannot both win and a late FAILED can
+// never overwrite PAID (see payment-state.ts). Notifications, the GHL tag and the hold release run after commit.
 export function createPaymentService(prisma: TenantPrismaClient) {
-  return {
-    applyOutcome: async (paymentId: string, outcome: PaymentOutcome) => {
-      const payment = await prisma.payment.findUnique({ where: { id: paymentId } });
-      if (!payment) throw new AppError(404, "Payment not found");
-
-      const paidAt = outcome === "PAID" ? new Date() : payment.paidAt;
-      const updated = await prisma.payment.update({
-        where: { id: paymentId },
-        data: {
-          status: outcome === "PAID" ? PaymentStatus.PAID : PaymentStatus.FAILED,
-          paidAt,
-        },
-      });
-
-      if (outcome === "PAID" && payment.visitId) {
-        await prisma.invoice.updateMany({
-          where: { visitId: payment.visitId, status: { not: "PAID" } },
-          data: { status: "PAID", paidAt },
-        });
+  const transition = async (paymentId: string, target: PaymentStatus, opts: TransitionOptions = {}): Promise<TransitionResult> => {
+    const result = await prisma.$transaction(async (tx): Promise<TransitionResult> => {
+      const current = await tx.payment.findUnique({ where: { id: paymentId } });
+      if (!current) throw new AppError(404, "Payment not found");
+      const unchanged: TransitionResult = { payment: current, changed: false, from: current.status, invoice: null };
+      if (current.status === target) return unchanged;
+      if (!canTransition(current.status, target)) {
+        if (opts.strict) {
+          throw new AppError(409, `A ${current.status} payment cannot become ${target}`, "INVALID_PAYMENT_TRANSITION");
+        }
+        return unchanged;
       }
 
-      const eventType = outcome === "PAID" ? "payment.collected" : "payment.failed";
-      queueGhlEvent(prisma, eventType, payment.customerId).catch(console.error);
+      const paidAt = target === PaymentStatus.PAID ? new Date() : current.paidAt;
+      const won = await tx.payment.updateMany({ where: { id: paymentId, status: current.status }, data: { status: target, paidAt } });
+      if (won.count === 0) return unchanged; // a concurrent event already moved it; it owns the side effects
 
-      // A3 auto-release: last unpaid invoice settled → lift the payment hold.
-      if (outcome === "PAID") await releaseHoldIfSettled(prisma, payment.customerId);
+      const invoice = await followInvoice(tx, current, target, paidAt, opts.invoiceId);
+      const audit = AUDITED[target];
+      if (audit || (current.status === PaymentStatus.DISPUTED && target === PaymentStatus.PAID)) {
+        const label = audit?.label ?? "dispute won";
+        await tx.activityLog.create({
+          data: {
+            type: audit?.type ?? "PAYMENT_DISPUTE_WON",
+            message: `Payment ${label}${opts.note ? ` (${opts.note})` : ""}`,
+            entityId: paymentId,
+            details: { from: current.status, to: target, customerId: current.customerId },
+          },
+        });
+      }
+      return { payment: { ...current, status: target, paidAt }, changed: true, from: current.status, invoice };
+    });
 
-      return updated;
-    },
+    if (!result.changed) return result;
+    const { payment, invoice } = result;
+    if (target === PaymentStatus.PAID) {
+      queueGhlEvent(prisma, "payment.collected", payment.customerId).catch(console.error);
+      // A3 auto-release: last unpaid invoice settled -> lift the payment hold.
+      await releaseHoldIfSettled(prisma, payment.customerId);
+      if (invoice && result.from !== PaymentStatus.DISPUTED) await notifyInvoicePaid(prisma, invoice);
+    } else if (target === PaymentStatus.FAILED) {
+      queueGhlEvent(prisma, "payment.failed", payment.customerId).catch(console.error);
+      await notifyPaymentFailed(prisma, payment.customerId);
+    }
+    if (target === PaymentStatus.REFUNDED || target === PaymentStatus.DISPUTED || result.from === PaymentStatus.DISPUTED) {
+      await notifyPaymentEvent(prisma, {
+        customerId: payment.customerId,
+        invoiceId: invoice?.id,
+        title: PAYMENT_EVENT_TITLES[target] as string, // only REFUNDED / DISPUTED / dispute-won PAID reach here
+        body: opts.note,
+      });
+    }
+    return result;
+  };
+
+  return {
+    transition,
+
+    // PAID / FAILED outcome of a settlement or a manual reconciliation. Illegal transitions are ignored (webhook
+    // safe); the manual route passes the strict transition itself.
+    applyOutcome: async (paymentId: string, outcome: PaymentOutcome) =>
+      (await transition(paymentId, outcome === "PAID" ? PaymentStatus.PAID : PaymentStatus.FAILED)).payment,
 
     // GET /payments (GAP-028) — newest first.
     listPayments: async (filters: PaymentListFilters, page: number, pageSize: number) => {

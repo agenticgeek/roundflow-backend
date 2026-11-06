@@ -10,3 +10,8 @@ process.env.STRIPE_SECRET_KEY ??= "sk_test_platform_secret";
 process.env.STRIPE_CONNECT_WEBHOOK_SECRET ??= "whsec_test_connect_webhook_secret";
 // src/middleware/requireAuth.ts throws at import time without this; CI has no .env.
 process.env.SUPABASE_ISSUER ??= "https://test-project.supabase.co/auth/v1";
+// Safety net: unit tests are fully mocked. If a test ever forgets to mock the
+// Prisma clients, point them at a dead local address instead of letting the
+// generated client pick up the shared remote dev database from .env.
+process.env.DATABASE_URL = "postgresql://unit:unit@127.0.0.1:1/unit";
+process.env.DIRECT_URL = "postgresql://unit:unit@127.0.0.1:1/unit";

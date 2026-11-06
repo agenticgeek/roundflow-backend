@@ -3,8 +3,10 @@ import { AppError } from "../lib/app-error";
 import { MessageChannel, PaymentMethod, Prisma, VisitStatus } from "../generated/tenant-client";
 import { createMessageService } from "./message.service";
 import { getCachedBusinessSettings } from "./settings.service";
+import { tenantToday } from "./business-time";
 import { holdNextVisits, releaseHeldVisits } from "./payment-hold";
 import { getInvoiceCheckoutLink } from "../integrations/stripe/checkout";
+import { NOT_COLLECTING_INVOICE } from "./direct-debit";
 import {
   FALLBACK_BODIES, TEMPLATE_NAMES, invoiceTemplateVars, loadTemplate, renderTemplate,
 } from "./message-templates";
@@ -27,12 +29,14 @@ interface BucketContext {
   failedVisitIds: string[];
   upcomingCustomerIds: string[];
   now: Date;
-  sevenDaysAgo: Date;
+  /** A5: due date that is exactly N days before the tenant's "today" (UTC-midnight dates). */
+  daysAgo: (n: number) => Date;
 }
 
 async function computeBucketContext(prisma: TenantPrismaClient): Promise<BucketContext> {
   const now = new Date();
-  const sevenDaysAgo = new Date(now.getTime() - 7 * 86_400_000);
+  const today = await tenantToday(prisma, now);
+  const daysAgo = (n: number) => new Date(today.getTime() - n * 86_400_000);
   const sevenDaysFromNow = new Date(now.getTime() + 7 * 86_400_000);
 
   const [failedPayments, upcomingVisits] = await Promise.all([
@@ -45,7 +49,7 @@ async function computeBucketContext(prisma: TenantPrismaClient): Promise<BucketC
   const failedVisitIds = [...new Set(failedPayments.map((p) => p.visitId).filter(Boolean) as string[])];
   const upcomingCustomerIds = [...new Set(upcomingVisits.map((v) => v.property.customerId))];
 
-  return { failedVisitIds, upcomingCustomerIds, now, sevenDaysAgo };
+  return { failedVisitIds, upcomingCustomerIds, now, daysAgo };
 }
 
 function buildBucketWhere(
@@ -54,13 +58,16 @@ function buildBucketWhere(
   ctx: BucketContext
 ): Prisma.InvoiceWhereInput {
   const { roundId, paymentMethod, search } = filters;
-  const { failedVisitIds, upcomingCustomerIds, now, sevenDaysAgo } = ctx;
+  const { failedVisitIds, upcomingCustomerIds, daysAgo } = ctx;
 
   const customerWhere: Prisma.CustomerWhereInput = {};
   if (paymentMethod) customerWhere.paymentMethod = paymentMethod as PaymentMethod;
 
-  const where: Prisma.InvoiceWhereInput = { status: "SENT", customer: customerWhere };
+  // ACT-07: invoices whose direct debit is still being collected are not overdue debt.
+  const where: Prisma.InvoiceWhereInput = { status: "SENT", customer: customerWhere, ...NOT_COLLECTING_INVOICE };
   if (roundId) where.visit = { property: { roundId } };
+  // A5: buckets count calendar days since the invoice due date. Due today (day 0) is not overdue; "7 days over"
+  // starts on day 8, "14 days over" on day 15; days 1-7 stay in the default bucket.
   switch (bucket) {
     case "BAD_DEBT":
       customerWhere.badDebt = true;
@@ -76,11 +83,11 @@ function buildBucketWhere(
       break;
     case "SEVEN_DAYS_OVER":
       customerWhere.badDebt = false;
-      where.dueDate = { gte: sevenDaysAgo, lt: now };
+      where.dueDate = { gte: daysAgo(14), lte: daysAgo(8) };
       break;
     case "FOURTEEN_DAYS_OVER":
       customerWhere.badDebt = false;
-      where.dueDate = { lt: sevenDaysAgo };
+      where.dueDate = { lte: daysAgo(15) };
       break;
     default:
       customerWhere.badDebt = false;
@@ -92,7 +99,7 @@ function buildBucketWhere(
       // visit. Explicitly allow null alongside "not in the failed set".
       where.AND = [
         { OR: [{ visitId: null }, { visitId: { notIn: failedVisitIds } }] },
-        { OR: [{ dueDate: null }, { dueDate: { gte: sevenDaysAgo } }] },
+        { OR: [{ dueDate: null }, { dueDate: { gte: daysAgo(7) } }] },
       ];
   }
 
@@ -209,7 +216,7 @@ export function createDebtService(prisma: TenantPrismaClient) {
               id: true, name: true, paymentMethod: true, badDebt: true, holdNextClean: true,
               properties: { select: { addressLine: true, postcode: true }, orderBy: { createdAt: "asc" }, take: 1 },
               invoices: {
-                where: { status: "SENT" },
+                where: { status: "SENT", ...NOT_COLLECTING_INVOICE },
                 select: { id: true, invoiceNumber: true, amount: true, dueDate: true },
                 orderBy: { createdAt: "asc" },
               },
@@ -308,7 +315,7 @@ export function createDebtService(prisma: TenantPrismaClient) {
       };
     },
     // A5: payment link = a real Stripe Checkout Session on the tenant's
-    // connected account, delivered through GHL. Contact/channel and the GHL
+    // connected account, delivered by email or SMS. Contact/channel and availability
     // connection are checked BEFORE the session is created (D-6), so a
     // request that can't be delivered never orphans a Stripe session.
     sendPaymentLink: async (
@@ -361,7 +368,7 @@ export function createDebtService(prisma: TenantPrismaClient) {
       const visitsUpdated = await (_flag ? holdNextVisits : releaseHeldVisits)(prisma, updated.id);
       if (_flag && options?.notify) {
         const body = options.message?.trim() || "Your next clean is on hold until this is resolved.";
-        await messages.send({ customerId: updated.id, channel: "SMS", body }).catch((err) => {
+        await messages.send({ customerId: updated.id, body }).catch((err) => {
           console.error(`[debt] hold notify failed for customer ${updated.id}:`, err);
         });
       }
@@ -379,11 +386,11 @@ export function createDebtService(prisma: TenantPrismaClient) {
       const updated = await prisma.customer.update({ where: { id: invoice.customerId }, data: { badDebt: _flag } });
       return { customerId: updated.id, badDebt: updated.badDebt };
     },
-    // A5: reminder through GHL. channel omitted = SMS if mobile, else EMAIL;
+    // A5: reminder. channel omitted = best available (SMS via GHL when connected, else email);
     // message omitted = the tenant's "Payment Overdue Reminder" template.
     sendReminder: async (invoiceId: string, options: { channel?: MessageChannel; message?: string }) => {
       const invoice = await loadInvoice(invoiceId);
-      const prep = await messages.prepare(invoice.customerId, options.channel);
+      const prep = await messages.prepare(invoice.customerId, options.channel, { respectOptOut: true });
       const template = options.message
         ? { id: null, body: options.message }
         : await loadTemplate(prisma, TEMPLATE_NAMES.PAYMENT_REMINDER, FALLBACK_BODIES.PAYMENT_REMINDER);
@@ -414,15 +421,15 @@ export function createDebtService(prisma: TenantPrismaClient) {
         totalOutstandingsAgg, badDebtAgg, failedGoCardless, dueBeforeClean, holdNextClean,
         totalOutstandingsCount, badDebtCount,
       ] = await Promise.all([
-        prisma.invoice.aggregate({ _sum: { amount: true }, where: { status: "SENT", customer: { badDebt: false } } }),
-        prisma.invoice.aggregate({ _sum: { amount: true }, where: { status: "SENT", customer: { badDebt: true } } }),
-        prisma.invoice.count({ where: { status: "SENT", customer: { badDebt: false }, visitId: { in: failedVisitIds } } }),
-        prisma.invoice.count({ where: { status: "SENT", customer: { badDebt: false }, customerId: { in: upcomingCustomerIds } } }),
+        prisma.invoice.aggregate({ _sum: { amount: true }, where: { status: "SENT", customer: { badDebt: false }, ...NOT_COLLECTING_INVOICE } }),
+        prisma.invoice.aggregate({ _sum: { amount: true }, where: { status: "SENT", customer: { badDebt: true }, ...NOT_COLLECTING_INVOICE } }),
+        prisma.invoice.count({ where: { status: "SENT", customer: { badDebt: false }, visitId: { in: failedVisitIds }, ...NOT_COLLECTING_INVOICE } }),
+        prisma.invoice.count({ where: { status: "SENT", customer: { badDebt: false }, customerId: { in: upcomingCustomerIds }, ...NOT_COLLECTING_INVOICE } }),
         // A3: customers on hold, whatever their invoice status.
         prisma.customer.count({ where: { holdNextClean: true, badDebt: false } }),
         // GAP-031: distinct customers behind each total.
-        prisma.customer.count({ where: { badDebt: false, invoices: { some: { status: "SENT" } } } }),
-        prisma.customer.count({ where: { badDebt: true, invoices: { some: { status: "SENT" } } } }),
+        prisma.customer.count({ where: { badDebt: false, invoices: { some: { status: "SENT", ...NOT_COLLECTING_INVOICE } } } }),
+        prisma.customer.count({ where: { badDebt: true, invoices: { some: { status: "SENT", ...NOT_COLLECTING_INVOICE } } } }),
       ]);
 
       const totalOutstandings = Number(totalOutstandingsAgg._sum.amount ?? 0);

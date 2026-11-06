@@ -10,142 +10,135 @@ vi.mock("../../lib/tenant-prisma-manager", () => ({
   getTenantPrismaForSchema: (...args: unknown[]) => getTenantPrismaForSchema(...args),
 }));
 
-const geocodePostcodesBulk = vi.fn();
+const geocodeProperty = vi.fn();
+vi.mock("../../services/property-geocoding", () => ({
+  geocodeProperty: (...args: unknown[]) => geocodeProperty(...args),
+}));
+
+const isConfigured = vi.fn();
+const quotaRemaining = vi.fn();
 vi.mock("../../integrations/geocoding/client", () => ({
-  geocodePostcodesBulk: (...args: unknown[]) => geocodePostcodesBulk(...args),
+  isGoogleGeocodingConfigured: () => isConfigured(),
+  geocodeQuotaRemaining: () => quotaRemaining(),
 }));
 
 import { runGeocodeBackfill } from "../geocodeBackfill";
+import { parseGeocodeCliArgs } from "../geocodeBackfillCli";
 
-type Property = { id: string; postcode: string; geocodeAttempts: number };
+type Row = { id: string; addressLine: string; postcode: string };
+const row = (id: string): Row => ({ id, addressLine: `${id} Street`, postcode: "AB1 2CD" });
 
-function makeTp(properties: Property[]) {
-  return {
-    property: {
-      findMany: vi.fn().mockResolvedValue(properties),
-      update: vi.fn().mockResolvedValue({}),
-    },
-  };
+// findMany returns the given pages in order, then [].
+function makeTp(pages: Row[][]) {
+  const findMany = vi.fn();
+  pages.forEach((p) => findMany.mockResolvedValueOnce(p));
+  findMany.mockResolvedValue([]);
+  return { property: { findMany } };
 }
 
 beforeEach(() => {
   vi.clearAllMocks();
+  isConfigured.mockReturnValue(true);
+  quotaRemaining.mockReturnValue(1000);
+  geocodeProperty.mockResolvedValue(undefined);
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.spyOn(console, "error").mockImplementation(() => {});
 });
 
 describe("runGeocodeBackfill", () => {
   it("does nothing when there are no tenants", async () => {
     tenantFindMany.mockResolvedValue([]);
-    await runGeocodeBackfill();
+    const s = await runGeocodeBackfill();
+    expect(s).toMatchObject({ tenants: 0, scanned: 0, geocoded: 0, dryRun: false });
     expect(getTenantPrismaForSchema).not.toHaveBeenCalled();
-  });
-
-  it("queries all tenants (not filtered by GHL connection)", async () => {
-    tenantFindMany.mockResolvedValue([]);
-    await runGeocodeBackfill();
     expect(tenantFindMany).toHaveBeenCalledWith({ select: { schemaName: true } });
   });
 
-  it("does nothing for a tenant with no pending properties", async () => {
+  it("with the Google key selects null/fallback/approximate precision or missing hash, default 200 per run", async () => {
     tenantFindMany.mockResolvedValue([{ schemaName: "t_1" }]);
     const tp = makeTp([]);
     getTenantPrismaForSchema.mockReturnValue(tp);
-
     await runGeocodeBackfill();
-
     expect(tp.property.findMany).toHaveBeenCalledWith({
-      where: { latitude: null, geocodeAttempts: { lt: 5 } },
-      select: { id: true, postcode: true, geocodeAttempts: true },
-      take: 500,
+      where: {
+        geocodeAttempts: { lt: 5 },
+        OR: [{ geocodePrecision: null }, { geocodePrecision: { in: ["POSTCODE_FALLBACK", "APPROXIMATE"] } }, { geocodeAddressHash: null }],
+      },
+      select: { id: true, addressLine: true, postcode: true },
+      orderBy: { id: "asc" },
+      take: 50,
     });
-    expect(geocodePostcodesBulk).not.toHaveBeenCalled();
-    expect(tp.property.update).not.toHaveBeenCalled();
+    expect(geocodeProperty).not.toHaveBeenCalled();
   });
 
-  it("writes latitude/longitude and clears geocodeError on a successful match", async () => {
+  it("without the key keeps the old behaviour: only properties with no coordinates", async () => {
+    isConfigured.mockReturnValue(false);
+    quotaRemaining.mockReturnValue(0); // quota is irrelevant without Google
     tenantFindMany.mockResolvedValue([{ schemaName: "t_1" }]);
-    const property: Property = { id: "p1", postcode: "SW1A 1AA", geocodeAttempts: 0 };
-    const tp = makeTp([property]);
+    const tp = makeTp([[row("p1")]]);
     getTenantPrismaForSchema.mockReturnValue(tp);
-    geocodePostcodesBulk.mockResolvedValue(new Map([["SW1A 1AA", { latitude: 51.5, longitude: -0.14 }]]));
-
-    await runGeocodeBackfill();
-
-    expect(geocodePostcodesBulk).toHaveBeenCalledWith(["SW1A 1AA"]);
-    expect(tp.property.update).toHaveBeenCalledWith({
-      where: { id: "p1" },
-      data: { latitude: 51.5, longitude: -0.14, geocodedAt: expect.any(Date), geocodeError: null },
-    });
+    const s = await runGeocodeBackfill();
+    expect(tp.property.findMany.mock.calls[0][0].where).toEqual({ latitude: null, geocodeAttempts: { lt: 5 } });
+    expect(geocodeProperty).toHaveBeenCalledWith(tp, "p1", { addressLine: "p1 Street", postcode: "AB1 2CD" });
+    expect(s.geocoded).toBe(1);
   });
 
-  it("bumps geocodeAttempts and records geocodeError when a postcode has no match", async () => {
+  it("geocodes each pending property with its full address and pages with a cursor", async () => {
     tenantFindMany.mockResolvedValue([{ schemaName: "t_1" }]);
-    const property: Property = { id: "p1", postcode: "ZZ99 9ZZ", geocodeAttempts: 1 };
-    const tp = makeTp([property]);
+    const tp = makeTp([[row("p1"), row("p2")], [row("p3")]]);
     getTenantPrismaForSchema.mockReturnValue(tp);
-    geocodePostcodesBulk.mockResolvedValue(new Map([["ZZ99 9ZZ", null]]));
-
-    await runGeocodeBackfill();
-
-    expect(tp.property.update).toHaveBeenCalledWith({
-      where: { id: "p1" },
-      data: { geocodeAttempts: 2, geocodeError: "postcode not found" },
-    });
+    const s = await runGeocodeBackfill();
+    expect(geocodeProperty).toHaveBeenCalledTimes(3);
+    expect(tp.property.findMany.mock.calls[1][0].where.id).toEqual({ gt: "p2" });
+    expect(s).toMatchObject({ tenants: 1, scanned: 3, geocoded: 3, quotaExhausted: false });
   });
 
-  it("logs when a not-found property reaches MAX_ATTEMPTS", async () => {
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+  it("dry run counts candidates but never geocodes or writes", async () => {
     tenantFindMany.mockResolvedValue([{ schemaName: "t_1" }]);
-    const property: Property = { id: "p1", postcode: "ZZ99 9ZZ", geocodeAttempts: 4 };
-    const tp = makeTp([property]);
+    const tp = makeTp([[row("p1"), row("p2")]]);
     getTenantPrismaForSchema.mockReturnValue(tp);
-    geocodePostcodesBulk.mockResolvedValue(new Map([["ZZ99 9ZZ", null]]));
-
-    await runGeocodeBackfill();
-
-    expect(tp.property.update).toHaveBeenCalledWith({
-      where: { id: "p1" },
-      data: { geocodeAttempts: 5, geocodeError: "postcode not found" },
-    });
-    expect(errorSpy).toHaveBeenCalledWith(
-      expect.stringContaining("property p1 dead after 5 attempts: postcode not found")
-    );
-    errorSpy.mockRestore();
+    const s = await runGeocodeBackfill({ dryRun: true });
+    expect(geocodeProperty).not.toHaveBeenCalled();
+    expect(s).toMatchObject({ scanned: 2, geocoded: 0, dryRun: true });
   });
 
-  it("bumps geocodeAttempts for every pending property when the bulk lookup itself fails", async () => {
-    tenantFindMany.mockResolvedValue([{ schemaName: "t_1" }]);
-    const properties: Property[] = [
-      { id: "p1", postcode: "SW1A 1AA", geocodeAttempts: 0 },
-      { id: "p2", postcode: "EC1A 1BB", geocodeAttempts: 4 },
-    ];
-    const tp = makeTp(properties);
-    getTenantPrismaForSchema.mockReturnValue(tp);
-    geocodePostcodesBulk.mockRejectedValue(new Error("network down"));
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-    await runGeocodeBackfill();
-
-    expect(tp.property.update).toHaveBeenCalledWith({
-      where: { id: "p1" },
-      data: { geocodeAttempts: 1, geocodeError: "Error: network down" },
-    });
-    expect(tp.property.update).toHaveBeenCalledWith({
-      where: { id: "p2" },
-      data: { geocodeAttempts: 5, geocodeError: "Error: network down" },
-    });
-    errorSpy.mockRestore();
-  });
-
-  it("processes multiple tenants independently", async () => {
+  it("stops at the per-run limit across tenants and shrinks the batch", async () => {
     tenantFindMany.mockResolvedValue([{ schemaName: "t_1" }, { schemaName: "t_2" }]);
-    const tp1 = makeTp([{ id: "p1", postcode: "SW1A 1AA", geocodeAttempts: 0 }]);
-    const tp2 = makeTp([{ id: "p2", postcode: "EC1A 1BB", geocodeAttempts: 0 }]);
-    getTenantPrismaForSchema.mockImplementation((schemaName: string) => (schemaName === "t_1" ? tp1 : tp2));
-    geocodePostcodesBulk.mockResolvedValue(new Map());
+    const tp1 = makeTp([[row("a"), row("b")]]);
+    const tp2 = makeTp([[row("c")]]);
+    getTenantPrismaForSchema.mockImplementation((n: string) => (n === "t_1" ? tp1 : tp2));
+    const s = await runGeocodeBackfill({ limit: 2 });
+    expect(tp1.property.findMany.mock.calls[0][0].take).toBe(2);
+    expect(tp2.property.findMany).not.toHaveBeenCalled();
+    expect(s).toMatchObject({ tenants: 1, scanned: 2 });
+  });
 
-    await runGeocodeBackfill();
+  it("stops when the daily quota is spent", async () => {
+    quotaRemaining.mockReturnValueOnce(1).mockReturnValue(0);
+    tenantFindMany.mockResolvedValue([{ schemaName: "t_1" }, { schemaName: "t_2" }]);
+    const tp1 = makeTp([[row("a"), row("b")]]);
+    getTenantPrismaForSchema.mockReturnValue(tp1);
+    const s = await runGeocodeBackfill();
+    expect(geocodeProperty).toHaveBeenCalledTimes(1);
+    expect(s).toMatchObject({ scanned: 1, geocoded: 1, quotaExhausted: true, tenants: 1 });
+  });
 
-    expect(tp1.property.findMany).toHaveBeenCalledTimes(1);
-    expect(tp2.property.findMany).toHaveBeenCalledTimes(1);
+  it("isolates a failing tenant and a failing property update", async () => {
+    tenantFindMany.mockResolvedValue([{ schemaName: "t_1" }, { schemaName: "t_2" }]);
+    const bad = { property: { findMany: vi.fn().mockRejectedValue(new Error("db down")) } };
+    const ok = makeTp([[row("p1")]]);
+    getTenantPrismaForSchema.mockImplementation((n: string) => (n === "t_1" ? bad : ok));
+    geocodeProperty.mockRejectedValue(new Error("update failed"));
+    const s = await runGeocodeBackfill();
+    expect(s).toMatchObject({ tenants: 2, failedTenants: 1, scanned: 1, geocoded: 0 });
+  });
+});
+
+describe("parseGeocodeCliArgs", () => {
+  it("reads --dry-run and --limit, defaulting to 200", () => {
+    expect(parseGeocodeCliArgs([])).toEqual({ dryRun: false, limit: 200 });
+    expect(parseGeocodeCliArgs(["--dry-run", "--limit=50"])).toEqual({ dryRun: true, limit: 50 });
+    expect(parseGeocodeCliArgs(["--limit=abc"]).limit).toBe(200);
+    expect(parseGeocodeCliArgs(["--limit=0"]).limit).toBe(200);
   });
 });

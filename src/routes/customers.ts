@@ -4,6 +4,7 @@ import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { queueGhlEvent } from "../integrations/ghl/sync";
 import { AppError } from "../lib/app-error";
+import { adminIdempotency } from "../lib/idempotency";
 import {
   asObject,
   h,
@@ -21,6 +22,7 @@ import {
   optPaymentMethod,
   optPropertyType,
   optIsoDate,
+  optEmail,
   MAX_NAME_LENGTH,
   MAX_ADDRESS_LENGTH,
   MAX_NOTES_LENGTH,
@@ -79,12 +81,13 @@ function parsePropertyAdd(raw: unknown, field = ""): PropertyAddInput {
 // ==========================================================================
 customersRouter.post(
   "/",
+  adminIdempotency(), // BE-17: optional Idempotency-Key
   h(async (req, res) => {
     const body = asObject(req.body);
     const input: CustomerCreateInput = {
       name: requireString(body.name, "name", { maxLength: MAX_NAME_LENGTH }),
       phone: optString(body.phone, "phone"),
-      email: optString(body.email, "email"),
+      email: optEmail(body.email, "email"),
       paymentMethod: optPaymentMethod(body.paymentMethod),
       property: body.property === undefined || body.property === null ? undefined : parsePropertyAdd(body.property, "property."),
     };
@@ -175,7 +178,7 @@ customersRouter.patch(
       name: optReqString(body.name, "name", { maxLength: MAX_NAME_LENGTH }),
       phone: optString(body.phone, "phone"),
       landline: optString(body.landline, "landline"),
-      email: optString(body.email, "email"),
+      email: optEmail(body.email, "email"),
       messagesOptOut: optBool(body.messagesOptOut, "messagesOptOut"),
       // Property
       addressLine: optReqString(body.addressLine, "addressLine", { maxLength: MAX_ADDRESS_LENGTH }),
