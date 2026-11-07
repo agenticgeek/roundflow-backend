@@ -3,11 +3,13 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
+import { adminIdempotency } from "../lib/idempotency";
 import { h, asObject, optBool, optReqNumber, optString, optStringArray, parsePageParams } from "../lib/http";
-import { optIsoDate, parseOptionalDateOnly } from "../lib/validation";
+import { optIsoDate, parseIsoDate, parseOptionalDateOnly } from "../lib/validation";
 import { toCsv } from "../lib/csv";
-import { InvoiceStatus } from "../generated/tenant-client";
-import { createInvoiceService, InvoiceListFilters, ManualPaymentMethod } from "../services/invoice.service";
+import { InvoiceStatus, MessageChannel } from "../generated/tenant-client";
+import { createInvoiceSendBatchService, MAX_BATCH, type BulkSendSelection } from "../services/invoice-send-batch.service";
+import { createInvoiceService, InvoiceListFilters, InvoiceStatusFilter, ManualPaymentMethod } from "../services/invoice.service";
 import { optOutboundChannel } from "../services/message.service";
 import { renderHtmlToPdf, invoiceHtml } from "../integrations/pdf/render";
 
@@ -18,15 +20,14 @@ invoicesRouter.use(requireBusinessAccess());
 
 const svc = (req: Request) => createInvoiceService(req.tenantPrisma!);
 
-const MANUAL_METHODS: ManualPaymentMethod[] = ["BACS", "CHEQUE", "CASH"];
 
 function parseListFilters(query: Record<string, unknown>): InvoiceListFilters {
   const { status, customerId, q } = query;
-  if (status !== undefined && !(Object.values(InvoiceStatus) as unknown[]).includes(status)) {
-    throw new AppError(400, `status must be one of: ${Object.values(InvoiceStatus).join(", ")}`);
+  if (status !== undefined && status !== "OVERDUE" && !(Object.values(InvoiceStatus) as unknown[]).includes(status)) {
+    throw new AppError(400, `status must be one of: ${[...Object.values(InvoiceStatus), "OVERDUE"].join(", ")}`);
   }
   return {
-    status: status as InvoiceStatus | undefined,
+    status: status as InvoiceStatusFilter | undefined,
     from: parseOptionalDateOnly(query.from, "from"),
     to: parseOptionalDateOnly(query.to, "to"),
     customerId: typeof customerId === "string" && customerId ? customerId : undefined,
@@ -121,6 +122,49 @@ invoicesRouter.post(
   })
 );
 
+// ---- bulk send (ACT-01) -----------------------------------------------------
+
+function parseBulkSend(body: unknown): BulkSendSelection {
+  const b = asObject(body);
+  const ids = optStringArray(b.ids, "ids");
+  if (ids && (ids.length === 0 || ids.length > MAX_BATCH)) {
+    throw new AppError(400, `"ids" must contain 1 to ${MAX_BATCH} invoice ids`, "INVALID_BATCH_SIZE");
+  }
+  const status = b.status === undefined ? undefined : (parseListFilters({ status: b.status }).status as InvoiceStatusFilter);
+  const { customerId, q, from, to } = parseListFilters(asObject(b.filters ?? {}) as Record<string, unknown>);
+  return {
+    ids,
+    status,
+    filters: { customerId, q, from, to },
+    channel: optOutboundChannel(b.channel),
+    resend: optBool(b.resend, "resend") ?? false,
+  };
+}
+
+// POST /invoices/bulk-send/preview { ids? | status?: DRAFT (default), filters?, channel?, resend? }
+// → { total, willSend, byChannel: { SMS?, EMAIL?, WHATSAPP? }, skipped: { <reason>: n }, truncated, totalMatching,
+//     invoices: [{ id, invoiceNumber, customerName, channel|null, skip|null }] }
+//   skip reasons: NOT_DRAFT PAID VOID NO_CONTACT_FOR_CHANNEL OPTED_OUT GHL_NOT_CONNECTED NOT_FOUND
+invoicesRouter.post(
+  "/bulk-send/preview",
+  h(async (req, res) => res.json(await createInvoiceSendBatchService(req.tenantPrisma!).preview(parseBulkSend(req.body))))
+);
+
+// POST /invoices/bulk-send { ids? | status?: DRAFT (default), filters?, channel?, resend?: false }
+// → 202 { batchId, queued, skipped: [{ id, reason }], truncated? } — max 500 per batch; sends run from the outbox.
+//   A second identical request while the first is in flight skips with ALREADY_QUEUED.
+invoicesRouter.post(
+  "/bulk-send",
+  h(async (req, res) => res.status(202).json(await createInvoiceSendBatchService(req.tenantPrisma!).send(parseBulkSend(req.body))))
+);
+
+// GET /invoices/bulk-send/:batchId
+// → { batchId, total, done, counts: { QUEUED, SENT, FAILED, SKIPPED }, results: [{ id, status, error?, code? }] } · 404 BATCH_NOT_FOUND
+invoicesRouter.get(
+  "/bulk-send/:batchId",
+  h(async (req, res) => res.json(await createInvoiceSendBatchService(req.tenantPrisma!).getBatch(req.params.batchId)))
+);
+
 // ---- per-invoice ------------------------------------------------------------
 
 // GET /invoices/:id
@@ -148,24 +192,37 @@ invoicesRouter.get(
 // defaults to today + BusinessSettings.invoiceDueDays.
 invoicesRouter.post(
   "/",
+  adminIdempotency(), // BE-17: optional Idempotency-Key
   h(async (req, res) => {
     const { visitId, notes, dueDate, sendEmail } = req.body ?? {};
     if (!visitId || typeof visitId !== "string") {
       return res.status(400).json({ error: "visitId is required" });
     }
+    if (sendEmail !== undefined && typeof sendEmail !== "boolean") {
+      throw new AppError(400, '"sendEmail" must be true or false', "VALIDATION_FAILED");
+    }
     const invoice = await svc(req).createInvoice({
       visitId,
       notes: optString(notes, "notes") ?? null,
-      dueDate: optString(dueDate, "dueDate") ?? null,
-      sendEmail: sendEmail === true,
+      dueDate: dueDate === undefined || dueDate === null ? null : (parseIsoDate(dueDate, "dueDate"), String(dueDate)),
+      sendEmail: false,
     });
-    return res.status(201).json(invoice);
+    if (sendEmail !== true) return res.status(201).json(invoice);
+    // The invoice exists either way; the email result is reported next to it (SENT only after SES accepted it).
+    try {
+      const sent = await svc(req).sendInvoice(invoice.id, { channel: MessageChannel.EMAIL });
+      return res.status(201).json({ ...invoice, emailSent: true, pdfAttached: sent.pdfAttached });
+    } catch (err) {
+      const raw = (err as { code?: unknown }).code;
+      const code = typeof raw === "string" ? raw : "EMAIL_SEND_FAILED";
+      return res.status(201).json({ ...invoice, emailSent: false, emailError: { code, message: (err as Error).message } });
+    }
   })
 );
 
 // POST /invoices/:id/send { channel?, resend? }
 // 409 INVOICE_NOT_SENDABLE (PAID/VOID) · 409 INVOICE_ALREADY_SENT (unless resend)
-// 409 GHL_NOT_CONNECTED · 400 NO_CONTACT_FOR_CHANNEL · 502 GHL_SEND_FAILED
+// 409 CHANNEL_UNAVAILABLE (reason) · 400 NO_CONTACT_FOR_CHANNEL · 502 GHL_SEND_FAILED / EMAIL_SEND_FAILED
 invoicesRouter.post(
   "/:id/send",
   h(async (req, res) => {
@@ -185,9 +242,6 @@ invoicesRouter.post(
   "/:id/mark-paid",
   h(async (req, res) => {
     const b = asObject(req.body);
-    if (!MANUAL_METHODS.includes(b.method as ManualPaymentMethod)) {
-      throw new AppError(400, `method must be one of: ${MANUAL_METHODS.join(", ")}`);
-    }
     const result = await svc(req).markPaid(
       req.params.id,
       {

@@ -1,5 +1,6 @@
 import { InvoiceStatus } from "../../generated/tenant-client";
 import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
+import { NOT_COLLECTING_INVOICE } from "../../services/direct-debit";
 
 export interface DebtGate {
   canStart: boolean;
@@ -33,7 +34,8 @@ export async function evaluateDebtGate(
   if (!settings?.debtHoldEnabled) return { canStart: true, blockReason: null };
 
   const invoices = await prisma.invoice.findMany({
-    where: { customerId, status: { in: [InvoiceStatus.DRAFT, InvoiceStatus.SENT] } },
+    // ACT-07: a direct debit that is still being collected is not debt.
+    where: { customerId, status: { in: [InvoiceStatus.DRAFT, InvoiceStatus.SENT] }, ...NOT_COLLECTING_INVOICE },
     select: { amount: true },
   });
   if (invoices.length === 0) return { canStart: true, blockReason: null };

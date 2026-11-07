@@ -1,4 +1,5 @@
-import { InvoiceStatus, PaymentMethod, PaymentStatus, Prisma, VisitStatus } from "../generated/tenant-client";
+import { InvoiceStatus, LifecycleStatus, PaymentMethod, PaymentStatus, Prisma, VisitStatus } from "../generated/tenant-client";
+import { nextDueAfter } from "../lib/schedule";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 import { TEMPLATE_NAMES } from "./message-templates";
@@ -14,12 +15,16 @@ import { grossOf } from "../lib/vat";
 // outbox events are then written in ONE transaction, so a 400 leaves the visit
 // untouched and a retry works.
 
-export type CompletionPaymentMethod = "CASH" | "CHEQUE" | "NONE";
+export type CompletionPaymentMethod = "CASH" | "CHEQUE" | "BACS" | "GOCARDLESS" | "STRIPE" | "NONE";
 
 export interface CompletionPaymentInput {
   method: CompletionPaymentMethod;
   amount?: number;
   chequeNumber?: string;
+  /** App extra: the method the technician picked when `method` is NONE (alias of the chosen method). */
+  collectVia?: Exclude<CompletionPaymentMethod, "NONE">;
+  /** Also make `method` (or collectVia) the customer's usual payment method. */
+  updateCustomerDefault?: boolean;
 }
 
 export interface CompleteVisitOptions {
@@ -45,7 +50,8 @@ export interface CompleteVisitResult {
 export const VISIT_COMPLETED_MESSAGE_EVENT = "message.visit_completed";
 export const VISIT_COMPLETED_TEMPLATE_NAME = TEMPLATE_NAMES.VISIT_COMPLETED;
 
-const METHODS: readonly CompletionPaymentMethod[] = ["CASH", "CHEQUE", "NONE"];
+const METHODS: readonly CompletionPaymentMethod[] = ["CASH", "CHEQUE", "BACS", "GOCARDLESS", "STRIPE", "NONE"];
+const REAL_METHODS = METHODS.filter((m) => m !== "NONE") as Array<Exclude<CompletionPaymentMethod, "NONE">>;
 const MAX_CHEQUE_NUMBER_LENGTH = 50;
 const MAX_AMOUNT = 9999.99;
 
@@ -87,7 +93,18 @@ export function parseCompletionPayment(body: Record<string, unknown>): Completio
     throw new AppError(400, `"payment.chequeNumber" is required for cheque payments`, "CHEQUE_NUMBER_REQUIRED");
   }
 
-  return { method, amount, chequeNumber };
+  let collectVia: CompletionPaymentInput["collectVia"];
+  if (p.collectVia !== undefined && p.collectVia !== null) {
+    if (typeof p.collectVia !== "string" || !REAL_METHODS.includes(p.collectVia as never)) {
+      throw new AppError(400, `"payment.collectVia" must be one of: ${REAL_METHODS.join(", ")}`, "INVALID_PAYMENT");
+    }
+    collectVia = p.collectVia as CompletionPaymentInput["collectVia"];
+  }
+  if (p.updateCustomerDefault !== undefined && typeof p.updateCustomerDefault !== "boolean") {
+    throw new AppError(400, `"payment.updateCustomerDefault" must be a boolean`, "INVALID_PAYMENT");
+  }
+
+  return { method, amount, chequeNumber, collectVia, updateCustomerDefault: p.updateCustomerDefault as boolean | undefined };
 }
 
 type PlannedPayment = {
@@ -113,9 +130,14 @@ export function createVisitCompletionService(tp: TenantPrismaClient) {
       const customer = visit.property.customer;
       const customerId = customer.id;
       // Effective method: visit override → service plan → customer default (D-9).
-      const effectiveMethod =
-        (visit.paymentMethod ?? visit.servicePlan?.paymentMethod ?? customer.paymentMethod) as PaymentMethod | null;
       const input = opts.payment;
+      // Wave 2B-2: the technician's choice (method, or collectVia when method is NONE) is the method of record.
+      const chosen = (input && input.method !== "NONE" ? input.method : input?.collectVia) as PaymentMethod | undefined;
+      const offSite = chosen === PaymentMethod.BACS || chosen === PaymentMethod.GOCARDLESS || chosen === PaymentMethod.STRIPE;
+      const effectiveMethod =
+        (offSite
+          ? chosen
+          : (visit.paymentMethod ?? visit.servicePlan?.paymentMethod ?? customer.paymentMethod)) as PaymentMethod | null;
       // A3: money is taken at the VAT-inclusive total (the invoice amount).
       const gross = grossOf(visit.price.toNumber(), await getCachedBusinessSettings(tp));
 
@@ -168,7 +190,10 @@ export function createVisitCompletionService(tp: TenantPrismaClient) {
       // ---- 3. One transaction for every write -----------------------------
       const now = new Date();
       const ops: Prisma.PrismaPromise<unknown>[] = [
-        tp.visit.update({ where: { id: visit.id }, data: { status: VisitStatus.COMPLETED, completedAt: now } }),
+        tp.visit.update({
+          where: { id: visit.id },
+          data: { status: VisitStatus.COMPLETED, completedAt: now, ...(chosen ? { collectedVia: chosen } : {}) },
+        }),
       ];
       if (planned) {
         ops.push(
@@ -201,8 +226,21 @@ export function createVisitCompletionService(tp: TenantPrismaClient) {
         }
       }
       // A6: the plan's "last completed" date (shown as Last clean in the app).
-      if (visit.servicePlanId) {
-        ops.push(tp.servicePlan.update({ where: { id: visit.servicePlanId }, data: { lastCompleted: now } }));
+      // GEN-001 / VIS-004n: a one-off visit (no servicePlanId) completes the property's ACTIVE plan when that plan is due.
+      // The plan moves one cycle ahead only if its nextDueDate is not already in the future (the nightly job advances it
+      // when it creates a visit, so a generated visit never double-advances it).
+      const plan = visit.servicePlan ?? (visit.servicePlanId ? null : await tp.servicePlan.findFirst({
+        where: { propertyId: visit.propertyId, status: LifecycleStatus.ACTIVE },
+        orderBy: { createdAt: "asc" },
+      }));
+      const planId = visit.servicePlanId ?? plan?.id;
+      if (planId) {
+        const data: Prisma.ServicePlanUpdateInput = { lastCompleted: now };
+        if (plan?.cleaningFrequency && (!plan.nextDueDate || plan.nextDueDate <= visit.date)) {
+          const round = visit.roundId ? await tp.round.findUnique({ where: { id: visit.roundId }, select: { defaultDay: true } }) : null;
+          data.nextDueDate = nextDueAfter(visit.date, plan.cleaningFrequency, round?.defaultDay);
+        }
+        ops.push(tp.servicePlan.update({ where: { id: planId }, data }));
       }
       if (opts.note) {
         ops.push(tp.propertyNote.create({ data: { propertyId: visit.propertyId, body: opts.note, type: "INTERNAL" } }));
@@ -225,7 +263,36 @@ export function createVisitCompletionService(tp: TenantPrismaClient) {
         );
       }
 
-      const results = await tp.$transaction(ops);
+      // Wave 2B-2: audit the technician's chosen method and optionally update the customer's usual one.
+      // Appended after the payment op so results[1] is still the payment.
+      if (chosen) {
+        ops.push(
+          tp.activityLog.create({
+            data: {
+              type: "PAYMENT_METHOD_RECORDED",
+              message: `Technician recorded ${chosen} for visit ${visit.id} — ${customer.name}`,
+              actorId: opts.actorProfileId ?? null,
+              actorRole: opts.actorRole ?? null,
+            },
+          }),
+        );
+        if (input?.updateCustomerDefault) {
+          ops.push(tp.customer.update({ where: { id: customerId }, data: { paymentMethod: chosen } }));
+        }
+      }
+
+      let results: unknown[];
+      try {
+        results = await tp.$transaction(ops);
+      } catch (err) {
+        // BUG-005: a double tap / retry on a flaky network completes the same visit twice at once. The loser hits the
+        // unique Payment.visitId; if the visit is completed by now, the winner's result is the answer.
+        if ((err as { code?: string }).code === "P2002") {
+          const now = await tp.visit.findUnique({ where: { id: visit.id }, select: { id: true, status: true } });
+          if (now?.status === VisitStatus.COMPLETED) return { id: now.id, status: now.status, payment: null, invoice: null };
+        }
+        throw err;
+      }
       const updated = results[0] as { id: string; status: VisitStatus };
       const payment = planned
         ? (results[1] as { id: string; method: PaymentMethod; status: PaymentStatus; amount: Prisma.Decimal })

@@ -3,13 +3,14 @@ import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { AppError } from "../lib/app-error";
-import { asObject, h, requireString, requireNumber, optString, optId } from "../lib/http";
+import { asObject, h, requireString, requireNumber, optString, optId, optBool, optStringArray } from "../lib/http";
 import { assertPositive, optPaymentMethod } from "../lib/validation";
 import { createVisitService, VisitCreateInput } from "../services/visit.service";
 import { createReportsService } from "../services/reports.service";
 import { createVisitCompletionService, parseCompletionPayment } from "../services/visit-completion";
 import { createVisitPhotosService } from "../services/visit-photos.service";
 import { createVisitRescheduleService } from "../services/visit-reschedule";
+import { createCarryoverService } from "../services/carryover.service";
 import { parseOptionalDateOnly } from "../lib/validation";
 
 export const visitsRouter = Router();
@@ -21,6 +22,50 @@ const svc = (req: Request) => {
   if (!req.tenantPrisma) throw new AppError(500, "Tenant client not initialised");
   return createVisitService(req.tenantPrisma);
 };
+
+// ==========================================================================
+// Job carryover (ACT-02..04). Registered before the /:id routes.
+// GET /visits/carryover/options?date=YYYY-MM-DD
+//   -> 200 { date, options: [{ key: NEXT_WORKING_DAY|SATURDAY|MONDAY, date, label, default }] }
+//   Friday: always Saturday + Monday (Monday default); other days: the next working day.
+// ==========================================================================
+visitsRouter.get(
+  "/carryover/options",
+  h(async (req, res) => {
+    const date = parseOptionalDateOnly(req.query.date, "date");
+    if (!date) throw new AppError(400, '"date" is required (YYYY-MM-DD)');
+    if (!req.tenantPrisma) throw new AppError(500, "Tenant client not initialised");
+    res.json(await createCarryoverService(req.tenantPrisma).options(date));
+  })
+);
+
+// POST /visits/carryover { date, target, visitIds?, notifyCustomers?, dryRun? }
+//   Moves the unfinished (SCHEDULED/IN_PROGRESS) visits of `date` (or `visitIds`) to the target day.
+//   -> 200 { moved, targetDate, conflicts[{ visitId, technicianId, reason }], notifiedTechnicians,
+//            notifiedCustomers, skipped[{ visitId, reason }], dryRun }
+//   400 INVALID_CARRYOVER_TARGET / CARRYOVER_TARGET_IN_PAST / bad body · 409 CARRYOVER_TARGET_CLOSED
+visitsRouter.post(
+  "/carryover",
+  h(async (req, res) => {
+    const body = asObject(req.body);
+    const date = parseOptionalDateOnly(body.date, "date");
+    if (!date) throw new AppError(400, '"date" is required (YYYY-MM-DD)');
+    const visitIds = optStringArray(body.visitIds, "visitIds");
+    if (visitIds && (visitIds.length === 0 || visitIds.length > 500)) {
+      throw new AppError(400, '"visitIds" must contain 1 to 500 ids');
+    }
+    if (!req.tenantPrisma) throw new AppError(500, "Tenant client not initialised");
+    const result = await createCarryoverService(req.tenantPrisma).carryover({
+      date,
+      target: requireString(body.target, "target"),
+      visitIds,
+      notifyCustomers: optBool(body.notifyCustomers, "notifyCustomers"),
+      dryRun: optBool(body.dryRun, "dryRun"),
+      actor: { id: req.profile?.id, role: req.profile?.role ?? undefined },
+    });
+    res.json(result);
+  })
+);
 
 // ==========================================================================
 // POST /visits — create a one-off (ad-hoc) visit

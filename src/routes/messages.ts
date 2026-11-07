@@ -4,12 +4,15 @@ import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { h, asObject, requireString, optId, optBool, optStringArray, parsePageParams } from "../lib/http";
 import { AppError } from "../lib/app-error";
+import { adminIdempotency, onlyPosts } from "../lib/idempotency";
 import { createMessageService, optOutboundChannel } from "../services/message.service";
 
 export const messagesRouter = Router();
 messagesRouter.use(requireAuth);
 messagesRouter.use(requireTenantAccess);
 messagesRouter.use(requireBusinessAccess());
+// BE-17: every POST /messages/* accepts an optional Idempotency-Key (a double click must not text a customer twice).
+messagesRouter.use(onlyPosts(adminIdempotency()));
 
 const svc = (req: Request) => createMessageService(req.tenantPrisma!);
 
@@ -40,7 +43,11 @@ messagesRouter.get(
   h(async (req, res) => {
     const { page, pageSize } = parsePageParams(req.query as Record<string, unknown>, { defaultPageSize: 50, maxPageSize: 100 });
     const customerId = typeof req.query.customerId === "string" && req.query.customerId ? req.query.customerId : undefined;
-    res.json(await svc(req).listInbox({ customerId, unreadOnly: req.query.unreadOnly === "true", page, pageSize }));
+    const unread = req.query.unreadOnly;
+    if (unread !== undefined && unread !== "true" && unread !== "false") {
+      throw new AppError(400, "unreadOnly must be true or false", "VALIDATION_FAILED");
+    }
+    res.json(await svc(req).listInbox({ customerId, unreadOnly: unread === "true", page, pageSize }));
   })
 );
 

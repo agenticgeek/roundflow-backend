@@ -142,6 +142,17 @@ it("listTechnicianPhotos pages by visit and returns every photo of those visits,
   expect(res.rows[0].jobRef).toBe("JOB-000124");
 });
 
+it("listTechnicianPhotos keeps a photo whose visit is not in the page order (treated as position 0)", async () => {
+  const tp = makeTp();
+  tp.technician.findUnique.mockResolvedValue({ id: "t1" });
+  tp.visit.count.mockResolvedValue(1);
+  tp.visit.findMany.mockResolvedValue([{ id: "v1" }]);
+  const stray = { ...PHOTOS[0], id: "ph-stray", visitId: "vX", visit: { ...PHOTOS[0].visit, id: "vX" } };
+  tp.photo.findMany.mockResolvedValue([stray, PHOTOS[0], { ...stray, id: "ph-stray2" }, PHOTOS[0]]);
+  const res = await createPhotoGalleryService(tp).listTechnicianPhotos("t1", { page: 1, pageSize: 24 });
+  expect(res.rows.map((r) => r.id)).toEqual(["ph-stray", "ph1", "ph-stray2", "ph1"]);
+});
+
 it("listTechnicianPhotos returns an empty page without querying photos when no visit matches", async () => {
   const tp = makeTp();
   tp.technician.findUnique.mockResolvedValue({ id: "t1" });

@@ -2,11 +2,12 @@ import { PaymentMethod, Prisma, VisitStatus } from "../../generated/tenant-clien
 import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
 import type { CompletionsSummary, MobileVisitRow, RoundSummary } from "../types";
 import { tenantTodayRange } from "../../services/business-time";
+import { isLocationApproximate } from "../../integrations/geocoding/client";
 
 export const visitMobileInclude = {
   property: {
     select: {
-      id: true, addressLine: true, postcode: true, latitude: true, longitude: true,
+      id: true, addressLine: true, postcode: true, latitude: true, longitude: true, geocodePrecision: true,
       customer: { select: { id: true, name: true, badDebt: true, paymentMethod: true } },
       notes: { select: { id: true, type: true, body: true } },
     },
@@ -14,6 +15,7 @@ export const visitMobileInclude = {
   round: { select: { id: true, name: true } },
   service: { select: { id: true, name: true } },
   servicePlan: { select: { paymentMethod: true } },
+  payment: { select: { status: true } },
   _count: { select: { issues: true } },
 } satisfies Prisma.VisitInclude;
 
@@ -33,11 +35,17 @@ export function toRow(v: VisitMobile, position: number | null = null): MobileVis
     status: v.status,
     price: v.price.toNumber(),
     paymentMethod: effectiveMethod(v),
+    // Status of the visit's Payment (PENDING, PAID, FAILED...), null when no payment exists yet.
+    paymentStatus: v.payment?.status ?? null,
     customerName: v.property.customer.name,
     addressLine: v.property.addressLine,
     postcode: v.property.postcode,
     latitude: v.property.latitude,
     longitude: v.property.longitude,
+    geocodePrecision: v.property.geocodePrecision,
+    locationApproximate: isLocationApproximate(v.property.geocodePrecision, v.property.latitude),
+    carriedOver: v.carriedOverFromDate != null,
+    carriedOverFromDate: v.carriedOverFromDate?.toISOString().slice(0, 10) ?? null,
     roundId: v.roundId,
     roundName: v.round?.name ?? null,
     serviceName: v.service?.name ?? null,

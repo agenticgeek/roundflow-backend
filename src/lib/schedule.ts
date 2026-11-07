@@ -1,4 +1,5 @@
 import { CleaningFrequency, DayOfWeek } from "../generated/tenant-client";
+import { snapToWorkingDay } from "./working-days";
 
 // Single home for round/visit date maths. Visit dates are date-only values
 // stored as UTC midnight, so everything here works in UTC (getUTCDay /
@@ -36,14 +37,11 @@ export function addWeeks(date: Date, weeks: number): Date {
   return d;
 }
 
-// Snap to nearest working day: Sat → Mon, Sun → Mon. Used for plans whose
-// round has no defaultDay (same rule as the nightly generator).
-export function snapToWeekday(date: Date): Date {
-  const d = new Date(date);
-  const day = d.getUTCDay();
-  if (day === 6) d.setUTCDate(d.getUTCDate() + 2);
-  else if (day === 0) d.setUTCDate(d.getUTCDate() + 1);
-  return d;
+// Snap forward onto a working day (BusinessSettings.defaultWorkingDays via
+// lib/working-days; Mon-Fri when none given: Sat → Mon, Sun → Mon). Used for
+// plans whose round has no defaultDay (same rule as the nightly generator).
+export function snapToWeekday(date: Date, workingDays?: readonly string[] | null): Date {
+  return snapToWorkingDay(date, { workingDays });
 }
 
 // First `day` on or after `from` (same day if `from` already is one).

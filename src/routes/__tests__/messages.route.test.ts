@@ -93,3 +93,41 @@ describe("POST /messages/bulk", () => {
     expect(sendToRound).not.toHaveBeenCalled();
   });
 });
+
+describe("Idempotency-Key on POST /messages/* (BE-17)", () => {
+  function appWithRecords() {
+    const records = {
+      create: vi.fn().mockResolvedValue({}),
+      update: vi.fn().mockResolvedValue({}),
+      findUnique: vi.fn(),
+      deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+    };
+    const app = express();
+    app.use(express.json());
+    app.use((req: any, _res, next) => {
+      req.profile = { id: "p1" };
+      req.tenantPrisma = { idempotencyRecord: records };
+      next();
+    });
+    app.use("/messages", messagesRouter);
+    return { app, records };
+  }
+
+  it("a POST with the header claims the key per profile and stores the response; the message is sent once", async () => {
+    send.mockResolvedValue({ status: "sent", messageId: "m1", channel: "SMS" });
+    const { app, records } = appWithRecords();
+    const res = await request(app).post("/messages/send").set("Idempotency-Key", "dbl-click").send({ customerId: "c1", body: "hi" });
+    expect(res.status).toBe(201);
+    expect(records.create).toHaveBeenCalledWith({ data: expect.objectContaining({ key: "admin:p1:dbl-click", state: "IN_PROGRESS", route: "POST /messages/send" }) });
+    expect(records.update).toHaveBeenCalledWith(expect.objectContaining({ where: { key: "admin:p1:dbl-click" } }));
+  });
+
+  it("GET requests are never touched, and a POST without the header is unchanged", async () => {
+    listRoundRecipients.mockResolvedValue({ total: 0, reachable: 0, recipients: [] });
+    const { app, records } = appWithRecords();
+    await request(app).get("/messages/bulk/recipients?roundId=r1").set("Idempotency-Key", "k");
+    send.mockResolvedValue({ status: "sent", messageId: "m1", channel: "SMS" });
+    await request(app).post("/messages/send").send({ customerId: "c1", body: "hi" });
+    expect(records.create).not.toHaveBeenCalled();
+  });
+});

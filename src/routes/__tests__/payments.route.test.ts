@@ -8,7 +8,7 @@ vi.mock("../../middleware/requireAuth", () => ({
 }));
 vi.mock("../../middleware/requireTenantAccess", () => ({
   requireTenantAccess: (_req: any, _res: any, next: any) => {
-    _req.profile = { tenantId: "tenant-1", role: "ADMIN" };
+    _req.profile = { id: "profile-1", tenantId: "tenant-1", role: "ADMIN" };
     next();
   },
 }));
@@ -42,18 +42,32 @@ vi.mock("../../services/payment-hold", () => ({
 import { paymentsRouter } from "../payments";
 
 function makeTenantPrisma() {
-  return {
+  const tp: any = {
     businessSettings: { findFirst: vi.fn() },
-    invoice: { findUnique: vi.fn(), updateMany: vi.fn().mockResolvedValue({}) },
+    invoice: {
+      findUnique: vi.fn(),
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      findFirst: vi.fn().mockResolvedValue({ id: "inv-9", invoiceNumber: "INV-9", customerId: "cust-1" }),
+    },
     stripeSession: { findFirst: vi.fn(), create: vi.fn() },
     customer: { findUniqueOrThrow: vi.fn(), findUnique: vi.fn() },
     payment: {
       findUnique: vi.fn(),
       update: vi.fn().mockResolvedValue({}),
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
       count: vi.fn().mockResolvedValue(0),
       findMany: vi.fn().mockResolvedValue([]),
     },
+    activityLog: { create: vi.fn().mockResolvedValue({}) },
+    idempotencyRecord: {
+      create: vi.fn().mockResolvedValue({}),
+      update: vi.fn().mockResolvedValue({}),
+      findUnique: vi.fn(),
+      deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+    },
   };
+  tp.$transaction = vi.fn(async (fn: (t: unknown) => unknown) => fn(tp));
+  return tp;
 }
 
 function makeApp(tenantPrisma: ReturnType<typeof makeTenantPrisma>) {
@@ -298,12 +312,12 @@ describe("PATCH /payments/:id/status", () => {
     const res = await request(makeApp(tp)).patch("/payments/pay-1/status").send({ status: "PAID" });
 
     expect(res.status).toBe(200);
-    expect(tp.payment.update).toHaveBeenCalledWith({
-      where: { id: "pay-1" },
+    expect(tp.payment.updateMany).toHaveBeenCalledWith({
+      where: { id: "pay-1", status: "PENDING" },
       data: { status: "PAID", paidAt: expect.any(Date) },
     });
     expect(tp.invoice.updateMany).toHaveBeenCalledWith({
-      where: { visitId: "visit-1", status: { not: "PAID" } },
+      where: { visitId: "visit-1", status: { in: ["DRAFT", "SENT"] } },
       data: { status: "PAID", paidAt: expect.any(Date) },
     });
     expect(queueGhlEvent).toHaveBeenCalledWith(tp, "payment.collected", "cust-1");
@@ -317,12 +331,60 @@ describe("PATCH /payments/:id/status", () => {
     const res = await request(makeApp(tp)).patch("/payments/pay-2/status").send({ status: "FAILED" });
 
     expect(res.status).toBe(200);
-    expect(tp.payment.update).toHaveBeenCalledWith({
-      where: { id: "pay-2" },
+    expect(tp.payment.updateMany).toHaveBeenCalledWith({
+      where: { id: "pay-2", status: "PENDING" },
       data: { status: "FAILED", paidAt: null },
     });
     expect(tp.invoice.updateMany).not.toHaveBeenCalled();
     expect(queueGhlEvent).toHaveBeenCalledWith(tp, "payment.failed", "cust-2");
+  });
+
+  it("BE-07: an illegal manual move (FAILED on a CANCELLED cheque) is 409 INVALID_PAYMENT_TRANSITION and writes nothing", async () => {
+    const tp = makeTenantPrisma();
+    tp.payment.findUnique.mockResolvedValue({ id: "pay-3", method: "CHEQUE", status: "CANCELLED", customerId: "c", visitId: "v", paidAt: null });
+    const res = await request(makeApp(tp)).patch("/payments/pay-3/status").send({ status: "FAILED" });
+    expect(res.status).toBe(409);
+    expect(tp.payment.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /payments/stripe/checkout: expiry + idempotency (BE-17)", () => {
+  const prime = (tp: ReturnType<typeof makeTenantPrisma>) => {
+    tp.businessSettings.findFirst.mockResolvedValue(connectedBusinessSettings);
+    tp.invoice.findUnique.mockResolvedValue({ id: "inv-1", status: "SENT", customerId: "cust-1", invoiceNumber: "INV-1", amount: 35 });
+    tp.stripeSession.findFirst.mockResolvedValue(null);
+    tp.customer.findUniqueOrThrow.mockResolvedValue({ id: "cust-1" });
+    tp.stripeSession.create.mockResolvedValue({ id: "sess-new", url: "https://checkout.stripe.com/pay/cs_new" });
+    createOneTimeSession.mockResolvedValue({ stripeSessionId: "cs_new", url: "https://checkout.stripe.com/pay/cs_new", expiresAt: null });
+  };
+
+  it("only reuses PENDING sessions that have not expired", async () => {
+    const tp = makeTenantPrisma();
+    prime(tp);
+    await request(makeApp(tp)).post("/payments/stripe/checkout").send({ invoiceId: "inv-1" });
+    expect(tp.stripeSession.findFirst).toHaveBeenCalledWith({
+      where: { invoiceId: "inv-1", status: "PENDING", OR: [{ expiresAt: null }, { expiresAt: { gt: expect.any(Date) } }] },
+    });
+  });
+
+  it("passes the caller's Idempotency-Key to Stripe, records it per profile, and replays a repeat without a second session", async () => {
+    const tp = makeTenantPrisma();
+    prime(tp);
+    const app = makeApp(tp);
+    const first = await request(app).post("/payments/stripe/checkout").set("Idempotency-Key", "abc-123").send({ invoiceId: "inv-1" });
+    expect(first.status).toBe(201);
+    expect(createOneTimeSession).toHaveBeenCalledWith(expect.anything(), tp, expect.objectContaining({ idempotencyKey: "rf-key-tenant-1-abc-123" }));
+    expect(tp.idempotencyRecord.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ key: "admin:profile-1:abc-123", actorId: "profile-1", state: "IN_PROGRESS" }),
+    });
+  });
+
+  it("without the header no Stripe key is forced by the route (the service derives a stable one)", async () => {
+    const tp = makeTenantPrisma();
+    prime(tp);
+    await request(makeApp(tp)).post("/payments/stripe/checkout").send({ invoiceId: "inv-1" });
+    expect(createOneTimeSession).toHaveBeenCalledWith(expect.anything(), tp, expect.objectContaining({ idempotencyKey: undefined }));
+    expect(tp.idempotencyRecord.create).not.toHaveBeenCalled();
   });
 });
 

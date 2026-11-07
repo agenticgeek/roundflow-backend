@@ -25,15 +25,15 @@ vi.mock("gocardless-nodejs", () => ({
   InvalidSignatureError: class InvalidSignatureError extends Error {},
 }));
 
-const queueGhlEvent = vi.fn().mockResolvedValue(undefined);
-vi.mock("../../integrations/ghl/sync", () => ({
-  queueGhlEvent: (...args: unknown[]) => queueGhlEvent(...args),
+const transition = vi.fn().mockResolvedValue({ changed: true });
+vi.mock("../../services/payment.service", () => ({
+  createPaymentService: () => ({ transition: (...args: unknown[]) => transition(...args) }),
 }));
 
 function makeTenantPrisma() {
   return {
     businessSettings: { findFirst: vi.fn() },
-    webhookEvent: { create: vi.fn().mockResolvedValue({}) },
+    webhookEvent: { create: vi.fn().mockResolvedValue({}), findUnique: vi.fn(), updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
     payment: {
       updateMany: vi.fn().mockResolvedValue({}),
       findFirst: vi.fn(),
@@ -191,169 +191,155 @@ describe("POST /webhooks/gocardless — event processing", () => {
     parse.mockReturnValue(events);
     return tp;
   }
+  const pay = (action: string, extra: Record<string, unknown> = {}) => ({
+    id: "ev_1",
+    resource_type: "payments",
+    action,
+    links: { payment: "PM1" },
+    ...extra,
+  });
+  const dup = () => new Prisma.PrismaClientKnownRequestError("dup", { code: "P2002", clientVersion: "x" });
 
-  it("200s immediately and processes events async", async () => {
-    const tp = setup([{ id: "ev_1", resource_type: "payments", action: "paid", links: { payment: "PM1" } }]);
-    tp.payment.findFirst.mockResolvedValue({ customerId: "cust-1" });
+  it("BE-03: records each event RECEIVED with its payload, processes it, marks DONE and answers 200", async () => {
+    const tp = setup([pay("paid_out")]);
+    tp.payment.findUnique.mockResolvedValue({ id: "pay-1" });
 
     const res = await send("?tenantId=tenant-1&secret=abc");
+
     expect(res.status).toBe(200);
-    await vi.waitFor(() => expect(tp.webhookEvent.create).toHaveBeenCalledWith({
-      data: { source: "gocardless", externalId: "ev_1" },
-    }));
+    expect(tp.webhookEvent.create).toHaveBeenCalledWith({
+      data: { source: "gocardless", externalId: "ev_1", status: "RECEIVED", payload: pay("paid_out") },
+    });
+    expect(transition).toHaveBeenCalledWith("pay-1", "PAID", { note: undefined });
+    expect(tp.webhookEvent.updateMany).toHaveBeenLastCalledWith({
+      where: { source: "gocardless", externalId: "ev_1" },
+      data: expect.objectContaining({ status: "DONE" }),
+    });
   });
 
   it("skips an event with no id", async () => {
-    const tp = setup([{ resource_type: "payments", action: "paid" }]);
-    await send("?tenantId=tenant-1&secret=abc");
-    await new Promise((r) => setTimeout(r, 10));
+    const tp = setup([{ resource_type: "payments", action: "paid_out" }]);
+    const res = await send("?tenantId=tenant-1&secret=abc");
+    expect(res.status).toBe(200);
     expect(tp.webhookEvent.create).not.toHaveBeenCalled();
   });
 
-  it("skips a duplicate event (unique constraint) without processing it", async () => {
-    const tp = setup([{ id: "ev_1", resource_type: "payments", action: "paid", links: { payment: "PM1" } }]);
-    tp.webhookEvent.create.mockRejectedValue(
-      new Prisma.PrismaClientKnownRequestError("dup", { code: "P2002", clientVersion: "6.19.3" })
-    );
-
-    await send("?tenantId=tenant-1&secret=abc");
-    await vi.waitFor(() => expect(tp.webhookEvent.create).toHaveBeenCalled());
-    expect(tp.payment.updateMany).not.toHaveBeenCalled();
+  it("skips a duplicate whose row is DONE without processing it", async () => {
+    const tp = setup([pay("paid_out")]);
+    tp.webhookEvent.create.mockRejectedValue(dup());
+    tp.webhookEvent.findUnique.mockResolvedValue({ status: "DONE" });
+    const res = await send("?tenantId=tenant-1&secret=abc");
+    expect(res.status).toBe(200);
+    expect(transition).not.toHaveBeenCalled();
   });
 
-  it("logs and continues when recording an event fails for a non-duplicate reason", async () => {
-    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const tp = setup([
-      { id: "ev_1", resource_type: "payments", action: "paid", links: { payment: "PM1" } },
-      { id: "ev_2", resource_type: "payments", action: "paid", links: { payment: "PM2" } },
-    ]);
-    tp.webhookEvent.create.mockRejectedValueOnce(new Error("db down")).mockResolvedValueOnce({});
-    const row = { id: "pay-2", customerId: "cust-2", visitId: null, paidAt: null };
-    tp.payment.findFirst.mockResolvedValue(row);
-    tp.payment.findUnique.mockResolvedValue(row);
+  it("BE-03: a failing effect answers 500 (provider redelivers), leaves the event FAILED, and the redelivery reconciles it", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const tp = setup([pay("paid_out")]);
+    tp.payment.findUnique.mockResolvedValue({ id: "pay-1" });
+    transition.mockRejectedValueOnce(new Error("db blip"));
 
-    await send("?tenantId=tenant-1&secret=abc");
-
-    await vi.waitFor(() => expect(consoleSpy).toHaveBeenCalledWith(
-      expect.stringContaining("failed to record webhook event ev_1"),
-      expect.any(Error)
-    ));
-    // the second event in the batch still gets processed
-    await vi.waitFor(() => expect(tp.payment.update).toHaveBeenCalledWith({
-      where: { id: "pay-2" },
-      data: { status: "PAID", paidAt: expect.any(Date) },
-    }));
-    consoleSpy.mockRestore();
-  });
-
-  it("logs and continues when handling an individual event throws", async () => {
-    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const tp = setup([{ id: "ev_1", resource_type: "payments", action: "paid", links: { payment: "PM1" } }]);
-    tp.payment.findFirst.mockRejectedValue(new Error("boom"));
-
-    await send("?tenantId=tenant-1&secret=abc");
-
-    await vi.waitFor(() => expect(consoleSpy).toHaveBeenCalledWith(
-      expect.stringContaining("event ev_1 (payments.paid) failed"),
-      expect.any(Error)
-    ));
-    consoleSpy.mockRestore();
-  });
-
-  it("logs when the whole batch processing promise rejects", async () => {
-    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    tenantFindUnique.mockResolvedValue({ id: "tenant-1", schemaName: "tenant_1" });
-    const tp = makeTenantPrisma();
-    tp.businessSettings.findFirst.mockResolvedValue({
-      gocardlessWebhookSecretEncrypted: "abc",
-      gocardlessWebhookSigningSecretEncrypted: "real-signing-secret",
+    const first = await send("?tenantId=tenant-1&secret=abc");
+    expect(first.status).toBe(500);
+    expect(tp.webhookEvent.updateMany).toHaveBeenLastCalledWith({
+      where: { source: "gocardless", externalId: "ev_1" },
+      data: expect.objectContaining({ status: "FAILED", attempts: { increment: 1 } }),
     });
-    getTenantPrismaForSchema.mockReturnValue(tp);
-    // A non-array/malformed parse result makes the for..of in processEvents throw synchronously.
-    parse.mockReturnValue(null);
 
-    await send("?tenantId=tenant-1&secret=abc");
+    tp.webhookEvent.create.mockRejectedValue(dup());
+    tp.webhookEvent.findUnique.mockImplementation(async (args: { where: { source_externalId?: unknown } }) =>
+      args.where.source_externalId ? { status: "FAILED" } : { id: "pay-1" }
+    );
+    const second = await send("?tenantId=tenant-1&secret=abc");
+    expect(second.status).toBe(200);
+    expect(transition).toHaveBeenCalledTimes(2);
+    err.mockRestore();
+  });
 
-    await vi.waitFor(() => expect(consoleSpy).toHaveBeenCalledWith(
-      expect.stringContaining("processing failed"),
-      expect.anything()
-    ));
-    consoleSpy.mockRestore();
+  it("one failing event in a batch still processes the others, then answers 500", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const tp = setup([pay("paid_out", { id: "ev_a" }), pay("failed", { id: "ev_b", links: { payment: "PM2" } })]);
+    tp.payment.findUnique.mockResolvedValue({ id: "pay-x" });
+    transition.mockRejectedValueOnce(new Error("first fails"));
+    const res = await send("?tenantId=tenant-1&secret=abc");
+    expect(res.status).toBe(500);
+    expect(transition).toHaveBeenCalledTimes(2);
+    err.mockRestore();
+  });
+
+  it("500s when recording the event fails for a non-duplicate reason (nothing was recorded, the provider retries)", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const tp = setup([pay("paid_out")]);
+    tp.webhookEvent.create.mockRejectedValue(new Error("connection reset"));
+    const res = await send("?tenantId=tenant-1&secret=abc");
+    expect(res.status).toBe(500);
+    expect(transition).not.toHaveBeenCalled();
+    err.mockRestore();
   });
 
   describe("payments resource", () => {
-    function setupPayments(action: string) {
-      return setup([{ id: "ev_1", resource_type: "payments", action, links: { payment: "PM1" } }]);
-    }
-
-    it("does nothing when a payments event has no payment link", async () => {
-      const tp = setup([{ id: "ev_1", resource_type: "payments", action: "paid", links: {} }]);
-      await send("?tenantId=tenant-1&secret=abc");
-      await vi.waitFor(() => expect(tp.webhookEvent.create).toHaveBeenCalled());
-      expect(tp.payment.findFirst).not.toHaveBeenCalled();
+    it.each([
+      ["confirmed", "PROCESSING", undefined],
+      ["paid_out", "PAID", undefined],
+      ["failed", "FAILED", undefined],
+      ["cancelled", "CANCELLED", undefined],
+      ["charged_back", "DISPUTED", "GoCardless chargeback"],
+      ["chargeback_cancelled", "PAID", "GoCardless chargeback reversed"],
+      ["refunded", "REFUNDED", "GoCardless refund"],
+    ])("action '%s' moves the payment to %s through the state machine", async (action, target, note) => {
+      const tp = setup([pay(action)]);
+      tp.payment.findUnique.mockResolvedValue({ id: "pay-1" });
+      const res = await send("?tenantId=tenant-1&secret=abc");
+      expect(res.status).toBe(200);
+      expect(tp.payment.findUnique).toHaveBeenCalledWith({ where: { gocardlessId: "PM1" } });
+      expect(transition).toHaveBeenCalledWith("pay-1", target, { note });
     });
 
-    it("marks PAID and queues a GHL event on 'paid'", async () => {
-      const tp = setupPayments("paid");
-      const row = { id: "pay-1", customerId: "cust-1", visitId: null, paidAt: null };
-      tp.payment.findFirst.mockResolvedValue(row);
-      tp.payment.findUnique.mockResolvedValue(row);
+    it("'confirmed' is collecting, NOT paid: it never reaches PAID", async () => {
+      const tp = setup([pay("confirmed")]);
+      tp.payment.findUnique.mockResolvedValue({ id: "pay-1" });
       await send("?tenantId=tenant-1&secret=abc");
-      await vi.waitFor(() => expect(tp.payment.update).toHaveBeenCalledWith({
-        where: { id: "pay-1" },
-        data: { status: "PAID", paidAt: expect.any(Date) },
-      }));
-      await vi.waitFor(() => expect(queueGhlEvent).toHaveBeenCalledWith(tp, "payment.collected", "cust-1"));
+      expect(transition).not.toHaveBeenCalledWith("pay-1", "PAID", expect.anything());
     });
 
-    it("skips the outcome handler on 'confirmed' when no payment row is found", async () => {
-      const tp = setupPayments("confirmed");
-      tp.payment.findFirst.mockResolvedValue(null);
+    it("ignores an event for a payment we do not know, an unmapped action, a missing action and a missing link", async () => {
+      const tp = setup([pay("paid_out")]);
+      tp.payment.findUnique.mockResolvedValue(null);
+      expect((await send("?tenantId=tenant-1&secret=abc")).status).toBe(200);
+
+      setup([pay("created")]);
       await send("?tenantId=tenant-1&secret=abc");
-      await vi.waitFor(() => expect(tp.payment.findFirst).toHaveBeenCalled());
-      await new Promise((r) => setTimeout(r, 10));
-      expect(tp.payment.update).not.toHaveBeenCalled();
-      expect(queueGhlEvent).not.toHaveBeenCalled();
+      setup([{ id: "ev_1", resource_type: "payments", links: { payment: "PM1" } }]);
+      await send("?tenantId=tenant-1&secret=abc");
+      setup([{ id: "ev_1", resource_type: "payments", action: "paid_out", links: {} }]);
+      await send("?tenantId=tenant-1&secret=abc");
+      expect(transition).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("refunds resource (BE-08)", () => {
+    const refund = (action?: string, links: Record<string, string> = { payment: "PM1" }) => ({
+      id: "ev_r",
+      resource_type: "refunds",
+      ...(action ? { action } : {}),
+      links,
     });
 
-    it("skips the outcome handler on 'failed' when no payment row is found", async () => {
-      const tp = setupPayments("failed");
-      tp.payment.findFirst.mockResolvedValue(null);
+    it.each(["paid", "refund_settled"])("a settled refund ('%s') moves the payment to REFUNDED", async (action) => {
+      const tp = setup([refund(action)]);
+      tp.payment.findUnique.mockResolvedValue({ id: "pay-1" });
       await send("?tenantId=tenant-1&secret=abc");
-      await vi.waitFor(() => expect(tp.payment.findFirst).toHaveBeenCalled());
-      await new Promise((r) => setTimeout(r, 10));
-      expect(tp.payment.update).not.toHaveBeenCalled();
-      expect(queueGhlEvent).not.toHaveBeenCalled();
+      expect(transition).toHaveBeenCalledWith("pay-1", "REFUNDED", { note: "GoCardless refund" });
     });
 
-    it("marks FAILED and queues a GHL event on 'failed'", async () => {
-      const tp = setupPayments("failed");
-      const row = { id: "pay-1", customerId: "cust-1", visitId: null, paidAt: null };
-      tp.payment.findFirst.mockResolvedValue(row);
-      tp.payment.findUnique.mockResolvedValue(row);
+    it("ignores unsettled refund actions, a missing action and a refund with no payment link", async () => {
+      setup([refund("created")]);
       await send("?tenantId=tenant-1&secret=abc");
-      await vi.waitFor(() => expect(tp.payment.update).toHaveBeenCalledWith({
-        where: { id: "pay-1" },
-        data: { status: "FAILED", paidAt: null },
-      }));
-      await vi.waitFor(() => expect(queueGhlEvent).toHaveBeenCalledWith(tp, "payment.failed", "cust-1"));
-    });
-
-    it("marks CANCELLED on 'cancelled'", async () => {
-      const tp = setupPayments("cancelled");
+      setup([refund()]);
       await send("?tenantId=tenant-1&secret=abc");
-      await vi.waitFor(() => expect(tp.payment.updateMany).toHaveBeenCalledWith({
-        where: { gocardlessId: "PM1" },
-        data: { status: "CANCELLED" },
-      }));
-    });
-
-    it("does nothing for an unrecognised action", async () => {
-      const tp = setupPayments("something_else");
+      setup([refund("paid", {})]);
       await send("?tenantId=tenant-1&secret=abc");
-      await vi.waitFor(() => expect(tp.webhookEvent.create).toHaveBeenCalled());
-      await new Promise((r) => setTimeout(r, 10));
-      expect(tp.payment.updateMany).not.toHaveBeenCalled();
+      expect(transition).not.toHaveBeenCalled();
     });
   });
 
@@ -365,42 +351,55 @@ describe("POST /webhooks/gocardless — event processing", () => {
     it("does nothing when a mandates event has no mandate link", async () => {
       const tp = setup([{ id: "ev_1", resource_type: "mandates", action: "active", links: {} }]);
       await send("?tenantId=tenant-1&secret=abc");
-      await vi.waitFor(() => expect(tp.webhookEvent.create).toHaveBeenCalled());
       expect(tp.customer.updateMany).not.toHaveBeenCalled();
     });
 
     it.each(["active", "cancelled", "failed", "expired"])("maps action '%s' to the matching mandate status", async (action) => {
       const tp = setupMandate(action);
       await send("?tenantId=tenant-1&secret=abc");
-      await vi.waitFor(() => expect(tp.customer.updateMany).toHaveBeenCalledWith({
+      expect(tp.customer.updateMany).toHaveBeenCalledWith({
         where: { gocardlessMandateId: "MD1" },
         data: { gocardlessMandateStatus: action },
-      }));
+      });
     });
 
-    it("does nothing for an unrecognised mandate action", async () => {
+    it("does nothing for an unrecognised mandate action or a missing one", async () => {
       const tp = setupMandate("something_else");
       await send("?tenantId=tenant-1&secret=abc");
-      await vi.waitFor(() => expect(tp.webhookEvent.create).toHaveBeenCalled());
-      await new Promise((r) => setTimeout(r, 10));
-      expect(tp.customer.updateMany).not.toHaveBeenCalled();
-    });
-
-    it("does nothing when a mandates event has no action at all", async () => {
-      const tp = setup([{ id: "ev_1", resource_type: "mandates", links: { mandate: "MD1" } }]);
+      const tp2 = setup([{ id: "ev_1", resource_type: "mandates", links: { mandate: "MD1" } }]);
       await send("?tenantId=tenant-1&secret=abc");
-      await vi.waitFor(() => expect(tp.webhookEvent.create).toHaveBeenCalled());
-      await new Promise((r) => setTimeout(r, 10));
       expect(tp.customer.updateMany).not.toHaveBeenCalled();
+      expect(tp2.customer.updateMany).not.toHaveBeenCalled();
     });
   });
 
   it("does nothing for an unrecognised resource_type", async () => {
-    const tp = setup([{ id: "ev_1", resource_type: "refunds", action: "created" }]);
-    await send("?tenantId=tenant-1&secret=abc");
-    await vi.waitFor(() => expect(tp.webhookEvent.create).toHaveBeenCalled());
-    await new Promise((r) => setTimeout(r, 10));
-    expect(tp.payment.updateMany).not.toHaveBeenCalled();
+    const tp = setup([{ id: "ev_1", resource_type: "payouts", action: "paid" }]);
+    const res = await send("?tenantId=tenant-1&secret=abc");
+    expect(res.status).toBe(200);
+    expect(transition).not.toHaveBeenCalled();
     expect(tp.customer.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /webhooks/gocardless — BE-02 crash safety", () => {
+  it("500s (and never crashes) when the tenant lookup throws", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    tenantFindUnique.mockRejectedValue(new Error("db down"));
+    const res = await send("?tenantId=t1&secret=abc");
+    expect(res.status).toBe(500);
+    consoleSpy.mockRestore();
+  });
+
+  it("500s when decrypt throws on a corrupt stored secret", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    tenantFindUnique.mockResolvedValue({ id: "t1", schemaName: "s1" });
+    const tp = makeTenantPrisma();
+    tp.businessSettings.findFirst.mockResolvedValue({ gocardlessWebhookSecretEncrypted: "garbage" });
+    getTenantPrismaForSchema.mockReturnValue(tp);
+    decrypt.mockImplementationOnce(() => { throw new Error("bad ciphertext"); });
+    const res = await send("?tenantId=t1&secret=abc");
+    expect(res.status).toBe(500);
+    consoleSpy.mockRestore();
   });
 });

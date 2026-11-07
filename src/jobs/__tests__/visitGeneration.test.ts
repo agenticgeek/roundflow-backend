@@ -192,6 +192,44 @@ describe("generateForRound", () => {
     expect(queueGhlEvent).not.toHaveBeenCalled();
   });
 
+  it("does not duplicate a carried-over visit: a SCHEDULED visit moved to a later day still counts as the plan's open visit (ACT-02..04)", async () => {
+    const carried = { id: "v-carried", status: "SCHEDULED", date: new Date("2026-03-09T00:00:00Z"), carryoverCount: 1 };
+    const tp: any = withProperties([property()], {
+      visit: { findFirst: vi.fn().mockResolvedValue(carried), create: vi.fn() },
+    });
+
+    const created = await generateForRound(tp, { id: "round-1", frequency: null }, TODAY);
+
+    expect(created).toBe(0);
+    expect(tp.visit.create).not.toHaveBeenCalled();
+    expect(tp.servicePlan.update).not.toHaveBeenCalled();
+    expect(tp.visit.findFirst).toHaveBeenCalledWith({
+      where: { servicePlanId: "plan-1", status: { in: ["SCHEDULED", "IN_PROGRESS"] }, date: { gte: TODAY } },
+      select: { id: true },
+    });
+  });
+
+  it("snaps a roundless visit date to the business working days (Sat is a working day for a Mon-Sat business, Sunday is not)", async () => {
+    const sat = new Date("2026-03-07T00:00:00Z");
+    const sun = new Date("2026-03-08T00:00:00Z");
+    const run = async (nextDueDate: Date, workingDays?: string[]) => {
+      const tp: any = withProperties([property({ servicePlans: [plan({ nextDueDate })] })]);
+      await generateForRound(tp, { id: "round-1", frequency: null }, new Date("2026-03-09T00:00:00Z"), workingDays);
+      return tp.visit.create.mock.calls[0][0].data.date as Date;
+    };
+    expect(await run(sat)).toEqual(new Date("2026-03-09T00:00:00Z")); // default Mon-Fri: Sat -> Mon
+    expect(await run(sat, ["MON", "TUE", "WED", "THU", "FRI", "SAT"])).toEqual(sat);
+    expect(await run(sun, ["MON", "TUE", "WED", "THU", "FRI", "SAT"])).toEqual(new Date("2026-03-09T00:00:00Z"));
+  });
+
+  it("loads the working days itself when the caller does not pass them (generate-visits endpoint)", async () => {
+    const tp: any = withProperties([property({ servicePlans: [plan({ nextDueDate: new Date("2026-03-07T00:00:00Z") })] })], {
+      businessSettings: { findFirst: vi.fn().mockResolvedValue({ defaultWorkingDays: ["SAT"] }) },
+    });
+    await generateForRound(tp, { id: "round-1", frequency: null }, new Date("2026-03-09T00:00:00Z"));
+    expect(tp.visit.create.mock.calls[0][0].data.date).toEqual(new Date("2026-03-07T00:00:00Z"));
+  });
+
   it("does not create a visit inside a future-dated pause window (A4)", async () => {
     const windows = [
       { pauseStartDate: new Date("2026-03-01T00:00:00Z"), pauseEndDate: null },                            // open-ended
@@ -309,6 +347,19 @@ describe("runVisitGeneration", () => {
 
     expect(tp.servicePlan.findMany).toHaveBeenCalledTimes(2);
     expect(tp.round.findMany).not.toHaveBeenCalled();
+  });
+
+  it("passes the tenant's working days to every round", async () => {
+    tenantFindMany.mockResolvedValue([{ schemaName: "t_1" }]);
+    const tp = makeTp({
+      businessSettings: { findFirst: vi.fn().mockResolvedValue({ autoCreateNextVisit: true, defaultWorkingDays: ["SAT"] }) },
+      round: { findMany: vi.fn().mockResolvedValue([{ id: "r1", frequency: null, defaultDay: null }]) },
+      property: { findMany: vi.fn().mockResolvedValue([property({ servicePlans: [plan({ nextDueDate: new Date("2000-01-01T00:00:00Z") })] })]) },
+    });
+    getTenantPrismaForSchema.mockReturnValue(tp);
+    await runVisitGeneration();
+    expect(tp.businessSettings.findFirst).toHaveBeenCalledWith({ select: { autoCreateNextVisit: true, defaultWorkingDays: true } });
+    expect(tp.visit.create.mock.calls[0][0].data.date.getUTCDay()).toBe(6);
   });
 
   it("generates when autoCreateNextVisit is on", async () => {

@@ -6,6 +6,7 @@ import { createInvoiceService } from "../invoice.service";
 
 function makePrisma() {
   const prisma = {
+    customer: { findUnique: vi.fn().mockResolvedValue({ id: "cust-1" }) },
     invoice: { findMany: vi.fn(), findUnique: vi.fn(), create: vi.fn(), update: vi.fn() },
     visit: { findUnique: vi.fn() },
     businessSettings: { findFirst: vi.fn() },
@@ -536,9 +537,52 @@ it("getRenderData computes VAT when vatInInvoices is true", async () => {
   expect(result.total).toBe(35);
   expect(result.vatAmount).toBeGreaterThan(0);
   expect(result.subtotal).toBe(+(35 - result.vatAmount).toFixed(2));
-  expect(result.business).toEqual({ name: "RoundFlow Ltd", email: "hello@roundflow.ai" });
+  expect(result.business).toMatchObject({ name: "RoundFlow Ltd", email: "hello@roundflow.ai" });
   expect(result.currency).toBe("£");
   expect(result.status).toBe("SENT");
+});
+
+it("getRenderData carries the tenant's address, VAT/company numbers, bank details, terms, footer and payment reference (GHL-10)", async () => {
+  const prisma = makePrisma();
+  (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(renderInvoice());
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+    vatInInvoices: false, currency: "£", businessName: "Shine Ltd", email: "hi@shine.test", phone: " 0123 ",
+    addressLine1: "1 Main St", addressLine2: "  ", town: "Leeds", postcode: "LS1 1AA",
+    vatRegistered: true, vatRegistration: "GB123", companyNumber: "0123",
+    bankDetails: { accountName: "Shine Ltd", bankName: "Bank plc", accountNumber: "12345678", sortCode: "12-34-56" },
+    invoiceDueDays: 14, paymentTerms: null, invoiceFooter: " Thanks ",
+  });
+  const result = await createInvoiceService(prisma).getRenderData("inv-1");
+  expect(result.business).toEqual({
+    name: "Shine Ltd", email: "hi@shine.test", phone: "0123",
+    address: { line1: "1 Main St", line2: null, town: "Leeds", postcode: "LS1 1AA" },
+    vatNumber: "GB123", companyNumber: "0123",
+    bank: { accountName: "Shine Ltd", bankName: "Bank plc", sortCode: "12-34-56", accountNumber: "12345678" },
+    paymentTerms: "Payment due within 14 days",
+    invoiceFooter: "Thanks",
+  });
+  expect(result.paymentReference).toBe("INV-2026-001");
+});
+
+it("getRenderData prefers the free-text paymentTerms and ignores malformed bank details", async () => {
+  // the settings cache is per client instance, so each case gets its own
+  const bankFor = async (bankDetails: unknown, paymentTerms: string | null = "Net 30") => {
+    const prisma = makePrisma();
+    (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(renderInvoice());
+    (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+      vatInInvoices: false, businessName: "B", paymentTerms, invoiceDueDays: 7, bankDetails,
+    });
+    return (await createInvoiceService(prisma).getRenderData("inv-1")).business;
+  };
+  expect((await bankFor("nope")).paymentTerms).toBe("Net 30");
+  expect((await bankFor("nope")).bank).toBeNull();
+  expect((await bankFor({ accountName: "A", accountNumber: "1" })).bank).toBeNull();
+  expect((await bankFor(null, null)).bank).toBeNull();
+  expect((await bankFor({ accountName: "A", accountNumber: "1", sortCode: "  " })).bank).toBeNull();
+  expect((await bankFor({ accountName: "A", accountNumber: "1", sortCode: "2", bankName: 7 })).bank).toEqual({
+    accountName: "A", bankName: null, sortCode: "2", accountNumber: "1",
+  });
+  expect((await bankFor(null, null)).paymentTerms).toBe("Payment due within 7 days");
 });
 
 it("getRenderData sets vatAmount to 0 when settings are absent", async () => {
@@ -551,7 +595,10 @@ it("getRenderData sets vatAmount to 0 when settings are absent", async () => {
   expect(result.vatAmount).toBe(0);
   expect(result.subtotal).toBe(35);
   expect(result.currency).toBe("£");
-  expect(result.business).toEqual({ name: null, email: null });
+  expect(result.business).toEqual({
+    name: null, email: null, phone: null, address: null, vatNumber: null, companyNumber: null, bank: null,
+    paymentTerms: "Payment due within 7 days", invoiceFooter: null,
+  });
 });
 
 it("getRenderData formats dueDate when present", async () => {

@@ -40,6 +40,14 @@ vi.mock("../../integrations/pdf/render", () => ({
   invoiceHtml: (...args: unknown[]) => invoiceHtml(...args),
 }));
 
+const batchPreview = vi.fn();
+const batchSend = vi.fn();
+const getBatch = vi.fn();
+vi.mock("../../services/invoice-send-batch.service", () => ({
+  MAX_BATCH: 500,
+  createInvoiceSendBatchService: vi.fn(() => ({ preview: batchPreview, send: batchSend, getBatch })),
+}));
+
 import { invoicesRouter } from "../invoices";
 import { AppError } from "../../lib/app-error";
 
@@ -52,7 +60,7 @@ function makeApp() {
   });
   app.use("/invoices", invoicesRouter);
   app.use((err: any, _req: any, res: any, _next: any) => {
-    res.status(err.statusCode ?? 500).json({ error: err.message ?? "Internal error" });
+    res.status(err.statusCode ?? 500).json({ error: err.message ?? "Internal error", code: err.code });
   });
   return app;
 }
@@ -159,17 +167,57 @@ describe("POST /invoices", () => {
     expect(createInvoice).toHaveBeenCalledWith({ visitId: "visit-1", notes: null, dueDate: null, sendEmail: false });
   });
 
-  it("passes through notes/dueDate/sendEmail when provided", async () => {
+  it("BUG-006/007: a garbage or impossible dueDate is a 400 (never a 500), nothing is created", async () => {
+    for (const dueDate of ["garbage", "2026-02-30", "2027-02-29"]) {
+      const res = await request(makeApp()).post("/invoices").send({ visitId: "visit-1", dueDate });
+      expect(res.status).toBe(400);
+    }
+    expect(createInvoice).not.toHaveBeenCalled();
+  });
+
+  it("passes through notes/dueDate when provided", async () => {
     createInvoice.mockResolvedValue({ id: "inv-1" });
 
     const res = await request(makeApp())
       .post("/invoices")
-      .send({ visitId: "visit-1", notes: "please pay promptly", dueDate: "2026-11-01", sendEmail: true });
+      .send({ visitId: "visit-1", notes: "please pay promptly", dueDate: "2026-11-01", sendEmail: false });
 
     expect(res.status).toBe(201);
     expect(createInvoice).toHaveBeenCalledWith({
-      visitId: "visit-1", notes: "please pay promptly", dueDate: "2026-11-01", sendEmail: true,
+      visitId: "visit-1", notes: "please pay promptly", dueDate: "2026-11-01", sendEmail: false,
     });
+  });
+
+  it("BUG-008: sendEmail must be a boolean", async () => {
+    for (const sendEmail of ["yes", 1, "true", {}]) {
+      expect((await request(makeApp()).post("/invoices").send({ visitId: "visit-1", sendEmail })).status).toBe(400);
+    }
+    expect(createInvoice).not.toHaveBeenCalled();
+  });
+
+  it("sendEmail:true creates the invoice, then emails it (EMAIL channel) and reports emailSent", async () => {
+    createInvoice.mockResolvedValue({ id: "inv-1", invoiceNumber: "INV-1" });
+    sendInvoice.mockResolvedValue({ id: "inv-1", status: "SENT", messageId: "m1", pdfAttached: true });
+    const res = await request(makeApp()).post("/invoices").send({ visitId: "visit-1", sendEmail: true });
+    expect(res.status).toBe(201);
+    expect(createInvoice).toHaveBeenCalledWith({ visitId: "visit-1", notes: null, dueDate: null, sendEmail: false });
+    expect(sendInvoice).toHaveBeenCalledWith("inv-1", { channel: "EMAIL" });
+    expect(res.body).toMatchObject({ id: "inv-1", emailSent: true, pdfAttached: true });
+  });
+
+  it("sendEmail:true keeps the created invoice when the email cannot be sent and says why", async () => {
+    createInvoice.mockResolvedValue({ id: "inv-1", invoiceNumber: "INV-1" });
+    sendInvoice.mockRejectedValue(Object.assign(new Error("Customer has no email address on file"), { statusCode: 400, code: "NO_CONTACT_FOR_CHANNEL" }));
+    const res = await request(makeApp()).post("/invoices").send({ visitId: "visit-1", sendEmail: true });
+    expect(res.status).toBe(201);
+    expect(res.body).toMatchObject({ id: "inv-1", emailSent: false, emailError: { code: "NO_CONTACT_FOR_CHANNEL", message: "Customer has no email address on file" } });
+  });
+
+  it("sendEmail:true reports a plain error without a code", async () => {
+    createInvoice.mockResolvedValue({ id: "inv-1" });
+    sendInvoice.mockRejectedValue(new Error("boom"));
+    const res = await request(makeApp()).post("/invoices").send({ visitId: "visit-1", sendEmail: true });
+    expect(res.body.emailError).toEqual({ code: "EMAIL_SEND_FAILED", message: "boom" });
   });
 });
 
@@ -196,6 +244,57 @@ describe("POST /invoices/:id/send", () => {
     sendInvoice.mockRejectedValue(new AppError(409, "Invoice has already been sent", "INVOICE_ALREADY_SENT"));
     const res = await request(makeApp()).post("/invoices/inv-1/send");
     expect(res.status).toBe(409);
+  });
+});
+
+describe("bulk send (ACT-01)", () => {
+  it("accepts OVERDUE as a list status filter", async () => {
+    listInvoices.mockResolvedValue({ rows: [] });
+    expect((await request(makeApp()).get("/invoices?status=OVERDUE")).status).toBe(200);
+    expect(listInvoices).toHaveBeenCalledWith(expect.objectContaining({ status: "OVERDUE" }), 1, 50);
+  });
+
+  it("POST /invoices/bulk-send/preview defaults to no ids/status and parses the view filters", async () => {
+    batchPreview.mockResolvedValue({ total: 0 });
+    const res = await request(makeApp()).post("/invoices/bulk-send/preview").send({});
+    expect(res.status).toBe(200);
+    expect(batchPreview).toHaveBeenCalledWith({
+      ids: undefined, status: undefined, filters: { customerId: undefined, q: undefined, from: undefined, to: undefined },
+      channel: undefined, resend: false,
+    });
+    await request(makeApp()).post("/invoices/bulk-send/preview").send({
+      status: "OVERDUE", channel: "email", resend: true, filters: { customerId: "c1", q: " jo ", from: "2026-10-01", to: "2026-10-31" },
+    });
+    expect(batchPreview).toHaveBeenLastCalledWith({
+      ids: undefined, status: "OVERDUE", channel: "EMAIL", resend: true,
+      filters: { customerId: "c1", q: "jo", from: new Date("2026-10-01T00:00:00Z"), to: new Date("2026-10-31T00:00:00Z") },
+    });
+  });
+
+  it("POST /invoices/bulk-send answers 202 with the batch", async () => {
+    batchSend.mockResolvedValue({ batchId: "b1", queued: 2, skipped: [] });
+    const res = await request(makeApp()).post("/invoices/bulk-send").send({ ids: ["i1", "i2"] });
+    expect(res.status).toBe(202);
+    expect(res.body).toEqual({ batchId: "b1", queued: 2, skipped: [] });
+    expect(batchSend).toHaveBeenCalledWith(expect.objectContaining({ ids: ["i1", "i2"] }));
+  });
+
+  it("validates ids size, status, filters and channel", async () => {
+    const app = makeApp();
+    expect((await request(app).post("/invoices/bulk-send").send({ ids: [] })).status).toBe(400);
+    expect((await request(app).post("/invoices/bulk-send").send({ ids: Array(501).fill("x") })).status).toBe(400);
+    expect((await request(app).post("/invoices/bulk-send").send({ status: "LOST" })).status).toBe(400);
+    expect((await request(app).post("/invoices/bulk-send").send({ filters: { from: "bad" } })).status).toBe(400);
+    expect((await request(app).post("/invoices/bulk-send").send({ channel: "PIGEON" })).status).toBe(400);
+    expect(batchSend).not.toHaveBeenCalled();
+  });
+
+  it("GET /invoices/bulk-send/:batchId is not captured by /:id", async () => {
+    getBatch.mockResolvedValue({ batchId: "b1", results: [] });
+    const res = await request(makeApp()).get("/invoices/bulk-send/b1");
+    expect(res.status).toBe(200);
+    expect(getBatch).toHaveBeenCalledWith("b1");
+    expect(getInvoice).not.toHaveBeenCalled();
   });
 });
 
@@ -231,6 +330,13 @@ describe("GET /invoices (list) and /invoices/export.csv", () => {
     expect((await request(makeApp()).get("/invoices?status=LOST")).status).toBe(400);
     expect((await request(makeApp()).get("/invoices?from=30-10-2026")).status).toBe(400);
     expect(listInvoices).not.toHaveBeenCalled();
+  });
+
+  it("exports the derived OVERDUE status too", async () => {
+    exportInvoices.mockResolvedValue([]);
+    const res = await request(makeApp()).get("/invoices/export.csv?status=OVERDUE");
+    expect(res.status).toBe(200);
+    expect(exportInvoices).toHaveBeenCalledWith(expect.objectContaining({ status: "OVERDUE" }));
   });
 
   it("exports CSV (not captured by /:id)", async () => {
@@ -273,10 +379,12 @@ describe("POST /invoices/bulk/preview and /invoices/bulk", () => {
 });
 
 describe("POST /invoices/:id/mark-paid", () => {
-  it("validates the method", async () => {
-    expect((await request(makeApp()).post("/invoices/inv-1/mark-paid").send({ method: "STRIPE" })).status).toBe(400);
+  it("BUG-009: the invoice is looked up (404) before the body is judged: the method is validated by the service", async () => {
+    markPaid.mockRejectedValueOnce(new AppError(404, "Invoice not found"));
+    expect((await request(makeApp()).post("/invoices/nope/mark-paid").send({ method: "STRIPE" })).status).toBe(404);
+    markPaid.mockRejectedValueOnce(new AppError(400, "method must be one of: BACS, CHEQUE, CASH"));
     expect((await request(makeApp()).post("/invoices/inv-1/mark-paid").send({})).status).toBe(400);
-    expect(markPaid).not.toHaveBeenCalled();
+    expect(markPaid).toHaveBeenCalledWith("inv-1", expect.objectContaining({ method: undefined }), expect.anything());
   });
 
   it("validates reference, paidAt and amount", async () => {

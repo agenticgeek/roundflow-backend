@@ -1,5 +1,5 @@
 import { DayOfWeek, PaymentMethod, NoteType, CleaningFrequency, RoundStatus, MessageChannel, PropertyType } from "../generated/tenant-client";
-import { AppError } from "./app-error";
+import { AppError, ValidationError } from "./app-error";
 
 // Shared request-value validators used by both the /setup and /settings routers,
 // so a fix lands in one place (see PR review §9 for the wider dedup this seeds).
@@ -66,16 +66,37 @@ export function assertNonNegative(v: number, field: string, max?: number): numbe
   return v;
 }
 
-/** Parse a required ISO date string → Date; throws AppError(400) if invalid. */
+/** True when year/month/day is a real calendar date (Date.UTC would silently roll 2026-02-30 over to March). */
+function isRealCalendarDate(year: number, month: number, day: number): boolean {
+  const d = new Date(Date.UTC(year, month - 1, day));
+  return d.getUTCFullYear() === year && d.getUTCMonth() === month - 1 && d.getUTCDate() === day;
+}
+
+/** Parse a required ISO date string → Date; throws AppError(400) if invalid. A leading YYYY-MM-DD must be a real
+ *  calendar date: 2026-02-29 and 2026-04-31 are rejected, never rolled over (BUG-007). */
 export function parseIsoDate(v: unknown, field: string): Date {
   if (typeof v !== "string" || v.trim() === "") {
     throw new AppError(400, `"${field}" is required and must be an ISO date string.`);
+  }
+  const lead = /^(\d{4})-(\d{2})-(\d{2})/.exec(v.trim());
+  if (lead && !isRealCalendarDate(Number(lead[1]), Number(lead[2]), Number(lead[3]))) {
+    throw new AppError(400, `"${field}" must be a valid calendar date.`);
   }
   const d = new Date(v);
   if (Number.isNaN(d.getTime())) {
     throw new AppError(400, `"${field}" must be a valid ISO date.`);
   }
   return d;
+}
+
+/** Strict "YYYY-MM-DD" → UTC-midnight Date (400 for any other shape or an impossible date). */
+export function assertCalendarDate(v: unknown, field: string): Date {
+  const match = typeof v === "string" ? DATE_ONLY_RE.exec(v) : null;
+  if (!match) throw new AppError(400, `"${field}" must be a YYYY-MM-DD date`);
+  if (!isRealCalendarDate(Number(match[1]), Number(match[2]), Number(match[3]))) {
+    throw new AppError(400, `"${field}" must be a valid calendar date`);
+  }
+  return new Date(`${v}T00:00:00.000Z`);
 }
 
 // YYYY-MM-DD, checked for calendar validity below (not just regex shape) —
@@ -196,8 +217,86 @@ export function optMessageChannel(v: unknown): MessageChannel | undefined {
 
 // ---- Invite helpers --------------------------------------------------------
 
+// Strict: no whitespace, CR/LF, angle brackets or quotes (header injection once email is sent), real domain labels,
+// RFC length caps (BUG-008).
+const EMAIL_RE = /^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
+
 export function isValidEmail(v: string): boolean {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+  return v.length <= 254 && v.indexOf("@") <= 64 && EMAIL_RE.test(v);
+}
+
+const fieldError = (field: string, code: string, message: string) => new ValidationError(message, [{ path: field, code, message }], code);
+
+/** Optional email: undefined = omitted, null/blank = clear, else a valid address (trimmed). 400 with fields[] otherwise. */
+export function optEmail(v: unknown, field: string): string | null | undefined {
+  if (v === undefined) return undefined;
+  if (v === null) return null;
+  const email = typeof v === "string" ? v.trim() : "";
+  if (typeof v === "string" && email === "") return null;
+  if (!isValidEmail(email)) throw fieldError(field, "INVALID_EMAIL_ADDRESS", `"${field}" must be a valid email address`);
+  return email;
+}
+
+/** Optional IANA time zone (Europe/London). An invented zone would break every date calculation of the tenant. */
+export function optTimeZone(v: unknown, field: string): string | null | undefined {
+  if (v === undefined || v === null) return v;
+  const ok =
+    typeof v === "string" &&
+    /^[A-Za-z_]+(\/[A-Za-z_+\-0-9]+)*$/.test(v) &&
+    (() => {
+      try {
+        new Intl.DateTimeFormat("en-GB", { timeZone: v });
+        return true;
+      } catch {
+        return false;
+      }
+    })();
+  if (!ok) throw fieldError(field, "INVALID_TIMEZONE", `"${field}" must be an IANA time zone such as Europe/London`);
+  return v as string;
+}
+
+const CURRENCY_SYMBOLS = ["£", "$", "€", "¥", "₹", "kr", "zł", "Fr"];
+const ISO_CURRENCIES: Set<string> = new Set((Intl as unknown as { supportedValuesOf(k: string): string[] }).supportedValuesOf("currency"));
+
+/** Optional currency: an ISO 4217 code (GBP) or a currency symbol (£), which is what BusinessSettings has always stored. */
+export function optCurrency(v: unknown, field: string): string | null | undefined {
+  if (v === undefined || v === null) return v;
+  if (typeof v === "string") {
+    if (CURRENCY_SYMBOLS.includes(v)) return v;
+    if (ISO_CURRENCIES.has(v.toUpperCase())) return v.toUpperCase();
+  }
+  throw fieldError(field, "INVALID_CURRENCY", `"${field}" must be an ISO 4217 code such as GBP, or a symbol such as £`);
+}
+
+/** UK bank details: 6-digit sort code (dashes optional) and 8-digit account number. */
+export function assertUkBankFormat(sortCode: string, accountNumber: string): void {
+  const problems: Array<{ path: string; code: string; message: string }> = [];
+  if (!/^\d{2}-?\d{2}-?\d{2}$/.test(sortCode)) problems.push({ path: "bankDetails.sortCode", code: "INVALID_BANK_DETAILS", message: "sortCode must be 6 digits, e.g. 12-34-56" });
+  if (!/^\d{8}$/.test(accountNumber)) problems.push({ path: "bankDetails.accountNumber", code: "INVALID_BANK_DETAILS", message: "accountNumber must be 8 digits" });
+  if (problems.length > 0) throw new ValidationError("Invalid bank details", problems, "INVALID_BANK_DETAILS");
+}
+
+/** Optional working-days list: omitted = untouched; anything but an array of DayOfWeek values is a 400. */
+export function optWorkingDaysArray(v: unknown): string[] | undefined {
+  if (v === undefined) return undefined;
+  if (!Array.isArray(v)) throw fieldError("defaultWorkingDays", "VALIDATION_FAILED", '"defaultWorkingDays" must be an array of day names');
+  return validateWorkingDays(v);
+}
+
+/** Optional whole number >= 0 (null clears). */
+export function optNonNegativeInt(v: unknown, field: string): number | null | undefined {
+  if (v === undefined || v === null) return v;
+  if (typeof v !== "number" || !Number.isInteger(v) || v < 0) throw fieldError(field, "VALIDATION_FAILED", `"${field}" must be a whole number of 0 or more`);
+  return v;
+}
+
+/** Optional money amount >= 0, at most 99,999,999.99 (null clears). */
+export function optNonNegativeAmount(v: unknown, field: string): number | null | undefined {
+  if (v === undefined || v === null) return v;
+  if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > 99_999_999.99) {
+    throw fieldError(field, "VALIDATION_FAILED", `"${field}" must be an amount of 0 or more`);
+  }
+  return v;
 }
 
 // ---- Technician role --------------------------------------------------------

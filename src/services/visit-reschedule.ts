@@ -4,6 +4,7 @@ import { VisitStatus } from "../generated/tenant-client";
 import { startOfUtcDay } from "../lib/schedule";
 import { tenantToday, tenantTodayRange } from "./business-time";
 import { getCachedBusinessSettings } from "./settings.service";
+import { notifyVisitTechnicians } from "./notify";
 
 export const ACTIVITY_VISIT_RESCHEDULED = "VISIT_RESCHEDULED";
 
@@ -48,7 +49,10 @@ export function createVisitRescheduleService(prisma: TenantPrismaClient) {
       visitId: string,
       input: { date: Date; actor?: { id?: string; role?: string } }
     ): Promise<{ id: string; status: VisitStatus; date: string }> => {
-      const visit = await prisma.visit.findUnique({ where: { id: visitId }, select: { id: true, status: true, date: true } });
+      const visit = await prisma.visit.findUnique({
+        where: { id: visitId },
+        select: { id: true, status: true, date: true, technicianId: true, roundId: true, propertyId: true },
+      });
       if (!visit) throw new AppError(404, "Visit not found");
       if (visit.status !== VisitStatus.SCHEDULED && visit.status !== VisitStatus.SKIPPED) {
         throw new AppError(409, "Only scheduled or skipped visits can be rescheduled", "VISIT_NOT_RESCHEDULABLE");
@@ -76,6 +80,12 @@ export function createVisitRescheduleService(prisma: TenantPrismaClient) {
           },
         });
       });
+      // FLOW-03: the assigned technician hears about the new date. Best effort.
+      await notifyVisitTechnicians(
+        prisma,
+        [{ ...visit, date: day }],
+        () => ({ type: "SCHEDULE", title: "A visit was rescheduled", body: `Moved from ${from} to ${to}.` })
+      );
       return { id: visitId, status: VisitStatus.SCHEDULED, date: to };
     },
   };

@@ -185,6 +185,16 @@ export function optVatRate(v: unknown): number | undefined {
   return Math.round(v * 100) / 100;
 }
 
+/** Optional free text (trimmed; blank -> null clears). Used for invoiceFooter / paymentTerms. */
+export function optFreeText(v: unknown, field: string, maxLength: number): string | null | undefined {
+  if (v === undefined) return undefined;
+  if (v === null) return null;
+  if (typeof v !== "string") throw new AppError(400, `${field} must be a string or null`);
+  const t = v.trim();
+  if (t.length > maxLength) throw new AppError(400, `${field} must be at most ${maxLength} characters`);
+  return t === "" ? null : t;
+}
+
 /** Days from invoice date to due date, 1–90. */
 export function optInvoiceDueDays(v: unknown): number | undefined {
   if (v === undefined) return undefined;

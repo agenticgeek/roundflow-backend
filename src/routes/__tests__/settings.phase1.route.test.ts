@@ -35,6 +35,8 @@ const settingsSvc = {
   createTechnician: vi.fn().mockResolvedValue({ id: "t1" }),
   updateTechnician: vi.fn().mockResolvedValue({ id: "t1" }),
 };
+const capabilities = vi.fn();
+vi.mock("../../services/message.service", () => ({ createMessageService: () => ({ capabilities: (...a: unknown[]) => capabilities(...a) }) }));
 const invalidateCachedBusinessSettings = vi.fn();
 vi.mock("../../services/settings.service", () => ({
   createSettingsService: vi.fn(() => settingsSvc),
@@ -155,6 +157,17 @@ describe("BusinessSettings DTO + new fields", () => {
     }));
     const bad = await authed(request(makeApp()).patch("/settings/payment")).send({ noDirectDebitAction: "NOPE" });
     expect(bad.status).toBe(400);
+  });
+
+  it("PATCH /payment accepts invoiceFooter and paymentTerms (trimmed, blank clears, length capped) (GHL-10)", async () => {
+    settingsSvc.assertSetupComplete.mockResolvedValue(undefined);
+    const ok = await authed(request(makeApp()).patch("/settings/payment")).send({ invoiceFooter: "  Thanks!  ", paymentTerms: "Net 14" });
+    expect(ok.status).toBe(200);
+    expect(settingsSvc.updatePaymentRules).toHaveBeenLastCalledWith(expect.objectContaining({ invoiceFooter: "Thanks!", paymentTerms: "Net 14" }));
+    await authed(request(makeApp()).patch("/settings/payment")).send({ invoiceFooter: null, paymentTerms: "   " });
+    expect(settingsSvc.updatePaymentRules).toHaveBeenLastCalledWith(expect.objectContaining({ invoiceFooter: null, paymentTerms: null }));
+    expect((await authed(request(makeApp()).patch("/settings/payment")).send({ invoiceFooter: "x".repeat(501) })).status).toBe(400);
+    expect((await authed(request(makeApp()).patch("/settings/payment")).send({ paymentTerms: 5 })).status).toBe(400);
   });
 
   it("technicians create/update fold a singular serviceAreaId into serviceAreaIds (GAP-004)", async () => {
@@ -351,5 +364,16 @@ describe("Stripe / GoCardless routes work before setup completes", () => {
     expect((await authed(request(makeApp(tp)).post("/settings/payment/gocardless/disconnect"))).status).toBe(200);
     expect((await authed(request(makeApp(tp)).patch("/settings/payment/gocardless/webhook-secret")).send({ secret: "s" })).status).toBe(200);
     expect(settingsSvc.assertSetupComplete).not.toHaveBeenCalled();
+  });
+});
+
+describe("GET /settings/business-profile channels (GHL-06)", () => {
+  it("adds the channel capability flags next to the (secret-free) settings", async () => {
+    capabilities.mockResolvedValue({ email: true, sms: false, whatsapp: false, calls: true });
+    const res = await authed(request(makeApp()).get("/settings/business-profile"));
+    expect(res.status).toBe(200);
+    expect(res.body.channels).toEqual({ email: true, sms: false, whatsapp: false, calls: true });
+    expect(res.body.businessName).toBe("Coates");
+    expect(JSON.stringify(res.body)).not.toContain("secret-1");
   });
 });

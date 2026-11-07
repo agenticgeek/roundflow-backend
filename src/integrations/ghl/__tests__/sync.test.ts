@@ -17,6 +17,7 @@ import { queueGhlEvent, applyGhlCustomFields } from "../sync";
 function makeTp() {
   return {
     integrationOutbox: { create: vi.fn().mockResolvedValue({}) },
+    businessSettings: { findFirst: vi.fn().mockResolvedValue({ ghlConnected: true }) },
     customer: { findUnique: vi.fn() },
   };
 }
@@ -26,6 +27,15 @@ beforeEach(() => {
 });
 
 describe("queueGhlEvent", () => {
+  it("queues nothing when GHL is not connected (GHL is an optional add-on)", async () => {
+    const tp: any = makeTp();
+    tp.businessSettings.findFirst.mockResolvedValue({ ghlConnected: false });
+    await queueGhlEvent(tp, "visit.completed", "cust-1");
+    tp.businessSettings.findFirst.mockResolvedValue(null);
+    await queueGhlEvent(tp, "visit.completed", "cust-1");
+    expect(tp.integrationOutbox.create).not.toHaveBeenCalled();
+  });
+
   it("writes an outbox row with just customerId when no extra payload is given", async () => {
     const tp: any = makeTp();
     await queueGhlEvent(tp, "visit.completed", "cust-1");

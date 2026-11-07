@@ -20,6 +20,17 @@ async function seedDefaultsBestEffort(schemaName: string): Promise<void> {
   });
 }
 
+// BUG-005: two simultaneous signups (or a signup racing its own retry) must not run the same tenant schema
+// migration in parallel. In-flight provisioning is shared per schema within this process; a failure is not cached.
+const provisioning = new Map<string, Promise<void>>();
+function provisionOnce(schemaName: string): Promise<void> {
+  const running = provisioning.get(schemaName);
+  if (running) return running;
+  const p = provisionTenantSchema(schemaName).finally(() => provisioning.delete(schemaName));
+  provisioning.set(schemaName, p);
+  return p;
+}
+
 export const authRouter = Router();
 
 // GET /auth/me
@@ -109,7 +120,7 @@ authRouter.post(
       // Re-attempt provisioning in case a prior signup call committed the
       // Profile+Tenant row but crashed before provisionTenantSchema completed.
       // provisionTenantSchema is idempotent: no-op if already fully provisioned.
-      await provisionTenantSchema(existing.tenant.schemaName);
+      await provisionOnce(existing.tenant.schemaName);
       await seedDefaultsBestEffort(existing.tenant.schemaName);
       return res.json({ profile: existing, tenantId: existing.tenantId });
     }
@@ -141,7 +152,7 @@ authRouter.post(
         return { profile, tenantId: tenant.id };
       });
 
-      await provisionTenantSchema(result.profile.tenant.schemaName);
+      await provisionOnce(result.profile.tenant.schemaName);
       await seedDefaultsBestEffort(result.profile.tenant.schemaName);
       return res.status(201).json(result);
     } catch (err: unknown) {
@@ -158,7 +169,7 @@ authRouter.post(
           include: { tenant: true },
         });
         if (profile) {
-          await provisionTenantSchema(profile.tenant.schemaName);
+          await provisionOnce(profile.tenant.schemaName);
           await seedDefaultsBestEffort(profile.tenant.schemaName);
           return res.json({ profile, tenantId: profile.tenantId });
         }

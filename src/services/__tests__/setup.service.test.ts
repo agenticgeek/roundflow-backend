@@ -1,5 +1,6 @@
 import { it, expect, vi } from "vitest";
 import { createSetupService } from "../setup.service";
+import { getCachedBusinessSettings } from "../settings.service";
 import { RoundStatus, Prisma } from "../../generated/tenant-client";
 
 function uniqueConstraintError() {
@@ -18,7 +19,7 @@ function makePrisma() {
     service: { findMany: vi.fn((args: any) => Promise.resolve(args?.where?.id?.in ? (args.where.id.in as string[]).map((id) => ({ id, defaultPrice: CATALOGUE_PRICE[id] ?? 10, active: true })) : [])), deleteMany: vi.fn(), createMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
     messageTemplate: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
     technician: { findMany: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
-    technicianServiceArea: { createMany: vi.fn().mockResolvedValue({ count: 0 }) },
+    technicianServiceArea: { createMany: vi.fn().mockResolvedValue({ count: 0 }), deleteMany: vi.fn().mockResolvedValue({ count: 0 }) },
     serviceArea: { findMany: vi.fn(), findUnique: vi.fn(), deleteMany: vi.fn(), createMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
     round: {
       findMany: vi.fn().mockResolvedValue([]),
@@ -586,6 +587,32 @@ it("saveTechnicians rejects an unknown serviceAreaId before writing anything", a
   expect(prisma.$transaction).not.toHaveBeenCalled();
 });
 
+it("BUG-011: re-saving step 6 first removes the service-area rows of the invite-pending technicians it deletes (no FK violation)", async () => {
+  const prisma = makePrisma();
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((fn: (tx: typeof prisma) => Promise<unknown>) => fn(prisma));
+  (prisma.technician.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  const order: string[] = [];
+  (prisma.technicianServiceArea as any).deleteMany = vi.fn(async () => { order.push("areas"); return { count: 1 }; });
+  (prisma.technician.deleteMany as ReturnType<typeof vi.fn>).mockImplementation(async () => { order.push("technicians"); return { count: 1 }; });
+  await createSetupService(prisma).saveTechnicians([{ name: "Jess" }]);
+  expect((prisma.technicianServiceArea as any).deleteMany).toHaveBeenCalledWith({ where: { technician: { profileId: null } } });
+  expect(order).toEqual(["areas", "technicians"]);
+});
+
+it("BUG-011: any other database error while saving technicians is rethrown untouched", async () => {
+  const prisma = makePrisma();
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation(() => Promise.reject(new Error("db down")));
+  await expect(createSetupService(prisma).saveTechnicians([{ name: "Jess" }])).rejects.toThrow("db down");
+});
+
+it("BUG-011: a technician still referenced elsewhere (FK violation) is a clean 409, not a 500", async () => {
+  const prisma = makePrisma();
+  (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation(() =>
+    Promise.reject(new Prisma.PrismaClientKnownRequestError("Foreign key constraint violated", { code: "P2003", clientVersion: "6.19.3" }))
+  );
+  await expect(createSetupService(prisma).saveTechnicians([{ name: "Jess" }])).rejects.toMatchObject({ statusCode: 409, code: "TECHNICIAN_IN_USE" });
+});
+
 it("saveTechnicians maps a duplicate-email unique constraint violation to a 409, not an unhandled error", async () => {
   const prisma = makePrisma();
   (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation(() =>
@@ -734,4 +761,19 @@ it("savePaymentSetup passes through undefined fields untouched (partial update)"
       },
     })
   );
+});
+
+// CARRY-001 / BUG: the wizard wrote BusinessSettings without invalidating the shared per-client settings cache, so
+// carryover options, invoices and visit generation kept using the OLD working days / time zone for up to the cache TTL.
+it("saving a wizard step invalidates the shared settings cache so other services see the new working days at once", async () => {
+  const prisma = makePrisma();
+  const rows = [{ defaultWorkingDays: ["MON"] }, { defaultWorkingDays: [] }];
+  (prisma.businessSettings.findFirst as ReturnType<typeof vi.fn>).mockImplementation(async () => rows[0]);
+  (prisma.businessSettings.upsert as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+    rows.shift(); // the database now holds the second row
+    return rows[0];
+  });
+  expect((await getCachedBusinessSettings(prisma))!.defaultWorkingDays).toEqual(["MON"]); // cached
+  await createSetupService(prisma).saveBusinessProfile({ businessName: "Acme", defaultWorkingDays: [] });
+  expect((await getCachedBusinessSettings(prisma))!.defaultWorkingDays).toEqual([]); // not the stale ["MON"]
 });

@@ -11,6 +11,7 @@ import { getStripeClient } from "../integrations/stripe/client";
 import { createOneTimeSession, createSetupSession } from "../integrations/stripe/checkout";
 import { StripeSessionType, PaymentMethod, PaymentStatus } from "../generated/tenant-client";
 import { createPaymentService, PaymentListFilters } from "../services/payment.service";
+import { adminIdempotency } from "../lib/idempotency";
 export const paymentsRouter = Router();
 paymentsRouter.use(requireAuth);
 paymentsRouter.use(requireTenantAccess);
@@ -37,6 +38,7 @@ async function getTenantId(req: Request): Promise<string> {
 // POST /payments/stripe/checkout — create a one-time payment session for an invoice
 paymentsRouter.post(
   "/stripe/checkout",
+  adminIdempotency(),
   h(async (req, res) => {
     const body = asObject(req.body);
     const invoiceId = requireString(body.invoiceId, "invoiceId");
@@ -46,9 +48,10 @@ paymentsRouter.post(
     if (invoice.status === "PAID") throw new AppError(409, "Invoice is already paid");
     if (invoice.status === "VOID") throw new AppError(409, "Invoice is void");
 
-    // Check no active session already exists for this invoice
+    // Reuse a still-open session for this invoice. A PENDING session whose expiresAt has passed is dead on
+    // Stripe's side (BE-17): skip it and mint a fresh one.
     const existing = await req.tenantPrisma!.stripeSession.findFirst({
-      where: { invoiceId, status: "PENDING" },
+      where: { invoiceId, status: "PENDING", OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] },
     });
     if (existing) {
       return res.json({ url: existing.url, sessionId: existing.id });
@@ -60,6 +63,7 @@ paymentsRouter.post(
 
     const stripe = await loadStripeClient(req);
     const tenantId = await getTenantId(req);
+    const clientKey = req.header("idempotency-key") ?? req.header("x-idempotency-key");
 
     const FRONTEND_URL = frontendUrl();
     const result = await createOneTimeSession(stripe, req.tenantPrisma!, {
@@ -70,6 +74,8 @@ paymentsRouter.post(
       amountPence: Math.round(Number(invoice.amount) * 100),
       successUrl: `${FRONTEND_URL}/invoices/${invoiceId}?payment=success`,
       cancelUrl:  `${FRONTEND_URL}/invoices/${invoiceId}?payment=cancelled`,
+      // The caller's Idempotency-Key (when sent) also goes to Stripe, so a retry cannot create a second session.
+      idempotencyKey: clientKey ? `rf-key-${tenantId}-${clientKey}` : undefined,
     });
 
     const session = await req.tenantPrisma!.stripeSession.create({
@@ -152,7 +158,12 @@ paymentsRouter.patch(
       throw new AppError(409, "Payment is already paid and cannot be changed");
     }
 
-    const updated = await createPaymentService(req.tenantPrisma!).applyOutcome(req.params.id, status);
+    // Strict: an illegal move (e.g. FAILED on a CANCELLED payment) is a 409 INVALID_PAYMENT_TRANSITION.
+    const { payment: updated } = await createPaymentService(req.tenantPrisma!).transition(
+      req.params.id,
+      status === "PAID" ? PaymentStatus.PAID : PaymentStatus.FAILED,
+      { strict: true }
+    );
     return res.json(updated);
   })
 );

@@ -189,3 +189,24 @@ it("GET /reports/export forwards a service rejection to the error handler", asyn
   const res = await request(makeApp()).get("/reports/export");
   expect(res.status).toBe(500);
 });
+
+it("BE-14: GET /reports/export 400s on an unknown type and never calls the service", async () => {
+  const app = makeApp();
+  const res = await request(app).get('/reports/export?type=../../etc/passwd"');
+  expect(res.status).toBe(400);
+  expect(getVisitsExport).not.toHaveBeenCalled();
+  expect(getTechniciansExport).not.toHaveBeenCalled();
+  expect(getRevenue).not.toHaveBeenCalled();
+});
+
+it("BE-14: GET /reports/export builds a safe Content-Disposition filename from the period", async () => {
+  const app = makeApp();
+  const res = await request(app).get('/reports/export?type=visits&period=a"b%0D%0Ac');
+  expect(res.headers["content-disposition"]).toBe('attachment; filename="visits-a_b__c.csv"');
+});
+
+it("BE-14: formula-looking cell values in an export are escaped", async () => {
+  getVisitsExport.mockResolvedValue([{ customer: "=HYPERLINK(\"x\")" }]);
+  const res = await request(makeApp()).get("/reports/export?type=visits");
+  expect(res.text).toContain("'=HYPERLINK");
+});

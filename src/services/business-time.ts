@@ -19,6 +19,15 @@ export async function tenantTodayRange(tp: TenantPrismaClient, now: Date = new D
   return todayRange(await tenantTimeZone(tp), now);
 }
 
+/** BusinessSettings.defaultWorkingDays (MON..SUN codes); [] = not configured (callers default to Mon-Fri). */
+export async function tenantWorkingDays(tp: TenantPrismaClient): Promise<string[]> {
+  try {
+    return (await getCachedBusinessSettings(tp))?.defaultWorkingDays ?? [];
+  } catch {
+    return [];
+  }
+}
+
 /** UTC-midnight Date of the tenant-local "today". */
 export async function tenantToday(tp: TenantPrismaClient, now: Date = new Date()): Promise<Date> {
   return localDay(await tenantTimeZone(tp), now);

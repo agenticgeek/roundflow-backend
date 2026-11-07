@@ -35,6 +35,15 @@ it("GET /messages/inbox forwards filters and paging", async () => {
   expect((await request(makeApp()).get("/messages/inbox?page=0")).status).toBe(400);
 });
 
+it("BUG-004: unreadOnly must be true or false (anything else is a 400); a page size above the maximum is clamped", async () => {
+  listInbox.mockResolvedValue({ rows: [], unreadCount: 0, pagination: {} });
+  expect((await request(makeApp()).get("/messages/inbox?unreadOnly=maybe")).status).toBe(400);
+  expect((await request(makeApp()).get("/messages/inbox?unreadOnly=false")).status).toBe(200);
+  expect(listInbox).toHaveBeenLastCalledWith(expect.objectContaining({ unreadOnly: false }));
+  expect((await request(makeApp()).get("/messages/inbox?pageSize=201")).status).toBe(200);
+  expect(listInbox).toHaveBeenLastCalledWith(expect.objectContaining({ pageSize: 100 }));
+});
+
 it("POST /messages/inbox/read forwards ids and customerId", async () => {
   markInboxRead.mockResolvedValue({ updated: 2 });
   const res = await request(makeApp()).post("/messages/inbox/read").send({ ids: ["m1", "m2"], customerId: "c1" });

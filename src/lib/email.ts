@@ -1,3 +1,5 @@
+import { outboundSignal } from "./outbound";
+
 export const INVITE_TTL_DAYS = 7;
 
 const SUPABASE_URL = process.env.SUPABASE_ISSUER?.replace("/auth/v1", "") ?? "";
@@ -7,6 +9,7 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
 // that way), not from the JSON body.
 function supabaseAuthPost(path: string, redirectTo: string, body: unknown): Promise<Response> {
   return fetch(`${SUPABASE_URL}/auth/v1${path}?redirect_to=${encodeURIComponent(redirectTo)}`, {
+    signal: outboundSignal(),
     method: "POST",
     headers: {
       "Content-Type": "application/json",

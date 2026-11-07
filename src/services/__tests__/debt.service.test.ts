@@ -19,6 +19,7 @@ vi.mock("../../integrations/stripe/checkout", () => ({
   getInvoiceCheckoutLink: (...a: unknown[]) => getInvoiceCheckoutLink(...a),
 }));
 
+import { NOT_COLLECTING_INVOICE } from "../direct-debit";
 import { createDebtService } from "../debt.service";
 
 function makePrisma() {
@@ -124,7 +125,7 @@ it("getKpis totalOutstandings uses the aggregate _sum.amount with customer.badDe
   expect(result.totalOutstandings).toBe(85);
   expect(prisma.invoice.aggregate).toHaveBeenNthCalledWith(1, {
     _sum: { amount: true },
-    where: { status: "SENT", customer: { badDebt: false } },
+    where: { status: "SENT", customer: { badDebt: false }, ...NOT_COLLECTING_INVOICE },
   });
 });
 
@@ -143,7 +144,7 @@ it("getKpis badDebt uses the aggregate _sum.amount with customer.badDebt:true", 
   expect(result.badDebt).toBe(100);
   expect(prisma.invoice.aggregate).toHaveBeenNthCalledWith(2, {
     _sum: { amount: true },
-    where: { status: "SENT", customer: { badDebt: true } },
+    where: { status: "SENT", customer: { badDebt: true }, ...NOT_COLLECTING_INVOICE },
   });
 });
 
@@ -153,7 +154,7 @@ it("getKpis failedGoCardless counts invoices via visitId:{in:[...failedVisitIds]
   const result = await createDebtService(prisma).getKpis();
   expect(result.failedGoCardless).toBe(1);
   expect(prisma.invoice.count).toHaveBeenNthCalledWith(1, {
-    where: { status: "SENT", customer: { badDebt: false }, visitId: { in: ["v1"] } },
+    where: { status: "SENT", customer: { badDebt: false }, visitId: { in: ["v1"] }, ...NOT_COLLECTING_INVOICE },
   });
 });
 
@@ -163,7 +164,7 @@ it("getKpis dueBeforeClean counts invoices via customerId:{in:[...upcomingCustom
   const result = await createDebtService(prisma).getKpis();
   expect(result.dueBeforeClean).toBe(1);
   expect(prisma.invoice.count).toHaveBeenNthCalledWith(2, {
-    where: { status: "SENT", customer: { badDebt: false }, customerId: { in: ["c1"] } },
+    where: { status: "SENT", customer: { badDebt: false }, customerId: { in: ["c1"] }, ...NOT_COLLECTING_INVOICE },
   });
   expect(prisma.visit.findMany).toHaveBeenCalledWith(expect.objectContaining({
     where: expect.objectContaining({ status: { not: "CANCELLED" } }),
@@ -184,8 +185,8 @@ it("getKpis totalOutstandingsCount / badDebtCount count distinct customers (GAP-
   const result = await createDebtService(prisma).getKpis();
   expect(result.totalOutstandingsCount).toBe(7);
   expect(result.badDebtCount).toBe(2);
-  expect(prisma.customer.count).toHaveBeenNthCalledWith(2, { where: { badDebt: false, invoices: { some: { status: "SENT" } } } });
-  expect(prisma.customer.count).toHaveBeenNthCalledWith(3, { where: { badDebt: true, invoices: { some: { status: "SENT" } } } });
+  expect(prisma.customer.count).toHaveBeenNthCalledWith(2, { where: { badDebt: false, invoices: { some: { status: "SENT", ...NOT_COLLECTING_INVOICE } } } });
+  expect(prisma.customer.count).toHaveBeenNthCalledWith(3, { where: { badDebt: true, invoices: { some: { status: "SENT", ...NOT_COLLECTING_INVOICE } } } });
 });
 
 // ---- getBoard: basic ----------------------------------------------------------
@@ -276,25 +277,43 @@ it("getBoard DUE_BEFORE_CLEAN builds where.customerId:{in:[...upcomingCustomerId
   expect(callArgs.where).toMatchObject({ status: "SENT", customer: { badDebt: false }, customerId: { in: ["c1"] } });
 });
 
-it("getBoard SEVEN_DAYS_OVER builds where.dueDate:{gte:sevenDaysAgo,lt:now}", async () => {
+// A5: days since the due date. Day 0 = due today (not overdue); "7 days over" from day 8; "14 days over" from day 15.
+const FIXED_NOW = new Date("2026-11-06T10:30:00Z");
+const TODAY = Date.UTC(2026, 10, 6);
+const dueDaysAgo = (d: number) => new Date(TODAY - d * 86_400_000);
+type Range = { gte?: Date; lte?: Date; lt?: Date; gt?: Date };
+const inRange = (r: Range, date: Date) =>
+  (!r.gte || date >= r.gte) && (!r.lte || date <= r.lte) && (!r.lt || date < r.lt) && (!r.gt || date > r.gt);
+
+async function boardWhere(bucket: string) {
   const prisma = makePrisma();
-  setupBoard(prisma, [inv()]);
-  await createDebtService(prisma).getBoard("SEVEN_DAYS_OVER");
-  const callArgs = (prisma.invoice.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
-  expect(callArgs.where.customer).toMatchObject({ badDebt: false });
-  expect(callArgs.where.dueDate.gte).toBeInstanceOf(Date);
-  expect(callArgs.where.dueDate.lt).toBeInstanceOf(Date);
-  expect(callArgs.where.dueDate.gte.getTime()).toBeLessThan(callArgs.where.dueDate.lt.getTime());
+  setupBoard(prisma, []);
+  await createDebtService(prisma).getBoard(bucket);
+  return (prisma.invoice.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0].where;
+}
+
+it.each([
+  [0, "ALL"], [1, "ALL"], [7, "ALL"], [8, "SEVEN_DAYS_OVER"], [14, "SEVEN_DAYS_OVER"], [15, "FOURTEEN_DAYS_OVER"], [40, "FOURTEEN_DAYS_OVER"],
+])("A5 boundary: an invoice %i days past its due date lands in %s only", async (days, expected) => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(FIXED_NOW);
+  try {
+    const date = dueDaysAgo(days);
+    const seven = (await boardWhere("SEVEN_DAYS_OVER")).dueDate as Range;
+    const fourteen = (await boardWhere("FOURTEEN_DAYS_OVER")).dueDate as Range;
+    const def = (await boardWhere("ALL")).AND[1].OR[1].dueDate as Range;
+    const hits = [inRange(seven, date) && "SEVEN_DAYS_OVER", inRange(fourteen, date) && "FOURTEEN_DAYS_OVER", inRange(def, date) && "ALL"].filter(Boolean);
+    expect(hits).toEqual([expected]);
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
-it("getBoard FOURTEEN_DAYS_OVER builds where.dueDate:{lt:sevenDaysAgo}", async () => {
-  const prisma = makePrisma();
-  setupBoard(prisma, [inv()]);
-  await createDebtService(prisma).getBoard("FOURTEEN_DAYS_OVER");
-  const callArgs = (prisma.invoice.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
-  expect(callArgs.where.customer).toMatchObject({ badDebt: false });
-  expect(callArgs.where.dueDate).toHaveProperty("lt");
-  expect(callArgs.where.dueDate.gte).toBeUndefined();
+it("A5: a due-today invoice is not overdue, and an invoice with no due date stays in the default bucket", async () => {
+  const where = await boardWhere("ALL");
+  expect(where.AND[1]).toEqual({ OR: [{ dueDate: null }, { dueDate: { gte: expect.any(Date) } }] });
+  const seven = await boardWhere("SEVEN_DAYS_OVER");
+  expect(seven.customer).toMatchObject({ badDebt: false });
 });
 
 it("getBoard default bucket builds the full exclusion where clause", async () => {
@@ -368,25 +387,6 @@ it("getBoard INVOICE_SENT excludes bad-debt invoices (output mapping)", async ()
 });
 
 // ---- getBoard: boundary + precedence cases ---------------------------------------
-
-it("getBoard SEVEN_DAYS_OVER boundary: dueDate exactly 7 days ago is included (gte)", async () => {
-  const prisma = makePrisma();
-  const now = Date.now();
-  const sevenDaysAgo = new Date(now - 7 * 86_400_000);
-  setupBoard(prisma, [inv({ dueDate: sevenDaysAgo })]);
-  const result = await createDebtService(prisma).getBoard("SEVEN_DAYS_OVER");
-  // Mock doesn't actually filter; this just asserts the where-clause boundary is gte (inclusive).
-  const callArgs = (prisma.invoice.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0];
-  expect(callArgs.where.dueDate.gte.getTime()).toBeLessThanOrEqual(sevenDaysAgo.getTime() + 1000);
-  expect(result.rows).toHaveLength(1);
-});
-
-it("getBoard FOURTEEN_DAYS_OVER boundary: dueDate exactly 7 days ago is NOT included (lt, exclusive)", async () => {
-  const prisma = makePrisma();
-  setupBoard(prisma, []); // DB would exclude the exact-boundary row from this bucket
-  const result = await createDebtService(prisma).getBoard("FOURTEEN_DAYS_OVER");
-  expect(result.rows).toHaveLength(0);
-});
 
 it("getBoard: a bad-debt customer who would otherwise match ON_HOLD is excluded when querying ON_HOLD (badDebt wins)", async () => {
   const prisma = makePrisma();
@@ -670,7 +670,7 @@ it("sendReminder propagates a contact/channel error from prepare (nothing delive
   (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue(sendable());
   prepareMessage.mockRejectedValue(Object.assign(new Error("no email"), { statusCode: 400, code: "NO_CONTACT_FOR_CHANNEL" }));
   await expect(createDebtService(prisma).sendReminder("inv-1", { channel: "EMAIL" })).rejects.toMatchObject({ code: "NO_CONTACT_FOR_CHANNEL" });
-  expect(prepareMessage).toHaveBeenCalledWith("c1", "EMAIL");
+  expect(prepareMessage).toHaveBeenCalledWith("c1", "EMAIL", { respectOptOut: true });
   expect(deliverMessage).not.toHaveBeenCalled();
 });
 
@@ -774,13 +774,13 @@ it("flagHold does not notify when notify is false/omitted, or when flag is false
   expect(sendMessage).not.toHaveBeenCalled();
 });
 
-it("flagHold sends the given message by SMS when notify is true", async () => {
+it("flagHold sends the given message by the best available channel when notify is true", async () => {
   const prisma = makePrisma();
   (prisma.invoice.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "inv-1", customerId: "c1" });
   (prisma.customer.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "c1" });
   sendMessage.mockResolvedValue({ status: "sent" });
   await createDebtService(prisma).flagHold("inv-1", true, { notify: true, message: "On hold" });
-  expect(sendMessage).toHaveBeenCalledWith({ customerId: "c1", channel: "SMS", body: "On hold" });
+  expect(sendMessage).toHaveBeenCalledWith({ customerId: "c1", body: "On hold" });
 });
 
 it("flagHold falls back to a default message when notify is true but message is blank", async () => {

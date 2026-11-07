@@ -7,6 +7,8 @@
 // signed in one batch request. A URL that isn't a storage object of this
 // bucket (e.g. an external image) is returned unchanged.
 
+import { outboundSignal } from "./outbound";
+
 export const READ_URL_TTL_SECONDS = 3600; // 1 h
 
 function bucket(): string {
@@ -48,6 +50,7 @@ export async function createSignedReadUrls(
 
   const paths = [...new Set(pathByStored.values())];
   const res = await fetch(`${url}/storage/v1/object/sign/${bucket()}`, {
+    signal: outboundSignal(),
     method: "POST",
     headers: { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
     body: JSON.stringify({ expiresIn, paths }),
@@ -78,6 +81,7 @@ const THUMBNAIL_CONCURRENCY = 8;
 async function signThumbnail(base: string, key: string, path: string): Promise<string | null> {
   try {
     const res = await fetch(`${base}/storage/v1/object/sign/${bucket()}/${path.split("/").map(encodeURIComponent).join("/")}`, {
+      signal: outboundSignal(),
       method: "POST",
       headers: { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
       body: JSON.stringify({

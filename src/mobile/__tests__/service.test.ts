@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createHomeService } from "../services/home.service";
 import { createJobDetailService } from "../services/job-detail.service";
 import { createJobTrackerService } from "../services/job-tracker.service";
@@ -6,6 +6,16 @@ import { createMediaService } from "../services/media.service";
 import { evaluateDebtGate } from "../services/debt-gate";
 import { createNotificationService } from "../services/notification.service";
 import { createChatService } from "../services/chat.service";
+import { notifyAdmins, notifyInvoicePaid } from "../../services/notify";
+
+// Notification wording/recipients are tested in services/__tests__/notify.test.ts;
+// here only that the right producer fires with the right event.
+vi.mock("../../services/notify", async () => (await import("../../test/notify-mock.js")).notifyMockModule());
+const notifyAdminsMock = vi.mocked(notifyAdmins);
+beforeEach(() => {
+  notifyAdminsMock.mockClear();
+  vi.mocked(notifyInvoicePaid).mockClear();
+});
 
 function makePrisma() {
   return {
@@ -13,12 +23,13 @@ function makePrisma() {
     issue: { create: vi.fn() },
     propertyNote: { create: vi.fn() },
     photo: { create: vi.fn() },
+    round: { findUnique: vi.fn().mockResolvedValue({ name: "Alnwick North" }) },
     technician: { findUnique: vi.fn() },
     invoice: { findMany: vi.fn(), updateMany: vi.fn() },
     customer: { findUnique: vi.fn().mockResolvedValue({ holdNextClean: false }), update: vi.fn() },
     payment: { create: vi.fn() },
     activityLog: { create: vi.fn() },
-    chatMessage: { findMany: vi.fn(), create: vi.fn() },
+    chatMessage: { findMany: vi.fn(), create: vi.fn(), findFirst: vi.fn() },
     $transaction: vi.fn(async (ops: unknown[]) => Promise.all(ops)),
     businessSettings: { findFirst: vi.fn().mockResolvedValue({ debtHoldEnabled: false, debtHoldMaxInvoices: null, debtHoldMaxAmount: null }) },
     notification: { findMany: vi.fn(), count: vi.fn(), updateMany: vi.fn(), create: vi.fn() },
@@ -86,7 +97,7 @@ it("markArrived throws 409 when visit is not IN_PROGRESS", async () => {
 
 it("skipVisit sets status SKIPPED and stores reason", async () => {
   const prisma = makePrisma();
-  (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1", status: "IN_PROGRESS" });
+  (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1", status: "IN_PROGRESS", propertyId: "p1", roundId: "r1", date: new Date("2026-11-09T00:00:00.000Z") });
   (prisma.visit.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1" });
 
   await createJobTrackerService(prisma).skipVisit("v1", "Gate locked");
@@ -94,11 +105,26 @@ it("skipVisit sets status SKIPPED and stores reason", async () => {
   const updateArgs = (prisma.visit.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
   expect(updateArgs.data.status).toBe("SKIPPED");
   expect(updateArgs.data.skipReason).toBe("Gate locked");
+  // NOTIF-03: the office is told why.
+  expect(notifyAdminsMock).toHaveBeenCalledWith(prisma, {
+    type: "SCHEDULE",
+    title: "Visit skipped",
+    body: "Gate locked",
+    data: { visitId: "v1", propertyId: "p1", roundId: "r1", date: "2026-11-09" },
+  });
+});
+
+it("skipVisit omits roundId from the notification data for a visit with no round", async () => {
+  const prisma = makePrisma();
+  (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1", status: "SCHEDULED", propertyId: "p1", roundId: null, date: new Date("2026-11-09T00:00:00.000Z") });
+  (prisma.visit.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1" });
+  await createJobTrackerService(prisma).skipVisit("v1", "No answer");
+  expect(notifyAdminsMock).toHaveBeenLastCalledWith(prisma, expect.objectContaining({ data: { visitId: "v1", propertyId: "p1", date: "2026-11-09" } }));
 });
 
 it("skipVisit appends description when provided", async () => {
   const prisma = makePrisma();
-  (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1", status: "IN_PROGRESS" });
+  (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1", status: "IN_PROGRESS", propertyId: "p1", date: new Date("2026-11-09T00:00:00.000Z") });
   (prisma.visit.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1" });
 
   await createJobTrackerService(prisma).skipVisit("v1", "Other", "Dog blocking the path");
@@ -121,6 +147,7 @@ it("skipVisit is idempotent when already SKIPPED", async () => {
   await createJobTrackerService(prisma).skipVisit("v1", "Gate locked");
 
   expect((prisma.visit.update as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+  expect(notifyAdminsMock).not.toHaveBeenCalled();
 });
 
 // ---------------------------------------------------------------------------
@@ -152,6 +179,25 @@ it("reportAccessIssue attaches photoPaths as ACCESS_ISSUE photos on the new Issu
   expect(createArgs.data.photos).toEqual({
     create: [{ url: "t/visits/v1/access_issue-1.jpg", type: "ACCESS_ISSUE", visitId: "v1", propertyId: "p1" }],
   });
+});
+
+it("reportAccessIssue tells the office (ACCESS_ISSUE) with a shortened description and deep-link ids", async () => {
+  const prisma = makePrisma();
+  (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1", propertyId: "p1", roundId: "r1" });
+  (prisma.issue.create as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "i1" });
+  const long = "x".repeat(200);
+  await createJobTrackerService(prisma).reportAccessIssue("v1", "GATE_LOCKED", long, [], { technicianName: "Sam" });
+  expect(notifyAdminsMock).toHaveBeenCalledWith(prisma, {
+    type: "ACCESS_ISSUE",
+    title: "Access problem reported",
+    body: `Sam: GATE_LOCKED - ${"x".repeat(117)}...`,
+    data: { visitId: "v1", propertyId: "p1", roundId: "r1" },
+  });
+  await createJobTrackerService(prisma).reportAccessIssue("v1", "OTHER", "short");
+  expect(notifyAdminsMock).toHaveBeenLastCalledWith(prisma, expect.objectContaining({
+    body: "technician: OTHER - short",
+    data: { visitId: "v1", propertyId: "p1", roundId: "r1" },
+  }));
 });
 
 it("reportAccessIssue without photos creates no Photo rows", async () => {
@@ -596,6 +642,20 @@ it("mobile readers exclude CANCELLED visits (A4)", async () => {
   expect(wheres).toEqual([{ not: "CANCELLED" }, { not: "CANCELLED" }, { not: "CANCELLED" }]);
 });
 
+it("rows carry paymentStatus (the visit's Payment status, null when there is none) on today, completions", async () => {
+  const prisma = makePrisma();
+  fn(prisma.technician.findUnique).mockResolvedValue({ id: "t1" });
+  fn(prisma.visit.findMany)
+    .mockResolvedValueOnce([mobileVisit({ id: "a", payment: { status: "PAID" } }), mobileVisit({ id: "b", payment: null }), mobileVisit({ id: "c" })])
+    .mockResolvedValueOnce([])
+    .mockResolvedValueOnce([mobileVisit({ id: "d", payment: { status: "PENDING" } })]);
+  const completions = await createHomeService(prisma).getCompletions("prof-1");
+  expect(completions.visits.map((v) => v.paymentStatus)).toEqual(["PAID", null, null]);
+  fn(prisma.visit.findMany).mockResolvedValueOnce([mobileVisit({ id: "d", payment: { status: "PENDING" } })]);
+  expect((await createHomeService(prisma).getTodayVisits("prof-1"))[0].paymentStatus).toBe("PENDING");
+  expect(fn(prisma.visit.findMany).mock.calls[0][0].include.payment).toEqual({ select: { status: true } });
+});
+
 it("revenueByMethod and row paymentMethod use visit, then plan, then customer method (D-9)", async () => {
   const prisma = makePrisma();
   fn(prisma.technician.findUnique).mockResolvedValue({ id: "t1" });
@@ -646,7 +706,10 @@ it("getVisitDetail falls back to the customer method, then null", async () => {
 
 describe("collectDebtPayment", () => {
   const debtVisit = { property: { customer: { id: "c1", name: "Tom" } } };
-  const invoices = [{ id: "i1", amount: { toNumber: () => 30 } }, { id: "i2", amount: { toNumber: () => 20 } }];
+  const invoices = [
+    { id: "i1", invoiceNumber: "INV-1", amount: { toNumber: () => 30 } },
+    { id: "i2", invoiceNumber: "INV-2", amount: { toNumber: () => 20 } },
+  ];
 
   it("404 when the visit is missing", async () => {
     const prisma = makePrisma();
@@ -671,6 +734,10 @@ describe("collectDebtPayment", () => {
     expect(out).toEqual({ cleared: true, amountPaid: 50, amountPending: 0, method: "CASH" });
     expect(fn(prisma.payment.create).mock.calls[0][0].data).toMatchObject({ amount: 50, method: "CASH", status: "PAID" });
     expect(prisma.invoice.updateMany).toHaveBeenCalled();
+    // the office is told about each paid invoice
+    expect(notifyInvoicePaid).toHaveBeenCalledTimes(2);
+    expect(notifyInvoicePaid).toHaveBeenCalledWith(prisma, { id: "i1", invoiceNumber: "INV-1", customerId: "c1" });
+    expect(notifyInvoicePaid).toHaveBeenCalledWith(prisma, { id: "i2", invoiceNumber: "INV-2", customerId: "c1" });
   });
 
   it("CHEQUE records a PENDING cheque payment, logs the number and leaves invoices open", async () => {
@@ -687,6 +754,7 @@ describe("collectDebtPayment", () => {
       type: "CHEQUE_RECEIVED", actorId: "prof-1", message: expect.stringContaining("Cheque 000777"),
     });
     expect(prisma.invoice.updateMany).not.toHaveBeenCalled();
+    expect(notifyInvoicePaid).not.toHaveBeenCalled(); // a pending cheque is not a paid invoice yet
 
     await svc.collectDebtPayment("v1", { method: "CHEQUE", chequeNumber: "1" });
     expect(fn(prisma.activityLog.create).mock.calls[1][0].data.actorId).toBeNull();
@@ -718,5 +786,49 @@ describe("chat service (D-4)", () => {
     expect(text).toMatchObject({ duplicate: false, row: { senderProfileId: "prof-1", senderRole: "TECHNICIAN", type: "TEXT", body: "hi", isMine: true } });
     expect((await svc.send("r1", "prof-1", { type: "WORK_PHOTOS", visitId: "v1" })).row).toMatchObject({ type: "WORK_PHOTOS", visitId: "v1" });
     expect((await svc.send("r1", "prof-1", { type: "PHOTOS", photoUrls: ["a"], text: "look" })).row).toMatchObject({ type: "PHOTOS", body: "look", photoUrls: ["a"] });
+  });
+
+  // NOTIF-03 / CHAT-03
+  describe("office notification", () => {
+    function chatPrisma() {
+      const prisma = makePrisma() as any;
+      prisma.round = { findUnique: vi.fn().mockResolvedValue({ name: "Alnwick North" }) };
+      fn(prisma.chatMessage.create).mockImplementation(async (a: any) => ({ id: "m", ...a.data }));
+      return prisma;
+    }
+
+    it("notifies ADMIN/MANAGER once per round per 5 minutes while unread, never for the sender", async () => {
+      const prisma = chatPrisma();
+      await createChatService(prisma).send("r1", "prof-1", { type: "TEXT", text: "Gate is locked" }, "Sam");
+      expect(notifyAdminsMock).toHaveBeenCalledWith(prisma, {
+        type: "CHAT",
+        title: "New message from Sam",
+        body: "Alnwick North: Gate is locked",
+        data: { roundId: "r1" },
+        dedupe: { windowMs: 300_000, keys: ["roundId"] },
+        excludeProfileIds: ["prof-1"],
+      });
+    });
+
+    it("falls back to generic wording for photos, unnamed senders, long text and a missing round", async () => {
+      const prisma = chatPrisma();
+      prisma.round.findUnique.mockResolvedValue(null);
+      await createChatService(prisma).send("r1", "prof-1", { type: "PHOTOS", photoUrls: ["a"] });
+      expect(notifyAdminsMock).toHaveBeenLastCalledWith(prisma, expect.objectContaining({
+        title: "New message from a technician",
+        body: "Round chat: Sent photos",
+      }));
+      await createChatService(prisma).send("r1", "prof-1", { type: "TEXT", text: "y".repeat(300) }, "  ");
+      expect(notifyAdminsMock.mock.lastCall![1].body).toBe(`Round chat: ${"y".repeat(117)}...`);
+      expect(notifyAdminsMock.mock.lastCall![1].title).toBe("New message from a technician");
+    });
+
+    it("does not notify for a duplicate clientMsgId", async () => {
+      const prisma = chatPrisma();
+      fn(prisma.chatMessage.findFirst).mockResolvedValue({ id: "m0", roundId: "r1" });
+      const out = await createChatService(prisma).send("r1", "prof-1", { type: "TEXT", text: "hi", clientMsgId: "c1" });
+      expect(out.duplicate).toBe(true);
+      expect(notifyAdminsMock).not.toHaveBeenCalled();
+    });
   });
 });

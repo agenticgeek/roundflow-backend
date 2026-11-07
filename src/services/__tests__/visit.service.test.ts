@@ -15,6 +15,12 @@ it("createVisitService returns an object", () => {
   expect(createVisitService(makePrisma())).toBeDefined();
 });
 
+it("BUG-007: createVisit rejects impossible calendar dates instead of rolling them over", async () => {
+  for (const date of ["2026-02-29", "2026-02-30", "2026-04-31", "2026-00-10", "2026-9-3"]) {
+    await expect(createVisitService(makePrisma()).createVisit({ propertyId: "p1", date, price: 5 })).rejects.toMatchObject({ statusCode: 400 });
+  }
+});
+
 it("createVisit sets isOneOff: true and status: SCHEDULED", async () => {
   const prisma = makePrisma();
   (prisma.property.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({

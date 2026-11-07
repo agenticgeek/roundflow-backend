@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import request from "supertest";
 import express from "express";
+import { Prisma } from "../../generated/tenant-client";
 
 // POST /mobile/day/close + GET /mobile/day: the real router, idempotency and
 // day-close service against a fake tenant client (today = 2026-11-03).
@@ -26,8 +27,11 @@ vi.mock("../../services/business-time", () => ({
   tenantTodayRange: async () => ({ start: new Date("2026-11-03T00:00:00.000Z"), end: new Date("2026-11-04T00:00:00.000Z") }),
 }));
 
+vi.mock("../../services/notify", async () => (await import("../../test/notify-mock.js")).notifyMockModule());
+
 import { mobileRouter } from "../routes";
 import { AppError } from "../../lib/app-error";
+import { notifyAdmins } from "../../services/notify";
 
 const visit = (id: string, status: string) => ({
   id,
@@ -38,14 +42,14 @@ const visit = (id: string, status: string) => ({
 
 function makeTp() {
   return {
-    technician: { findUnique: vi.fn().mockResolvedValue({ id: "tech-1", active: true }) },
+    technician: { findUnique: vi.fn().mockResolvedValue({ id: "tech-1", active: true, name: "Sam Taylor" }) },
     visit: { findMany: vi.fn().mockResolvedValue([]) },
     technicianDayClose: {
       findUnique: vi.fn().mockResolvedValue(null),
       create: vi.fn().mockResolvedValue({ closedAt: new Date("2026-11-03T17:00:00.000Z") }),
     },
     activityLog: { create: vi.fn().mockResolvedValue({}) },
-    idempotencyRecord: { findUnique: vi.fn().mockResolvedValue(null), create: vi.fn().mockResolvedValue({}) },
+    idempotencyRecord: { findUnique: vi.fn().mockResolvedValue(null), create: vi.fn().mockResolvedValue({}), update: vi.fn().mockResolvedValue({}), deleteMany: vi.fn().mockResolvedValue({ count: 0 }) },
   };
 }
 
@@ -127,6 +131,34 @@ describe("POST /mobile/day/close", () => {
     expect(tp.activityLog.create.mock.calls[0][0].data).toMatchObject({ type: "TECHNICIAN_DAY_CLOSED", actorId: "profile-1" });
   });
 
+  it("NOTIF-03: tells the office on the first close only, naming the technician and the counts", async () => {
+    tp.visit.findMany.mockResolvedValue([visit("a", "COMPLETED"), visit("b", "SKIPPED"), visit("e", "COMPLETED")]);
+    await request(makeApp()).post("/mobile/day/close").send({});
+    expect(notifyAdmins).toHaveBeenCalledWith(tp, {
+      type: "DAY_CLOSED",
+      title: "Sam Taylor finished the day",
+      body: "2 completed, 1 skipped.",
+      data: { date: "2026-11-03" },
+    });
+    expect(tp.technician.findUnique).toHaveBeenCalledWith({ where: { id: "tech-1" }, select: { name: true } });
+  });
+
+  it("NOTIF-03: falls back to 'A technician' when the name is unknown", async () => {
+    tp.technician.findUnique.mockResolvedValueOnce({ id: "tech-1", active: true }); // ownership check
+    tp.technician.findUnique.mockResolvedValueOnce(null); // name lookup
+    await request(makeApp()).post("/mobile/day/close").send({});
+    expect(notifyAdmins).toHaveBeenCalledWith(tp, expect.objectContaining({ title: "A technician finished the day" }));
+  });
+
+  it("NOTIF-03: sends nothing for an already-closed day or when visits remain", async () => {
+    tp.technicianDayClose.findUnique.mockResolvedValue({ closedAt: new Date(), completedCount: 1, skippedCount: 0 });
+    await request(makeApp()).post("/mobile/day/close").send({});
+    tp.technicianDayClose.findUnique.mockResolvedValue(null);
+    tp.visit.findMany.mockResolvedValue([visit("c", "SCHEDULED")]);
+    await request(makeApp()).post("/mobile/day/close").send({});
+    expect(notifyAdmins).not.toHaveBeenCalled();
+  });
+
   it("closes a day with no visits at all", async () => {
     const res = await request(makeApp()).post("/mobile/day/close").send({ date: "2026-11-03" });
     expect(res.status).toBe(200);
@@ -158,8 +190,9 @@ describe("POST /mobile/day/close", () => {
   });
 
   it("replays a stored response for a repeated X-Idempotency-Key", async () => {
+    tp.idempotencyRecord.create.mockRejectedValue(new Prisma.PrismaClientKnownRequestError("dup", { code: "P2002", clientVersion: "x" }));
     tp.idempotencyRecord.findUnique.mockResolvedValue({
-      technicianId: "tech-1", route: "POST /mobile/day/close", responseStatus: 200, responseBody: { alreadyClosed: false, closed: true },
+      technicianId: "tech-1", state: "DONE", route: "POST /mobile/day/close", responseStatus: 200, responseBody: { alreadyClosed: false, closed: true },
     });
     const res = await request(makeApp()).post("/mobile/day/close").set("X-Idempotency-Key", "k1").send({});
     expect(res.status).toBe(200);

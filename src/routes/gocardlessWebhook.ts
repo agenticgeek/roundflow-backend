@@ -2,14 +2,16 @@ import { Router, Request, Response } from "express";
 // @ts-expect-error — gocardless-nodejs ships ESM as main but has a CJS build under require condition
 import { parse, InvalidSignatureError } from "gocardless-nodejs";
 import { prisma } from "../lib/prisma";
+import { guardWebhook } from "../lib/webhook-guard";
 import { getTenantPrismaForSchema } from "../lib/tenant-prisma-manager";
 import { decrypt, safeEqual } from "../lib/crypto";
-import { Prisma, PaymentStatus } from "../generated/tenant-client";
+import { PaymentStatus } from "../generated/tenant-client";
 import { createPaymentService } from "../services/payment.service";
+import { processWebhookEvent } from "../services/webhook-events.service";
 
 export const gocardlessWebhookRouter = Router();
 
-gocardlessWebhookRouter.post("/", async (req: Request, res: Response) => {
+gocardlessWebhookRouter.post("/", guardWebhook("gcWebhook", async (req: Request, res: Response) => {
   const tenantId = req.query.tenantId as string | undefined;
   const secret   = req.query.secret   as string | undefined;
 
@@ -47,7 +49,7 @@ gocardlessWebhookRouter.post("/", async (req: Request, res: Response) => {
   const webhookSecret = decrypt(bs.gocardlessWebhookSigningSecretEncrypted);
   const sig = req.headers["webhook-signature"] as string | undefined;
 
-  let events: Event[];
+  let events: GcEvent[];
   try {
     events = parse(req.body as Buffer, webhookSecret, sig ?? "");
   } catch (err) {
@@ -59,70 +61,69 @@ gocardlessWebhookRouter.post("/", async (req: Request, res: Response) => {
     return;
   }
 
-  // Ack immediately; process async
-  res.sendStatus(200);
-  processEvents(tp, events).catch((err) =>
-    console.error(`[gcWebhook] ${tenantId} processing failed:`, err)
-  );
-});
-
-async function processEvents(
-  tp: Awaited<ReturnType<typeof getTenantPrismaForSchema>>,
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  events: any[]
-): Promise<void> {
-  for (const event of events as Array<{ id?: string; resource_type?: string; action?: string; links?: { payment?: string; mandate?: string } }>) {
+  // Process-then-ack (BE-03): each event gets a durable dedup row (RECEIVED -> DONE/FAILED). If any event's effect
+  // fails we answer 500 so GoCardless redelivers the batch; events already DONE are skipped on redelivery and the
+  // retry sweep also re-runs FAILED ones.
+  let failed = 0;
+  for (const event of events) {
     if (!event.id) continue;
-
-    // Idempotency — skip replays. Only a genuine unique-constraint violation
-    // means "already processed, safe to skip". Any other error must not be
-    // silently swallowed, or a transient failure would permanently drop the
-    // event with no record it ever arrived.
-    try {
-      await tp.webhookEvent.create({
-        data: { source: "gocardless", externalId: event.id },
-      });
-    } catch (err) {
-      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
-        continue;
-      }
-      console.error(`[gcWebhook] failed to record webhook event ${event.id}:`, err);
-      continue;
-    }
-
-    try {
-      await handleEvent(tp, event);
-    } catch (err) {
-      console.error(`[gcWebhook] event ${event.id} (${event.resource_type}.${event.action}) failed:`, err);
-    }
+    const outcome = await processWebhookEvent(tp, "gocardless", event.id, event, () => handleGocardlessEvent(tp, event));
+    if (outcome === "failed") failed++;
   }
-}
+  res.sendStatus(failed > 0 ? 500 : 200);
+}));
 
-type GcEvent = { id?: string; resource_type?: string; action?: string; links?: { payment?: string; mandate?: string } };
+export type GcEvent = {
+  id?: string;
+  resource_type?: string;
+  action?: string;
+  links?: { payment?: string; mandate?: string };
+};
 
-async function handleEvent(
-  tp: Awaited<ReturnType<typeof getTenantPrismaForSchema>>,
-  event: GcEvent
-): Promise<void> {
+type TenantDb = Awaited<ReturnType<typeof getTenantPrismaForSchema>>;
+
+// GoCardless payment actions -> our PaymentStatus (BE-07/BE-08, ACT-07):
+//   confirmed   = the bank accepted the debit and it is being collected: PROCESSING (NOT paid)
+//   paid_out    = the money reached the merchant: PAID
+//   failed / cancelled
+//   charged_back = the customer's bank took the money back: DISPUTED
+//   chargeback_cancelled = the chargeback was reversed: PAID again
+//   refunded    = REFUNDED
+const PAYMENT_ACTIONS: Record<string, { target: PaymentStatus; note?: string }> = {
+  confirmed: { target: PaymentStatus.PROCESSING },
+  paid_out: { target: PaymentStatus.PAID },
+  failed: { target: PaymentStatus.FAILED },
+  cancelled: { target: PaymentStatus.CANCELLED },
+  charged_back: { target: PaymentStatus.DISPUTED, note: "GoCardless chargeback" },
+  chargeback_cancelled: { target: PaymentStatus.PAID, note: "GoCardless chargeback reversed" },
+  refunded: { target: PaymentStatus.REFUNDED, note: "GoCardless refund" },
+};
+
+// GoCardless `refunds` events carry the payment link; a settled refund returns the money. The event does not say
+// whether it was partial, so any settled refund is treated as a full one (part payments / credit notes deferred).
+const REFUND_SETTLED_ACTIONS = new Set(["paid", "refund_settled"]);
+
+/** Applies one GoCardless event. Idempotent; also used by the webhook retry sweep. */
+export async function handleGocardlessEvent(tp: TenantDb, event: GcEvent): Promise<void> {
   const resourceType = event.resource_type;
   const action = event.action;
 
-  if (resourceType === "payments") {
+  if (resourceType === "payments" || resourceType === "refunds") {
     const gcPaymentId = event.links?.payment;
     if (!gcPaymentId) return;
 
-    if (action === "paid" || action === "confirmed") {
-      const payment = await tp.payment.findFirst({ where: { gocardlessId: gcPaymentId } });
-      if (payment) await createPaymentService(tp).applyOutcome(payment.id, "PAID");
-    } else if (action === "failed") {
-      const payment = await tp.payment.findFirst({ where: { gocardlessId: gcPaymentId } });
-      if (payment) await createPaymentService(tp).applyOutcome(payment.id, "FAILED");
-    } else if (action === "cancelled") {
-      await tp.payment.updateMany({
-        where: { gocardlessId: gcPaymentId },
-        data: { status: PaymentStatus.CANCELLED },
-      });
-    }
+    const mapped =
+      resourceType === "refunds"
+        ? action && REFUND_SETTLED_ACTIONS.has(action)
+          ? PAYMENT_ACTIONS.refunded
+          : undefined
+        : action
+          ? PAYMENT_ACTIONS[action]
+          : undefined;
+    if (!mapped) return;
+
+    const payment = await tp.payment.findUnique({ where: { gocardlessId: gcPaymentId } });
+    if (payment) await createPaymentService(tp).transition(payment.id, mapped.target, { note: mapped.note });
     return;
   }
 

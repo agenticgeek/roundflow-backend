@@ -115,12 +115,12 @@ export async function loadTemplate(
   tp: TenantDb,
   name: string,
   fallback: string
-): Promise<{ id: string | null; body: string }> {
+): Promise<{ id: string | null; body: string; subject: string | null }> {
   const template = await tp.messageTemplate.findFirst({
     where: { name: { equals: name, mode: "insensitive" } },
-    select: { id: true, body: true },
+    select: { id: true, body: true, subject: true },
   });
-  return template ?? { id: null, body: fallback };
+  return template ?? { id: null, body: fallback, subject: null };
 }
 
 /** "Monday 9 November" — visit dates are UTC-midnight date-only values. */

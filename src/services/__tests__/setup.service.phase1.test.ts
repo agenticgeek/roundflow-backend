@@ -23,7 +23,7 @@ function makePrisma() {
       delete: vi.fn(),
     },
     technician: { findMany: vi.fn().mockResolvedValue([]), deleteMany: vi.fn(), createMany: vi.fn(), count: vi.fn().mockResolvedValue(0) },
-    technicianServiceArea: { createMany: vi.fn() },
+    technicianServiceArea: { createMany: vi.fn(), deleteMany: vi.fn() },
     technicianAvailability: { findMany: vi.fn().mockResolvedValue([]) },
     round: {
       findMany: vi.fn().mockResolvedValue([]),
