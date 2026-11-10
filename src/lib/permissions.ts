@@ -6,7 +6,8 @@ import { AppError } from "./app-error";
 //   - connect or disconnect Stripe / GoCardless / GoHighLevel,
 //   - change payment, bank or VAT settings,
 //   - delete technicians,
-//   - view or replay the integration dead-letter queue (/integrations/outbox).
+//   - view or replay the integration dead-letter queue (/integrations/outbox),
+//   - use Flo AI (/flo/*).
 // Failures are 403 with code ADMIN_ONLY. The role matrix test (src/__tests__/role-matrix.test.ts) enforces this
 // against the OpenAPI route table.
 
@@ -38,6 +39,13 @@ export const ADMIN_ONLY_ROUTES: ReadonlyArray<readonly [string, string]> = [
   ["DELETE", "/settings/email/logo"],
   ["GET", "/integrations/outbox"],
   ["POST", "/integrations/outbox/:id/replay"],
+  // Flo AI (2026-11): admin-only assistant (plan D3). Enforced by enforceAdminOnlyRoutes() on the flo router.
+  ["GET", "/flo/status"],
+  ["GET", "/flo/suggestions"],
+  ["POST", "/flo/chat"],
+  ["GET", "/flo/conversations"],
+  ["GET", "/flo/conversations/:id"],
+  ["DELETE", "/flo/conversations/:id"],
 ];
 
 /** PATCH /settings/business-profile fields a MANAGER may not touch (bank and VAT). */

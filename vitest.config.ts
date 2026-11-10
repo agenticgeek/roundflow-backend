@@ -183,6 +183,40 @@ const WAVE2B2_FILES = [
   "src/lib/tenant-jobs.ts",
 ];
 
+// Flo AI (2026-11-10): admin-only, read-only assistant. New whole files, gated at 100%. The orchestration, answer
+// builder, stream parser, figure check, SSE writer, service and routes append their own files to this list.
+const FLO_FILES = [
+  "src/integrations/anthropic/client.ts",
+  "src/jobs/floPurge.ts",
+  "src/services/flo/types.ts",
+  "src/services/flo/modes.ts",
+  "src/services/flo/limits.ts",
+  "src/services/flo/scope-gate.ts",
+  "src/services/flo/declines.ts",
+  "src/services/flo/prose-lint.ts",
+  "src/services/flo/system-prompt.ts",
+  "src/services/flo/tool-registry.ts",
+  "src/services/flo/tools/shared.ts",
+  "src/services/flo/tools/get-day-overview.ts",
+  "src/services/flo/tools/list-rounds-due.ts",
+  "src/services/flo/tools/list-debtors.ts",
+  "src/services/flo/tools/list-payments.ts",
+  "src/services/flo/tools/compare-technicians.ts",
+  "src/services/flo/tools/list-complaints.ts",
+  "src/services/flo/tools/list-at-risk-customers.ts",
+  "src/services/flo/tools/revenue-summary.ts",
+  "src/services/flo/tools/list-skipped-visits.ts",
+  "src/services/flo/tools/get-customer-summary.ts",
+  // B4-B6: answer contract and builders, stream parser, figure check, orchestrator, service, SSE writer, routes.
+  "src/services/flo/answer.ts",
+  "src/services/flo/stream-parser.ts",
+  "src/services/flo/figure-check.ts",
+  "src/services/flo/orchestrator.ts",
+  "src/services/flo/flo.service.ts",
+  "src/services/flo/sse.ts",
+  "src/routes/flo.ts",
+];
+
 export default defineConfig({
   test: {
     include: ["src/**/*.test.ts"],
@@ -191,7 +225,7 @@ export default defineConfig({
     coverage: {
       provider: "v8",
       reporter: ["text", "html", "lcov"],
-      include: [...PAYMENT_DOMAIN_FILES, ...AUDIT_REMEDIATION_FILES, ...GEOCODING_FILES, ...INVITE_FILES, ...PHASE1_AUDIT_FILES, ...WAVE1_FILES, ...WAVE2A_FILES, ...WAVE2B1_FILES, ...WAVE2B2_FILES],
+      include: [...PAYMENT_DOMAIN_FILES, ...AUDIT_REMEDIATION_FILES, ...GEOCODING_FILES, ...INVITE_FILES, ...PHASE1_AUDIT_FILES, ...WAVE1_FILES, ...WAVE2A_FILES, ...WAVE2B1_FILES, ...WAVE2B2_FILES, ...FLO_FILES],
       thresholds: {
         100: true,
         perFile: true,

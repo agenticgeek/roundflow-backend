@@ -32,6 +32,7 @@ import { sesWebhookRouter } from "../routes/sesWebhook";
 import { chatRouter } from "../routes/chat";
 import { notificationsRouter } from "../routes/notifications";
 import { integrationsRouter } from "../routes/integrations";
+import { floRouter } from "../routes/flo";
 import { mobileRouter } from "../mobile";
 import { openApiDocument } from "../swagger";
 import { errorHandler } from "../lib/error-handler";
@@ -51,6 +52,7 @@ import { runIdempotencyPurge } from "../jobs/idempotencyPurge";
 import { runWebhookRetry } from "../jobs/webhookRetry";
 import { runOverdueSweep } from "../jobs/overdueSweep";
 import { runEmailDomainRecheck } from "../jobs/emailDomainRecheck";
+import { runFloPurge } from "../jobs/floPurge";
 
 // App construction, cron wiring and startup sequencing, kept out of
 // src/index.ts so they can be tested without binding a port, running tenant
@@ -256,6 +258,8 @@ export function createApp({ allowedOrigins, readiness, env = process.env, pingDb
   app.use("/chat", chatRouter);
   app.use("/notifications", notificationsRouter);
   app.use("/integrations", integrationsRouter);
+  // Flo AI (admin only). Literal paths are registered before /conversations/:id inside the router.
+  app.use("/flo", floRouter);
   app.use("/mobile", mobileRouter);
 
   // API docs — interactive UI at /docs, raw spec at /openapi.json. Public
@@ -315,6 +319,8 @@ export function registerCronJobs(
     ["overdueSweep", "0 4 * * *", () => runOverdueSweep()],
     // Nightly at 05:00 UTC: re-check tenants' sending-domain verification in SES (tier 2 -> tier 1 fallback)
     ["emailDomainRecheck", "0 5 * * *", () => runEmailDomainRecheck()],
+    // Nightly at 03:30 UTC: purge Flo AI conversations past FLO_RETENTION_DAYS (default 90)
+    ["floPurge", "30 3 * * *", () => runFloPurge()],
   ];
   // Every 15 min — pre-clean reminders (B2), opt-in per deployment
   if (isPreCleanRemindersEnabled(env)) {

@@ -43,10 +43,12 @@ export function rateLimitConfig(env: NodeJS.ProcessEnv = process.env): RateLimit
 export interface LimiterOptions extends LimitSpec {
   disabled?: boolean;
   skip?: (req: Request) => boolean;
+  /** Counter key per request (default: the client IP). Flo keys on the signed-in profile id. */
+  keyGenerator?: (req: Request) => string;
 }
 
 /** A limiter that answers 429 `{ error, code: "RATE_LIMITED", requestId? }` with `Retry-After` (seconds). */
-export function createLimiter({ windowMs, limit, disabled, skip }: LimiterOptions): RequestHandler {
+export function createLimiter({ windowMs, limit, disabled, skip, keyGenerator }: LimiterOptions): RequestHandler {
   if (disabled) return (_req, _res, next) => next();
   return rateLimit({
     windowMs,
@@ -54,6 +56,7 @@ export function createLimiter({ windowMs, limit, disabled, skip }: LimiterOption
     standardHeaders: "draft-7",
     legacyHeaders: false,
     skip,
+    ...(keyGenerator ? { keyGenerator } : {}),
     handler: (req: Request, res: Response) => {
       const resetTime = (req as Request & { rateLimit: { resetTime: Date } }).rateLimit.resetTime;
       const seconds = Math.max(1, Math.ceil((resetTime.getTime() - Date.now()) / 1000));

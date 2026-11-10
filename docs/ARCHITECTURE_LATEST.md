@@ -23,10 +23,15 @@
 > `/notifications` API and push preferences, the assignment result of `PUT /rounds/:id/technicians` (§18), and one
 > new tenant migration (§12). Handoffs: `docs/handoff/backend/2026-11-06-wave1-backend.md` and
 > `docs/handoff/frontend/2026-11-06-wave1-frontend-contract.md`.
+>
+> **2026-11-10 update (Flo AI):** an admin-only, read-only, streaming AI assistant over the tenant's own data: the
+> `/flo/*` routes, the scope gate and guardrails, the ten lookup tools, the streamed answer pipeline, two new tenant
+> tables and the `FLO_FILES` coverage gate (§22, §12, §16). Handoffs:
+> `docs/handoff/backend/2026-11-10-flo-ai-backend.md` and `docs/handoff/frontend/2026-11-10-flo-ai-frontend-contract.md`.
 
 ## 1. Overview
 
-RoundFlow is a multi-tenant SaaS backend for UK window-cleaning businesses. Each business (tenant) operates in complete isolation — they share the same Express/TypeScript process and the same PostgreSQL instance, but their operational data lives in a dedicated Postgres schema. The backend is deployed on Railway and communicates with a React frontend; it has no HTML rendering concerns.
+RoundFlow is a multi-tenant SaaS backend for UK window-cleaning businesses. Each business (tenant) operates in complete isolation — they share the same Express/TypeScript process and the same PostgreSQL instance, but their operational data lives in a dedicated Postgres schema. The backend is deployed on AWS EC2 (region eu-west-1 or us-east-1: confirm which, then update this line) and communicates with a React frontend; it has no HTML rendering concerns.
 
 **Phase 1 target:** GHL-connected clients only. RoundFlow is sold as a private integration to businesses already on Agentum's GoHighLevel agency — not listed on the GHL Marketplace yet. GHL connection is required in Phase 1; marketplace listing and standalone mode are Phase 2.
 
@@ -47,7 +52,7 @@ Note: the code already supports **both** a marketplace-style OAuth install flow 
 | Identity provider | Supabase Auth (ES256 JWTs, JWKS) |
 | Staff invite email | Supabase Auth (`admin.auth.inviteUserByEmail`) — same infrastructure as OTP + password reset |
 | Customer-facing email | GHL (same as SMS/WhatsApp — all customer comms route through the GHL outbox) |
-| Deployment | Railway |
+| Deployment | AWS EC2 (region to confirm: eu-west-1 or us-east-1) |
 | API docs | Swagger UI (`/docs`) |
 
 ---
@@ -88,6 +93,8 @@ flowchart TD
 ```
 
 Startup and cron wiring live in `src/server/bootstrap.ts`; `src/index.ts` only calls it (see §6).
+
+Flo AI (§22) adds `/flo/*` to the protected routes (ADMIN only, a streaming `POST /flo/chat`), with its code in `src/routes/flo.ts`, `src/services/flo/` (orchestrator, scope gate, tools, answer builder), `src/integrations/anthropic/client.ts` and the nightly `src/jobs/floPurge.ts`.
 
 ---
 
@@ -783,6 +790,8 @@ it everywhere.
 | `20261108100000_visit_collected_via` | Wave 2B-2 (§21.8): nullable `Visit.collectedVia` (PaymentMethod chosen by the technician at completion). |
 | `20261108110000_email_identity_delivery` | Wave 2B-2 (§21): `EmailDomainStatus` and `MessageDeliveryStatus` enums; `BusinessSettings.email*` identity/limits/pause, `logoPath`, `logoAltText`, `brandColour`; `Message.deliveryStatus/deliveryUpdatedAt/deliveryError` + index on `externalId`; `Customer.emailInvalidAt`; one-off cleanup parking GHL-only outbox rows of tenants without GHL as `dropped`. |
 
+| `20261110100000_flo_ai` | Flo AI (§22): new tables `FloConversation` (per admin profile) and `FloMessage` (role, mode, model, text, answer JSON, tool-call audit, token counts, duration, status `OK/ERROR/DECLINED/ABORTED`, decline reason, error code) with indexes on `(profileId, updatedAt)` and `(conversationId, createdAt)`. Additive and idempotent. |
+
 The three 2026-10-30 migrations are additive (new enum values, nullable columns, new tables). They are paired with idempotent, per-tenant backfill scripts that support `--dry-run`: `scripts/backfill-visit-technicians.ts`, `backfill-next-due-date.ts` and `backfill-completed-steps.ts`, with their logic in `src/jobs/backfills.ts`. Run them after the deploy has migrated the tenants, dry-run first.
 
 ---
@@ -1043,6 +1052,8 @@ Three gates run in CI and locally. They exist so this class of problem is caught
 
 Also: openapi-typescript marks any schema field that has a `default` as *required* in the generated frontend and app types, so optional request fields must not carry a swagger `default` (describe it in the text instead).
 
+**Flo AI gate (2026-11-10).** `FLO_FILES` in `vitest.config.ts` lists every Flo file (`services/flo/*`, `services/flo/tools/*`, `integrations/anthropic/client.ts`, `routes/flo.ts`, `jobs/floPurge.ts`) at 100% line, branch, function and statement coverage per file. `bootstrap.ts`, `swagger.ts`, `permissions.ts` and `rate-limit.ts` stay at 100% with the Flo changes. Guardrail fixtures (`services/flo/__tests__/guardrails.fixtures.ts`: 75 red-team prompts, 43 golden questions, 3 capability questions) run through the real pipeline in unit tests. A live-API eval with pass thresholds (all red-team prompts declined with no tool call, at least 95% of golden questions answered correctly) is planned but **not yet written or run**.
+
 **End-to-end regression suite.** `roundflow-e2e/` (a sibling folder, not part of this package) runs one Playwright spec per audit gap against a local Docker Postgres, a locally started backend (port 3100) and web app (port 5173). The integration gaps use real Stripe test-mode, GoCardless sandbox and GHL sandbox credentials. It creates a fresh tenant per run and deletes the test users afterwards. Its first runs found a real defect: `GET /settings/stripe/callback` returned 500 when Stripe rejected a code. It is now `400 STRIPE_CONNECT_FAILED` or `502 STRIPE_UNAVAILABLE` (defect D-11).
 
 ---
@@ -1268,3 +1279,67 @@ AWS setup, IAM policy, DNS and sandbox exit: `docs/handoff/backend/2026-11-06-wa
 
 Background jobs that touch every tenant use `lib/tenant-jobs.ts#forEachTenant` (4 tenants at a time by default, `TENANT_JOB_CONCURRENCY`) through the shared 15-entry client cache; `withTenantClient` pins a client while in use so eviction never disconnects it (BUG-010). Other changes of the pass: unique-constraint races on invite accept, signup and visit completion are idempotent; completing a visit advances the plan `nextDueDate`; wizard saves invalidate the shared settings cache; strict calendar-date and email validation with `fields[]` errors; all-skipped bulk invoice batches are fetchable. Details: `docs/handoff/backend/2026-11-06-wave2b2-backend.md` section 10.
 
+
+
+---
+
+## 22. Flo AI: Admin Assistant over Tenant Data (2026-11-10)
+
+An AI assistant in the admin web app ("Flo AI", from `FloAI.pdf`). The admin asks a question in plain English and gets a streamed answer built from the tenant's own live data. Plan: `docs/FLO_AI_PLAN_2026-11-10.md` (repo root). Handoffs: `docs/handoff/backend/2026-11-10-flo-ai-backend.md`, `docs/handoff/frontend/2026-11-10-flo-ai-frontend-contract.md`.
+
+### 22.1 Boundaries
+
+- **Admin only** (`ADMIN_ONLY_ROUTES`, `ROLE_MATRIX` = ADMIN). Managers and technicians get 403 `ADMIN_ONLY`.
+- **Read-only.** No tool writes, sends or changes anything. Enforced by a tool allow-list and a test that runs every tool against a Prisma fake whose write methods throw.
+- **Tenant data only.** Anything else is declined with fixed, server-written copy (22.5). The model never writes a refusal.
+- **Included in the SaaS price.** The daily cap is a platform env var (`FLO_DAILY_LIMIT_PER_TENANT`, default 100 answered questions per tenant-local day). Tenants cannot see or change it.
+- **No PII stripping** (owner decision): names, balances, dates and counts reach the provider as-is. **Secrets never do** (bank details, payment tokens, API keys, auth and webhook secrets); a per-tool key snapshot and a canary test enforce it. Provider request bodies are never logged.
+- **Not built:** writes, the customer-facing agent (the tools take a `ToolContext` with `scope: "ADMIN"` so a customer scope can be added later), manager access, per-tenant cap overrides, resuming a dropped stream.
+
+### 22.2 Module map
+
+| Path | Role |
+|---|---|
+| `src/routes/flo.ts` | The six endpoints; ADMIN-only; per-profile rate limiter |
+| `src/services/flo/flo.service.ts` | Conversations, history, caps, idempotency, persistence; runs the orchestrator as an event generator |
+| `src/services/flo/orchestrator.ts` | Scope gate, tool loop, streamed answer, abort and failure handling |
+| `src/services/flo/scope-gate.ts`, `declines.ts` | Pre-checks, Haiku classifier (fails closed), fixed decline and capability copy |
+| `src/services/flo/tool-registry.ts`, `tools/*` | Ten read-only lookups with fixed column lists |
+| `src/services/flo/answer.ts`, `stream-parser.ts` | Block builders and the incremental parser for the tagged answer |
+| `src/services/flo/figure-check.ts`, `prose-lint.ts` | Per-sentence number grounding and text lint |
+| `src/services/flo/system-prompt.ts`, `modes.ts`, `limits.ts`, `sse.ts`, `types.ts` | Prompt and tenant context, mode config, caps, SSE writer, shared types |
+| `src/integrations/anthropic/client.ts` | Injectable wrapper over `@anthropic-ai/sdk` (pinned 1.3.0): streaming, timeout, one retry before the first byte, error mapping |
+| `src/jobs/floPurge.ts` | Nightly (`30 3 * * *`) purge by `FLO_RETENTION_DAYS` (90) through the tenant fan-out |
+
+### 22.3 Request pipeline
+
+1. HTTP checks before any byte is sent (plain JSON errors): auth, admin, validation, rate limit, daily cap, decline cap, `Idempotency-Key` (claimed as `flo:<profileId>:<key>`; a replay streams the stored result).
+2. The stream opens (`text/event-stream`, `no-transform`, `X-Accel-Buffering: no`, a `: ping` every 15 s).
+3. **Scope gate.** Not `IN_SCOPE` means no main-model call and no tool run.
+4. **Tool loop** with history of the last 10 turns (assistant turns stored as final text only). Tool results are returned to the model wrapped as untrusted data. Caps: 8, 6 and 3 rounds for Thorough, Balanced and Quick, tokens per call, 90 s total.
+5. **Streamed answer** in a closed tag grammar (`intro`, `block` JSON, `insight`, `follow_up`). Text outside the tags is discarded.
+6. Persist, then `done`. A client disconnect aborts the provider call and persists ABORTED.
+
+Models: Thorough = Opus 5.5, Balanced = Sonnet 5.5, Quick = Haiku 5.5, scope gate = Haiku 5.5; each overridable by env (`FLO_MODEL_*`).
+
+### 22.4 Why the numbers can be trusted
+
+Cards and tables are **built by the server from stored tool results**; the model only picks a `sourceId`, columns and a title. Prose is split into sentences, and each sentence passes `prose-lint` and `figure-check` **before** it is streamed (every number must match a tool result; dates, ranks, ordinals and times are whitelisted). A streamed sentence cannot be retracted, so a failing sentence is sent with `unverified: true`, the answer gets the `UNVERIFIED_FIGURES` warning, and the UI shows a notice. There is no repair turn. Prose is sentence-level, not token-level, for this reason.
+
+### 22.5 Guardrails
+
+Six layers, none of which trusts the main model: (1) deterministic pre-checks, (2) the scope classifier (`IN_SCOPE`, `OUT_OF_SCOPE`, `WRITE_REQUEST`, `CAPABILITY_QUESTION`, `UNSAFE`; any error or odd output is `OUT_OF_SCOPE`; it never sees tool data), (3) data only through tools (an answer with zero tool calls becomes the fixed `NO_DATA_USED` decline), (4) the strict tag format with length caps, (5) the prose lint (no URLs, markdown links, code, HTML, emails or phones; links come only from the closed `link.screen` enum), (6) fixed refusal copy. Declined messages do not count to the daily answer cap but count to the rate limit and a per-admin decline cap (`FLO_DECLINE_LIMIT_PER_DAY`, 30), except capability replies ("what can you do?"), which are served from the suggestion list with no model call.
+
+Known limit: model text before a `tool_use` in the same turn is released once tool results exist; it still passes lint and figure check.
+
+### 22.6 Tools
+
+`get_day_overview`, `list_rounds_due`, `list_debtors`, `list_payments`, `compare_technicians`, `list_complaints`, `list_at_risk_customers`, `revenue_summary`, `list_skipped_visits`, `get_customer_summary`. Money is decimal GBP rounded to 2 dp; `percent` columns hold percentages. Rows are capped at 200 and date ranges at 366 days; the tenant client comes from the request, never an id from the model. Several use small direct queries because the existing services could not provide the shape (the Today service handles only "today"; `listComplaints` cannot sort by severity). A new tool needs: a file, a registry entry (the allow-list snapshot test fails until updated on purpose), the no-write and no-secrets tests, a golden fixture, and a place in `FLO_FILES`.
+
+### 22.7 Endpoints and data
+
+`GET /flo/status`, `GET /flo/suggestions`, `POST /flo/chat` (SSE), `GET /flo/conversations`, `GET /flo/conversations/{id}`, `DELETE /flo/conversations/{id}` (204). Conversations belong to the admin profile that created them (others get 404). SSE events: `start`, `status`, `block`, `text`, `follow_ups`, `declined`, `warning`, `done`, `error` (shapes in the frontend contract). The daily cap is counted from `FloMessage` rows with status OK in the tenant-local day; the decline cap from DECLINED rows (capability replies excluded). Errors after the first byte are `error` events (`FLO_PROVIDER_ERROR`, `FLO_TIMEOUT`, `FLO_NO_ANSWER`, `FLO_INTERNAL_ERROR`).
+
+### 22.8 Operations and open items
+
+Env vars: `ANTHROPIC_API_KEY` (recommended; unset disables Flo, 503 `FLO_UNAVAILABLE`), `ANTHROPIC_BASE_URL`, `FLO_ENABLED` (kill switch), `FLO_MODEL_THOROUGH/_BALANCED/_QUICK/_SCOPE`, `FLO_DAILY_LIMIT_PER_TENANT`, `FLO_DECLINE_LIMIT_PER_DAY`, `RATE_LIMIT_FLO_PER_MIN` (20, per profile), `FLO_TIMEOUT_MS` (90000), `FLO_RETENTION_DAYS`. As of 2026-11-10 these were **not yet done**: the live-API eval (the system and classifier prompts are untuned first drafts), a check that the stream is not buffered on the deployed AWS path, a run of the web app against this backend, a cumulative token cap across tool rounds (only per-call caps exist), and e2e scenarios (deferred by the owner). The app's generated `types.gen.ts` was left unchanged because it was already stale for unrelated reasons.

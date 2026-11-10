@@ -68,4 +68,11 @@ describe("createLimiter", () => {
     const skipped = build({ windowMs: 60_000, limit: 1, skip: () => true });
     for (let i = 0; i < 3; i++) expect((await request(skipped).get("/")).status).toBe(200);
   });
+
+  it("counts per keyGenerator key instead of per IP (Flo keys on the profile id)", async () => {
+    const app = build({ windowMs: 60_000, limit: 1, keyGenerator: (req) => String(req.headers["x-profile"]) });
+    expect((await request(app).get("/").set("x-profile", "a")).status).toBe(200);
+    expect((await request(app).get("/").set("x-profile", "b")).status).toBe(200);
+    expect((await request(app).get("/").set("x-profile", "a")).status).toBe(429);
+  });
 });

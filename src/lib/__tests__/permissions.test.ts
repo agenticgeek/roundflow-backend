@@ -28,6 +28,12 @@ describe("ADMIN_ONLY_ROUTES (BE-01)", () => {
         "DELETE /settings/technicians/:id",
         "GET /integrations/outbox",
         "POST /integrations/outbox/:id/replay",
+        "GET /flo/status",
+        "GET /flo/suggestions",
+        "POST /flo/chat",
+        "GET /flo/conversations",
+        "GET /flo/conversations/:id",
+        "DELETE /flo/conversations/:id",
       ])
     );
   });
@@ -41,6 +47,10 @@ describe("ADMIN_ONLY_ROUTES (BE-01)", () => {
     expect(isAdminOnlyRoute("PATCH", "/settings/payment/other")).toBe(false);
     expect(isAdminOnlyRoute("DELETE", "/settings/technicians")).toBe(false);
     expect(isAdminOnlyRoute("PATCH", "/settings/technicians/abc")).toBe(false);
+    expect(isAdminOnlyRoute("POST", "/flo/chat")).toBe(true);
+    expect(isAdminOnlyRoute("DELETE", "/flo/conversations/c1")).toBe(true);
+    expect(isAdminOnlyRoute("GET", "/flo/conversations")).toBe(true);
+    expect(isAdminOnlyRoute("PUT", "/flo/conversations/c1")).toBe(false);
   });
 });
 

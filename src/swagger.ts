@@ -2489,6 +2489,156 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     },
   },
 
+  // ---- Flo AI (admin-only assistant). No `default` values: openapi-typescript would mark such fields required. ----
+  FloLink: {
+    type: "object",
+    required: ["screen"],
+    description: "A deep link. `screen` is a closed enum the frontend maps to a route; params are validated server-side (roundId, date, visitId, period).",
+    properties: {
+      screen: { type: "string", enum: ["TODAYS_WORK", "ROUND", "CUSTOMERS", "DEBT_PAYMENT", "REPORTS", "COMPLAINTS", "TECHNICIANS", "INVOICES"] },
+      params: { type: "object", additionalProperties: { type: "string" } },
+    },
+  },
+  FloColumn: {
+    type: "object",
+    required: ["key", "label", "format", "align"],
+    properties: {
+      key: { type: "string" },
+      label: { type: "string" },
+      format: { type: "string", enum: ["text", "integer", "currency", "percent", "date"], description: "Currency is decimal GBP (never pence); percent holds a percentage (96.4 = 96.4%)." },
+      align: { type: "string", enum: ["left", "right"] },
+    },
+  },
+  FloCardItem: {
+    type: "object",
+    required: ["label", "value", "format"],
+    properties: {
+      label: { type: "string" },
+      value: { oneOf: [{ type: "string" }, { type: "number" }], nullable: true },
+      format: { type: "string", enum: ["text", "integer", "currency", "percent", "date"] },
+      sub: { type: "string" },
+      tone: { type: "string", enum: ["neutral", "positive", "negative", "warning"] },
+    },
+  },
+  FloBlock: {
+    type: "object",
+    required: ["type"],
+    description: "A card row (`type: cards`, with `items`) or a table (`type: table`, with `title`, `sourceId`, `columns`, `rows`, optional `totals` and `link`). Built by the server from stored tool results; the model never supplies a value. Clients must ignore unknown block types.",
+    properties: {
+      type: { type: "string", enum: ["cards", "table"] },
+      items: { type: "array", items: ref("FloCardItem") },
+      title: { type: "string" },
+      sourceId: { type: "string" },
+      columns: { type: "array", items: ref("FloColumn") },
+      rows: { type: "array", items: { type: "object", additionalProperties: { oneOf: [{ type: "string" }, { type: "number" }], nullable: true } } },
+      totals: { type: "object", additionalProperties: { oneOf: [{ type: "string" }, { type: "number" }], nullable: true } },
+      link: ref("FloLink"),
+    },
+  },
+  FloAnswer: {
+    type: "object",
+    required: ["intro", "introUnverified", "blocks", "insights", "followUps", "sources", "truncated"],
+    properties: {
+      intro: { type: "string" },
+      introUnverified: { type: "boolean", description: "True when an intro sentence contains a figure that could not be checked against the data." },
+      dateRange: { type: "object", required: ["from", "to", "label"], properties: { from: { type: "string" }, to: { type: "string" }, label: { type: "string" } } },
+      blocks: { type: "array", items: ref("FloBlock") },
+      insights: {
+        type: "array",
+        items: {
+          type: "object",
+          required: ["text", "unverified"],
+          properties: { text: { type: "string" }, unverified: { type: "boolean" }, link: ref("FloLink") },
+        },
+      },
+      followUps: { type: "array", items: { type: "string" } },
+      sources: {
+        type: "array",
+        items: {
+          type: "object",
+          required: ["id", "tool", "label", "rows"],
+          properties: { id: { type: "string" }, tool: { type: "string" }, label: { type: "string" }, rows: { type: "integer" } },
+        },
+      },
+      truncated: { type: "boolean" },
+    },
+  },
+  FloDeclined: {
+    type: "object",
+    required: ["reason", "text", "suggestions"],
+    description: "Fixed server-written copy; never model-written.",
+    properties: {
+      reason: { type: "string", enum: ["OUT_OF_SCOPE", "WRITE_REQUEST", "UNSAFE", "NO_DATA_USED", "CAPABILITY"] },
+      text: { type: "string" },
+      suggestions: { type: "array", items: { type: "string" } },
+    },
+  },
+  FloMessage: {
+    type: "object",
+    required: ["id", "role"],
+    description:
+      "`role: USER` messages carry `text` and `createdAt`. `role: ASSISTANT` messages carry `mode`, `model`, `status`, `declined`, `answer`, `warnings` (and `errorCode` when ERROR). " +
+      "The same shape is the `message` of the `done` event.",
+    properties: {
+      id: { type: "string" },
+      role: { type: "string", enum: ["USER", "ASSISTANT"] },
+      text: { type: "string" },
+      mode: { type: "string", enum: ["THOROUGH", "BALANCED", "QUICK"], nullable: true },
+      model: { type: "string", nullable: true },
+      status: { type: "string", enum: ["OK", "ERROR", "DECLINED", "ABORTED"] },
+      createdAt: { type: "string", format: "date-time" },
+      declined: { allOf: [ref("FloDeclined")], nullable: true },
+      answer: { allOf: [ref("FloAnswer")], nullable: true },
+      warnings: { type: "array", items: { type: "string", enum: ["UNVERIFIED_FIGURES"] } },
+      errorCode: { type: "string" },
+    },
+  },
+  FloStatus: {
+    type: "object",
+    required: ["enabled", "modes", "dailyRemaining"],
+    properties: {
+      enabled: { type: "boolean", description: "False when ANTHROPIC_API_KEY is unset or FLO_ENABLED=false." },
+      modes: {
+        type: "array",
+        items: {
+          type: "object",
+          required: ["key", "label", "description"],
+          properties: { key: { type: "string", enum: ["THOROUGH", "BALANCED", "QUICK"] }, label: { type: "string" }, description: { type: "string" } },
+        },
+      },
+      dailyRemaining: { type: "integer", description: "Questions left today for the whole business (tenant-local day). The limit itself is platform-owned and not exposed." },
+    },
+  },
+  FloSuggestions: {
+    type: "object",
+    required: ["groups"],
+    properties: {
+      groups: { type: "array", items: { type: "object", required: ["area", "questions"], properties: { area: { type: "string" }, questions: { type: "array", items: { type: "string" } } } } },
+    },
+  },
+  FloConversationList: {
+    type: "object",
+    required: ["conversations", "nextCursor"],
+    properties: {
+      conversations: { type: "array", items: { type: "object", required: ["id", "title", "updatedAt"], properties: { id: { type: "string" }, title: { type: "string" }, updatedAt: { type: "string", format: "date-time" } } } },
+      nextCursor: { type: "string", nullable: true, description: "Pass as `?cursor=` for the next page; null on the last page." },
+    },
+  },
+  FloConversation: {
+    type: "object",
+    required: ["id", "title", "messages"],
+    properties: { id: { type: "string" }, title: { type: "string" }, messages: { type: "array", items: ref("FloMessage"), description: "Oldest first." } },
+  },
+  FloChatRequest: {
+    type: "object",
+    required: ["message"],
+    properties: {
+      conversationId: { type: "string", description: "Omit to start a new conversation." },
+      message: { type: "string", minLength: 1, maxLength: 2000 },
+      mode: { type: "string", enum: ["THOROUGH", "BALANCED", "QUICK"], description: "Omitted means BALANCED." },
+    },
+  },
+
   AdminNotificationPage: {
     type: "object",
     required: ["notifications", "unreadCount", "nextCursor"],
@@ -8413,6 +8563,87 @@ const paths: OpenAPIV3.PathsObject = {
       },
     },
   },
+  "/flo/status": {
+    get: {
+      tags: ["Flo AI"],
+      summary: "Flo AI: is it on, the modes, and questions left today",
+      description: "ADMIN only (MANAGER and TECHNICIAN get 403). `enabled` is false when `ANTHROPIC_API_KEY` is unset or `FLO_ENABLED=false`.",
+      responses: { "200": jsonResponse("Status.", ref("FloStatus")), "401": ERR[401], "403": ERR[403] },
+    },
+  },
+  "/flo/suggestions": {
+    get: {
+      tags: ["Flo AI"],
+      summary: "Flo AI: suggested questions by area",
+      description: "ADMIN only. Static list, also the content of the \"what can you do\" reply.",
+      responses: { "200": jsonResponse("Suggestion groups.", ref("FloSuggestions")), "401": ERR[401], "403": ERR[403] },
+    },
+  },
+  "/flo/chat": {
+    post: {
+      tags: ["Flo AI"],
+      summary: "Flo AI: ask a question (Server-Sent Events stream)",
+      description:
+        "ADMIN only. Answers `text/event-stream` (headers `Cache-Control: no-cache, no-transform`, `X-Accel-Buffering: no`, `Connection: keep-alive`); a `: ping` comment is sent every 15 s. " +
+        "Read it with `fetch` (EventSource cannot POST or send the bearer token). Every event is `event: <name>` plus one JSON `data:` line:\n\n" +
+        "- `start` `{ conversationId, messageId, mode }`: the stream opened; `messageId` is the id of the assistant message used in `done` and in GET.\n" +
+        "- `status` `{ phase: \"checking\"|\"checked\", tool, label, rows? }`: one pair per data source looked up.\n" +
+        "- `block` `{ index, block }`: a finished card row or table (`index` = 0-based position among blocks).\n" +
+        "- `text` `{ target: \"intro\"|\"insight\", index, text, unverified? }`: one sentence; `index` is the 0-based position within its target. `unverified: true` = a figure could not be checked against the data.\n" +
+        "- `follow_ups` `{ items }`: up to 3 suggested next questions.\n" +
+        "- `declined` `{ reason, text, suggestions }`: out of scope, a write request, a capability question or no data; the text is fixed server copy. Followed by `done` with status DECLINED.\n" +
+        "- `warning` `{ code: \"UNVERIFIED_FIGURES\" }`.\n" +
+        "- `done` `{ message }`: the final persisted message (same shape as GET /flo/conversations/{id}); the client replaces its streamed state with it.\n" +
+        "- `error` `{ code, message, retryable }`: a failure after the stream started (`FLO_PROVIDER_ERROR`, `FLO_TIMEOUT`, `FLO_NO_ANSWER`, `FLO_INTERNAL_ERROR`); no `done` follows.\n\n" +
+        "Failures before the first byte are normal JSON errors: 400 `INVALID_MESSAGE`, 404 `FLO_CONVERSATION_NOT_FOUND`, 409 `FLO_REQUEST_IN_PROGRESS` (same Idempotency-Key still running), 429 `RATE_LIMITED`, 429 `FLO_DAILY_LIMIT` (body has `resetsAt`), 429 `FLO_DECLINE_LIMIT`, 503 `FLO_UNAVAILABLE`. " +
+        "A repeat with the same `Idempotency-Key` after the first finished replays `start` + `done` (response header `Idempotent-Replay: true`). A client disconnect cancels the work and records the message as ABORTED.",
+      parameters: [IDEMPOTENCY_KEY_PARAM],
+      requestBody: jsonBody(ref("FloChatRequest")),
+      responses: {
+        "200": {
+          description: "The event stream described above.",
+          content: { "text/event-stream": { schema: { type: "string" } } },
+        },
+        "400": errorResponse("Empty, over-long or malformed message, bad mode or bad Idempotency-Key (code INVALID_MESSAGE / INVALID_IDEMPOTENCY_KEY).", "Type a question for Flo."),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": errorResponse("conversationId is not one of the caller's conversations (code FLO_CONVERSATION_NOT_FOUND).", "Conversation not found."),
+        "409": errorResponse("The same Idempotency-Key is still being answered (code FLO_REQUEST_IN_PROGRESS).", "This question is still being answered."),
+        "429": {
+          description: "Rate limited (code RATE_LIMITED, Retry-After header), the business's daily cap (code FLO_DAILY_LIMIT, body has `resetsAt`) or too many declined messages (code FLO_DECLINE_LIMIT).",
+          content: { "application/json": { schema: { allOf: [ref("Error")], properties: { resetsAt: { type: "string", format: "date-time" } } }, example: { error: "Flo has reached today's limit. It resets at midnight.", code: "FLO_DAILY_LIMIT", resetsAt: "2026-11-11T00:00:00.000Z" } } },
+        },
+        "503": errorResponse("Flo is switched off or has no API key (code FLO_UNAVAILABLE).", "Flo is not switched on for this account."),
+      },
+    },
+  },
+  "/flo/conversations": {
+    get: {
+      tags: ["Flo AI"],
+      summary: "Flo AI: the caller's own conversations, newest first",
+      description: "ADMIN only. Another admin's conversations are never listed.",
+      parameters: [
+        { name: "cursor", in: "query", required: false, schema: { type: "string" }, description: "The previous page's `nextCursor`." },
+        { name: "limit", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100 }, description: "Page size, 30 when omitted. Values above the maximum are clamped to it (no error)." },
+      ],
+      responses: { "200": jsonResponse("A page of conversations.", ref("FloConversationList")), "400": errorResponse("Bad cursor or limit (code INVALID_CURSOR / INVALID_LIMIT).", "limit must be a positive whole number."), "401": ERR[401], "403": ERR[403] },
+    },
+  },
+  "/flo/conversations/{id}": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Flo AI"],
+      summary: "Flo AI: one conversation with its messages",
+      description: "ADMIN only. USER messages carry `text`; ASSISTANT messages are the final-message shape (ERROR and ABORTED ones carry `status` and `errorCode`). Another admin's id answers 404 `FLO_CONVERSATION_NOT_FOUND`. A client whose stream dropped re-reads the final message here.",
+      responses: { "200": jsonResponse("The conversation.", ref("FloConversation")), "401": ERR[401], "403": ERR[403], "404": errorResponse("Not one of the caller's conversations (code FLO_CONVERSATION_NOT_FOUND).", "Conversation not found.") },
+    },
+    delete: {
+      tags: ["Flo AI"],
+      summary: "Flo AI: delete one of the caller's conversations",
+      description: "ADMIN only. Another admin's id answers 404 `FLO_CONVERSATION_NOT_FOUND`.",
+      responses: { "204": { description: "Deleted." }, "401": ERR[401], "403": ERR[403], "404": errorResponse("Not one of the caller's conversations (code FLO_CONVERSATION_NOT_FOUND).", "Conversation not found.") },
+    },
+  },
   "/notifications/read-all": {
     post: {
       tags: ["Notifications"],
@@ -8774,6 +9005,7 @@ export const openApiDocument: OpenAPIV3.Document = {
     { name: "Dashboard", description: "Dashboard screen data — KPI cards, alert counts, today's rounds, technician performance, and chart series. ADMIN/MANAGER only." },
     { name: "Emergencies", description: "Technician emergency reporting and reassignment flow — report, list, inspect, pick a replacement, and confirm reassignment." },
     { name: "Integrations", description: "Integration outbox dead-letter queue (GHL sends, invoice.send): list and replay. ADMIN only." },
+    { name: "Flo AI", description: "Flo AI: the admin-only, read-only assistant. Answers questions about the tenant's own business data (rounds, jobs, payments, debt, complaints, technicians, revenue) as a Server-Sent Events stream. ADMIN only." },
     { name: "Notifications", description: "Admin/manager notification feed (list, unread count, mark read). Technicians use /mobile/notifications. ADMIN/MANAGER only." },
     { name: "Rounds", description: "Round CRUD, the planner (calendar + list/map views, including batched multi-round variants), the Today panel, reassign, push-missed, weather hold (preview + apply), and on-demand visit generation. ADMIN/MANAGER only." },
     { name: "Technicians", description: "Technician directory — list/detail/create/update with round names and today's job stats. Distinct from Settings → /settings/technicians, which is the invite-pending-only editor. ADMIN/MANAGER only." },

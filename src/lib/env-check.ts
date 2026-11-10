@@ -30,6 +30,9 @@ RECOMMENDED_ENV_VARS.SES_REGION =
 RECOMMENDED_ENV_VARS.SES_FROM_DOMAIN_ADDRESS =
   "GHL-03: shared sending address on the RoundFlow-owned, SES-verified subdomain (e.g. notifications@mail.roundflow.ai) used for tier 1 sender identity";
 
+RECOMMENDED_ENV_VARS.ANTHROPIC_API_KEY =
+  "FLO-01: Anthropic API key for Flo AI (admin assistant). Unset = Flo is disabled (GET /flo/status says so, POST /flo/chat answers 503 FLO_UNAVAILABLE). Never logged";
+
 export function listMissingRecommendedEnv(env: NodeJS.ProcessEnv = process.env): string[] {
   return Object.keys(RECOMMENDED_ENV_VARS).filter((name) => !env[name] || env[name]!.trim() === "");
 }
@@ -53,5 +56,16 @@ export const OPTIONAL_ENV_VARS: Record<string, string> = {
   SES_SNS_TOPIC_ARN: "GHL-07: when set, /webhooks/ses only accepts SNS messages from this topic ARN (recommended in production)",
   EMAIL_DISABLED: "GHL-03: 'true' switches all native customer email off (sends are refused as CHANNEL_UNAVAILABLE); Supabase auth emails are unaffected",
   RATE_LIMIT_EMAIL_ADMIN_PER_HOUR: "Wave 2B-2: /settings/email/* (domain verification, test email) per IP per hour (default 60)",
+  ANTHROPIC_BASE_URL: "FLO-01: points the Anthropic SDK at a mock server or proxy (default: the SDK default, api.anthropic.com)",
+  FLO_ENABLED: "FLO-01: kill switch for Flo AI; 'false' disables it (default true; also needs ANTHROPIC_API_KEY)",
+  FLO_MODEL_THOROUGH: "FLO-01: model id for Thorough mode (default claude-opus-5-5)",
+  FLO_MODEL_BALANCED: "FLO-01: model id for Balanced mode (default claude-sonnet-5-5)",
+  FLO_MODEL_QUICK: "FLO-01: model id for Quick mode (default claude-haiku-5-5)",
+  FLO_MODEL_SCOPE: "FLO-01: model id for the Flo scope-gate classifier (default claude-haiku-5-5)",
+  FLO_DAILY_LIMIT_PER_TENANT: "FLO-01: platform-owned cap on answered Flo questions per tenant per tenant-local day (default 100; not tenant-editable)",
+  FLO_DECLINE_LIMIT_PER_DAY: "FLO-01: declined Flo messages per admin per day before 429 FLO_DECLINE_LIMIT (default 30)",
+  RATE_LIMIT_FLO_PER_MIN: "FLO-01: Flo requests per admin profile per minute (default 20; keyed on profile id, not IP)",
+  FLO_TIMEOUT_MS: "FLO-01: whole-request budget for a Flo answer in ms, minimum 5000 (default 90000)",
+  FLO_RETENTION_DAYS: "FLO-01: days a Flo conversation is kept before the nightly purge (default 90)",
   OUTBOUND_TIMEOUT_MS: "BE-09: timeout for outbound HTTP calls in ms, minimum 1000 (default 15000; PDF render 60000)",
 };

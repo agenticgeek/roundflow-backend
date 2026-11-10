@@ -1040,3 +1040,53 @@ model TechnicianDayClose {
   @@unique([technicianId, date])
   @@index([date])
 }
+
+// ── Flo AI (2026-11-10) ───────────────────────────────────────────────────
+// Admin-only read-only assistant. profileId references public.Profile.id (no cross-schema FK).
+// The daily cap is counted from FloMessage rows, so there is no counter table to drift.
+enum FloRole {
+  USER
+  ASSISTANT
+}
+
+enum FloMessageStatus {
+  OK
+  ERROR
+  DECLINED
+  ABORTED
+}
+
+model FloConversation {
+  id        String       @id @default(cuid())
+  profileId String
+  title     String
+  messages  FloMessage[]
+  createdAt DateTime     @default(now()) @db.Timestamptz
+  updatedAt DateTime     @updatedAt @db.Timestamptz
+
+  @@index([profileId, updatedAt])
+}
+
+model FloMessage {
+  id             String           @id @default(cuid())
+  conversationId String
+  conversation   FloConversation  @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           FloRole
+  mode           String?
+  model          String?
+  text           String           @default("")
+  answer         Json?
+  toolCalls      Json?
+  warnings       String[]         @default([])
+  inputTokens    Int?
+  outputTokens   Int?
+  cachedTokens   Int?
+  durationMs     Int?
+  status         FloMessageStatus @default(OK)
+  declineReason  String?
+  errorCode      String?
+  createdAt      DateTime         @default(now()) @db.Timestamptz
+
+  @@index([conversationId, createdAt])
+  @@index([status, createdAt])
+}

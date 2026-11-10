@@ -20,12 +20,26 @@ it("documents optional switches (BE-25) and never reports them as missing", () =
 });
 
 it("lists unset recommended vars (Google geocoding key) and documents the daily limit", () => {
-  const SES = ["SES_REGION", "SES_FROM_DOMAIN_ADDRESS"];
+  const SES = ["SES_REGION", "SES_FROM_DOMAIN_ADDRESS", "ANTHROPIC_API_KEY"];
   expect(listMissingRecommendedEnv({} as NodeJS.ProcessEnv)).toEqual(["GOOGLE_MAPS_GEOCODING_API_KEY", ...SES]);
   expect(listMissingRecommendedEnv({ GOOGLE_MAPS_GEOCODING_API_KEY: " " } as NodeJS.ProcessEnv)).toEqual(["GOOGLE_MAPS_GEOCODING_API_KEY", ...SES]);
-  expect(listMissingRecommendedEnv({ GOOGLE_MAPS_GEOCODING_API_KEY: "k", SES_REGION: "r", SES_FROM_DOMAIN_ADDRESS: "a@b.co" } as NodeJS.ProcessEnv)).toEqual([]);
+  expect(listMissingRecommendedEnv({ GOOGLE_MAPS_GEOCODING_API_KEY: "k", SES_REGION: "r", SES_FROM_DOMAIN_ADDRESS: "a@b.co", ANTHROPIC_API_KEY: "k" } as NodeJS.ProcessEnv)).toEqual([]);
   expect(Object.keys(OPTIONAL_ENV_VARS)).toEqual(expect.arrayContaining(["SES_CONFIGURATION_SET", "SES_ACCESS_KEY_ID", "SES_SECRET_ACCESS_KEY", "SES_SNS_TOPIC_ARN", "EMAIL_DISABLED"]));
   expect(Array.isArray(listMissingRecommendedEnv())).toBe(true);
   expect(Object.keys(RECOMMENDED_ENV_VARS)).toContain("GOOGLE_MAPS_GEOCODING_API_KEY");
   expect(Object.keys(OPTIONAL_ENV_VARS)).toContain("GEOCODE_DAILY_LIMIT");
+});
+
+it("Flo AI: the Anthropic key is recommended (unset = Flo disabled) and every Flo switch is documented", () => {
+  expect(Object.keys(RECOMMENDED_ENV_VARS)).toContain("ANTHROPIC_API_KEY");
+  expect(listMissingRecommendedEnv({} as NodeJS.ProcessEnv)).toContain("ANTHROPIC_API_KEY");
+  expect(listMissingRecommendedEnv({ ANTHROPIC_API_KEY: " " } as NodeJS.ProcessEnv)).toContain("ANTHROPIC_API_KEY");
+  expect(listMissingRecommendedEnv({ ANTHROPIC_API_KEY: "k" } as NodeJS.ProcessEnv)).not.toContain("ANTHROPIC_API_KEY");
+  expect(Object.keys(OPTIONAL_ENV_VARS)).toEqual(
+    expect.arrayContaining([
+      "ANTHROPIC_BASE_URL", "FLO_ENABLED", "FLO_MODEL_THOROUGH", "FLO_MODEL_BALANCED", "FLO_MODEL_QUICK", "FLO_MODEL_SCOPE",
+      "FLO_DAILY_LIMIT_PER_TENANT", "FLO_DECLINE_LIMIT_PER_DAY", "RATE_LIMIT_FLO_PER_MIN", "FLO_TIMEOUT_MS", "FLO_RETENTION_DAYS",
+    ])
+  );
+  expect(Object.values(RECOMMENDED_ENV_VARS).join(" ")).not.toMatch(/sk-ant/);
 });

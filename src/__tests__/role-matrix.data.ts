@@ -12,6 +12,7 @@ export type AccessClass = "PUBLIC" | "AUTHENTICATED" | "TENANT_MEMBER" | "BUSINE
 
 export const ROLE_MATRIX: Record<string, AccessClass> = {
   "DELETE /customers/{id}": "BUSINESS",
+  "DELETE /flo/conversations/{id}": "ADMIN",
   "DELETE /invites/{token}": "BUSINESS",
   "DELETE /mobile/devices/{token}": "TECHNICIAN",
   "DELETE /properties/{id}": "BUSINESS",
@@ -48,6 +49,10 @@ export const ROLE_MATRIX: Record<string, AccessClass> = {
   "GET /emergencies": "BUSINESS",
   "GET /emergencies/{id}": "BUSINESS",
   "GET /emergencies/{id}/available-technicians": "BUSINESS",
+  "GET /flo/conversations": "ADMIN",
+  "GET /flo/conversations/{id}": "ADMIN",
+  "GET /flo/status": "ADMIN",
+  "GET /flo/suggestions": "ADMIN",
   "GET /health": "PUBLIC",
   "GET /health/ready": "PUBLIC",
   "GET /invites": "BUSINESS",
@@ -183,6 +188,7 @@ export const ROLE_MATRIX: Record<string, AccessClass> = {
   "POST /debt/{id}/payment-link": "BUSINESS",
   "POST /debt/{id}/remind": "BUSINESS",
   "POST /emergencies": "TENANT_MEMBER",
+  "POST /flo/chat": "ADMIN",
   "POST /emergencies/{id}/reassign": "BUSINESS",
   "POST /invites": "BUSINESS",
   "POST /invites/{id}/resend": "BUSINESS",

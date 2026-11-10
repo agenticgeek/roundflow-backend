@@ -15,6 +15,7 @@ const { schedule, migrate, jobs } = vi.hoisted(() => ({
     runWebhookRetry: vi.fn(),
     runOverdueSweep: vi.fn(),
     runEmailDomainRecheck: vi.fn(),
+    runFloPurge: vi.fn(),
   },
 }));
 
@@ -28,6 +29,7 @@ vi.mock("../../jobs/idempotencyPurge", () => ({ runIdempotencyPurge: jobs.runIde
 vi.mock("../../jobs/webhookRetry", () => ({ runWebhookRetry: jobs.runWebhookRetry }));
 vi.mock("../../jobs/overdueSweep", () => ({ runOverdueSweep: jobs.runOverdueSweep }));
 vi.mock("../../jobs/emailDomainRecheck", () => ({ runEmailDomainRecheck: jobs.runEmailDomainRecheck }));
+vi.mock("../../jobs/floPurge", () => ({ runFloPurge: jobs.runFloPurge }));
 vi.mock("../../jobs/preCleanReminders", async (orig) => ({
   ...((await orig()) as object),
   runPreCleanReminders: jobs.runPreCleanReminders,
@@ -60,6 +62,7 @@ const FULL_ENV = {
   GOOGLE_MAPS_GEOCODING_API_KEY: "x",
   SES_REGION: "eu-west-2",
   SES_FROM_DOMAIN_ADDRESS: "n@mail.roundflow.ai",
+  ANTHROPIC_API_KEY: "x",
 };
 
 beforeEach(() => {
@@ -220,8 +223,8 @@ describe("BE-02: installProcessErrorHandlers", () => {
 describe("registerCronJobs", () => {
   it("registers the base jobs and skips pre-clean reminders when disabled", () => {
     const labels = registerCronJobs(schedule, {});
-    expect(labels).toEqual(["visitGen", "outbox", "geocodeBackfill", "kpiThresholds", "idempotencyPurge", "webhookRetry", "overdueSweep", "emailDomainRecheck"]);
-    expect(schedule).toHaveBeenCalledTimes(8);
+    expect(labels).toEqual(["visitGen", "outbox", "geocodeBackfill", "kpiThresholds", "idempotencyPurge", "webhookRetry", "overdueSweep", "emailDomainRecheck", "floPurge"]);
+    expect(schedule).toHaveBeenCalledTimes(9);
   });
 
   it("adds pre-clean reminders when PRECLEAN_REMINDERS_ENABLED=true and runs/guards every task", async () => {
@@ -239,15 +242,15 @@ describe("registerCronJobs", () => {
     for (const [, task] of schedule.mock.calls) task();
     await new Promise((r) => setImmediate(r));
     expect(console.error).toHaveBeenCalledWith("[kpiThresholds] run failed:", expect.any(Error));
-    expect(console.error).toHaveBeenCalledTimes(9);
+    expect(console.error).toHaveBeenCalledTimes(10);
   });
 
   it("defaults to node-cron and process.env", () => {
     const prev = process.env.PRECLEAN_REMINDERS_ENABLED;
     delete process.env.PRECLEAN_REMINDERS_ENABLED;
     try {
-      expect(registerCronJobs()).toHaveLength(8);
-      expect(schedule).toHaveBeenCalledTimes(8);
+      expect(registerCronJobs()).toHaveLength(9);
+      expect(schedule).toHaveBeenCalledTimes(9);
     } finally {
       if (prev !== undefined) process.env.PRECLEAN_REMINDERS_ENABLED = prev;
     }
@@ -275,7 +278,7 @@ describe("startServer", () => {
     resolveMigrate();
     const { app, readiness } = await pending;
     expect(readiness.ready).toBe(true);
-    expect(sched).toHaveBeenCalledTimes(8);
+    expect(sched).toHaveBeenCalledTimes(9);
     expect((await request(app).get("/health")).status).toBe(200);
   });
 
