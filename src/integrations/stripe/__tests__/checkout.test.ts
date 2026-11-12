@@ -36,7 +36,8 @@ function makeTenantPrisma(customerOverrides: Record<string, unknown> = {}) {
     }),
     update: vi.fn().mockResolvedValue({}),
   };
-  return { customer } as unknown as TenantPrismaClient;
+  const stripeSession = { count: vi.fn().mockResolvedValue(2) };
+  return { customer, stripeSession } as unknown as TenantPrismaClient;
 }
 
 describe("createOneTimeSession", () => {
@@ -81,7 +82,9 @@ describe("createOneTimeSession", () => {
         metadata: { tenantId: "tenant-1", invoiceId: "inv-1", customerId: "cust-1" },
         success_url: "https://app.test/success",
         cancel_url: "https://app.test/cancel",
-      })
+      }),
+      // BE-17: stable per invoice + amount + attempt (2 sessions already stored), so a retry returns the same session
+      { idempotencyKey: "rf-pay-inv-1-3500-2" }
     );
     expect(result).toEqual({
       stripeSessionId: "cs_test_123",
@@ -107,8 +110,26 @@ describe("createOneTimeSession", () => {
     expect(stripe.customers.create).not.toHaveBeenCalled();
     expect(tp.customer.update).not.toHaveBeenCalled();
     expect(stripe.checkout.sessions.create).toHaveBeenCalledWith(
-      expect.objectContaining({ customer: "cus_existing" })
+      expect.objectContaining({ customer: "cus_existing" }),
+      { idempotencyKey: "rf-pay-inv-1-1000-2" }
     );
+  });
+
+  it("BE-17: a caller-supplied idempotencyKey is forwarded to Stripe untouched (and no attempt lookup is made)", async () => {
+    const stripe = makeStripe();
+    const tp = makeTenantPrisma({ stripeCustomerId: "cus_existing" });
+    await createOneTimeSession(stripe, tp, {
+      tenantId: "tenant-1",
+      customerId: "cust-1",
+      invoiceId: "inv-1",
+      invoiceNumber: "INV-2026-001",
+      amountPence: 1000,
+      successUrl: "https://app.test/success",
+      cancelUrl: "https://app.test/cancel",
+      idempotencyKey: "rf-key-t1-abc",
+    });
+    expect(stripe.checkout.sessions.create).toHaveBeenCalledWith(expect.anything(), { idempotencyKey: "rf-key-t1-abc" });
+    expect(tp.stripeSession.count).not.toHaveBeenCalled();
   });
 
   it("omits email/phone when the customer has none, and handles a null expires_at", async () => {
@@ -195,7 +216,7 @@ describe("getInvoiceCheckoutLink", () => {
   function linkPrisma(bs: Record<string, unknown> | null, existing: Record<string, unknown> | null = null) {
     return {
       businessSettings: { findFirst: vi.fn().mockResolvedValue(bs) },
-      stripeSession: { findFirst: vi.fn().mockResolvedValue(existing), create: vi.fn().mockResolvedValue({}) },
+      stripeSession: { findFirst: vi.fn().mockResolvedValue(existing), create: vi.fn().mockResolvedValue({}), count: vi.fn().mockResolvedValue(0) },
       customer: {
         findUniqueOrThrow: vi.fn().mockResolvedValue({ id: "cust-1", name: "J", email: null, phone: null, stripeCustomerId: "cus_1" }),
         update: vi.fn(),
@@ -225,7 +246,7 @@ describe("getInvoiceCheckoutLink", () => {
     expect(stripe.checkout.sessions.create).toHaveBeenCalledWith(expect.objectContaining({
       success_url: expect.stringMatching(/\/invoices\/inv-1\?payment=success$/),
       line_items: [expect.objectContaining({ price_data: expect.objectContaining({ unit_amount: 3350 }) })],
-    }));
+    }), { idempotencyKey: "rf-pay-inv-1-3350-0" });
     expect(tp.stripeSession.create).toHaveBeenCalledWith({
       data: expect.objectContaining({ stripeSessionId: "cs_test_123", type: "ONE_TIME", invoiceId: "inv-1", customerId: "cust-1" }),
     });
@@ -239,7 +260,7 @@ describe("getInvoiceCheckoutLink", () => {
       const stripe = makeStripe();
       getStripeClientMock.mockReturnValue(stripe);
       await getInvoiceCheckoutLink(linkPrisma({ stripeConnected: true, stripeSecretKeyEncrypted: encrypt("k") }), input);
-      expect(stripe.checkout.sessions.create).toHaveBeenCalledWith(expect.objectContaining({ success_url: "/invoices/inv-1?payment=success" }));
+      expect(stripe.checkout.sessions.create).toHaveBeenCalledWith(expect.objectContaining({ success_url: "/invoices/inv-1?payment=success" }), expect.anything());
     } finally {
       process.env.FRONTEND_URL = original;
     }

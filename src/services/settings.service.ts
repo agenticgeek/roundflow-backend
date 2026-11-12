@@ -123,6 +123,10 @@ export interface PaymentRulesUpdateInput {
   /** BUG-05: methods the business accepts; defaultPaymentMethod must be one of them. */
   acceptedPaymentMethods?: PaymentMethod[];
   invoiceDueDays?: number;
+  /** GHL-10: free text printed at the bottom of invoices; null clears. */
+  invoiceFooter?: string | null;
+  /** GHL-10: free-text payment terms that replace "Payment due within N days"; null clears. */
+  paymentTerms?: string | null;
   noDirectDebitAction?: NoDirectDebitAction;
 }
 
@@ -224,6 +228,10 @@ type SettingsWritable = {
   defaultPaymentMethod?: PaymentMethod | null;
   acceptedPaymentMethods?: PaymentMethod[];
   invoiceDueDays?: number;
+  /** GHL-10: free text printed at the bottom of invoices; null clears. */
+  invoiceFooter?: string | null;
+  /** GHL-10: free-text payment terms that replace "Payment due within N days"; null clears. */
+  paymentTerms?: string | null;
   noDirectDebitAction?: NoDirectDebitAction;
 };
 
@@ -682,6 +690,8 @@ class SettingsService {
       defaultPaymentMethod: methods.defaultPaymentMethod,
       acceptedPaymentMethods: methods.acceptedPaymentMethods,
       invoiceDueDays: input.invoiceDueDays,
+      invoiceFooter: input.invoiceFooter,
+      paymentTerms: input.paymentTerms,
       noDirectDebitAction: input.noDirectDebitAction,
     });
   }

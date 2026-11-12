@@ -21,6 +21,7 @@ import { createVisitCompletionService, parseCompletionPayment } from "../service
 import { requireTechnician, requireVisitOwner, assertRoundMember, assertVisitOwner } from "./ownership";
 import { idempotency } from "./idempotency";
 import { signAvatar, signChatRows, signPhotos } from "./media-urls";
+import { toObjectPath } from "../lib/signed-read-url";
 
 export const mobileRouter = Router();
 mobileRouter.use(requireAuth);
@@ -358,7 +359,13 @@ mobileRouter.post("/visits/:id/photos", ...visitWrite, h(async (req, res) => {
   if (type !== "BEFORE" && type !== "AFTER") throw new AppError(400, 'type must be "BEFORE" or "AFTER"');
   // `path` (from upload-url) is accepted as an alias for `url`.
   const url = body.url !== undefined ? requireString(body.url, "url") : requireString(body.path, "path");
-  await media(req).addVisitPhoto(req.params.id, url, type);
+  // BE-16: only this visit's own storage objects ("<tenant>/visits/<visit>/..."). The app may send the object path
+  // returned by upload-url, or the full Supabase storage URL it uploaded to; a storage URL is reduced to its object path.
+  const objectPath = toObjectPath(url);
+  if (objectPath === null || !objectPath.startsWith(`${req.profile!.tenantId}/visits/${req.params.id}/`) || objectPath.includes("..")) {
+    throw new AppError(400, "url must be a storage path returned by this visit's photos/upload-url", "INVALID_PHOTO_PATH");
+  }
+  await media(req).addVisitPhoto(req.params.id, objectPath, type);
   res.status(201).json({ recorded: true });
 }));
 
@@ -443,12 +450,12 @@ mobileRouter.post("/chat/messages", h(async (req, res) => {
   } else {
     throw new AppError(400, 'type must be "TEXT", "WORK_PHOTOS", or "PHOTOS"');
   }
-  const { row, duplicate } = await chat(req).send(roundId, sender, input);
+  const { row, duplicate } = await chat(req).send(roundId, sender, input, req.profile!.name);
   res.status(duplicate ? 200 : 201).json((await signChatRows(req.profile!.tenantId, [row]))[0]);
 }));
 
 // PATCH /mobile/visits/:id/complete
-// Body: { payment?: { method: CASH|CHEQUE|NONE, amount?, chequeNumber? }, note? }
+// Body: { payment?: { method: CASH|CHEQUE|BACS|GOCARDLESS|STRIPE|NONE, amount?, chequeNumber?, collectVia?, updateCustomerDefault? }, note? }
 // (cashConfirmed: true is a deprecated alias for payment.method CASH). Shares
 // the web completion logic: validate first, then one transaction (D-2), and
 // queues the visit.completed + "Visit completed" message outbox events (D-9/A5).

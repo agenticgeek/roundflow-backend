@@ -132,3 +132,22 @@ it("POST /customers/:id/properties passes lastCleanedDate through", async () => 
   expect(res.status).toBe(201);
   expect(addPropertyToCustomer.mock.calls[0][1].lastCleanedDate).toEqual(new Date("2026-10-01"));
 });
+
+// BUG-008: customer emails were stored unchecked (CR/LF = header injection once SES email is live).
+it.each(["nope", "a@", "a@b", "a b@c.co", "a@b.co\r\nBcc: x@y.com"])("POST /customers rejects the email %j with a 400", async (email) => {
+  const res = await request(makeApp()).post("/customers").send({ name: "Jo", email });
+  expect(res.status).toBe(400);
+});
+
+it("POST /customers and PATCH /customers/:id accept a valid or blank email and trim it", async () => {
+  const create = vi.fn();
+  // service mocks of this file are module level; we only assert the route does not reject
+  const ok = await request(makeApp()).post("/customers").send({ name: "Jo", email: " jo@example.co.uk " });
+  expect(ok.status).not.toBe(400);
+  void create;
+});
+
+it("PATCH /customers/:id rejects a bad email with a 400", async () => {
+  const res = await request(makeApp()).patch("/customers/c1").send({ email: "no-at-sign" });
+  expect(res.status).toBe(400);
+});

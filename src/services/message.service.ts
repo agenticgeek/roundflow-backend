@@ -1,20 +1,86 @@
+import { randomUUID } from "crypto";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
-import { InvoiceStatus, LifecycleStatus, MessageChannel, MessageDirection, VisitStatus } from "../generated/tenant-client";
+import { ChannelUnavailableError, getEmailAvailability, sendTenantEmail, unavailableError, type EmailAvailability } from "./email.service";
+import type { EmailAttachment } from "../lib/mailer/ses";
+import { InvoiceStatus, LifecycleStatus, MessageChannel, MessageDeliveryStatus, MessageDirection, VisitStatus } from "../generated/tenant-client";
 import { getGhlToken, createGhlContact, sendGhlMessage, GhlTokenContext } from "../integrations/ghl/api";
 import { formatMoney, formatTemplateDate, renderTemplate, type TemplateVars } from "./message-templates";
 import { tenantToday } from "./business-time";
 
 const CHANNELS = new Set<string>(Object.values(MessageChannel));
 
-type ContactCustomer = { id: string; name: string; phone: string | null; email: string | null; ghlContactId: string | null };
+type ContactCustomer = {
+  id: string;
+  name: string;
+  phone: string | null;
+  email: string | null;
+  ghlContactId: string | null;
+  /** Set by a hard bounce / complaint (SES): the address is not used until it is edited. */
+  emailInvalidAt?: Date | null;
+  messagesOptOut?: boolean;
+};
 
-// A customer + channel + GHL token, resolved and checked *before* anything
-// with side effects (e.g. creating a Stripe session for a payment link) runs.
+// A customer + channel (+ GHL token for SMS/WhatsApp), resolved and checked *before* anything with side effects
+// (e.g. creating a Stripe session for a payment link) runs. `ctx` is null for EMAIL (native mailer).
 export interface PreparedSend {
   customer: ContactCustomer;
   channel: MessageChannel;
-  ctx: GhlTokenContext;
+  ctx: GhlTokenContext | null;
+}
+
+/** What can be sent right now: GHL (SMS/WhatsApp) connected? Email available (SES configured, tenant on, not paused)? */
+export interface ChannelCaps {
+  ghl: boolean;
+  email: EmailAvailability;
+}
+
+export type SkipReason = "NO_AVAILABLE_CHANNEL" | "CUSTOMER_OPTED_OUT";
+
+const GHL_REQUIRED_MESSAGE = "SMS and WhatsApp need GoHighLevel to be connected (Settings > SMS and calling). Send by email instead.";
+const EMAIL_INVALID_MESSAGE = "This customer's email address bounced or was reported as spam, so we no longer email it. Edit the address to try again.";
+
+/** Router for ONE explicit or AUTO send. Throws a typed 400/409 when the message cannot go out. */
+export function pickChannel(customer: ContactCustomer, requested: MessageChannel | undefined, caps: ChannelCaps, preferred?: MessageChannel): MessageChannel {
+  if (requested) {
+    const channel = resolveChannel(customer, requested); // 400 NO_CONTACT_FOR_CHANNEL
+    if (channel === MessageChannel.EMAIL) {
+      if (customer.emailInvalidAt) throw new ChannelUnavailableError("EMAIL_ADDRESS_INVALID", EMAIL_INVALID_MESSAGE, "EMAIL");
+      if (!caps.email.available) throw unavailableError(caps.email);
+    } else if (!caps.ghl) {
+      throw new ChannelUnavailableError("GHL_NOT_CONNECTED", GHL_REQUIRED_MESSAGE, channel);
+    }
+    return channel;
+  }
+  const emailUsable = !!customer.email && !customer.emailInvalidAt && caps.email.available;
+  if (preferred === MessageChannel.EMAIL && emailUsable) return MessageChannel.EMAIL;
+  if (customer.phone && caps.ghl) return MessageChannel.SMS;
+  if (emailUsable) return MessageChannel.EMAIL;
+  if (!customer.phone && !customer.email) {
+    throw new AppError(400, "Customer has no phone or email on file", "NO_CONTACT_FOR_CHANNEL");
+  }
+  if (customer.email) {
+    if (customer.emailInvalidAt) throw new ChannelUnavailableError("EMAIL_ADDRESS_INVALID", EMAIL_INVALID_MESSAGE, "EMAIL");
+    // Present, valid and not usable: the channel itself is unavailable.
+    throw unavailableError(caps.email as Extract<EmailAvailability, { available: false }>);
+  }
+  throw new ChannelUnavailableError("GHL_NOT_CONNECTED", GHL_REQUIRED_MESSAGE, MessageChannel.SMS);
+}
+
+/** Router for automated flows: best usable channel for the customer, else a skip reason (never throws). */
+export function bestChannel(
+  customer: ContactCustomer & { messagesOptOut: boolean },
+  preferred: MessageChannel | undefined,
+  caps: ChannelCaps
+): { channel: MessageChannel } | { skip: SkipReason } {
+  if (customer.messagesOptOut) return { skip: "CUSTOMER_OPTED_OUT" };
+  const emailUsable = !!customer.email && !customer.emailInvalidAt && caps.email.available;
+  const phoneUsable = !!customer.phone && caps.ghl;
+  const order = preferred
+    ? [preferred, ...[MessageChannel.SMS, MessageChannel.EMAIL].filter((c) => c !== preferred)]
+    : [MessageChannel.SMS, MessageChannel.EMAIL];
+  const channel = order.find((c) => (c === MessageChannel.EMAIL ? emailUsable : phoneUsable));
+  return channel ? { channel } : { skip: "NO_AVAILABLE_CHANNEL" };
 }
 
 function normaliseChannel(channel: string): MessageChannel {
@@ -53,9 +119,9 @@ export function resolveChannel(
   return channel;
 }
 
-const customerSelect = { id: true, name: true, phone: true, email: true, ghlContactId: true } as const;
+const customerSelect = { id: true, name: true, phone: true, email: true, ghlContactId: true, emailInvalidAt: true, messagesOptOut: true } as const;
 
-export type BroadcastRecipientStatus = "sent" | "scheduled" | "skipped_opted_out" | "skipped_no_contact" | "failed";
+export type BroadcastRecipientStatus = "sent" | "scheduled" | "skipped_opted_out" | "skipped_no_contact" | "skipped_no_channel" | "failed";
 
 export interface BroadcastRecipient {
   customerId: string;
@@ -64,6 +130,8 @@ export interface BroadcastRecipient {
   channel?: MessageChannel;
   /** Why it was skipped / failed. */
   error?: string;
+  /** Machine-readable skip reason (CUSTOMER_OPTED_OUT, NO_AVAILABLE_CHANNEL). */
+  reason?: SkipReason;
 }
 
 export interface BroadcastResult {
@@ -73,6 +141,8 @@ export interface BroadcastResult {
   scheduled: number;
   skippedOptedOut: number;
   skippedNoContact: number;
+  /** No usable channel for the customer (e.g. only a mobile and GHL is not connected). */
+  skippedNoChannel: number;
   failed: number;
   /** ISO time the messages were queued for; null = sent immediately. */
   scheduledFor: string | null;
@@ -96,28 +166,89 @@ export function createMessageService(prisma: TenantPrismaClient) {
     return contactId;
   };
 
-  const requireGhl = async (): Promise<GhlTokenContext> => {
-    const ctx = await getGhlToken(prisma);
-    if (!ctx) throw new AppError(409, "GoHighLevel is not connected", "GHL_NOT_CONNECTED");
-    return ctx;
+  const getCaps = async (): Promise<ChannelCaps & { ctx: GhlTokenContext | null }> => {
+    const [ctx, email] = await Promise.all([getGhlToken(prisma), getEmailAvailability(prisma)]);
+    return { ghl: !!ctx, email, ctx };
   };
 
-  const prepare = async (customerId: string, channel?: string): Promise<PreparedSend> => {
+  // Explicit channel chosen up front (round broadcasts): fail before anything is attempted when it cannot work.
+  const assertChannelUsable = (channel: MessageChannel, caps: ChannelCaps): void => {
+    if (channel === MessageChannel.EMAIL) {
+      if (!caps.email.available) throw unavailableError(caps.email);
+    } else if (!caps.ghl) {
+      throw new ChannelUnavailableError("GHL_NOT_CONNECTED", GHL_REQUIRED_MESSAGE, channel);
+    }
+  };
+
+  const assertAnyAvailable = (caps: ChannelCaps): void => {
+    if (!caps.ghl && !caps.email.available) {
+      throw new ChannelUnavailableError("NO_AVAILABLE_CHANNEL", "No messaging channel is available: email is unavailable and GoHighLevel (SMS) is not connected.");
+    }
+  };
+
+  const prepare = async (customerId: string, channel?: string, opts?: { respectOptOut?: boolean; preferred?: MessageChannel | string }): Promise<PreparedSend> => {
     const requested = channel === undefined ? undefined : normaliseChannel(channel);
     const customer = await prisma.customer.findUnique({ where: { id: customerId }, select: customerSelect });
     if (!customer) throw new AppError(404, "Customer not found");
-    const resolved = resolveChannel(customer, requested);
-    const ctx = await requireGhl();
-    return { customer, channel: resolved, ctx };
+    if (opts?.respectOptOut && customer.messagesOptOut) {
+      throw new AppError(409, "Customer has opted out of messages", "CUSTOMER_OPTED_OUT");
+    }
+    const caps = await getCaps();
+    const resolved = pickChannel(customer, requested, caps, opts?.preferred === undefined ? undefined : normaliseChannel(opts.preferred));
+    return { customer, channel: resolved, ctx: resolved === MessageChannel.EMAIL ? null : caps.ctx };
   };
 
-  // Send through GHL, then record the outbound Message — only once GHL has
-  // accepted it, so the history never shows a message that wasn't delivered.
-  const deliver = async (prep: PreparedSend, body: string, opts?: { templateId?: string | null }) => {
+  // EMAIL goes through the native mailer, SMS/WhatsApp through GHL. The outbound Message is recorded only once the
+  // provider has accepted it, so the history never shows a message that wasn't sent. EMAIL rows start as SENT and are
+  // moved to DELIVERED / BOUNCED / COMPLAINED by the SES webhook.
+  const deliver = async (
+    prep: PreparedSend,
+    body: string,
+    opts?: {
+      templateId?: string | null;
+      complaintId?: string | null;
+      subject?: string;
+      transactional?: boolean;
+      cta?: { label: string; url: string };
+      summary?: Array<[string, string]>;
+      attachments?: EmailAttachment[];
+    }
+  ) => {
+    if (prep.channel === MessageChannel.EMAIL) {
+      const id = randomUUID();
+      const sentEmail = await sendTenantEmail(prisma, {
+        to: prep.customer.email as string,
+        subject: opts?.subject,
+        bodyText: body,
+        transactional: opts?.transactional ?? false,
+        messageId: id,
+        ...(opts?.cta ? { cta: opts.cta } : {}),
+        ...(opts?.summary ? { summary: opts.summary } : {}),
+        ...(opts?.attachments ? { attachments: opts.attachments } : {}),
+      });
+      const now = new Date();
+      const msg = await prisma.message.create({
+        data: {
+          id,
+          channel: prep.channel,
+          direction: MessageDirection.OUTBOUND,
+          body,
+          customerId: prep.customer.id,
+          templateId: opts?.templateId ?? null,
+          complaintId: opts?.complaintId ?? null,
+          externalId: sentEmail.externalId,
+          sentAt: now,
+          deliveryStatus: MessageDeliveryStatus.SENT,
+          deliveryUpdatedAt: now,
+        },
+      });
+      return { messageId: msg.id, channel: prep.channel, externalId: sentEmail.externalId };
+    }
+    const ctx = prep.ctx as GhlTokenContext;
     let externalId: string | null;
     try {
-      const contactId = await ensureContact(prep.ctx, prep.customer);
-      externalId = await sendGhlMessage(prep.ctx, contactId, body, prep.channel);
+      const contactId = await ensureContact(ctx, prep.customer);
+      externalId = await sendGhlMessage(ctx, contactId, body, prep.channel);
     } catch (err) {
       console.error(`[messages] GHL send to customer ${prep.customer.id} failed:`, err);
       throw new AppError(502, `GoHighLevel could not send the message: ${(err as Error).message}`, "GHL_SEND_FAILED");
@@ -129,11 +260,12 @@ export function createMessageService(prisma: TenantPrismaClient) {
         body,
         customerId: prep.customer.id,
         templateId: opts?.templateId ?? null,
+        complaintId: opts?.complaintId ?? null,
         externalId,
         sentAt: new Date(),
       },
     });
-    return { messageId: msg.id, channel: prep.channel };
+    return { messageId: msg.id, channel: prep.channel, externalId };
   };
 
   // Distinct customers of a round (first property supplies {{address}} etc.) with their
@@ -188,8 +320,9 @@ export function createMessageService(prisma: TenantPrismaClient) {
   // Render the body per customer, honour messagesOptOut, then send now (each
   // success persisted as a Message row via deliver) or queue on the outbox for
   // `scheduledFor`. Best-effort per recipient: one customer's problem never
-  // throws, it is reported in `recipients`. GHL must be connected (409) or
-  // nothing is attempted.
+  // throws, it is reported in `recipients`. With an explicit channel that cannot work, or no channel
+  // at all, it fails up front (409 CHANNEL_UNAVAILABLE); otherwise each customer gets the best available channel
+  // (SMS via GHL when connected, else email) or is skipped with a reason.
   const broadcast = async (
     targets: BroadcastTarget[],
     opts: {
@@ -198,25 +331,41 @@ export function createMessageService(prisma: TenantPrismaClient) {
       templateId?: string | null;
       scheduledFor?: Date;
       reason: string;
+      subject?: string;
       extraPayload?: Record<string, unknown>;
     }
   ): Promise<BroadcastResult> => {
-    const ctx = await requireGhl();
+    const caps = await getCaps();
+    if (opts.channel) assertChannelUsable(opts.channel, caps);
+    else assertAnyAvailable(caps);
     const recipients: BroadcastRecipient[] = [];
 
     for (const { customer, vars } of targets) {
       const base = { customerId: customer.id, customerName: customer.name };
       if (customer.messagesOptOut) {
-        recipients.push({ ...base, status: "skipped_opted_out" });
+        recipients.push({ ...base, status: "skipped_opted_out", reason: "CUSTOMER_OPTED_OUT" });
         continue;
       }
 
       let channel: MessageChannel;
-      try {
-        channel = resolveChannel(customer, opts.channel);
-      } catch (err) {
-        recipients.push({ ...base, status: "skipped_no_contact", error: (err as Error).message });
-        continue;
+      if (opts.channel) {
+        try {
+          channel = resolveChannel(customer, opts.channel);
+        } catch (err) {
+          recipients.push({ ...base, status: "skipped_no_contact", error: (err as Error).message });
+          continue;
+        }
+        if (channel === MessageChannel.EMAIL && customer.emailInvalidAt) {
+          recipients.push({ ...base, status: "skipped_no_channel", reason: "NO_AVAILABLE_CHANNEL", error: EMAIL_INVALID_MESSAGE });
+          continue;
+        }
+      } else {
+        const best = bestChannel({ ...customer, messagesOptOut: false }, undefined, caps);
+        if ("skip" in best) {
+          recipients.push({ ...base, status: "skipped_no_channel", reason: best.skip });
+          continue;
+        }
+        channel = best.channel;
       }
 
       const body = renderTemplate(opts.body, vars);
@@ -231,7 +380,7 @@ export function createMessageService(prisma: TenantPrismaClient) {
           });
           recipients.push({ ...base, status: "scheduled", channel });
         } else {
-          await deliver({ customer, channel, ctx }, body, { templateId: opts.templateId });
+          await deliver({ customer, channel, ctx: caps.ctx }, body, { templateId: opts.templateId, subject: opts.subject });
           recipients.push({ ...base, status: "sent", channel });
         }
       } catch (err) {
@@ -249,6 +398,7 @@ export function createMessageService(prisma: TenantPrismaClient) {
       scheduled,
       skippedOptedOut: count("skipped_opted_out"),
       skippedNoContact: count("skipped_no_contact"),
+      skippedNoChannel: count("skipped_no_channel"),
       failed: count("failed"),
       scheduledFor: opts.scheduledFor ? opts.scheduledFor.toISOString() : null,
       recipients,
@@ -259,14 +409,26 @@ export function createMessageService(prisma: TenantPrismaClient) {
     prepare,
     deliver,
     broadcast,
-    /** 409 GHL_NOT_CONNECTED — lets callers fail before they change anything. */
-    assertGhlConnected: async (): Promise<void> => {
-      await requireGhl();
+    /** 409 CHANNEL_UNAVAILABLE (NO_AVAILABLE_CHANNEL) when neither email nor GHL can send: lets callers fail before they change anything. */
+    assertAnyChannelAvailable: async (): Promise<void> => {
+      assertAnyAvailable(await getCaps());
     },
 
-    // Send one message to a customer (resolved by property or customer id) via GHL.
-    // channel omitted = SMS if the customer has a mobile, else EMAIL.
-    send: async (input: { propertyId?: string; customerId?: string; channel?: string; body: string; templateId?: string | null }) => {
+    /** Raw channel state (GHL connected? email availability) for per-customer routing in bulk flows. */
+    channelCaps: async (): Promise<ChannelCaps> => {
+      const caps = await getCaps();
+      return { ghl: caps.ghl, email: caps.email };
+    },
+
+    /** Capability flags for the settings/bootstrap response. */
+    capabilities: async () => {
+      const caps = await getCaps();
+      return { email: caps.email.available, sms: caps.ghl, whatsapp: caps.ghl, calls: true };
+    },
+
+    // Send one message to a customer (resolved by property or customer id). channel omitted = best available:
+    // SMS (GHL, when the customer has a mobile) else EMAIL (native mailer).
+    send: async (input: { propertyId?: string; customerId?: string; channel?: string; body: string; subject?: string; templateId?: string | null }) => {
       if (input.channel !== undefined) normaliseChannel(input.channel);
 
       let customerId = input.customerId;
@@ -281,8 +443,31 @@ export function createMessageService(prisma: TenantPrismaClient) {
       if (!customerId) throw new AppError(400, "propertyId or customerId is required");
 
       const prep = await prepare(customerId, input.channel);
-      const sent = await deliver(prep, input.body, { templateId: input.templateId });
-      return { status: "sent" as const, ...sent };
+      const sent = await deliver(prep, input.body, { templateId: input.templateId, subject: input.subject });
+      return { status: "sent" as const, messageId: sent.messageId, channel: sent.channel };
+    },
+
+    // Automated one-off message (pre-clean reminder, visit completed, complaint reply): the preferred channel when it
+    // can be used, else the best available one, else a skip with a reason. Never throws for "cannot reach".
+    sendBest: async (input: {
+      customerId: string;
+      preferred?: string;
+      body: string;
+      subject?: string;
+      templateId?: string | null;
+      complaintId?: string | null;
+    }) => {
+      const customer = await prisma.customer.findUnique({ where: { id: input.customerId }, select: customerSelect });
+      if (!customer) throw new AppError(404, "Customer not found");
+      const caps = await getCaps();
+      const best = bestChannel({ ...customer, messagesOptOut: customer.messagesOptOut }, input.preferred ? normaliseChannel(input.preferred) : undefined, caps);
+      if ("skip" in best) return { status: "skipped" as const, reason: best.skip };
+      const sent = await deliver(
+        { customer, channel: best.channel, ctx: best.channel === MessageChannel.EMAIL ? null : caps.ctx },
+        input.body,
+        { templateId: input.templateId, subject: input.subject, complaintId: input.complaintId }
+      );
+      return { status: "sent" as const, messageId: sent.messageId, channel: sent.channel };
     },
 
     // Inbound replies stored by the GHL webhook (direction INBOUND), newest first.
@@ -370,7 +555,7 @@ export function createMessageService(prisma: TenantPrismaClient) {
       scheduledFor?: Date;
     }): Promise<BroadcastResult> => {
       const channel = normaliseChannel(input.channel);
-      await requireGhl();
+      // MSG-003b: the round and recipients are validated first (404 / 400); broadcast() then judges the channel.
 
       const { targets: all, settings } = await buildRoundTargets(input.roundId, input.excludePaymentHold);
       let targets = all;

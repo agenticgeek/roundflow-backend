@@ -2,7 +2,13 @@ import { it, expect, vi, beforeEach } from "vitest";
 import { UserRole } from "@prisma/client";
 import { createCustomerService } from "../customer.service";
 
-vi.mock("../../integrations/geocoding/client", () => ({ geocodePostcode: vi.fn().mockResolvedValue(null) }));
+// Notification producers are covered by notify.test.ts and the notification-producers tests.
+vi.mock("../notify", async () => (await import("../../test/notify-mock.js")).notifyMockModule());
+
+vi.mock("../../integrations/geocoding/client", async (orig) => ({
+  ...(await orig<typeof import("../../integrations/geocoding/client")>()),
+  geocodeAddress: vi.fn().mockResolvedValue({ result: null, error: "x" }),
+}));
 
 // QA batch 2026-11-03: A7/BUG-05 defaults, B3 visits follow a round move, B4 area
 // mismatch, C5 service checks, E2E-028 paused status, delete consistency, pause defects.
@@ -25,8 +31,8 @@ function makePrisma(over: Record<string, any> = {}) {
     round: { findUnique: vi.fn().mockResolvedValue(null) },
     serviceArea: { findUnique: vi.fn().mockResolvedValue({ id: "sa1" }) },
     service: { findUnique: vi.fn().mockResolvedValue({ id: "svc1", active: true }) },
-    visit: { updateMany: vi.fn().mockResolvedValue({ count: 2 }) },
-    invoice: { aggregate: vi.fn().mockResolvedValue({ _sum: { amount: 0 } }) },
+    visit: { findMany: vi.fn().mockResolvedValue([]), updateMany: vi.fn().mockResolvedValue({ count: 2 }) },
+    invoice: { aggregate: vi.fn().mockResolvedValue({ _count: { _all: 0 }, _sum: { amount: 0 } }) },
     $transaction: vi.fn((cb: any) => (typeof cb === "function" ? cb(prisma) : Promise.all(cb))),
     ...over,
   };
@@ -286,4 +292,42 @@ it("pauseService on a property uses its primary plan and 404s with no plan", asy
   await expect(svc.pauseService("p1", { pauseStartDate: new Date() })).rejects.toMatchObject({ statusCode: 404 });
   prisma.property.findUnique.mockResolvedValue({ id: "p1", servicePlans: [pausePlanRow({ status: "CANCELLED" })] });
   await expect(svc.pauseService("p1", { pauseStartDate: new Date() })).rejects.toMatchObject({ statusCode: 409 });
+});
+
+// ---- B5: unpaid invoices block deletion -------------------------------------
+
+it("deleting an unknown customer is a 404 and nothing is checked or written", async () => {
+  const prisma = makePrisma();
+  prisma.customer.findUnique.mockResolvedValue(null);
+  await expect(createCustomerService(prisma).deleteCustomer("nope")).rejects.toMatchObject({ statusCode: 404 });
+  expect(prisma.invoice.aggregate).not.toHaveBeenCalled();
+  expect(prisma.$transaction).not.toHaveBeenCalled();
+});
+
+it("B5: deleting a customer with unpaid (SENT) invoices is a 409 UNPAID_INVOICES with count and total; nothing is written", async () => {
+  const prisma = makePrisma();
+  prisma.customer.findUnique.mockResolvedValue({ id: "c1" });
+  prisma.invoice.aggregate.mockResolvedValue({ _count: { _all: 2 }, _sum: { amount: 85.5 } });
+  await expect(createCustomerService(prisma).deleteCustomer("c1")).rejects.toMatchObject({
+    statusCode: 409, code: "UNPAID_INVOICES", count: 2, total: 85.5,
+  });
+  expect(prisma.invoice.aggregate.mock.calls[0][0].where).toEqual({ customerId: "c1", status: "SENT" });
+  expect(prisma.$transaction).not.toHaveBeenCalled();
+});
+
+it("B5: deleting a property whose visits have unpaid invoices is a 409; paid/void/draft do not block", async () => {
+  const prisma = makePrisma();
+  prisma.property.findUnique.mockResolvedValue({ id: "p1" });
+  prisma.invoice.aggregate.mockResolvedValue({ _count: { _all: 1 }, _sum: { amount: null } });
+  await expect(createCustomerService(prisma).deleteProperty("p1")).rejects.toMatchObject({
+    statusCode: 409, code: "UNPAID_INVOICES", count: 1, total: 0,
+  });
+  expect(prisma.invoice.aggregate.mock.calls[0][0].where).toEqual({ status: "SENT", visit: { propertyId: "p1" } });
+
+  const ok = makePrisma();
+  ok.property.findUnique.mockResolvedValue({ id: "p1" });
+  ok.property.update.mockResolvedValue({ customerId: "c1" });
+  ok.property.count.mockResolvedValue(1);
+  await createCustomerService(ok).deleteProperty("p1");
+  expect(ok.property.update).toHaveBeenCalled();
 });

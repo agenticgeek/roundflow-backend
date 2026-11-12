@@ -31,6 +31,8 @@ function makeTp() {
     propertyNote: { create: vi.fn((args: any) => ({ op: "propertyNote.create", args })) },
     integrationOutbox: { create: vi.fn((args: any) => ({ op: "outbox.create", args })) },
     businessSettings: { findFirst: vi.fn() },
+    servicePlan: { findFirst: vi.fn().mockResolvedValue(null), update: vi.fn((args: any) => ({ op: "servicePlan.update", args })) },
+    round: { findUnique: vi.fn().mockResolvedValue(null) },
     $transaction: vi.fn(async (ops: any[]) =>
       ops.map((o) => {
         if (o.op === "visit.update") return { id: o.args.where.id, status: o.args.data.status };
@@ -110,11 +112,84 @@ describe("parseCompletionPayment", () => {
   });
 });
 
+describe("completeVisit advances the plan (GEN-001 / VIS-004n)", () => {
+  const visitDate = new Date("2026-11-06T00:00:00.000Z");
+  const plan = (over: Record<string, unknown> = {}) => ({
+    id: "sp1", status: "ACTIVE", cleaningFrequency: "FOUR_WEEKLY", nextDueDate: new Date("2026-11-06T00:00:00.000Z"), ...over,
+  });
+  const planUpdate = (tp: ReturnType<typeof makeTp>) => tp.servicePlan.update.mock.calls[0][0];
+
+  it("a one-off visit completes the property's due ACTIVE plan: lastCompleted stamped, nextDueDate one cycle ahead", async () => {
+    const tp = makeTp();
+    tp.visit.findUnique.mockResolvedValue(baseVisit({ date: visitDate, servicePlanId: null }));
+    tp.servicePlan.findFirst.mockResolvedValue(plan());
+    await createVisitCompletionService(tp as any).completeVisit("v1");
+    expect(tp.servicePlan.findFirst).toHaveBeenCalledWith({ where: { propertyId: "prop-1", status: "ACTIVE" }, orderBy: { createdAt: "asc" } });
+    expect(planUpdate(tp)).toEqual({ where: { id: "sp1" }, data: { lastCompleted: expect.any(Date), nextDueDate: new Date("2026-12-04T00:00:00.000Z") } });
+  });
+
+  it("the next due date snaps to the round day when the visit is on a round", async () => {
+    const tp = makeTp();
+    tp.visit.findUnique.mockResolvedValue(baseVisit({ date: visitDate, servicePlanId: null, roundId: "r1" }));
+    tp.servicePlan.findFirst.mockResolvedValue(plan({ nextDueDate: null }));
+    tp.round.findUnique.mockResolvedValue({ defaultDay: "MON" });
+    await createVisitCompletionService(tp as any).completeVisit("v1");
+    expect(tp.round.findUnique).toHaveBeenCalledWith({ where: { id: "r1" }, select: { defaultDay: true } });
+    expect(planUpdate(tp).data.nextDueDate).toEqual(new Date("2026-12-07T00:00:00.000Z")); // 2026-12-04 is a Friday, round day Monday
+  });
+
+  it("a plan whose next due date is still in the future (the nightly job already advanced it) is not moved again", async () => {
+    const tp = makeTp();
+    tp.visit.findUnique.mockResolvedValue(baseVisit({ date: visitDate, servicePlanId: "sp1", servicePlan: plan({ nextDueDate: new Date("2026-12-04T00:00:00.000Z") }) }));
+    await createVisitCompletionService(tp as any).completeVisit("v1");
+    expect(planUpdate(tp).data).toEqual({ lastCompleted: expect.any(Date) });
+    expect(tp.servicePlan.findFirst).not.toHaveBeenCalled();
+  });
+
+  it("a linked visit whose plan is due is advanced too; a plan with no frequency only gets lastCompleted", async () => {
+    const tp = makeTp();
+    tp.visit.findUnique.mockResolvedValue(baseVisit({ date: visitDate, servicePlanId: "sp1", servicePlan: plan() }));
+    await createVisitCompletionService(tp as any).completeVisit("v1");
+    expect(planUpdate(tp).data.nextDueDate).toEqual(new Date("2026-12-04T00:00:00.000Z"));
+    const tp2 = makeTp();
+    tp2.visit.findUnique.mockResolvedValue(baseVisit({ date: visitDate, servicePlanId: "sp1", servicePlan: plan({ cleaningFrequency: null }) }));
+    await createVisitCompletionService(tp2 as any).completeVisit("v1");
+    expect(planUpdate(tp2).data).toEqual({ lastCompleted: expect.any(Date) });
+  });
+
+  it("a property with no ACTIVE plan writes nothing to any plan", async () => {
+    const tp = makeTp();
+    tp.visit.findUnique.mockResolvedValue(baseVisit({ date: visitDate, servicePlanId: null }));
+    await createVisitCompletionService(tp as any).completeVisit("v1");
+    expect(tp.servicePlan.update).not.toHaveBeenCalled();
+  });
+});
+
 describe("completeVisit", () => {
   it("404s when the visit is missing", async () => {
     const tp = makeTp();
     tp.visit.findUnique.mockResolvedValue(null);
     await expect(createVisitCompletionService(tp as any).completeVisit("v1")).rejects.toMatchObject({ statusCode: 404 });
+  });
+
+  it("BUG-005: two simultaneous completions: the loser unique violation (Payment.visitId) returns the winner result, not a 500", async () => {
+    const tp = makeTp();
+    tp.visit.findUnique
+      .mockResolvedValueOnce(baseVisit({ paymentMethod: PaymentMethod.CASH }))
+      .mockResolvedValueOnce({ id: "visit-12345678", status: VisitStatus.COMPLETED });
+    tp.$transaction.mockRejectedValueOnce(Object.assign(new Error("Unique constraint failed on the fields: (visitId)"), { code: "P2002" }));
+    const res = await createVisitCompletionService(tp as any).completeVisit("v1", { payment: { method: "CASH" } });
+    expect(res).toEqual({ id: "visit-12345678", status: "COMPLETED", payment: null, invoice: null });
+    expect(autoCreateForCompletedVisit).not.toHaveBeenCalled();
+  });
+
+  it("a unique violation while the visit is NOT completed (a genuine conflict), or any other error, is rethrown", async () => {
+    const tp = makeTp();
+    tp.visit.findUnique.mockResolvedValue(baseVisit({ paymentMethod: PaymentMethod.CASH }));
+    tp.$transaction.mockRejectedValueOnce(Object.assign(new Error("dup"), { code: "P2002" }));
+    await expect(createVisitCompletionService(tp as any).completeVisit("v1", { payment: { method: "CASH" } })).rejects.toThrow("dup");
+    tp.$transaction.mockRejectedValueOnce(new Error("db down"));
+    await expect(createVisitCompletionService(tp as any).completeVisit("v1", { payment: { method: "CASH" } })).rejects.toThrow("db down");
   });
 
   it("is idempotent for an already COMPLETED visit (no writes)", async () => {
@@ -151,7 +226,7 @@ describe("completeVisit", () => {
     tp.visit.findUnique.mockResolvedValue(baseVisit());
     await createVisitCompletionService(tp as any).completeVisit("v1", { payment: { method: "CASH" } });
 
-    expect(ops(tp)).toEqual(["visit.update", "payment.create", "outbox.create", "outbox.create"]);
+    expect(ops(tp)).toEqual(["visit.update", "payment.create", "outbox.create", "outbox.create", "activityLog.create"]);
     const pay = tp.payment.create.mock.calls[0][0].data;
     expect(pay).toMatchObject({ customerId: "cust-1", visitId: "visit-12345678", method: "CASH", status: "PAID" });
     expect(Number(pay.amount)).toBe(35);
@@ -170,7 +245,7 @@ describe("completeVisit", () => {
       property: { customer: { id: "cust-1", name: "Tom", paymentMethod: null, gocardlessMandateId: null, gocardlessMandateStatus: null, messagesOptOut: true } },
     }));
     await createVisitCompletionService(tp as any).completeVisit("v1", { payment: { method: "CASH" } });
-    expect(ops(tp)).toEqual(["visit.update", "payment.create", "outbox.create"]);
+    expect(ops(tp)).toEqual(["visit.update", "payment.create", "outbox.create", "activityLog.create"]);
     expect(tp.payment.create.mock.calls[0][0].data.reference).toBeUndefined();
   });
 
@@ -189,7 +264,7 @@ describe("completeVisit", () => {
       payment: { method: "CHEQUE", chequeNumber: "000123" }, actorProfileId: "prof-1", actorRole: "TECHNICIAN",
     });
 
-    expect(ops(tp)).toEqual(["visit.update", "payment.create", "activityLog.create", "outbox.create", "outbox.create"]);
+    expect(ops(tp)).toEqual(["visit.update", "payment.create", "activityLog.create", "outbox.create", "outbox.create", "activityLog.create"]);
     const pay = tp.payment.create.mock.calls[0][0].data;
     expect(pay).toMatchObject({ method: "CHEQUE", status: "PENDING", reference: "000123" });
     expect(pay.paidAt).toBeUndefined();
@@ -372,5 +447,78 @@ describe("QA batch 2026-11-03 (A1, A3, A6)", () => {
     expect(res2.invoice).toBeNull();
     expect(err).toHaveBeenCalled();
     err.mockRestore();
+  });
+});
+
+describe("Wave 2B-2 task 6a: payment method recording", () => {
+  it.each(["BACS", "GOCARDLESS", "STRIPE"])("parse accepts method %s", (method) => {
+    expect(parseCompletionPayment({ payment: { method } })).toMatchObject({ method });
+  });
+
+  it("parse accepts collectVia (alias) and updateCustomerDefault, rejecting bad types", () => {
+    expect(parseCompletionPayment({ payment: { method: "CASH", collectVia: "BACS", updateCustomerDefault: true } })).toMatchObject({
+      method: "CASH", collectVia: "BACS", updateCustomerDefault: true,
+    });
+    expect(parseCompletionPayment({ payment: { method: "NONE", collectVia: null } })).toMatchObject({ method: "NONE", collectVia: undefined });
+    expect(() => parseCompletionPayment({ payment: { method: "CASH", collectVia: "PAYPAL" } })).toThrow(expect.objectContaining({ code: "INVALID_PAYMENT" }));
+    expect(() => parseCompletionPayment({ payment: { method: "CASH", collectVia: 3 } })).toThrow(expect.objectContaining({ code: "INVALID_PAYMENT" }));
+    expect(() => parseCompletionPayment({ payment: { method: "CASH", updateCustomerDefault: "yes" } })).toThrow(expect.objectContaining({ code: "INVALID_PAYMENT" }));
+  });
+
+  it("records the chosen method on the visit and writes an activity log; CASH behaviour unchanged", async () => {
+    const tp = makeTp();
+    tp.visit.findUnique.mockResolvedValue(baseVisit());
+    await createVisitCompletionService(tp as any).completeVisit("v1", { payment: { method: "CASH" }, actorProfileId: "p1", actorRole: "TECHNICIAN" });
+    expect(tp.visit.update.mock.calls[0][0].data).toMatchObject({ collectedVia: PaymentMethod.CASH });
+    expect(tp.payment.create.mock.calls[0][0].data).toMatchObject({ method: "CASH", status: "PAID" });
+    expect(tp.activityLog.create.mock.calls[0][0].data).toMatchObject({ type: "PAYMENT_METHOD_RECORDED", actorId: "p1" });
+  });
+
+  it("NONE records no collectedVia and no activity row", async () => {
+    const tp = makeTp();
+    tp.visit.findUnique.mockResolvedValue(baseVisit());
+    await createVisitCompletionService(tp as any).completeVisit("v1", { payment: { method: "NONE" } });
+    expect(tp.visit.update.mock.calls[0][0].data).not.toHaveProperty("collectedVia");
+    expect(tp.activityLog.create).not.toHaveBeenCalled();
+  });
+
+  it("STRIPE chosen on a CASH customer: no cash payment, no confirmation demanded, collectedVia STRIPE", async () => {
+    const tp = makeTp();
+    tp.visit.findUnique.mockResolvedValue(baseVisit({ paymentMethod: PaymentMethod.CASH }));
+    const r = await createVisitCompletionService(tp as any).completeVisit("v1", { payment: { method: "STRIPE" } });
+    expect(tp.payment.create).not.toHaveBeenCalled();
+    expect(r.payment).toBeNull();
+    expect(tp.visit.update.mock.calls[0][0].data.collectedVia).toBe("STRIPE");
+  });
+
+  it("BACS chosen creates the normal PENDING BACS payment", async () => {
+    const tp = makeTp();
+    tp.visit.findUnique.mockResolvedValue(baseVisit({ paymentMethod: PaymentMethod.CASH }));
+    await createVisitCompletionService(tp as any).completeVisit("v1", { payment: { method: "BACS" } });
+    expect(tp.payment.create.mock.calls[0][0].data).toMatchObject({ method: "BACS", status: "PENDING" });
+  });
+
+  it("collectVia is used when method is NONE-like, and method wins when both are given", async () => {
+    const tp = makeTp();
+    tp.visit.findUnique.mockResolvedValue(baseVisit());
+    await createVisitCompletionService(tp as any).completeVisit("v1", { payment: { method: "NONE", collectVia: "BACS" } });
+    expect(tp.visit.update.mock.calls[0][0].data.collectedVia).toBe("BACS");
+  });
+
+  it("updateCustomerDefault updates the customer's usual method inside the transaction", async () => {
+    const tp: any = makeTp();
+    tp.customer = { update: vi.fn((args: any) => ({ op: "customer.update", args })) };
+    tp.visit.findUnique.mockResolvedValue(baseVisit());
+    await createVisitCompletionService(tp).completeVisit("v1", { payment: { method: "CASH", updateCustomerDefault: true } });
+    expect(tp.customer.update).toHaveBeenCalledWith({ where: { id: "cust-1" }, data: { paymentMethod: "CASH" } });
+    expect(ops(tp)).toContain("customer.update");
+  });
+
+  it("updateCustomerDefault is ignored for NONE", async () => {
+    const tp: any = makeTp();
+    tp.customer = { update: vi.fn() };
+    tp.visit.findUnique.mockResolvedValue(baseVisit());
+    await createVisitCompletionService(tp).completeVisit("v1", { payment: { method: "NONE", updateCustomerDefault: true } });
+    expect(tp.customer.update).not.toHaveBeenCalled();
   });
 });

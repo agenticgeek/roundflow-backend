@@ -32,6 +32,7 @@ it("fetchGhlLocation returns the location name with the token as bearer", async 
   fetchMock.mockResolvedValue(res(200, { location: { name: "Coates Windows" } }));
   await expect(fetchGhlLocation("tok", "loc/1")).resolves.toEqual({ ok: true, locationName: "Coates Windows" });
   expect(fetchMock).toHaveBeenCalledWith("https://services.leadconnectorhq.com/locations/loc%2F1", {
+    signal: expect.any(AbortSignal), // BE-09: outbound timeout
     headers: { Authorization: "Bearer tok", Version: "2021-07-28" },
   });
 });

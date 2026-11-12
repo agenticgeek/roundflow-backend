@@ -19,9 +19,10 @@ vi.mock("../../middleware/requireRole", () => ({
 
 const assertSetupComplete = vi.fn().mockResolvedValue(undefined);
 const updatePaymentRules = vi.fn();
+const createMessageTemplate = vi.fn();
 const invalidateCachedBusinessSettings = vi.fn((..._args: unknown[]) => undefined);
 vi.mock("../../services/settings.service", () => ({
-  createSettingsService: vi.fn(() => ({ assertSetupComplete, updatePaymentRules })),
+  createSettingsService: vi.fn(() => ({ assertSetupComplete, updatePaymentRules, createMessageTemplate })),
   invalidateCachedBusinessSettings: (...args: unknown[]) => invalidateCachedBusinessSettings(...args),
 }));
 
@@ -292,5 +293,56 @@ describe("POST /settings/stripe/disconnect", () => {
       },
     });
     expect(tenantUpdate).toHaveBeenCalledWith({ where: { id: "tenant-1" }, data: { stripeConnectAccountId: null } });
+  });
+});
+
+describe("BUG-008 / SETUP-004c: PATCH /settings/payment validation", () => {
+  it.each([
+    ["negative invoices limit", { debtHoldMaxInvoices: -1 }],
+    ["fractional invoices limit", { debtHoldMaxInvoices: 1.5 }],
+    ["text invoices limit", { debtHoldMaxInvoices: "many" }],
+    ["negative amount limit", { debtHoldMaxAmount: -5 }],
+    ["NaN amount limit", { debtHoldMaxAmount: "abc" }],
+  ])("%s is a 400", async (_n, body) => {
+    const res = await request(makeApp()).patch("/settings/payment").send(body);
+    expect(res.status).toBe(400);
+    expect(updatePaymentRules).not.toHaveBeenCalled();
+  });
+
+  it("provider connection flags are not writable here (400 FIELD_REMOVED)", async () => {
+    for (const body of [{ stripeConnected: true }, { gocardlessConnected: true }]) {
+      const res = await request(makeApp()).patch("/settings/payment").send(body);
+      expect(res.status).toBe(400);
+    }
+    expect(updatePaymentRules).not.toHaveBeenCalled();
+  });
+});
+
+describe("BUG-003 / BUG-008: PATCH /settings/business-profile validation", () => {
+  it.each([
+    ["bad email", { email: "nope" }],
+    ["bad timezone", { timezone: "Mars/Olympus" }],
+    ["bad currency", { currency: "ZZZZ" }],
+    ["bad sort code", { bankDetails: { accountName: "A", accountNumber: "12345678", sortCode: "12" } }],
+    ["bad account number", { bankDetails: { accountName: "A", accountNumber: "12", sortCode: "12-34-56" } }],
+  ])("%s is a 400", async (_n, body) => {
+    const res = await request(makeApp()).patch("/settings/business-profile").send(body);
+    expect(res.status).toBe(400);
+  });
+});
+
+describe("BUG-002: EMAIL message templates need a subject", () => {
+  it.each([undefined, null, "", "   "])("POST with channel EMAIL and subject %j is a 400 with a field error", async (subject) => {
+    const res = await request(makeApp()).post("/settings/message-templates").send({ name: "Hello", channel: "EMAIL", body: "Hi", subject });
+    expect(res.status).toBe(400);
+  });
+  it("an SMS template needs no subject", async () => {
+    createMessageTemplate.mockResolvedValue({ id: "t1" });
+    const res = await request(makeApp()).post("/settings/message-templates").send({ name: "Hi", channel: "SMS", body: "Hi" });
+    expect(res.status).toBe(201);
+  });
+  it("PATCH that sets channel EMAIL with a blank subject is a 400", async () => {
+    const res = await request(makeApp()).patch("/settings/message-templates/t1").send({ channel: "EMAIL", subject: " " });
+    expect(res.status).toBe(400);
   });
 });

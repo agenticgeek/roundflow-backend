@@ -32,6 +32,19 @@ describe("evaluateDebtGate", () => {
     expect((await evaluateDebtGate(makeTp({ settings: { debtHoldEnabled: false } }), "c1")).canStart).toBe(true);
   });
 
+  it("ACT-07: invoices whose direct debit is still being collected are excluded from the debt count", async () => {
+    const tp = makeTp({ settings: enabled({}), invoices: [5] }) as unknown as { invoice: { findMany: ReturnType<typeof vi.fn> } };
+    await evaluateDebtGate(tp as never, "c1");
+    expect(tp.invoice.findMany).toHaveBeenCalledWith({
+      where: {
+        customerId: "c1",
+        status: { in: ["DRAFT", "SENT"] },
+        NOT: { visit: { is: { payment: { is: { method: "GOCARDLESS", status: { in: ["PENDING", "PROCESSING"] } } } } } },
+      },
+      select: { amount: true },
+    });
+  });
+
   it("allows when there is no outstanding debt", async () => {
     expect((await evaluateDebtGate(makeTp({ settings: enabled({}) }), "c1")).canStart).toBe(true);
   });

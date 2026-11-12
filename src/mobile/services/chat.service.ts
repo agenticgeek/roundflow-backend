@@ -7,6 +7,7 @@ import {
   type ChatSendInput,
   type ChatViewer,
 } from "../../services/chat.service";
+import { notifyAdmins } from "../../services/notify";
 
 export type { ChatViewer };
 
@@ -36,9 +37,29 @@ class ChatService {
   async send(
     roundId: string,
     senderProfileId: string,
-    input: ChatSendInput
+    input: ChatSendInput,
+    senderName?: string | null
   ): Promise<{ row: ChatMessageRow; duplicate: boolean }> {
-    return this.core.send(roundId, { profileId: senderProfileId, role: "TECHNICIAN" }, input);
+    const sent = await this.core.send(roundId, { profileId: senderProfileId, role: "TECHNICIAN" }, input);
+    if (!sent.duplicate) await this.notifyOffice(roundId, senderProfileId, input, senderName);
+    return sent;
+  }
+
+  // NOTIF-03 / CHAT-03: the office hears about a technician's message. At most
+  // one notification per admin per round per 5 minutes while the previous one
+  // is unread. Best effort.
+  private async notifyOffice(roundId: string, senderProfileId: string, input: ChatSendInput, senderName?: string | null) {
+    const round = await this.prisma.round.findUnique({ where: { id: roundId }, select: { name: true } });
+    const text = input.text ?? "Sent photos";
+    const preview = text.length > 120 ? `${text.slice(0, 117)}...` : text;
+    await notifyAdmins(this.prisma, {
+      type: "CHAT",
+      title: `New message from ${senderName?.trim() || "a technician"}`,
+      body: `${round?.name ?? "Round chat"}: ${preview}`,
+      data: { roundId },
+      dedupe: { windowMs: 5 * 60_000, keys: ["roundId"] },
+      excludeProfileIds: [senderProfileId],
+    });
   }
 
   async markRead(roundId: string, viewer: ChatViewer) {

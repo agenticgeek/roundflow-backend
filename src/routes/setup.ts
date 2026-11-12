@@ -3,6 +3,7 @@ import { PaymentTiming } from "../generated/tenant-client";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
+import { enforceAdminOnlyRoutes } from "../middleware/requireAdmin";
 import { AppError } from "../lib/app-error";
 import {
   validateWorkingDays,
@@ -11,6 +12,11 @@ import {
   MAX_NAME_LENGTH,
   MAX_ADDRESS_LENGTH,
   MAX_NOTES_LENGTH,
+  assertUkBankFormat,
+  optCurrency,
+  optEmail,
+  optTimeZone,
+  optWorkingDaysArray,
 } from "../lib/validation";
 import {
   asObject,
@@ -64,6 +70,8 @@ setupRouter.use(requireAuth);
 setupRouter.use(requireTenantAccess);
 // Authorization: reads allowed for any known role; mutations require ADMIN/MANAGER.
 setupRouter.use(requireBusinessAccess());
+// Wave 2B-2: step 1 (business profile, bank/VAT) and step 2 (payment) are ADMIN only, as in BE-01.
+setupRouter.use(enforceAdminOnlyRoutes());
 
 const svc = (req: Request) => createSetupService(req.tenantPrisma!);
 
@@ -111,6 +119,7 @@ setupRouter.post(
         if (!accountNumber) throw new AppError(400, '"bankDetails.accountNumber" must not be blank');
         const sortCode = requireString(b.sortCode, "bankDetails.sortCode").trim();
         if (!sortCode) throw new AppError(400, '"bankDetails.sortCode" must not be blank');
+        assertUkBankFormat(sortCode, accountNumber);
         const bankName = typeof b.bankName === "string" ? b.bankName : null;
         bankDetails = { accountName, bankName, accountNumber, sortCode };
       }
@@ -118,16 +127,14 @@ setupRouter.post(
     const input: BusinessProfileInput = {
       businessName: body.businessName as string,
       phone: body.phone as string | undefined,
-      email: body.email as string | undefined,
+      email: optEmail(body.email, "email") as string | undefined,
       companyNumber: body.companyNumber as string | undefined,
       vatRegistered:
         typeof body.vatRegistered === "boolean" ? body.vatRegistered : undefined,
       vatRegistration: body.vatRegistration as string | undefined,
-      defaultWorkingDays: Array.isArray(body.defaultWorkingDays)
-        ? validateWorkingDays(body.defaultWorkingDays)
-        : undefined,
-      timezone: body.timezone as string | undefined,
-      currency: body.currency as string | undefined,
+      defaultWorkingDays: optWorkingDaysArray(body.defaultWorkingDays),
+      timezone: optTimeZone(body.timezone, "timezone") as string | undefined,
+      currency: optCurrency(body.currency, "currency") as string | undefined,
       bankDetails,
       addressLine1: optString(body.addressLine1, "addressLine1", { maxLength: MAX_ADDRESS_LENGTH }),
       addressLine2: optString(body.addressLine2, "addressLine2", { maxLength: MAX_ADDRESS_LENGTH }),

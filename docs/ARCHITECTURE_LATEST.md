@@ -17,10 +17,21 @@
 > **2026-11-03 update (QA bug batch and chat):** reminders as a list, no automatic debt hold on new visits, round
 > postcode sectors, accepted payment methods, catalogue-priced imports, editable property services, auto-invoice on
 > completion, single-visit assignment, polling-based office chat, and the decisions behind them (§17).
+>
+> **2026-11-06 update (Wave 1: hardening, assignment and notifications):** process-level error handlers, webhook
+> crash guard, 404 for unknown routes, gated API docs (§6, §9), the notification producers, the admin
+> `/notifications` API and push preferences, the assignment result of `PUT /rounds/:id/technicians` (§18), and one
+> new tenant migration (§12). Handoffs: `docs/handoff/backend/2026-11-06-wave1-backend.md` and
+> `docs/handoff/frontend/2026-11-06-wave1-frontend-contract.md`.
+>
+> **2026-11-10 update (Flo AI):** an admin-only, read-only, streaming AI assistant over the tenant's own data: the
+> `/flo/*` routes, the scope gate and guardrails, the ten lookup tools, the streamed answer pipeline, two new tenant
+> tables and the `FLO_FILES` coverage gate (§22, §12, §16). Handoffs:
+> `docs/handoff/backend/2026-11-10-flo-ai-backend.md` and `docs/handoff/frontend/2026-11-10-flo-ai-frontend-contract.md`.
 
 ## 1. Overview
 
-RoundFlow is a multi-tenant SaaS backend for UK window-cleaning businesses. Each business (tenant) operates in complete isolation — they share the same Express/TypeScript process and the same PostgreSQL instance, but their operational data lives in a dedicated Postgres schema. The backend is deployed on Railway and communicates with a React frontend; it has no HTML rendering concerns.
+RoundFlow is a multi-tenant SaaS backend for UK window-cleaning businesses. Each business (tenant) operates in complete isolation — they share the same Express/TypeScript process and the same PostgreSQL instance, but their operational data lives in a dedicated Postgres schema. The backend is deployed on AWS EC2 (region eu-west-1 or us-east-1: confirm which, then update this line) and communicates with a React frontend; it has no HTML rendering concerns.
 
 **Phase 1 target:** GHL-connected clients only. RoundFlow is sold as a private integration to businesses already on Agentum's GoHighLevel agency — not listed on the GHL Marketplace yet. GHL connection is required in Phase 1; marketplace listing and standalone mode are Phase 2.
 
@@ -41,7 +52,7 @@ Note: the code already supports **both** a marketplace-style OAuth install flow 
 | Identity provider | Supabase Auth (ES256 JWTs, JWKS) |
 | Staff invite email | Supabase Auth (`admin.auth.inviteUserByEmail`) — same infrastructure as OTP + password reset |
 | Customer-facing email | GHL (same as SMS/WhatsApp — all customer comms route through the GHL outbox) |
-| Deployment | Railway |
+| Deployment | AWS EC2 (region to confirm: eu-west-1 or us-east-1) |
 | API docs | Swagger UI (`/docs`) |
 
 ---
@@ -82,6 +93,8 @@ flowchart TD
 ```
 
 Startup and cron wiring live in `src/server/bootstrap.ts`; `src/index.ts` only calls it (see §6).
+
+Flo AI (§22) adds `/flo/*` to the protected routes (ADMIN only, a streaming `POST /flo/chat`), with its code in `src/routes/flo.ts`, `src/services/flo/` (orchestrator, scope gate, tools, answer builder), `src/integrations/anthropic/client.ts` and the nightly `src/jobs/floPurge.ts`.
 
 ---
 
@@ -211,9 +224,11 @@ flowchart LR
 | `idempotencyPurge` | 03:00 daily | Deletes mobile `IdempotencyRecord` rows past their 7-day TTL |
 | `preCleanReminders` | every 15 min | Pre-clean reminders; **only registered when `PRECLEAN_REMINDERS_ENABLED=true`**, so it can't duplicate the GHL workflow |
 
-The startup log also lists missing integration env vars (`listMissingIntegrationEnv()`).
+The startup log also lists missing integration env vars (`listMissingIntegrationEnv()`). `src/index.ts` also calls `installProcessErrorHandlers()` (Wave 1): an `unhandledRejection` is logged and the process keeps running; an `uncaughtException` is logged and the process exits with code 1 so the supervisor restarts it.
 
 **405 pre-filter:** before the routers, a middleware built from the swagger `paths` answers `405` for a method the spec doesn't list on a known path, so a wrong method never reaches auth and gets a misleading 401. Consequence: **a documented path must list every method the code serves**, and literal paths must precede templated ones (`/invoices/bulk` before `/invoices/{id}`). `src/__tests__/swagger.contract.test.ts` enforces both.
+
+**Unknown routes are `404 {error:"Not Found"}`** (Wave 1, BE-26). Only a documented path with an unsupported method gets `405` + `Allow`. **`/docs` and `/openapi.json`** are mounted only outside production, or in production when `EXPOSE_API_DOCS=true` (`shouldExposeApiDocs()`); otherwise they are 404 (BE-25).
 
 ### An authenticated request
 
@@ -422,6 +437,8 @@ Extra own fields are forwarded generically. For example, `AllocationError.fields
 Untyped errors (unexpected exceptions) become 500s and are logged.
 
 **Integration failures are typed too**, so a provider's rejection isn't a 500. A Stripe Connect code exchange that Stripe rejects is `400 STRIPE_CONNECT_FAILED`, with Stripe's reason; a Stripe outage is `502 STRIPE_UNAVAILABLE`. GHL send failures are `502 GHL_SEND_FAILED`, and a missing connection is `409 GHL_NOT_CONNECTED` / `STRIPE_NOT_CONNECTED`.
+
+**Webhook routes** (`/webhooks/stripe`, `/webhooks/gocardless`, `/webhooks/ghl`) are not behind `h()`, so each handler is wrapped by `guardWebhook()` (`src/lib/webhook-guard.ts`, Wave 1): a throw (database, decrypt) is logged and answered `503 DATABASE_UNAVAILABLE` with `Retry-After` when the database is unreachable, otherwise `500`, so the provider retries and the process never sees an unhandled rejection. Work done after the early `200` ack keeps its own `.catch` logging.
 
 This means service code never touches `res` — it throws, the route handler propagates via `next(err)`, and the handler decides the HTTP response.
 
@@ -761,6 +778,19 @@ it everywhere.
 | `20261030010000_phase1_followups` | `Customer.messagesOptOut`, `Message.externalId` (GHL message id), `Round.defaultServiceId`. |
 | `20261030020000_access_issue_photos` | `PhotoType.ACCESS_ISSUE` + nullable `Photo.issueId` (photos attached to an access-issue report from the technician app). |
 | `20261103000000_qa_bugfix_batch` | QA bug batch (§17), additive only. `BusinessSettings.preCleanReminders` (JSONB list) and `acceptedPaymentMethods`; `Round.postcodeSectors`; `Visit.reminderSentTypes`; `ActivityLog.entityId`/`details`; chat: `ChatMessage.senderRole`/`clientMsgId` (unique per round and sender) and a `ChatRead` table; `Message.readAt` (inbound messages older than 30 days are backfilled as read). Applied by hand to long-lived tenants; see the `dist/` caveat in §17.6. |
+| `20261106000000_notification_data_category` | Wave 1 (§18): nullable `Notification.data` (JSONB deep-link payload) and `Notification.category`. Additive. |
+| `20261106100000_property_geocode_precision` | Wave 2A (§19.1): nullable `Property.geocodePrecision`, `geocodePlaceId`, `geocodeAddressHash`. Additive. |
+| `20261106100100_visit_carryover` | Wave 2A (§19.2): `Visit.carriedOverFromDate` (DATE, nullable) and `Visit.carryoverCount` (INT, default 0). Additive. |
+| `20261106100200_invoice_footer_payment_terms` | Wave 2A (§19.3): nullable `BusinessSettings.invoiceFooter` and `paymentTerms`. Additive. |
+| `20261106100300_outbox_dedupe_batch` | Wave 2A (§19.4): nullable `IntegrationOutbox.dedupeKey` (unique) and `batchId` (indexed). Additive. |
+| `20261107100000_payment_status_unique_ids` | Wave 2B-1 (§20.3): `PaymentStatus` gains `PROCESSING`, `REFUNDED`, `DISPUTED` (`ADD VALUE IF NOT EXISTS`); unique indexes `Payment_stripeId_key` and `Payment_gocardlessId_key`, each created only when the tenant has no duplicates (otherwise a NOTICE and the index is skipped). Not applied by the agent. |
+| `20261107100100_webhook_event_status` | Wave 2B-1 (§20.2): `WebhookEvent.status` (default `DONE`, so old rows count as processed), `attempts`, `lastError`, `payload` (JSONB), `updatedAt`, index `(status, updatedAt)`. Additive. |
+| `20261107100200_idempotency_inflight` | Wave 2B-1 (§20.5): `IdempotencyRecord.technicianId`, `responseStatus` and `responseBody` become nullable; adds `actorId` and `state` (default `DONE`). Additive and relaxing. |
+| `20261107100300_customer_ghl_contact_unique` | Wave 2B-1 (§20.7): unique index `Customer_ghlContactId_key`, created only when no duplicates exist (otherwise a NOTICE and the index is skipped). |
+| `20261108100000_visit_collected_via` | Wave 2B-2 (§21.8): nullable `Visit.collectedVia` (PaymentMethod chosen by the technician at completion). |
+| `20261108110000_email_identity_delivery` | Wave 2B-2 (§21): `EmailDomainStatus` and `MessageDeliveryStatus` enums; `BusinessSettings.email*` identity/limits/pause, `logoPath`, `logoAltText`, `brandColour`; `Message.deliveryStatus/deliveryUpdatedAt/deliveryError` + index on `externalId`; `Customer.emailInvalidAt`; one-off cleanup parking GHL-only outbox rows of tenants without GHL as `dropped`. |
+
+| `20261110100000_flo_ai` | Flo AI (§22): new tables `FloConversation` (per admin profile) and `FloMessage` (role, mode, model, text, answer JSON, tool-call audit, token counts, duration, status `OK/ERROR/DECLINED/ABORTED`, decline reason, error code) with indexes on `(profileId, updatedAt)` and `(conversationId, createdAt)`. Additive and idempotent. |
 
 The three 2026-10-30 migrations are additive (new enum values, nullable columns, new tables). They are paired with idempotent, per-tenant backfill scripts that support `--dry-run`: `scripts/backfill-visit-technicians.ts`, `backfill-next-due-date.ts` and `backfill-completed-steps.ts`, with their logic in `src/jobs/backfills.ts`. Run them after the deploy has migrated the tenants, dry-run first.
 
@@ -1022,6 +1052,8 @@ Three gates run in CI and locally. They exist so this class of problem is caught
 
 Also: openapi-typescript marks any schema field that has a `default` as *required* in the generated frontend and app types, so optional request fields must not carry a swagger `default` (describe it in the text instead).
 
+**Flo AI gate (2026-11-10).** `FLO_FILES` in `vitest.config.ts` lists every Flo file (`services/flo/*`, `services/flo/tools/*`, `integrations/anthropic/client.ts`, `routes/flo.ts`, `jobs/floPurge.ts`) at 100% line, branch, function and statement coverage per file. `bootstrap.ts`, `swagger.ts`, `permissions.ts` and `rate-limit.ts` stay at 100% with the Flo changes. Guardrail fixtures (`services/flo/__tests__/guardrails.fixtures.ts`: 75 red-team prompts, 43 golden questions, 3 capability questions) run through the real pipeline in unit tests. A live-API eval with pass thresholds (all red-team prompts declined with no tool call, at least 95% of golden questions answered correctly) is planned but **not yet written or run**.
+
 **End-to-end regression suite.** `roundflow-e2e/` (a sibling folder, not part of this package) runs one Playwright spec per audit gap against a local Docker Postgres, a locally started backend (port 3100) and web app (port 5173). The integration gaps use real Stripe test-mode, GoCardless sandbox and GHL sandbox credentials. It creates a fresh tenant per run and deletes the test users afterwards. Its first runs found a real defect: `GET /settings/stripe/callback` returned 500 when Stripe rejected a code. It is now `400 STRIPE_CONNECT_FAILED` or `502 STRIPE_UNAVAILABLE` (defect D-11).
 
 ---
@@ -1112,3 +1144,202 @@ Every decision below is in force. "Open" marks the ones still waiting on the cli
 | D16 | **Mobile round position uses one definition everywhere:** the technician's own visits in the round on the visit's day, ordered by creation time then id. | The detail screen counted every technician's visits ordered differently from the Today list, so "stop 13 of 19" disagreed with the list and changed when a visit started. | List, schedule and detail agree and are stable. |
 | D17 | **Property notes returned to the app carry `source` (`TECHNICIAN`/`OFFICE`) and `mine`.** Notes added from the app now store the author profile. Access notes remain only `Property.accessNotes`. | The technician's own "note for office" was shown under ACCESS NOTES because the app treated every non-risk note as one. | The app renders `source: TECHNICIAN` notes in a separate list. Notes written before this change have no author and count as OFFICE. |
 | D18 | **Database connectivity failures answer `503 DATABASE_UNAVAILABLE`** (`Retry-After: 5`) instead of a bare 500: Prisma P1001, P1002, P1017, pool timeout P2024 and client initialisation errors. | A brief Postgres outage surfaced as a raw "Internal Server Error" in the app. | Clients can treat 503 as retryable and show friendly copy. Other unexpected errors remain 500. |
+
+---
+
+## 18. Wave 1: Assignment Result and Notifications (2026-11-06)
+
+### 18.1 Round assignment (FLOW-01/02/04)
+
+`RoundService.setTechnicians()` (`PUT /rounds/:id/technicians`) still writes `RoundTechnician`, the property allocation and the restamp in one transaction, now using the tenant-local "today". After the commit, for an ACTIVE round with at least one technician, it calls `generateForRound()` (the nightly job's per-round generator) so the due visits exist at once; they are stamped from the committed allocation. The result adds `visitsGenerated`, `overriddenVisits` (future SCHEDULED visits with `technicianOverride`) and `nextVisitDate` (earliest SCHEDULED visit from today, recomputed after generation). `dryRun` rolls back as before and never generates or notifies.
+
+### 18.2 The notifier (`src/services/notify.ts`)
+
+Every event that should reach a person goes through `notifyEvent(tp, { type, title, body?, data?, to, dedupe? })`:
+
+- **Recipients:** `technicianIds` (active, invite-accepted technicians only), `profileIds`, `admins: true` (all ADMIN and MANAGER profiles of the tenant owning `tp`; the tenant is found with `getSchemaNameForClient(tp)`, a client-to-schema map kept next to the LRU cache in `tenant-prisma-manager.ts`), minus `excludeProfileIds`. Recipients are deduped.
+- **Dedupe:** `dedupe: { windowMs, keys }` skips a recipient with an unread notification of the same type inside the window whose `data` matches on `keys` (used for technician chat: one per admin per round per 5 minutes while unread).
+- **Best effort:** it never throws into the caller; a failure is logged as `[notify] <TYPE> failed` and the business action stands.
+- **Delivery:** `NotificationService.create()` stores the `Notification` row (`type`, `title`, `body`, `data`, `category` = `type`) and sends the Expo push best effort, with `data` in the payload. If the profile has `preferences.notifications.categories.<TYPE> === false` the push is skipped and the row is still stored (`src/lib/notification-prefs.ts`; missing or malformed preferences mean on).
+- **Types:** `SCHEDULE`, `ROUND_UPDATE`, `CHAT`, `PAYMENT`, `COMPLAINT`, `ACCESS_ISSUE`, `DAY_CLOSED`, `INVITE`, `KPI_ALERT`. `data` keys: `visitId`, `roundId`, `customerId`, `invoiceId`, `propertyId`, `date`.
+
+Producers (technician-facing): round technician assign, remove and change, reassign, single-visit assign, reschedule, cancel (pause and frequency change), weather hold, complaint revisit, debt hold placed and released. Producers (office-facing, to ADMIN and MANAGER): technician chat message, access issue, skipped visit, technician day closed, payment failed, invoice paid (Stripe webhook, GoCardless outcome, manual mark-paid), complaint logged, invite accepted. The full table with call sites is in the backend handoff. Cash debt collected in the app now raises the office "invoice paid" notification and KPI alerts now reach ADMIN and MANAGER (§19.5). Not produced: email bounces (Phase 1B).
+
+### 18.3 The office feed
+
+`/notifications` (`src/routes/notifications.ts`; ADMIN and MANAGER) exposes the caller's own `Notification` rows: `GET /notifications?cursor=`, `GET /notifications/unread-count`, `POST /notifications/:id/read`, `POST /notifications/read-all` (`{ ok: true }`). It shares `NotificationService` with `/mobile/notifications`, which now also returns `data`.
+
+### 18.4 Test safety net
+
+`src/test/env.setup.ts` points `DATABASE_URL`/`DIRECT_URL` at a dead local address for every unit test, so an unmocked Prisma client fails fast instead of reaching the shared dev database.
+
+---
+
+## 19. Wave 2A: Geocoding, Working Days and Carryover, Invoice Details, Bulk Send (2026-11-06)
+
+Handoffs: `docs/handoff/backend/2026-11-06-wave2a-backend.md` and `docs/handoff/frontend/2026-11-06-wave2a-frontend-contract.md`.
+
+### 19.1 Google geocoding (ACT-10, supersedes the provider choice in section 14.2)
+
+`src/integrations/geocoding/client.ts` geocodes the **full address** (line, optional town, postcode, country GB, `region=gb`) with the Google Geocoding API using the server key `GOOGLE_MAPS_GEOCODING_API_KEY` (a separate key from the browser Maps key). Each call has an `AbortSignal` timeout and one retry on 5xx or network error, and `geocodeAddress()` **never throws**: it returns `{ result, error }`. The Google `location_type` is stored as `Property.geocodePrecision` (`ROOFTOP`, `RANGE_INTERPOLATED`, `GEOMETRIC_CENTER`, `APPROXIMATE`); `partial_match` and unknown types are stored as `APPROXIMATE`. postcodes.io remains only as the last resort and is stored as `POSTCODE_FALLBACK`; with no key set the old behaviour is kept and startup logs a warning (`RECOMMENDED_ENV_VARS` in `src/lib/env-check.ts`). `GEOCODE_DAILY_LIMIT` (default 2000) is an in-memory per-process, per-UTC-day guard; over it, lookups fall back to postcodes.io.
+
+`src/services/property-geocoding.ts` writes the result with `geocodeAddressHash`. A property is geocoded again **only when the hash of its address inputs changes** (create, address or postcode edit; case and spacing are ignored) and never on read; an address change first resets the coordinates (`GEOCODE_RESET`). The DTOs (property detail and list, customer detail, round planner stops, today panel stops, visit detail, mobile visit row and job detail) carry `geocodePrecision` and `locationApproximate` (true for `POSTCODE_FALLBACK`, `APPROXIMATE` and legacy rows that have coordinates but no precision).
+
+`src/jobs/geocodeBackfill.ts` (cron, every 15 minutes, and `scripts/backfill-geocode.ts --dry-run --limit=N`) re-geocodes properties whose precision is null, `POSTCODE_FALLBACK` or `APPROXIMATE`, or that have no address hash, in batches of 50, at most 200 properties per run across tenants, stopping when the daily quota is spent. `geocodeAttempts < 5` stops an address that stays approximate from being re-billed forever. Without the key it only fills properties that have no coordinates.
+
+### 19.2 Working days and job carryover (ACT-02 to ACT-04)
+
+`src/lib/working-days.ts` is the one place that reads `BusinessSettings.defaultWorkingDays` (`MON`..`SUN`, Mon-Fri when empty): `nextWorkingDay`, `snapToWorkingDay`, `isWorkingDay`, `carryoverOptions`, `resolveCarryoverTarget`. A Date at UTC midnight is a date-only value; any other Date is an instant resolved to the tenant-local day. `lib/schedule.snapToWeekday`, visit generation (nightly and on-demand), plan resume and weather hold all use it. Bank holidays are not modelled.
+
+`src/services/carryover.service.ts` is shared by `POST /visits/carryover` and `POST /today/close` (`push_to_tomorrow`, optional `target`). On a **Friday the options are always Saturday and Monday** (Sunday never; Monday is the default unless only Saturday is a working day); other days offer the next working day. Carried visits go back to `SCHEDULED`, `startedAt`/`arrivedAt` are cleared, reminder markers reset, queued pre-clean outbox rows cancelled, `carriedOverFromDate` and `carryoverCount` recorded, a `VISITS_CARRIED_OVER` activity row is written and the technicians get a `SCHEDULE` notification. A target in the past is 400 and an already-closed target is 409. Technicians unavailable or deactivated on the target day are reported as `conflicts`, not blocked. Customer messages are opt-in (`notifyCustomers`), best effort, and skip opted-out customers. The nightly generator does not duplicate a carried visit: it skips a plan that already has an open visit dated today or later. Round planner stops, today panel stops, the Today's Work KPI and round rows, and the mobile visit row expose `carriedOver` (and `carriedOverFromDate`).
+
+### 19.3 Tenant details on the invoice (GHL-10)
+
+`invoiceBusiness(settings)` in `invoice.service.ts` builds the supplier block (name, address, phone, VAT number, company number, bank details, payment terms, footer) for both the preview and the saved invoice, and `paymentReference` is the invoice number. `invoiceHtml` prints it with every tenant value escaped, `lang="en"`, a `<title>`, `th scope="col"` and a `.muted` colour of `#595959` (7:1). Payment terms read "Payment due within N days" (`invoiceDueDays`) unless `paymentTerms` is set. `invoiceFooter` and `paymentTerms` are edited through `PATCH /settings/payment`. Logo and brand colour are Wave 2B.
+
+### 19.4 Bulk invoice send (ACT-01)
+
+`src/services/invoice-send-batch.service.ts`. `POST /invoices/bulk-send/preview` reports counts per channel and per skip reason; `POST /invoices/bulk-send` queues one `invoice.send` row per sendable invoice on the `IntegrationOutbox` (202 `{ batchId, queued, skipped }`, max 500); `GET /invoices/bulk-send/:batchId` returns per-invoice results. The channel decision is isolated in `resolveInvoiceChannel()` (today: SMS when there is a mobile, else email, both through GHL) so the Wave 2B channel router plugs in there. **Idempotency:** each row carries a unique `dedupeKey` (`invoice.send:<invoiceId>`, with an hourly bucket for deliberate resends); a duplicate insert is skipped as `ALREADY_QUEUED`, and a finished attempt is re-armed. **Atomic claim:** the worker leases a row by moving `runAfter` ten minutes ahead in a conditional `updateMany` (count must be 1), so a second worker or a duplicate row cannot send the same row twice and a crashed row comes back later. The invoice flips to `SENT` only inside `sendInvoice()` after GHL accepts. Terminal errors (`NO_CONTACT_FOR_CHANNEL`, `INVOICE_NOT_SENDABLE`, `INVOICE_ALREADY_SENT`) fail the row at once; others retry with back-off to five attempts, then `dead`. `GET /invoices?status=OVERDUE` (SENT and past due) joins the existing status filter and rows carry `overdue`.
+
+### 19.5 Notification follow-ups
+
+The KPI threshold job now uses `notifyAdmins` (ADMIN and MANAGER). `POST /mobile/visits/:id/debt-payment` with `CASH` raises `notifyInvoicePaid` for each invoice it settles (a pending cheque does not). `sendEmail: true` on `POST /invoices` still returns `400 EMAIL_NOT_AVAILABLE` until Wave 2B.
+
+## 20. Wave 2B-1: Money Correctness and Security Hardening (2026-11-07)
+
+Handoffs: `docs/handoff/backend/2026-11-06-wave2b1-backend.md` and `docs/handoff/frontend/2026-11-06-wave2b1-frontend-contract.md`. Scope decision from the remediation plan: no new bank-transfer reconciliation or payment-link work; only webhook and state-machine hardening.
+
+### 20.1 Authorisation (BE-01)
+
+`src/lib/permissions.ts` is the one place that lists the ADMIN-only actions: `ADMIN_ONLY_ROUTES` (provider connect/disconnect for Stripe, GoCardless and GHL, `PATCH /settings/payment`, `DELETE /settings/technicians/:id`, the integration dead-letter routes), `ADMIN_ONLY_BUSINESS_PROFILE_FIELDS` (bank and VAT fields of `PATCH /settings/business-profile`) and `assertCanInviteRole` (a MANAGER cannot invite an ADMIN; no other endpoint changes a role). `src/middleware/requireAdmin.ts` provides `requireAdmin()` and `enforceAdminOnlyRoutes()` (mounted on the settings and integrations routers). A refused call is `403 { code: "ADMIN_ONLY" }`. Everything else behind `requireBusinessAccess()` stays ADMIN or MANAGER. `src/__tests__/role-matrix.test.ts` drives the real app for every OpenAPI operation x ADMIN / MANAGER / TECHNICIAN / anonymous against the explicit table `role-matrix.data.ts`; an operation with no entry fails the test, and the ADMIN class must equal `ADMIN_ONLY_ROUTES`. The setup wizard (`/setup/step/*`) is unchanged (it is locked after setup completes).
+
+### 20.2 Webhook reliability (BE-03)
+
+Design: process-then-ack with a durable status (`src/services/webhook-events.service.ts`). After the signature check the dedup row is inserted (`WebhookEvent.status = RECEIVED`, payload stored); the handler runs; success marks the row `DONE` and drops the payload; a failure marks it `FAILED` (attempts, lastError) and the HTTP answer is 500 so the provider redelivers. A redelivery of a `DONE` event is acknowledged and skipped; a redelivery of a `FAILED` or `RECEIVED` event runs the handler again. A recording failure other than the unique violation is also a 5xx (nothing was recorded). The retry sweep `src/jobs/webhookRetry.ts` (cron every 2 minutes) re-runs `FAILED` rows and abandoned `RECEIVED` rows older than a minute with back-off 1 min, 5 min, 30 min, 2 h, 6 h up to 8 attempts, using the stored payload. Handlers are exported from the webhook route files (`handleStripeEvent`, `handleGocardlessEvent`, `handleGhlEvent`) and are idempotent. GHL events without an id (the lead handoff) cannot be deduplicated by id: they run inline, a failure is a 500, and a unique violation on `Customer.ghlContactId` is treated as a replay (BE-27).
+
+### 20.3 Payment state machine, refunds, disputes, direct debit (BE-07, BE-08, ACT-06, ACT-07)
+
+`src/services/payment-state.ts`: PENDING, NOT_DUE and OVERDUE go to PROCESSING, PAID, FAILED or CANCELLED; PROCESSING goes to PAID, FAILED or CANCELLED; FAILED goes to PAID (retry) or PROCESSING; PAID is terminal except REFUNDED and DISPUTED; DISPUTED goes to PAID (won) or REFUNDED; CANCELLED and REFUNDED are terminal. `createPaymentService(tp).transition(id, target, { strict?, note?, invoiceId? })` reads the payment, validates the transition, applies a conditional `updateMany({ id, status: <what was read> })`, moves the invoice and writes the audit row in ONE transaction, then fires the GHL tag, hold release and notifications after commit. An illegal transition is ignored for webhooks (a late FAILED never overwrites PAID) and is a 409 `INVALID_PAYMENT_TRANSITION` for manual actions (`PATCH /payments/:id/status`). `markPaid` claims the invoice with a conditional update inside its transaction (409 `INVOICE_ALREADY_PAID` or `INVOICE_VOID` when it loses), keeps an already-PAID payment as is and refuses a DISPUTED or REFUNDED one (409 `PAYMENT_NOT_SETTLEABLE`). `Payment.stripeId` and `gocardlessId` are unique.
+
+The invoice follows the payment: PAID settles it (DRAFT or SENT only; a VOID invoice is never revived); DISPUTED reopens it (PAID to SENT); REFUNDED voids it. GoCardless mapping: `confirmed` is PROCESSING (collecting, not paid), `paid_out` PAID, `failed` FAILED, `cancelled` CANCELLED, `charged_back` DISPUTED, `chargeback_cancelled` PAID, `refunded` and settled `refunds` events REFUNDED. Stripe: `charge.refunded` (full: REFUNDED; partial: activity log plus an office notification, no state change), `charge.dispute.created` (DISPUTED), `charge.dispute.closed` (won: PAID; lost: logged and notified, stays DISPUTED). Each change writes an `ActivityLog` row and notifies ADMIN and MANAGER profiles (`notifyPaymentEvent`). ACT-07: `NOT_COLLECTING_INVOICE` (`src/services/direct-debit.ts`) excludes invoices whose GoCardless payment is PENDING or PROCESSING from the debt board, the debt KPIs, the debt gate and the hold auto-release. The nightly `overdueSweep` job (04:00 UTC) sets `Payment.status = OVERDUE` for unsettled NOT_DUE or PENDING non-direct-debit payments whose SENT invoice is past its due date and sends no reminders; the invoice itself stays SENT (its "overdue" flag stays derived). Deferred: credit notes, part payments, a dunning cadence and a failed-payment retry policy.
+
+### 20.4 Hardening (BE-09, BE-13 partial, BE-18, BE-19)
+
+`createApp` order: request id (`X-Request-Id`, echoed in the `requestId` field of error bodies), `helmet` (no CSP on `/docs`), CORS, rate limits, body parsing. Rate limits (`src/lib/rate-limit.ts`, in memory per process, env-configurable): 600 per minute global (not `/health`), 10 per hour on `POST /auth/signup`, 20 per minute on the public invite lookup and accept, 300 per minute per webhook source; the answer is 429 `RATE_LIMITED` with `Retry-After`. `trust proxy` follows `TRUST_PROXY` (default 1 in production). Every outbound `fetch` carries `signal: outboundSignal()` (default 15 s, PDF 60 s, `OUTBOUND_TIMEOUT_MS`), and the Stripe SDK client has a 20 s timeout and one network retry; the GoCardless SDK client has no timeout option and is left as is. Graceful shutdown (`src/server/shutdown.ts`): on SIGTERM or SIGINT stop accepting, stop the cron tasks, wait for in-flight cron runs and requests, disconnect the tenant pools and the public client, exit, with a 25 s hard timeout. An oversized JSON body is 413 `PAYLOAD_TOO_LARGE` (limit `JSON_BODY_LIMIT`, default 100 kb). The central error handler adds `requestId` everywhere and `ValidationError` (`src/lib/app-error.ts`) carries `fields: [{ path, code, message }]`; existing validators are not migrated. `GET /health/ready` pings the database (3 s) and reports `failedTenantMigrations` (a count) from `migrateAllTenantSchemas()`. `src/lib/schema-name.ts` validates `/^t_[0-9a-f]{20}$/` at every sink (tenant connection URL, `search_path`, `CREATE` and `DROP SCHEMA`, the migrations table).
+
+### 20.5 Idempotency (BE-17)
+
+`src/lib/idempotency.ts`: the key row is inserted FIRST with `state = IN_PROGRESS` (the primary key is the lock), so concurrent same-key requests run once. The same key and route after completion replays the stored 2xx (`Idempotent-Replay: true`); a concurrent duplicate gets 409 `IDEMPOTENCY_IN_PROGRESS` with `Retry-After: 1`; an `IN_PROGRESS` row older than 2 minutes is taken over; another owner is 403 `IDEMPOTENCY_KEY_CONFLICT`; another route is 409 `IDEMPOTENCY_KEY_REUSED`; a non-2xx response or a response not sent through `res.json` releases the key. The mobile middleware keeps `X-Idempotency-Key`. Admin writes accept an optional `Idempotency-Key` (stored as `admin:<profileId>:<key>`) on `POST /invoices`, `POST /customers`, `POST /payments/stripe/checkout` and every `POST /messages/*`. Stripe Checkout creation sends an `idempotencyKey` (the caller's key, else invoice + amount + attempt number) and `POST /payments/stripe/checkout` no longer reuses a PENDING session whose `expiresAt` has passed.
+
+### 20.6 Outbox (BE-12)
+
+Retries back off through `runAfter`: 30 s, 2 min, 10 min, 1 h, 6 h (`src/lib/outbox-backoff.ts`); the row is `dead` on the 6th failure. An unknown event type is `dead` with a `lastError` (it used to be marked `sent`). A row going `dead` (GHL events and `invoice.send`) notifies ADMIN and MANAGER profiles (`INTEGRATION` notification, deduplicated for an hour). `GET /integrations/outbox?status=dead|failed&page` and `POST /integrations/outbox/:id/replay` (ADMIN only) list and re-queue rows; payloads are never returned.
+
+### 20.7 Smaller items
+
+Push payloads carry `data.type` and an Android `channelId` (`schedule` for SCHEDULE, ROUND_UPDATE and DAY_CLOSED; `chat`; `payments`; everything else `alerts`). The supplier VAT number prints on an invoice only when `vatRegistered` is true and a number is stored. Carryover onto a day where the technician is unavailable or deactivated stays flag-only (decided). `Customer.ghlContactId` is unique (guarded migration) and the lead handoff catches the unique violation. New environment variables are documented in `.env.example` and `src/lib/env-check.ts`.
+
+## 21. Wave 2B-2: GHL Optional and Native Tenant Email (2026-11-06)
+
+GoHighLevel is now an optional add-on for SMS/WhatsApp. Email is sent by RoundFlow itself through Amazon SES, per tenant.
+
+### 21.1 Mailer (`src/lib/mailer/`)
+
+`config.ts` (env `SES_*`, `EMAIL_DISABLED`), `ses.ts` (SES v2 `SesMailer` behind the `MailProvider` interface: Simple or Raw MIME content with attachments, 15 s timeout, one retry on throttling/5xx, logs without recipient PII, `tenantId` and `messageId` SES message tags; identity create/get/delete), `template.ts` (accessible branded HTML with `lang`, title, preheader, logo with alt text, contrast-safe button, plain-text part, tenant footer, opt-out note for non-transactional mail), `contrast.ts` (WCAG ratio, automatic text colour, safe accent colour, brand colour check), `sender.ts` (validation against header injection, free-mail and reserved domains, tier 1/2 sender resolution), `sns.ts` (SNS signature verification). Supabase Auth emails (`lib/email.ts`) are untouched.
+
+### 21.2 Sender identity (two tiers)
+
+Tier 1: `"<name>" <SES_FROM_DOMAIN_ADDRESS>` with Reply-To = `emailReplyTo` or the business email. Tier 2: `<localPart|accounts>@<tenant domain>` only while `emailDomainStatus = VERIFIED`; otherwise tier 1. `services/email.service.ts#sendTenantEmail` checks availability (SES configured, `emailEnabled`, not paused, daily cap, default 1000), resolves the sender, signs the logo (90 days), renders and sends.
+
+### 21.3 Channel router (`services/message.service.ts`)
+
+`pickChannel` (one send: explicit channel must be usable, AUTO prefers SMS via GHL, optional `preferred`), `bestChannel` (automated flows: opt-out first, then best usable channel, else a skip reason `CUSTOMER_OPTED_OUT` / `NO_AVAILABLE_CHANNEL`), `capabilities()` -> `channels { email, sms, whatsapp, calls }` (also on `GET /settings/business-profile` and `GET /settings/email`). Errors are `409 CHANNEL_UNAVAILABLE` with `reason` (`GHL_NOT_CONNECTED` for SMS/WhatsApp only, `EMAIL_NOT_CONFIGURED`, `EMAIL_TURNED_OFF`, `EMAIL_PAUSED`, `EMAIL_DAILY_LIMIT`, `EMAIL_ADDRESS_INVALID`, `NO_AVAILABLE_CHANNEL`). EMAIL messages are recorded with `deliveryStatus SENT` and the SES message id in `externalId`. Converted flows: broadcast/round messages, weather hold, carryover notice, debt remind (single and bulk, respects opt-out), hold notice, payment link, pre-clean reminders and visit-completed messages (outbox `sendBest`), complaint replies, invoice bulk send. GHL CRM events are queued only when connected and are dropped (status `dropped`) by the worker otherwise; the worker now drains every tenant.
+
+### 21.4 Invoice email
+
+`InvoiceService.sendInvoice` prefers EMAIL, subject from the "Invoice Ready" template subject, inline summary (amount, due date, payment reference, bank details), PDF attached when Gotenberg renders it (`pdfAttached` flag in the response, email still sent without it). The invoice becomes SENT only after SES accepts; resend works. `POST /invoices` with `sendEmail: true` creates then emails (`emailSent`, `emailError`).
+
+### 21.5 SES events (`routes/sesWebhook.ts`, `services/email-events.service.ts`)
+
+SES configuration set -> SNS -> `POST /webhooks/ses`. Verified SNS signature (certificate host `sns.<region>.amazonaws.com`), optional `SES_SNS_TOPIC_ARN`, subscription auto-confirm, idempotent through `WebhookEvent` (`source ses`, retried by the webhook sweep). Delivery -> DELIVERED, Bounce -> BOUNCED (Permanent also sets `Customer.emailInvalidAt`), Complaint -> COMPLAINED (+ `emailInvalidAt`); a status never moves backwards. After a bounce/complaint the tenant is evaluated: only hard (permanent) bounces count; with at least 100 sends in the window, complaints > 0.3% or hard bounces > 5% pause the tenant's email (`emailPausedReason`); regardless of volume, 3 or more complaints or 10 or more hard bounces within 7 days also pause. ADMIN/MANAGER are notified once; `PATCH /settings/email { emailPaused: false }` resumes. Editing a customer's email to a different address clears `Customer.emailInvalidAt`.
+
+### 21.6 Settings, domain and branding endpoints
+
+`GET /settings/email` (ADMIN/MANAGER), ADMIN only: `PATCH /settings/email`, `POST /settings/email/test`, `GET|POST|DELETE /settings/email/domain` (SES Easy DKIM, 3 CNAME records, tenant-tagged identity so another tenant cannot adopt it, free-mail refused), `POST /settings/email/logo/upload-url`, `PUT|DELETE /settings/email/logo` (`<tenantId>/branding/`). Nightly job `emailDomainRecheck` (05:00 UTC). Rate limit `RATE_LIMIT_EMAIL_ADMIN_PER_HOUR` (60) on `/settings/email/*`.
+
+### 21.7 Operations
+
+AWS setup, IAM policy, DNS and sandbox exit: `docs/handoff/backend/2026-11-06-wave2b2-backend.md` section 5.
+
+### 21.8 Task 6 follow-ups
+
+`Visit.collectedVia` and `payment.method` BACS/GOCARDLESS/STRIPE/NONE with `collectVia`/`updateCustomerDefault` on visit completion; `409 UNPAID_INVOICES` on customer/property delete; debt buckets by days past due (day 8 = 7 days over, day 15 = 14 days over); `POST /today/close { notifyCustomers }`; setup steps 1 and 2 ADMIN only; mobile rows carry `paymentStatus`.
+
+### 21.9 Tenant job fan-out and E2E fixes (2026-11-07)
+
+Background jobs that touch every tenant use `lib/tenant-jobs.ts#forEachTenant` (4 tenants at a time by default, `TENANT_JOB_CONCURRENCY`) through the shared 15-entry client cache; `withTenantClient` pins a client while in use so eviction never disconnects it (BUG-010). Other changes of the pass: unique-constraint races on invite accept, signup and visit completion are idempotent; completing a visit advances the plan `nextDueDate`; wizard saves invalidate the shared settings cache; strict calendar-date and email validation with `fields[]` errors; all-skipped bulk invoice batches are fetchable. Details: `docs/handoff/backend/2026-11-06-wave2b2-backend.md` section 10.
+
+
+
+---
+
+## 22. Flo AI: Admin Assistant over Tenant Data (2026-11-10)
+
+An AI assistant in the admin web app ("Flo AI", from `FloAI.pdf`). The admin asks a question in plain English and gets a streamed answer built from the tenant's own live data. Plan: `docs/FLO_AI_PLAN_2026-11-10.md` (repo root). Handoffs: `docs/handoff/backend/2026-11-10-flo-ai-backend.md`, `docs/handoff/frontend/2026-11-10-flo-ai-frontend-contract.md`.
+
+### 22.1 Boundaries
+
+- **Admin only** (`ADMIN_ONLY_ROUTES`, `ROLE_MATRIX` = ADMIN). Managers and technicians get 403 `ADMIN_ONLY`.
+- **Read-only.** No tool writes, sends or changes anything. Enforced by a tool allow-list and a test that runs every tool against a Prisma fake whose write methods throw.
+- **Tenant data only.** Anything else is declined with fixed, server-written copy (22.5). The model never writes a refusal.
+- **Included in the SaaS price.** The daily cap is a platform env var (`FLO_DAILY_LIMIT_PER_TENANT`, default 100 answered questions per tenant-local day). Tenants cannot see or change it.
+- **No PII stripping** (owner decision): names, balances, dates and counts reach the provider as-is. **Secrets never do** (bank details, payment tokens, API keys, auth and webhook secrets); a per-tool key snapshot and a canary test enforce it. Provider request bodies are never logged.
+- **Not built:** writes, the customer-facing agent (the tools take a `ToolContext` with `scope: "ADMIN"` so a customer scope can be added later), manager access, per-tenant cap overrides, resuming a dropped stream.
+
+### 22.2 Module map
+
+| Path | Role |
+|---|---|
+| `src/routes/flo.ts` | The six endpoints; ADMIN-only; per-profile rate limiter |
+| `src/services/flo/flo.service.ts` | Conversations, history, caps, idempotency, persistence; runs the orchestrator as an event generator |
+| `src/services/flo/orchestrator.ts` | Scope gate, tool loop, streamed answer, abort and failure handling |
+| `src/services/flo/scope-gate.ts`, `declines.ts` | Pre-checks, Haiku classifier (fails closed), fixed decline and capability copy |
+| `src/services/flo/tool-registry.ts`, `tools/*` | Ten read-only lookups with fixed column lists |
+| `src/services/flo/answer.ts`, `stream-parser.ts` | Block builders and the incremental parser for the tagged answer |
+| `src/services/flo/figure-check.ts`, `prose-lint.ts` | Per-sentence number grounding and text lint |
+| `src/services/flo/system-prompt.ts`, `modes.ts`, `limits.ts`, `sse.ts`, `types.ts` | Prompt and tenant context, mode config, caps, SSE writer, shared types |
+| `src/integrations/anthropic/client.ts` | Injectable wrapper over `@anthropic-ai/sdk` (pinned 1.3.0): streaming, timeout, one retry before the first byte, error mapping |
+| `src/jobs/floPurge.ts` | Nightly (`30 3 * * *`) purge by `FLO_RETENTION_DAYS` (90) through the tenant fan-out |
+
+### 22.3 Request pipeline
+
+1. HTTP checks before any byte is sent (plain JSON errors): auth, admin, validation, rate limit, daily cap, decline cap, `Idempotency-Key` (claimed as `flo:<profileId>:<key>`; a replay streams the stored result).
+2. The stream opens (`text/event-stream`, `no-transform`, `X-Accel-Buffering: no`, a `: ping` every 15 s).
+3. **Scope gate.** Not `IN_SCOPE` means no main-model call and no tool run.
+4. **Tool loop** with history of the last 10 turns (assistant turns stored as final text only). Tool results are returned to the model wrapped as untrusted data. Caps: 8, 6 and 3 rounds for Thorough, Balanced and Quick, tokens per call, 90 s total.
+5. **Streamed answer** in a closed tag grammar (`intro`, `block` JSON, `insight`, `follow_up`). Text outside the tags is discarded.
+6. Persist, then `done`. A client disconnect aborts the provider call and persists ABORTED.
+
+Models: Thorough = Opus 5.5, Balanced = Sonnet 5.5, Quick = Haiku 5.5, scope gate = Haiku 5.5; each overridable by env (`FLO_MODEL_*`).
+
+### 22.4 Why the numbers can be trusted
+
+Cards and tables are **built by the server from stored tool results**; the model only picks a `sourceId`, columns and a title. Prose is split into sentences, and each sentence passes `prose-lint` and `figure-check` **before** it is streamed (every number must match a tool result; dates, ranks, ordinals and times are whitelisted). A streamed sentence cannot be retracted, so a failing sentence is sent with `unverified: true`, the answer gets the `UNVERIFIED_FIGURES` warning, and the UI shows a notice. There is no repair turn. Prose is sentence-level, not token-level, for this reason.
+
+### 22.5 Guardrails
+
+Six layers, none of which trusts the main model: (1) deterministic pre-checks, (2) the scope classifier (`IN_SCOPE`, `OUT_OF_SCOPE`, `WRITE_REQUEST`, `CAPABILITY_QUESTION`, `UNSAFE`; any error or odd output is `OUT_OF_SCOPE`; it never sees tool data), (3) data only through tools (an answer with zero tool calls becomes the fixed `NO_DATA_USED` decline), (4) the strict tag format with length caps, (5) the prose lint (no URLs, markdown links, code, HTML, emails or phones; links come only from the closed `link.screen` enum), (6) fixed refusal copy. Declined messages do not count to the daily answer cap but count to the rate limit and a per-admin decline cap (`FLO_DECLINE_LIMIT_PER_DAY`, 30), except capability replies ("what can you do?"), which are served from the suggestion list with no model call.
+
+Known limit: model text before a `tool_use` in the same turn is released once tool results exist; it still passes lint and figure check.
+
+### 22.6 Tools
+
+`get_day_overview`, `list_rounds_due`, `list_debtors`, `list_payments`, `compare_technicians`, `list_complaints`, `list_at_risk_customers`, `revenue_summary`, `list_skipped_visits`, `get_customer_summary`. Money is decimal GBP rounded to 2 dp; `percent` columns hold percentages. Rows are capped at 200 and date ranges at 366 days; the tenant client comes from the request, never an id from the model. Several use small direct queries because the existing services could not provide the shape (the Today service handles only "today"; `listComplaints` cannot sort by severity). A new tool needs: a file, a registry entry (the allow-list snapshot test fails until updated on purpose), the no-write and no-secrets tests, a golden fixture, and a place in `FLO_FILES`.
+
+### 22.7 Endpoints and data
+
+`GET /flo/status`, `GET /flo/suggestions`, `POST /flo/chat` (SSE), `GET /flo/conversations`, `GET /flo/conversations/{id}`, `DELETE /flo/conversations/{id}` (204). Conversations belong to the admin profile that created them (others get 404). SSE events: `start`, `status`, `block`, `text`, `follow_ups`, `declined`, `warning`, `done`, `error` (shapes in the frontend contract). The daily cap is counted from `FloMessage` rows with status OK in the tenant-local day; the decline cap from DECLINED rows (capability replies excluded). Errors after the first byte are `error` events (`FLO_PROVIDER_ERROR`, `FLO_TIMEOUT`, `FLO_NO_ANSWER`, `FLO_INTERNAL_ERROR`).
+
+### 22.8 Operations and open items
+
+Env vars: `ANTHROPIC_API_KEY` (recommended; unset disables Flo, 503 `FLO_UNAVAILABLE`), `ANTHROPIC_BASE_URL`, `FLO_ENABLED` (kill switch), `FLO_MODEL_THOROUGH/_BALANCED/_QUICK/_SCOPE`, `FLO_DAILY_LIMIT_PER_TENANT`, `FLO_DECLINE_LIMIT_PER_DAY`, `RATE_LIMIT_FLO_PER_MIN` (20, per profile), `FLO_TIMEOUT_MS` (90000), `FLO_RETENTION_DAYS`. As of 2026-11-10 these were **not yet done**: the live-API eval (the system and classifier prompts are untuned first drafts), a check that the stream is not buffered on the deployed AWS path, a run of the web app against this backend, a cumulative token cap across tool rounds (only per-call caps exist), and e2e scenarios (deferred by the owner). The app's generated `types.gen.ts` was left unchanged because it was already stale for unrelated reasons.

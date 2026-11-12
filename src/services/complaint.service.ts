@@ -4,6 +4,8 @@ import { AppError } from "../lib/app-error";
 import { prisma as publicPrisma } from "../lib/prisma";
 import { parseOptionalDateOnly } from "../lib/validation";
 import { resolveTechnicianForVisit, technicianIdsUnavailableOn } from "./visit-assignment";
+import { notifyAdmins, notifyVisitTechnicians } from "./notify";
+import { createMessageService } from "./message.service";
 
 export interface ComplaintCreateInput {
   customerId: string;
@@ -155,6 +157,14 @@ class ComplaintService {
       include: INCLUDE,
     });
 
+    // NOTIF-03: the office is told a complaint was logged. Best effort.
+    await notifyAdmins(this.prisma, {
+      type: "COMPLAINT",
+      title: "New complaint logged",
+      body: `${customer.name}: ${input.title}`,
+      data: { customerId: input.customerId, ...(input.propertyId ? { propertyId: input.propertyId } : {}) },
+    });
+
     return this.toDetail(complaint);
   }
 
@@ -194,6 +204,22 @@ class ComplaintService {
         : null;
       return { complaint, visitId };
     });
+
+    // FLOW-03: the technician who got the revisit hears about it. Best effort.
+    if (visitId) {
+      const visit = await this.prisma.visit.findUnique({
+        where: { id: visitId },
+        select: { id: true, technicianId: true, date: true, roundId: true, propertyId: true },
+      });
+      if (visit) {
+        await notifyVisitTechnicians(
+          this.prisma,
+          [visit],
+          ({ first }) => ({ type: "SCHEDULE", title: "Complaint revisit scheduled", body: `A free revisit is booked for ${first}.` }),
+          { customerId: complaint.customerId }
+        );
+      }
+    }
 
     return { ...(await this.toDetail(complaint)), visitId };
   }
@@ -325,6 +351,20 @@ class ComplaintService {
   async addMessage(complaintId: string, body: string): Promise<MessageDetail> {
     const existing = await this.prisma.complaint.findUnique({ where: { id: complaintId } });
     if (!existing) throw new AppError(404, "Complaint not found");
+
+    // Reply to the customer on the best available channel (email by the native mailer, SMS via GHL when connected).
+    // Best effort: when it cannot be delivered the reply is still recorded on the complaint thread.
+    if (existing.customerId) {
+      try {
+        const sent = await createMessageService(this.prisma).sendBest({ customerId: existing.customerId, body, complaintId });
+        if (sent.status === "sent") {
+          const delivered = await this.prisma.message.findUnique({ where: { id: sent.messageId } });
+          return this.toMessageDetail(delivered as MessageRow);
+        }
+      } catch (err) {
+        console.error(`[complaints] could not deliver the reply for complaint ${complaintId}:`, (err as Error).message);
+      }
+    }
 
     const message = await this.prisma.message.create({
       data: {

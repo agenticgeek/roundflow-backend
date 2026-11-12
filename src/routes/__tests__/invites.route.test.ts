@@ -46,6 +46,9 @@ vi.mock("../../lib/tenant-prisma-manager", () => ({
   }),
 }));
 
+const notifyTenantAdmins = vi.fn().mockResolvedValue(0);
+vi.mock("../../services/notify", () => ({ notifyTenantAdmins: (...a: unknown[]) => notifyTenantAdmins(...a) }));
+
 const sendInviteEmail = vi.fn();
 vi.mock("../../lib/email", () => ({
   INVITE_TTL_DAYS: 7,
@@ -63,7 +66,7 @@ vi.mock("../../middleware/requireAuth", () => ({
 const reqTechFindUnique = vi.fn();
 vi.mock("../../middleware/requireTenantAccess", () => ({
   requireTenantAccess: (req: any, _res: any, next: any) => {
-    req.profile = { tenantId: "t1" };
+    req.profile = { tenantId: "t1", role: req.headers["x-role"] ?? "ADMIN" };
     req.tenantPrisma = { technician: { findUnique: (...a: unknown[]) => reqTechFindUnique(...a) } };
     next();
   },
@@ -116,6 +119,15 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("POST /invites", () => {
+  it("BUG-008: an HTML or over-long email is a 400 before anything is created or sent", async () => {
+    for (const email of ["<b>x</b>@example.com", `${"a".repeat(300)}@example.com`, "a@b.co" + String.fromCharCode(13, 10) + "Bcc: x@y.com"]) {
+      const res = await request(makeApp()).post("/invites").send({ email });
+      expect(res.status).toBe(400);
+    }
+    expect(inviteCreate).not.toHaveBeenCalled();
+    expect(sendInviteEmail).not.toHaveBeenCalled();
+  });
+
   it("creates a TECHNICIAN invite by default and emails the accept link", async () => {
     inviteCreate.mockResolvedValue(pendingInvite());
     const res = await request(makeApp()).post("/invites").send({ email: " Jess@Example.com " });
@@ -412,6 +424,17 @@ describe("POST /invites/:token/accept — first accept", () => {
     expect(txInviteUpdate).toHaveBeenCalledWith({ where: { id: "inv1" }, data: { acceptedAt: expect.any(Date) } });
   });
 
+  it("NOTIF-03: tells the tenant's office (not the new user) that the invite was accepted", async () => {
+    inviteFindUnique.mockResolvedValue(pendingInvite());
+    await request(makeApp()).post("/invites/tok1/accept").send({ name: " Jess " });
+    expect(notifyTenantAdmins).toHaveBeenCalledWith("t1", {
+      type: "INVITE",
+      title: "Invite accepted",
+      body: "Jess (TECHNICIAN) accepted their invite.",
+      excludeProfileIds: ["p1"],
+    });
+  });
+
   it("links the technician", async () => {
     inviteFindUnique.mockResolvedValue(pendingInvite({ technicianId: "tech1" }));
     tenantFindUnique.mockResolvedValue({ schemaName: "tenant_t1" });
@@ -435,5 +458,39 @@ describe("POST /invites/:token/accept — first accept", () => {
     const res = await request(makeApp()).post("/invites/tok1/accept").send({ name: "Jess" });
     expect(res.status).toBe(500);
     expect(res.body.error).toMatch(/sign in again/);
+    expect(notifyTenantAdmins).not.toHaveBeenCalled();
+  });
+
+  // BUG-005: two simultaneous accepts of one invite: the loser profile.create hits the unique supabaseUserId.
+  describe("concurrent accept (unique-constraint race)", () => {
+    const p2002 = () => Object.assign(new Error("Unique constraint failed on supabaseUserId"), { code: "P2002" });
+
+    it("the loser gets the winner profile (200), not a 500, and nobody is notified twice", async () => {
+      inviteFindUnique.mockResolvedValue(pendingInvite());
+      txProfileCreate.mockRejectedValue(p2002());
+      profileFindUnique.mockResolvedValueOnce(null).mockResolvedValueOnce({ id: "p1", tenantId: "t1", role: "TECHNICIAN", name: "Jess" });
+      const res = await request(makeApp()).post("/invites/tok1/accept").send({ name: "Jess" });
+      expect(res.status).toBe(200);
+      expect(res.body.profile).toMatchObject({ id: "p1", tenantId: "t1" });
+      expect(notifyTenantAdmins).not.toHaveBeenCalled();
+    });
+
+    it("a winner profile belonging to another organisation is a clean 409", async () => {
+      inviteFindUnique.mockResolvedValue(pendingInvite());
+      txProfileCreate.mockRejectedValue(p2002());
+      profileFindUnique.mockResolvedValueOnce(null).mockResolvedValueOnce({ id: "p9", tenantId: "t2" });
+      const res = await request(makeApp()).post("/invites/tok1/accept").send({ name: "Jess" });
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe("PROFILE_EXISTS");
+    });
+
+    it("a unique violation with no profile to be found, and any other error, still surface", async () => {
+      inviteFindUnique.mockResolvedValue(pendingInvite());
+      txProfileCreate.mockRejectedValue(p2002());
+      profileFindUnique.mockResolvedValue(null);
+      expect((await request(makeApp()).post("/invites/tok1/accept").send({ name: "Jess" })).status).toBe(500);
+      txProfileCreate.mockRejectedValue(new Error("db down"));
+      expect((await request(makeApp()).post("/invites/tok1/accept").send({ name: "Jess" })).status).toBe(500);
+    });
   });
 });

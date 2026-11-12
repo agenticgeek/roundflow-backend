@@ -15,11 +15,16 @@ export interface MobileVisitRow {
   status: string;
   price: number;
   paymentMethod: string | null;
+  paymentStatus: string | null;
   customerName: string;
   addressLine: string;
   postcode: string;
   latitude: number | null;
   longitude: number | null;
+  geocodePrecision: string | null;
+  locationApproximate: boolean;
+  carriedOver: boolean;
+  carriedOverFromDate: string | null;
   roundId: string | null;
   roundName: string | null;
   serviceName: string | null;

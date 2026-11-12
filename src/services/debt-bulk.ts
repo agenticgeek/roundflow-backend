@@ -1,6 +1,7 @@
 import type { MessageChannel } from "../generated/tenant-client";
 import { AppError } from "../lib/app-error";
 import type { createDebtService } from "./debt.service";
+import { ChannelUnavailableError } from "./email.service";
 
 // Debt board bulk actions: POST /debt/bulk { ids, action }. Each id is an
 // invoice id (the debt board row id) and goes through the same per-debt
@@ -27,6 +28,16 @@ export interface BulkDebtResultRow {
   ok: boolean;
   error?: string;
   code?: string;
+  /** true = not an error: the customer could not be messaged (see reason). */
+  skipped?: boolean;
+  /** CUSTOMER_OPTED_OUT | NO_AVAILABLE_CHANNEL when skipped. */
+  reason?: "CUSTOMER_OPTED_OUT" | "NO_AVAILABLE_CHANNEL";
+}
+
+function skipReason(err: unknown): BulkDebtResultRow["reason"] {
+  if (err instanceof ChannelUnavailableError || (err instanceof AppError && err.code === "NO_CONTACT_FOR_CHANNEL")) return "NO_AVAILABLE_CHANNEL";
+  if (err instanceof AppError && err.code === "CUSTOMER_OPTED_OUT") return "CUSTOMER_OPTED_OUT";
+  return undefined;
 }
 
 export interface BulkDebtResult {
@@ -71,11 +82,13 @@ export async function runBulkDebtAction(
       }
       results.push({ id, ok: true });
     } catch (err) {
+      const reason = skipReason(err);
       results.push({
         id,
         ok: false,
         error: err instanceof Error ? err.message : String(err),
         ...(err instanceof AppError && err.code ? { code: err.code } : {}),
+        ...(reason ? { skipped: true, reason } : {}),
       });
     }
   }

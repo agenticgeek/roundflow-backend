@@ -13,6 +13,8 @@ interface OneTimeSessionInput {
   amountPence: number;       // integer pence
   successUrl: string;
   cancelUrl: string;
+  /** Sent to Stripe as the request Idempotency-Key. Default: stable per invoice + amount + session attempt. */
+  idempotencyKey?: string;
 }
 
 interface SetupSessionInput {
@@ -60,6 +62,13 @@ export async function createOneTimeSession(
 ): Promise<SessionResult> {
   const stripeCustomerId = await ensureStripeCustomer(stripe, tp, input.customerId);
 
+  // BE-17: a retry of the same request (timeout, double click, crash before we saved the session) maps to the same
+  // Stripe request and returns the same Checkout Session instead of minting a second one. The attempt number
+  // (sessions we already stored for this invoice) changes the key once a session has expired or been used.
+  const idempotencyKey =
+    input.idempotencyKey ??
+    `rf-pay-${input.invoiceId}-${input.amountPence}-${await tp.stripeSession.count({ where: { invoiceId: input.invoiceId } })}`;
+
   const session = await stripe.checkout.sessions.create({
     mode: "payment",
     customer: stripeCustomerId,
@@ -80,7 +89,7 @@ export async function createOneTimeSession(
     },
     success_url: input.successUrl,
     cancel_url: input.cancelUrl,
-  });
+  }, { idempotencyKey });
 
   return {
     stripeSessionId: session.id,

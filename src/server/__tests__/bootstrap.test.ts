@@ -12,6 +12,10 @@ const { schedule, migrate, jobs } = vi.hoisted(() => ({
     runPreCleanReminders: vi.fn(),
     runKpiThresholdCheck: vi.fn(),
     runIdempotencyPurge: vi.fn(),
+    runWebhookRetry: vi.fn(),
+    runOverdueSweep: vi.fn(),
+    runEmailDomainRecheck: vi.fn(),
+    runFloPurge: vi.fn(),
   },
 }));
 
@@ -22,6 +26,10 @@ vi.mock("../../jobs/outboxWorker", () => ({ runOutboxWorker: jobs.runOutboxWorke
 vi.mock("../../jobs/geocodeBackfill", () => ({ runGeocodeBackfill: jobs.runGeocodeBackfill }));
 vi.mock("../../jobs/kpiThresholds", () => ({ runKpiThresholdCheck: jobs.runKpiThresholdCheck }));
 vi.mock("../../jobs/idempotencyPurge", () => ({ runIdempotencyPurge: jobs.runIdempotencyPurge }));
+vi.mock("../../jobs/webhookRetry", () => ({ runWebhookRetry: jobs.runWebhookRetry }));
+vi.mock("../../jobs/overdueSweep", () => ({ runOverdueSweep: jobs.runOverdueSweep }));
+vi.mock("../../jobs/emailDomainRecheck", () => ({ runEmailDomainRecheck: jobs.runEmailDomainRecheck }));
+vi.mock("../../jobs/floPurge", () => ({ runFloPurge: jobs.runFloPurge }));
 vi.mock("../../jobs/preCleanReminders", async (orig) => ({
   ...((await orig()) as object),
   runPreCleanReminders: jobs.runPreCleanReminders,
@@ -33,6 +41,8 @@ import {
   createApp,
   registerCronJobs,
   startServer,
+  shouldExposeApiDocs,
+  installProcessErrorHandlers,
   ALLOWED_METHODS,
 } from "../bootstrap";
 import { openApiDocument } from "../../swagger";
@@ -49,6 +59,10 @@ const FULL_ENV = {
   ENCRYPTION_KEY: "x",
   PUBLIC_API_URL: "x",
   FRONTEND_URL: "x",
+  GOOGLE_MAPS_GEOCODING_API_KEY: "x",
+  SES_REGION: "eu-west-2",
+  SES_FROM_DOMAIN_ADDRESS: "n@mail.roundflow.ai",
+  ANTHROPIC_API_KEY: "x",
 };
 
 beforeEach(() => {
@@ -83,7 +97,7 @@ describe("buildPathMethodMap / findBlockingEntry", () => {
 
 describe("createApp", () => {
   const readiness = { ready: false };
-  const app = createApp({ allowedOrigins: ["http://localhost"], readiness });
+  const app = createApp({ allowedOrigins: ["http://localhost"], readiness, pingDb: async () => 1 });
 
   it("/health and /health/ready answer 503 migrating until ready, then 200", async () => {
     readiness.ready = false;
@@ -101,7 +115,7 @@ describe("createApp", () => {
     expect(typeof res.body.timestamp).toBe("string");
     res = await request(app).get("/health/ready");
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ status: "ready" });
+    expect(res.body).toEqual({ status: "ready", failedTenantMigrations: 0 });
   });
 
   it("405s non-standard methods with the global Allow list", async () => {
@@ -125,16 +139,24 @@ describe("createApp", () => {
     expect(res.body.paths).toBeDefined();
   });
 
-  it("405s unmatched routes via the trailing handler", async () => {
+  it("BE-26: 404s unknown routes (not 405) via the trailing handler", async () => {
     const res = await request(app).get("/definitely-not-a-route");
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: "Not Found" });
+    expect(res.headers.allow).toBeUndefined();
+    expect((await request(app).post("/definitely-not-a-route")).status).toBe(404);
+  });
+
+  it("BE-26: a documented path with the wrong method still 405s with Allow", async () => {
+    const res = await request(app).delete("/health");
     expect(res.status).toBe(405);
-    expect(res.headers.allow).toBe(ALLOWED_METHODS);
+    expect(res.headers.allow).toBe("GET");
   });
 
   it("returns a JSON 400 for malformed JSON bodies via the error handler", async () => {
     const res = await request(app).post("/definitely-not-a-route").set("Content-Type", "application/json").send("{bad");
     expect(res.status).toBe(400);
-    expect(res.body).toEqual({ error: "Invalid JSON in request body." });
+    expect(res.body).toMatchObject({ error: "Invalid JSON in request body." });
   });
 
   it("mounts /settings/kpi-thresholds before /settings, and /technician-incidents", () => {
@@ -146,11 +168,63 @@ describe("createApp", () => {
   });
 });
 
+describe("BE-25: API docs gating", () => {
+  it("shouldExposeApiDocs: open outside production, flag-gated in production", () => {
+    expect(shouldExposeApiDocs({})).toBe(true);
+    expect(shouldExposeApiDocs({ NODE_ENV: "development" })).toBe(true);
+    expect(shouldExposeApiDocs({ NODE_ENV: "production" })).toBe(false);
+    expect(shouldExposeApiDocs({ NODE_ENV: "production", EXPOSE_API_DOCS: "false" })).toBe(false);
+    expect(shouldExposeApiDocs({ NODE_ENV: "production", EXPOSE_API_DOCS: "true" })).toBe(true);
+  });
+
+  it("production without the flag serves 404 for /docs and /openapi.json", async () => {
+    const prodApp = createApp({ allowedOrigins: [], readiness: { ready: true }, env: { NODE_ENV: "production" } });
+    expect((await request(prodApp).get("/openapi.json")).status).toBe(404);
+    expect((await request(prodApp).get("/docs/")).status).toBe(404);
+  });
+
+  it("production with EXPOSE_API_DOCS=true serves them", async () => {
+    const prodApp = createApp({
+      allowedOrigins: [],
+      readiness: { ready: true },
+      env: { NODE_ENV: "production", EXPOSE_API_DOCS: "true" },
+    });
+    expect((await request(prodApp).get("/openapi.json")).status).toBe(200);
+  });
+});
+
+describe("BE-02: installProcessErrorHandlers", () => {
+  it("logs unhandled rejections without exiting, and logs + exits(1) on uncaughtException", () => {
+    const handlers: Record<string, (...a: unknown[]) => void> = {};
+    const proc = { on: vi.fn((ev: string, fn: (...a: unknown[]) => void) => { handlers[ev] = fn; }) };
+    const exit = vi.fn();
+    installProcessErrorHandlers(proc, exit);
+
+    handlers.unhandledRejection(new Error("lost"), Promise.resolve());
+    expect(console.error).toHaveBeenCalledWith("[process] unhandledRejection:", expect.any(Error));
+    expect(exit).not.toHaveBeenCalled();
+
+    handlers.uncaughtException(new Error("fatal"));
+    expect(console.error).toHaveBeenCalledWith("[process] uncaughtException:", expect.any(Error));
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  it("defaults to the real process and process.exit", () => {
+    const onSpy = vi.spyOn(process, "on").mockImplementation((() => process) as never);
+    installProcessErrorHandlers();
+    expect(onSpy).toHaveBeenCalledWith("unhandledRejection", expect.any(Function));
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    const call = onSpy.mock.calls.find((c) => c[0] === "uncaughtException")!;
+    (call[1] as (e: Error) => void)(new Error("x"));
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+});
+
 describe("registerCronJobs", () => {
   it("registers the base jobs and skips pre-clean reminders when disabled", () => {
     const labels = registerCronJobs(schedule, {});
-    expect(labels).toEqual(["visitGen", "outbox", "geocodeBackfill", "kpiThresholds", "idempotencyPurge"]);
-    expect(schedule).toHaveBeenCalledTimes(5);
+    expect(labels).toEqual(["visitGen", "outbox", "geocodeBackfill", "kpiThresholds", "idempotencyPurge", "webhookRetry", "overdueSweep", "emailDomainRecheck", "floPurge"]);
+    expect(schedule).toHaveBeenCalledTimes(9);
   });
 
   it("adds pre-clean reminders when PRECLEAN_REMINDERS_ENABLED=true and runs/guards every task", async () => {
@@ -168,15 +242,15 @@ describe("registerCronJobs", () => {
     for (const [, task] of schedule.mock.calls) task();
     await new Promise((r) => setImmediate(r));
     expect(console.error).toHaveBeenCalledWith("[kpiThresholds] run failed:", expect.any(Error));
-    expect(console.error).toHaveBeenCalledTimes(6);
+    expect(console.error).toHaveBeenCalledTimes(10);
   });
 
   it("defaults to node-cron and process.env", () => {
     const prev = process.env.PRECLEAN_REMINDERS_ENABLED;
     delete process.env.PRECLEAN_REMINDERS_ENABLED;
     try {
-      expect(registerCronJobs()).toHaveLength(5);
-      expect(schedule).toHaveBeenCalledTimes(5);
+      expect(registerCronJobs()).toHaveLength(9);
+      expect(schedule).toHaveBeenCalledTimes(9);
     } finally {
       if (prev !== undefined) process.env.PRECLEAN_REMINDERS_ENABLED = prev;
     }
@@ -204,7 +278,7 @@ describe("startServer", () => {
     resolveMigrate();
     const { app, readiness } = await pending;
     expect(readiness.ready).toBe(true);
-    expect(sched).toHaveBeenCalledTimes(5);
+    expect(sched).toHaveBeenCalledTimes(9);
     expect((await request(app).get("/health")).status).toBe(200);
   });
 
@@ -220,6 +294,7 @@ describe("startServer", () => {
       schedule,
     });
     expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("STRIPE_SECRET_KEY"));
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("GOOGLE_MAPS_GEOCODING_API_KEY"));
     expect(exit).toHaveBeenCalledWith(1);
     expect(console.error).toHaveBeenCalledWith("FATAL: tenant migration failed —", expect.any(Error));
     expect(readiness.ready).toBe(false);

@@ -69,6 +69,11 @@ enum PaymentStatus {
   FAILED
   OVERDUE
   CANCELLED
+  // Wave 2B-1 (BE-07/08): direct debit accepted by the bank and being collected
+  // (GoCardless "confirmed"), money returned to the customer, money under dispute.
+  PROCESSING
+  REFUNDED
+  DISPUTED
 }
 
 enum PaymentMethod {
@@ -285,9 +290,43 @@ model BusinessSettings {
   autoCreateNextVisit      Boolean        @default(true)
   defaultPaymentMethod     PaymentMethod?
   invoiceDueDays           Int            @default(7)
+  // GHL-10: optional free-text invoice footer and payment-terms override (printed instead of "Payment due within N days").
+  invoiceFooter            String?
+  paymentTerms             String?
   noDirectDebitAction      NoDirectDebitAction @default(SEND_INVOICE)
   completedSteps           Int[]          @default([]) // setup wizard steps saved at least once
+  // Wave 2B-2 (GHL-10/11): per-tenant email identity and branding. Tier 1 sends from the shared RoundFlow sending
+  // address with the tenant's display name; tier 2 from the tenant's own domain once emailDomainStatus is VERIFIED.
+  emailSenderName          String?
+  emailReplyTo             String?
+  emailSenderDomain        String?
+  emailSenderLocalPart     String?
+  emailDomainStatus        EmailDomainStatus @default(NONE)
+  emailDkimRecords         Json?
+  emailDomainVerifiedAt    DateTime?      @db.Timestamptz
+  emailEnabled             Boolean        @default(true)
+  emailDailyLimit          Int?
+  emailPausedReason        String?        // set when email is paused automatically (bounce/complaint rate) or by an admin
+  emailPausedAt            DateTime?      @db.Timestamptz
+  logoPath                 String?        // object path in the private bucket: <tenantId>/branding/...
+  logoAltText              String?
+  brandColour              String?        // #RRGGBB
   updatedAt                DateTime       @updatedAt
+}
+
+enum EmailDomainStatus {
+  NONE
+  PENDING
+  VERIFIED
+  FAILED
+}
+
+enum MessageDeliveryStatus {
+  SENT
+  DELIVERED
+  BOUNCED
+  COMPLAINED
+  FAILED
 }
 
 // Mobile "Report a problem" submissions. profileId = the reporting user's Profile.id.
@@ -309,7 +348,7 @@ model Customer {
   landline      String?
   email         String?
   status        LifecycleStatus @default(ACTIVE)
-  ghlContactId                 String?
+  ghlContactId                 String?   @unique
   stripeCustomerId             String?
   stripeDefaultPaymentMethodId String?
   gocardlessCustomerId         String?
@@ -321,6 +360,7 @@ model Customer {
   holdReason    String?
   holdSince     DateTime?
   messagesOptOut Boolean        @default(false)
+  emailInvalidAt DateTime?      @db.Timestamptz // set by a hard bounce / complaint (SES); cleared when the email is edited
   properties    Property[]
   invoices      Invoice[]
   payments      Payment[]
@@ -344,6 +384,12 @@ model Property {
   geocodedAt      DateTime?
   geocodeAttempts Int       @default(0)
   geocodeError    String?
+  // ACT-10: ROOFTOP | RANGE_INTERPOLATED | GEOMETRIC_CENTER | APPROXIMATE | POSTCODE_FALLBACK.
+  // null = not geocoded yet, or a legacy postcodes.io centre (treated as approximate).
+  geocodePrecision   String?
+  geocodePlaceId     String?
+  // Hash of the address inputs the coordinates were computed from; geocode again only when it changes.
+  geocodeAddressHash String?
   serviceAreaId String?
   serviceArea   ServiceArea?    @relation(fields: [serviceAreaId], references: [id])
   propertyType  PropertyType?
@@ -517,9 +563,14 @@ model Visit {
   cancelReason  String?        // set when status = CANCELLED, e.g. "PAUSED"
   reminderSentAt DateTime?     @db.Timestamptz // pre-clean reminder idempotency (last send)
   reminderSentTypes String[]   @default([])     // BUG-01: reminder types already sent for this visit ("EVENING_BEFORE" | "MORNING_OF")
+  // ACT-02..04: set when "close day" / carryover moves the visit to a later working day.
+  carriedOverFromDate DateTime? @db.Date          // the date it was originally due
+  carryoverCount      Int       @default(0)
   complaintId   String?        // revisit booked from a complaint
   complaint     Complaint?     @relation(fields: [complaintId], references: [id], onDelete: SetNull)
   paymentMethod PaymentMethod?
+  // Wave 2B-2: the method the technician chose at completion (null = none recorded).
+  collectedVia  PaymentMethod?
   invoice       Invoice?
   payment       Payment?
   photos        Photo[]
@@ -618,8 +669,8 @@ model Payment {
   amount       Decimal       @db.Decimal(10, 2)
   method       PaymentMethod
   status       PaymentStatus @default(PENDING)
-  gocardlessId     String?
-  stripeId         String?   // Stripe PaymentIntent ID (pi_xxx)
+  gocardlessId     String?   @unique
+  stripeId         String?   @unique // Stripe PaymentIntent ID (pi_xxx)
   stripeReceiptUrl String?
   reference        String?   // manual-payment reference (cheque number, bank ref)
   contactedAt      DateTime?
@@ -647,7 +698,10 @@ model Message {
   scheduledFor DateTime?
   sentAt       DateTime?
   creditCost   Int?
-  externalId   String?          // provider message id (GHL messageId)
+  externalId   String?          // provider message id (GHL messageId, or the SES MessageId for EMAIL)
+  deliveryStatus    MessageDeliveryStatus? // OUTBOUND only; EMAIL moves SENT -> DELIVERED | BOUNCED | COMPLAINED via SES events
+  deliveryUpdatedAt DateTime?     @db.Timestamptz
+  deliveryError     String?
   readAt       DateTime?        @db.Timestamptz // INBOUND only: when the office marked it read (null = unread)
   createdAt    DateTime         @default(now())
 
@@ -655,6 +709,7 @@ model Message {
   @@index([technicianId])
   @@index([complaintId])
   @@index([templateId])
+  @@index([externalId])
 }
 
 model MessageTemplate {
@@ -833,6 +888,10 @@ model Notification {
   title     String
   body      String?
   read      Boolean  @default(false)
+  // Deep-link payload: { visitId?, roundId?, customerId?, invoiceId?, propertyId?, date? }
+  data      Json?
+  // Preference category (matches Profile.preferences.notifications.categories.<category>); defaults to `type`.
+  category  String?
   createdAt DateTime @default(now()) @db.Timestamptz
 
   @@index([profileId, read])
@@ -851,17 +910,30 @@ model IntegrationOutbox {
   processedAt DateTime?
   // Delayed sends (scheduled round messages): the worker skips pending rows until this time. null = due now.
   runAfter    DateTime?
+  // ACT-01: per-item idempotency (e.g. "invoice.send:<invoiceId>"); a second insert with the same key is rejected.
+  dedupeKey   String?   @unique
+  // ACT-01: groups the rows of one bulk send so GET /invoices/bulk-send/:batchId can report them.
+  batchId     String?
 
   @@index([status, createdAt])
+  @@index([batchId])
 }
 
 // Inbound webhook dedup — insert before processing; unique constraint rejects replays.
 model WebhookEvent {
   id         String   @id @default(cuid())
-  source     String   // "stripe" | "ghl"
+  source     String   // "stripe" | "gocardless" | "ghl"
   externalId String   // Stripe event ID or GHL event ID
   receivedAt DateTime @default(now()) @db.Timestamptz
+  // Wave 2B-1 (BE-03): RECEIVED (recorded, not finished) | DONE | FAILED. A FAILED or stale RECEIVED row is
+  // retried by the webhook retry sweep (and by the provider's redelivery) using the stored payload.
+  status     String   @default("DONE")
+  attempts   Int      @default(0)
+  lastError  String?
+  payload    Json?
+  updatedAt  DateTime @default(now()) @updatedAt @db.Timestamptz
 
+  @@index([status, updatedAt])
   @@unique([source, externalId])
 }
 
@@ -940,10 +1012,14 @@ model TechnicianAvailability {
 // Purged after 7 days by the nightly job.
 model IdempotencyRecord {
   key            String   @id
-  technicianId   String
+  // Mobile keys are owned by a technician; admin keys (Idempotency-Key header, BE-17) carry the profile id in `actorId`.
+  technicianId   String?
+  actorId        String?
   route          String
-  responseStatus Int
-  responseBody   Json
+  // IN_PROGRESS rows are inserted first (unique key = the lock); DONE rows hold the stored response.
+  state          String   @default("DONE")
+  responseStatus Int?
+  responseBody   Json?
   createdAt      DateTime @default(now()) @db.Timestamptz
 
   @@index([createdAt])
@@ -963,4 +1039,54 @@ model TechnicianDayClose {
 
   @@unique([technicianId, date])
   @@index([date])
+}
+
+// ── Flo AI (2026-11-10) ───────────────────────────────────────────────────
+// Admin-only read-only assistant. profileId references public.Profile.id (no cross-schema FK).
+// The daily cap is counted from FloMessage rows, so there is no counter table to drift.
+enum FloRole {
+  USER
+  ASSISTANT
+}
+
+enum FloMessageStatus {
+  OK
+  ERROR
+  DECLINED
+  ABORTED
+}
+
+model FloConversation {
+  id        String       @id @default(cuid())
+  profileId String
+  title     String
+  messages  FloMessage[]
+  createdAt DateTime     @default(now()) @db.Timestamptz
+  updatedAt DateTime     @updatedAt @db.Timestamptz
+
+  @@index([profileId, updatedAt])
+}
+
+model FloMessage {
+  id             String           @id @default(cuid())
+  conversationId String
+  conversation   FloConversation  @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           FloRole
+  mode           String?
+  model          String?
+  text           String           @default("")
+  answer         Json?
+  toolCalls      Json?
+  warnings       String[]         @default([])
+  inputTokens    Int?
+  outputTokens   Int?
+  cachedTokens   Int?
+  durationMs     Int?
+  status         FloMessageStatus @default(OK)
+  declineReason  String?
+  errorCode      String?
+  createdAt      DateTime         @default(now()) @db.Timestamptz
+
+  @@index([conversationId, createdAt])
+  @@index([status, createdAt])
 }

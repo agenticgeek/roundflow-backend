@@ -38,7 +38,7 @@ function makeTenantPrisma() {
   };
   return {
     businessSettings: { findFirst: vi.fn(), updateMany: vi.fn().mockResolvedValue({}) },
-    webhookEvent: { create: vi.fn().mockResolvedValue({}) },
+    webhookEvent: { create: vi.fn().mockResolvedValue({}), findUnique: vi.fn(), updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
     customer: { findFirst: vi.fn().mockResolvedValue(null) },
     message: { create: vi.fn().mockResolvedValue({}) },
     $transaction: vi.fn((cb: (t: typeof tx) => unknown) => cb(tx)),
@@ -140,14 +140,48 @@ describe("POST /webhooks/ghl — event processing", () => {
     tp.webhookEvent.create.mockRejectedValue(
       new Prisma.PrismaClientKnownRequestError("dup", { code: "P2002", clientVersion: "x" })
     );
+    tp.webhookEvent.findUnique.mockResolvedValue({ status: "DONE" });
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
 
-    await send("?tenantId=t1&secret=abc", { id: "ev1", contactId: "c1" });
+    const res = await send("?tenantId=t1&secret=abc", { id: "ev1", contactId: "c1" });
 
-    await vi.waitFor(() => expect(tp.webhookEvent.create).toHaveBeenCalled());
-    await new Promise((r) => setTimeout(r, 10));
+    expect(res.status).toBe(200);
     expect(tp.customer.findFirst).not.toHaveBeenCalled();
     expect(err).not.toHaveBeenCalled();
+    err.mockRestore();
+  });
+
+  it("BE-03: an id-bearing event is recorded RECEIVED, processed, then marked DONE", async () => {
+    const tp = setup();
+    const res = await send("?tenantId=t1&secret=abc", { id: "ev2", contactId: "c1", firstName: "A" });
+    expect(res.status).toBe(200);
+    expect(tp.webhookEvent.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ source: "ghl", externalId: "ev2", status: "RECEIVED" }),
+    });
+    expect(tp.__tx.customer.create).toHaveBeenCalled();
+    expect(tp.webhookEvent.updateMany).toHaveBeenLastCalledWith({
+      where: { source: "ghl", externalId: "ev2" },
+      data: expect.objectContaining({ status: "DONE" }),
+    });
+  });
+
+  it("BE-03: a failing effect leaves the event FAILED and answers 500 so GHL redelivers; the redelivery then succeeds", async () => {
+    const tp = setup();
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    tp.customer.findFirst.mockRejectedValueOnce(new Error("db down"));
+
+    const first = await send("?tenantId=t1&secret=abc", { id: "ev3", contactId: "c1" });
+    expect(first.status).toBe(500);
+    expect(tp.webhookEvent.updateMany).toHaveBeenLastCalledWith({
+      where: { source: "ghl", externalId: "ev3" },
+      data: expect.objectContaining({ status: "FAILED", attempts: { increment: 1 } }),
+    });
+
+    tp.webhookEvent.create.mockRejectedValue(new Prisma.PrismaClientKnownRequestError("dup", { code: "P2002", clientVersion: "x" }));
+    tp.webhookEvent.findUnique.mockResolvedValue({ status: "FAILED" });
+    const second = await send("?tenantId=t1&secret=abc", { id: "ev3", contactId: "c1" });
+    expect(second.status).toBe(200);
+    expect(tp.__tx.customer.create).toHaveBeenCalledTimes(1);
     err.mockRestore();
   });
 
@@ -156,9 +190,10 @@ describe("POST /webhooks/ghl — event processing", () => {
     tp.webhookEvent.create.mockRejectedValue(new Error("connection reset"));
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
 
-    await send("?tenantId=t1&secret=abc", { id: "ev1", contactId: "c1" });
+    const res = await send("?tenantId=t1&secret=abc", { id: "ev1", contactId: "c1" });
 
-    await vi.waitFor(() => expect(err).toHaveBeenCalledWith(expect.stringContaining("[ghlWebhook]"), expect.any(Error)));
+    expect(res.status).toBe(500);
+    expect(err).toHaveBeenCalledWith(expect.stringContaining("[ghlWebhook]"), expect.any(Error));
     expect(tp.customer.findFirst).not.toHaveBeenCalled();
     err.mockRestore();
   });
@@ -308,12 +343,46 @@ describe("POST /webhooks/ghl — event processing", () => {
     const tp = setup();
     tp.customer.findFirst.mockRejectedValue(new Error("db down"));
 
-    await send("?tenantId=t1&secret=abc", { contactId: "ghl-1" });
+    const res = await send("?tenantId=t1&secret=abc", { contactId: "ghl-1" });
 
-    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
-      expect.stringContaining("t1/undefined failed:"),
-      expect.any(Error)
-    ));
+    expect(res.status).toBe(500);
+    expect(errorSpy).toHaveBeenCalledWith("[ghlWebhook] handler failed:", expect.any(Error));
     errorSpy.mockRestore();
+  });
+
+  it("BE-27: a unique-violation on ghlContactId during the lead handoff is a replay, not an error", async () => {
+    const tp = setup();
+    tp.$transaction.mockRejectedValueOnce(new Prisma.PrismaClientKnownRequestError("dup", { code: "P2002", clientVersion: "x" }));
+    const res = await send("?tenantId=t1&secret=abc", { contactId: "ghl-race", firstName: "Race" });
+    expect(res.status).toBe(200);
+  });
+
+  it("BE-27: any other error from the lead handoff transaction still fails the request", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const tp = setup();
+    tp.$transaction.mockRejectedValueOnce(new Error("boom"));
+    const res = await send("?tenantId=t1&secret=abc", { contactId: "ghl-x" });
+    expect(res.status).toBe(500);
+    err.mockRestore();
+  });
+});
+
+describe("POST /webhooks/ghl — BE-02 crash safety", () => {
+  it("500s (and never crashes) when the tenant lookup throws", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    tenantFindUnique.mockRejectedValue(new Error("db down"));
+    const res = await send("?tenantId=t1&secret=abc", {});
+    expect(res.status).toBe(500);
+    consoleSpy.mockRestore();
+  });
+
+  it("500s when decrypt throws on a corrupt stored secret", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const tp = setup();
+    tp.businessSettings.findFirst.mockResolvedValue({ ghlWebhookSecretEncrypted: "garbage" });
+    decrypt.mockImplementationOnce(() => { throw new Error("bad ciphertext"); });
+    const res = await send("?tenantId=t1&secret=abc", {});
+    expect(res.status).toBe(500);
+    consoleSpy.mockRestore();
   });
 });

@@ -21,19 +21,19 @@ describe("renderTemplate", () => {
 
 describe("loadTemplate", () => {
   it("returns the tenant template when one matches by name (case-insensitive)", async () => {
-    const findFirst = vi.fn().mockResolvedValue({ id: "t1", body: "custom" });
+    const findFirst = vi.fn().mockResolvedValue({ id: "t1", body: "custom", subject: null });
     const tp = { messageTemplate: { findFirst } } as never;
-    await expect(loadTemplate(tp, TEMPLATE_NAMES.INVOICE, "fallback")).resolves.toEqual({ id: "t1", body: "custom" });
+    await expect(loadTemplate(tp, TEMPLATE_NAMES.INVOICE, "fallback")).resolves.toEqual({ id: "t1", body: "custom", subject: null });
     expect(findFirst).toHaveBeenCalledWith({
       where: { name: { equals: "Invoice Ready", mode: "insensitive" } },
-      select: { id: true, body: true },
+      select: { id: true, body: true, subject: true },
     });
   });
 
   it("falls back to the built-in body when the tenant has no such template", async () => {
     const tp = { messageTemplate: { findFirst: vi.fn().mockResolvedValue(null) } } as never;
     await expect(loadTemplate(tp, "x", FALLBACK_BODIES.PAYMENT_LINK))
-      .resolves.toEqual({ id: null, body: FALLBACK_BODIES.PAYMENT_LINK });
+      .resolves.toEqual({ id: null, body: FALLBACK_BODIES.PAYMENT_LINK, subject: null });
   });
 });
 

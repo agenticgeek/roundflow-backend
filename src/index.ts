@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { startServer } from "./server/bootstrap";
+import { startServer, installProcessErrorHandlers } from "./server/bootstrap";
 
 // Thin entry point: required env checks, then src/server/bootstrap.ts builds
 // the app, listens, runs tenant migrations and starts cron jobs.
@@ -15,7 +15,10 @@ if (!process.env.INVITE_BASE_URL) {
   process.exit(1);
 }
 
+installProcessErrorHandlers();
+
 void startServer({
   allowedOrigins: FRONTEND_URL.split(",").map((u) => u.trim()),
   port: Number(process.env.PORT) || 3000,
+  shutdownProc: process,
 });

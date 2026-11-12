@@ -6,6 +6,7 @@ import { prisma } from "../lib/prisma";
 import { getTenantPrismaForSchema, type TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { buildGhlAuthUrl, exchangeGhlCode } from "../integrations/ghl/oauth";
 import { getGhlToken } from "../integrations/ghl/api";
+import { createMessageService } from "../services/message.service";
 import {
   fetchGhlLocation,
   ghlApiRedirectUri,
@@ -23,18 +24,23 @@ import {
   optReminderTime,
   optCleanMethod,
   optPaymentMethod,
+  rejectRemovedFields,
   optNoDirectDebitAction,
   optVatRate,
   optInvoiceDueDays,
+  optFreeText,
   reminderModeFromLegacy,
   foldServiceAreaIds,
 } from "../lib/settings-validators";
 import { requireAuth } from "../middleware/requireAuth";
 import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
-import { AppError } from "../lib/app-error";
+import { AppError, ValidationError } from "../lib/app-error";
+import { MessageChannel } from "../generated/tenant-client";
 import { invalidateCachedBusinessSettings } from "../services/settings.service";
-import { validateWorkingDays, assertPositiveInt, assertNonNegative, requireMessageChannel, optMessageChannel, optTechnicianRole, isValidEmail, MAX_NAME_LENGTH, MAX_ADDRESS_LENGTH } from "../lib/validation";
+import { validateWorkingDays, assertPositiveInt, assertNonNegative, requireMessageChannel, optMessageChannel, optTechnicianRole, isValidEmail, MAX_NAME_LENGTH, MAX_ADDRESS_LENGTH, optEmail, optTimeZone, optCurrency, assertUkBankFormat, optNonNegativeInt, optNonNegativeAmount } from "../lib/validation";
+import { enforceAdminOnlyRoutes } from "../middleware/requireAdmin";
+import { assertAdminForBusinessProfileFields } from "../lib/permissions";
 import {
   asObject,
   h,
@@ -146,6 +152,8 @@ settingsRouter.use(requireAuth);
 settingsRouter.use(requireTenantAccess);
 // Authorization: reads allowed for any known role; mutations require ADMIN/MANAGER.
 settingsRouter.use(requireBusinessAccess());
+// BE-01: connect/disconnect, payment rules and technician delete are ADMIN-only (src/lib/permissions.ts).
+settingsRouter.use(enforceAdminOnlyRoutes());
 
 const svc = (req: Request) => createSettingsService(req.tenantPrisma!, req.tenantSchemaName!);
 
@@ -175,8 +183,16 @@ function parseBankDetails(v: unknown): BankDetails | null | undefined {
   if (!accountNumber) throw new AppError(400, '"bankDetails.accountNumber" must not be blank');
   const sortCode = requireString(b.sortCode, "bankDetails.sortCode").trim();
   if (!sortCode) throw new AppError(400, '"bankDetails.sortCode" must not be blank');
+  assertUkBankFormat(sortCode, accountNumber);
   const bankName = optString(b.bankName, "bankDetails.bankName") ?? null;
   return { accountName, bankName, accountNumber, sortCode };
+}
+
+// BUG-002: native email needs a subject line; an EMAIL template without one would send "Message from ...".
+function assertEmailTemplateHasSubject(channel: unknown, subject: string | null | undefined): void {
+  if (channel === MessageChannel.EMAIL && (typeof subject !== "string" || subject.trim() === "")) {
+    throw new ValidationError("An email template needs a subject", [{ path: "subject", code: "SUBJECT_REQUIRED", message: "subject is required for EMAIL templates" }], "SUBJECT_REQUIRED");
+  }
 }
 
 // Working-days array: omitted = untouched; otherwise every element must be a
@@ -217,23 +233,26 @@ function optPaymentTiming(v: unknown): PaymentTiming | null | undefined {
 settingsRouter.get(
   "/business-profile",
   h(async (req, res) => {
-    res.json(toBusinessSettingsDto(await svc(req).getSettings()));
+    // channels = what the business can send right now (email native; sms/whatsapp only with GHL) so UIs can hide SMS.
+    const channels = await createMessageService(req.tenantPrisma!).capabilities();
+    res.json({ ...toBusinessSettingsDto(await svc(req).getSettings()), channels });
   })
 );
 settingsRouter.patch(
   "/business-profile",
   h(async (req, res) => {
+    assertAdminForBusinessProfileFields(req.profile!, req.body); // BE-01: bank and VAT are ADMIN-only
     await svc(req).assertSetupComplete();
     const body = asObject(req.body);
     const input: BusinessProfileUpdateInput = {
       businessName: optString(body.businessName, "businessName", { maxLength: MAX_NAME_LENGTH }),
       phone: optString(body.phone, "phone"),
-      email: optString(body.email, "email"),
+      email: optEmail(body.email, "email"),
       companyNumber: optString(body.companyNumber, "companyNumber"),
       vatRegistered: optBool(body.vatRegistered, "vatRegistered"),
       vatRegistration: optString(body.vatRegistration, "vatRegistration"),
-      timezone: optString(body.timezone, "timezone"),
-      currency: optString(body.currency, "currency"),
+      timezone: optTimeZone(body.timezone, "timezone"),
+      currency: optCurrency(body.currency, "currency"),
       defaultWorkingDays: optWorkingDays(body.defaultWorkingDays, "defaultWorkingDays"),
       bankDetails: parseBankDetails(body.bankDetails),
       addressLine1: optString(body.addressLine1, "addressLine1", { maxLength: MAX_ADDRESS_LENGTH }),
@@ -465,15 +484,18 @@ settingsRouter.patch(
   h(async (req, res) => {
     await svc(req).assertSetupComplete();
     const body = asObject(req.body);
+    rejectRemovedFields(body, ["gocardlessConnected", "stripeConnected"]); // connect/disconnect has its own flow
     const input: PaymentRulesUpdateInput = {
       paymentRule: optPaymentTiming(body.paymentRule),
       vatInInvoices: optBool(body.vatInInvoices, "vatInInvoices"),
       debtHoldEnabled: optBool(body.debtHoldEnabled, "debtHoldEnabled"),
-      debtHoldMaxInvoices: body.debtHoldMaxInvoices !== undefined ? (body.debtHoldMaxInvoices === null ? null : Number(body.debtHoldMaxInvoices)) : undefined,
-      debtHoldMaxAmount: body.debtHoldMaxAmount !== undefined ? (body.debtHoldMaxAmount === null ? null : Number(body.debtHoldMaxAmount)) : undefined,
+      debtHoldMaxInvoices: optNonNegativeInt(body.debtHoldMaxInvoices, "debtHoldMaxInvoices"),
+      debtHoldMaxAmount: optNonNegativeAmount(body.debtHoldMaxAmount, "debtHoldMaxAmount"),
       defaultPaymentMethod: optPaymentMethod(body.defaultPaymentMethod, "defaultPaymentMethod"),
       acceptedPaymentMethods: optPaymentMethods(body.acceptedPaymentMethods),
       invoiceDueDays: optInvoiceDueDays(body.invoiceDueDays),
+      invoiceFooter: optFreeText(body.invoiceFooter, "invoiceFooter", 500),
+      paymentTerms: optFreeText(body.paymentTerms, "paymentTerms", 200),
       noDirectDebitAction: optNoDirectDebitAction(body.noDirectDebitAction),
     };
     res.json(toBusinessSettingsDto(await svc(req).updatePaymentRules(input)));
@@ -659,6 +681,7 @@ settingsRouter.post(
       body: requireString(body.body, "body"),
       subject: optString(body.subject, "subject"),
     };
+    assertEmailTemplateHasSubject(input.channel, input.subject);
     res.status(201).json(await svc(req).createMessageTemplate(input));
   })
 );
@@ -674,6 +697,9 @@ settingsRouter.patch(
       body: optReqString(body.body, "body"),
       subject: optString(body.subject, "subject"),
     };
+    // Only when this request sets an EMAIL channel together with an explicitly blank subject (a partial update that
+    // leaves the subject alone is fine).
+    if (input.channel === MessageChannel.EMAIL && body.subject !== undefined) assertEmailTemplateHasSubject(input.channel, input.subject);
     res.json(await svc(req).updateMessageTemplate(req.params.id, input));
   })
 );

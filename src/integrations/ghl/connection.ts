@@ -1,6 +1,8 @@
 // GHL connection helpers used by the /settings/ghl/* routes (connect, status,
 // test). Messaging/contact calls live in ./api.ts.
 
+import { outboundSignal } from "../../lib/outbound";
+
 const GHL_API = "https://services.leadconnectorhq.com";
 
 export type GhlLocationResult =
@@ -14,6 +16,7 @@ export async function fetchGhlLocation(token: string, locationId: string): Promi
   let res: Response;
   try {
     res = await fetch(`${GHL_API}/locations/${encodeURIComponent(locationId)}`, {
+      signal: outboundSignal(),
       headers: { Authorization: `Bearer ${token}`, Version: "2021-07-28" },
     });
   } catch (err) {

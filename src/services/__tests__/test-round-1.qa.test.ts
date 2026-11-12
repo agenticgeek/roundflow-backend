@@ -18,7 +18,13 @@ import { findAliasTokens, listSnakeCaseTemplates, listSnakeCaseTemplatesForTenan
 import { createJobDetailService } from "../../mobile/services/job-detail.service";
 import { createMediaService } from "../../mobile/services/media.service";
 
-vi.mock("../../integrations/geocoding/client", () => ({ geocodePostcode: vi.fn().mockResolvedValue(null) }));
+// Notification producers are covered by notify.test.ts and the notification-producers tests.
+vi.mock("../notify", async () => (await import("../../test/notify-mock.js")).notifyMockModule());
+
+vi.mock("../../integrations/geocoding/client", async (orig) => ({
+  ...(await orig<typeof import("../../integrations/geocoding/client")>()),
+  geocodeAddress: vi.fn().mockResolvedValue({ result: null, error: "x" }),
+}));
 const tenantFindMany = vi.fn();
 vi.mock("../../lib/prisma", () => ({ prisma: { tenant: { findMany: (...a: unknown[]) => tenantFindMany(...a) } } }));
 const getTenantPrismaForSchema = vi.fn();
@@ -178,7 +184,7 @@ it("technician notes for the office store the author profile", async () => {
 // ---- 4. pause in the past ---------------------------------------------------------------
 
 function pausePrisma(settings: any = null) {
-  const tx: any = { visit: { updateMany: vi.fn().mockResolvedValue({ count: 0 }) }, servicePlan: { update: vi.fn().mockImplementation(({ data }: any) => Promise.resolve({ id: "sp1", ...data })) } };
+  const tx: any = { visit: { findMany: vi.fn().mockResolvedValue([]), updateMany: vi.fn().mockResolvedValue({ count: 0 }) }, servicePlan: { update: vi.fn().mockImplementation(({ data }: any) => Promise.resolve({ id: "sp1", ...data })) } };
   return {
     businessSettings: { findFirst: vi.fn().mockResolvedValue(settings) },
     servicePlan: { findUnique: vi.fn().mockResolvedValue({ id: "sp1", propertyId: "p1", status: "ACTIVE", pauseStartDate: null }) },

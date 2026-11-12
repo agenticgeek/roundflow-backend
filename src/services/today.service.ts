@@ -3,21 +3,13 @@ import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 import { tenantTodayRange } from "./business-time";
 import { getCachedBusinessSettings, invalidateCachedBusinessSettings } from "./settings.service";
+import { carryOverVisits, notifyCarryoverCustomers, notifyCarryoverTechnicians, pickTarget, type MovedVisit } from "./carryover.service";
 
 // ---------------------------------------------------------------------------
 // M4 — Today's Work (BE-M4-01, BE-M4-05).
 // ---------------------------------------------------------------------------
 
 export const DEFAULT_CLOSE_DAY_SKIP_REASON = "Not completed - day closed";
-
-// Returns the next Mon–Fri date after `date` (UTC). Skips Sat → Mon, Sun → Mon.
-function nextWorkingDay(date: Date): Date {
-  const next = new Date(date.getTime() + 86_400_000);
-  const dow = next.getUTCDay(); // 0=Sun, 6=Sat
-  if (dow === 6) return new Date(next.getTime() + 2 * 86_400_000); // Sat → Mon
-  if (dow === 0) return new Date(next.getTime() + 86_400_000);     // Sun → Mon
-  return next;
-}
 
 function deriveRoundStatus(
   total: number,
@@ -40,6 +32,7 @@ export interface TodayKpi {
   skipped: number;
   issues: number;
   paymentHolds: number;
+  carriedOver: number;
   valueCompleted: number;
 }
 
@@ -54,6 +47,8 @@ export interface TodayRoundRow {
   skipped: number;
   issueCount: number;
   paymentHolds: number;
+  /** Visits on this round today that were carried over from an earlier day. */
+  carriedOver: number;
   scheduledValue: number; // every (non-cancelled) stop today
   completedValue: number; // COMPLETED stops only
   /** @deprecated same as completedValue; kept for one release (GAP-035). */
@@ -87,6 +82,12 @@ export interface CloseDaySummary {
   issues: number;
   paymentHolds: number;
   revenue: number;
+  /** YYYY-MM-DD the unfinished visits were carried to; null for mark_as_skipped or when nothing was left. */
+  carriedToDate: string | null;
+  /** Customers messaged about the carryover (notifyCustomers); 0 otherwise. */
+  notifiedCustomers: number;
+  /** Set when notifyCustomers was requested but the message step failed (the close itself succeeded). */
+  customerNotificationError?: string;
 }
 
 // ---- Prisma payload ---------------------------------------------------------
@@ -135,9 +136,15 @@ class TodayService {
 
   async closeDay(
     unfinishedAction: "push_to_tomorrow" | "mark_as_skipped",
-    skipReason?: string | null
+    skipReason?: string | null,
+    /** ACT-02..04: CarryoverKey for the push (default: the option flagged default for today). */
+    target?: string,
+    actor?: { id?: string | null; role?: string | null },
+    /** Also message the customers of the carried visits (push_to_tomorrow only; best effort). */
+    opts: { notifyCustomers?: boolean } = {}
   ): Promise<CloseDaySummary> {
     const { start, end } = await tenantTodayRange(this.prisma);
+    let carried: { moved: MovedVisit[]; targetDate: Date } | null = null;
 
     const result = await this.prisma.$transaction(async (tx) => {
       const today = start.toISOString().slice(0, 10);
@@ -173,12 +180,17 @@ class TodayService {
 
       if (unfinishedIds.length > 0) {
         if (unfinishedAction === "push_to_tomorrow") {
-          const nextDay = nextWorkingDay(start);
-          // Reset IN_PROGRESS back to SCHEDULED so the next working day starts fresh.
-          await tx.visit.updateMany({
-            where: { id: { in: unfinishedIds } },
-            data: { date: nextDay, status: VisitStatus.SCHEDULED },
+          // Same service as POST /visits/carryover: IN_PROGRESS goes back to SCHEDULED, start/arrival
+          // and reminder markers reset, queued reminders cancelled, carryover recorded.
+          const settings = await getCachedBusinessSettings(this.prisma);
+          const targetDate = pickTarget(start, target, {
+            workingDays: settings?.defaultWorkingDays ?? [],
+            tz: settings?.timezone ?? undefined,
           });
+          const core = await carryOverVisits(tx, {
+            fromDate: start, targetDate, visitIds: unfinishedIds, actor, via: "close-day",
+          });
+          carried = { moved: core.moved, targetDate };
         } else {
           await tx.visit.updateMany({
             where: { id: { in: unfinishedIds } },
@@ -204,8 +216,21 @@ class TodayService {
         issues: visits.reduce((acc, v) => acc + v._count.issues, 0),
         paymentHolds: visits.filter((v) => v.paymentHold).length,
         revenue: preCompleted.reduce((acc, v) => acc.add(v.price), new Prisma.Decimal(0)).toNumber(),
+        carriedToDate: null as string | null,
+        notifiedCustomers: 0,
+        customerNotificationError: undefined as string | undefined,
       };
     });
+    if (carried) {
+      const { moved, targetDate } = carried as { moved: MovedVisit[]; targetDate: Date };
+      result.carriedToDate = targetDate.toISOString().slice(0, 10);
+      await notifyCarryoverTechnicians(this.prisma, moved, start, targetDate);
+      if (opts.notifyCustomers) {
+        const sent = await notifyCarryoverCustomers(this.prisma, moved, start, targetDate);
+        result.notifiedCustomers = sent.notified;
+        if (sent.error) result.customerNotificationError = sent.error;
+      }
+    }
     // Invalidate after the transaction commits (not inside the tx callback —
     // the cache is keyed by this outer long-lived client, not the short-lived
     // `tx` object). Without this, getTodaysWork()'s cached read of
@@ -225,6 +250,7 @@ class TodayService {
       skipped: visits.filter((v) => v.status === VisitStatus.SKIPPED).length,
       issues: visits.filter((v) => v._count.issues > 0).length,
       paymentHolds: visits.filter((v) => v.paymentHold).length,
+      carriedOver: visits.filter((v) => v.carriedOverFromDate != null).length,
       valueCompleted: visits
         .filter((v) => v.status === VisitStatus.COMPLETED)
         .reduce((acc, v) => acc.add(v.price), new Prisma.Decimal(0))
@@ -267,6 +293,7 @@ class TodayService {
         skipped,
         issueCount: vs.reduce((acc, v) => acc + v._count.issues, 0),
         paymentHolds: vs.filter((v) => v.paymentHold).length,
+        carriedOver: vs.filter((v) => v.carriedOverFromDate != null).length,
         scheduledValue: vs.reduce((acc, v) => acc + v.price.toNumber(), 0),
         completedValue,
         value: completedValue,

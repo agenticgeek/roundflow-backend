@@ -1,14 +1,16 @@
 import { timingSafeEqual } from "crypto";
 import { Router, Request, Response } from "express";
 import { prisma } from "../lib/prisma";
+import { guardWebhook } from "../lib/webhook-guard";
 import { getTenantPrismaForSchema } from "../lib/tenant-prisma-manager";
 import { decrypt } from "../lib/crypto";
 import { MessageChannel, MessageDirection, Prisma } from "../generated/tenant-client";
 import { invalidateCachedBusinessSettings } from "../services/settings.service";
+import { processWebhookEvent } from "../services/webhook-events.service";
 
 export const ghlWebhookRouter = Router();
 
-ghlWebhookRouter.post("/", async (req: Request, res: Response) => {
+ghlWebhookRouter.post("/", guardWebhook("ghlWebhook", async (req: Request, res: Response) => {
   const tenantId = req.query.tenantId as string | undefined;
   const secret   = req.query.secret   as string | undefined;
 
@@ -40,14 +42,20 @@ ghlWebhookRouter.post("/", async (req: Request, res: Response) => {
     res.status(400).json({ error: "Malformed JSON" }); return;
   }
 
-  // Ack immediately; process async
+  // Process-then-ack (BE-03). Events with an id are recorded (RECEIVED -> DONE/FAILED) and a failed effect answers
+  // 500 so GHL redelivers; the retry sweep re-runs FAILED rows. Events without an id (the lead handoff) cannot be
+  // deduplicated by id: they run inline and a failure also answers 500 (the handler is idempotent per contact).
+  if (payload.id) {
+    const tp = getTenantPrismaForSchema(tenant.schemaName);
+    const outcome = await processWebhookEvent(tp, "ghl", payload.id, payload, () => handleGhlEvent(tenant.schemaName, payload));
+    res.sendStatus(outcome === "failed" ? 500 : 200);
+    return;
+  }
+  await handleGhlEvent(tenant.schemaName, payload);
   res.sendStatus(200);
-  processEvent(tenant.schemaName, payload, payload.id).catch((err) =>
-    console.error(`[ghlWebhook] ${tenantId}/${payload.type} failed:`, err)
-  );
-});
+}));
 
-type GhlEvent = {
+export type GhlEvent = {
   type?: string;
   id?: string;
   locationId?: string;
@@ -61,22 +69,10 @@ type GhlEvent = {
   message?: { body?: string; type?: string };
 };
 
-async function processEvent(schemaName: string, event: GhlEvent, eventId?: string): Promise<void> {
+/** Applies one GHL event. Idempotent; also used by the webhook retry sweep. */
+export async function handleGhlEvent(schemaName: string, event: GhlEvent): Promise<void> {
   const tp = getTenantPrismaForSchema(schemaName);
   const { type, contactId } = event;
-
-  // Idempotency for events that carry an id
-  if (eventId) {
-    // D-8: only a unique-constraint violation means "already processed".
-    // Anything else (e.g. a transient DB error) is rethrown and logged by the
-    // caller instead of being silently treated as a replay.
-    try {
-      await tp.webhookEvent.create({ data: { source: "ghl", externalId: eventId } });
-    } catch (err) {
-      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") return;
-      throw err;
-    }
-  }
 
   // Lead Handoff to RoundFlow (docs/GHL_AUTOMATION_OWNER_HANDOFF.md §3
   // Workflow 5) — a GHL Workflow's custom-webhook action, fired when a
@@ -89,16 +85,22 @@ async function processEvent(schemaName: string, event: GhlEvent, eventId?: strin
 
     const name = [event.firstName, event.lastName].filter(Boolean).join(" ").trim() || "Unknown";
 
-    await tp.$transaction(async (tx) => {
-      const customer = await tx.customer.create({
-        data: { name, email: event.email ?? null, phone: event.phone ?? null, ghlContactId: contactId },
-      });
-      if (event.address1 && event.postalCode) {
-        await tx.property.create({
-          data: { customerId: customer.id, addressLine: event.address1, postcode: event.postalCode },
+    try {
+      await tp.$transaction(async (tx) => {
+        const customer = await tx.customer.create({
+          data: { name, email: event.email ?? null, phone: event.phone ?? null, ghlContactId: contactId },
         });
-      }
-    });
+        if (event.address1 && event.postalCode) {
+          await tx.property.create({
+            data: { customerId: customer.id, addressLine: event.address1, postcode: event.postalCode },
+          });
+        }
+      });
+    } catch (err) {
+      // BE-27: Customer.ghlContactId is unique. A concurrent delivery of the same handoff already created the
+      // customer (the find above raced it): that is a replay, not an error.
+      if (!(err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002")) throw err;
+    }
     return;
   }
 

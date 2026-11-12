@@ -118,6 +118,105 @@ const PHASE1_AUDIT_FILES = [
   "src/swagger.ts",
 ];
 
+// Wave 1 (2026-11-06): webhook crash guard, central notifier, notification
+// preferences/feed/push. New whole files, gated at 100%.
+const WAVE1_FILES = [
+  "src/lib/webhook-guard.ts",
+  "src/lib/notification-prefs.ts",
+  "src/services/notify.ts",
+  "src/routes/notifications.ts",
+  "src/mobile/services/notification.service.ts",
+  "src/mobile/services/push.ts",
+];
+
+// Wave 2A (2026-11-06): working days + carryover, Google geocoding, bulk invoice
+// send. New whole files, gated at 100%.
+const WAVE2A_FILES = [
+  "src/lib/working-days.ts",
+  "src/services/carryover.service.ts",
+  "src/services/property-geocoding.ts",
+  "src/services/invoice-send-batch.service.ts",
+  "src/jobs/geocodeBackfillCli.ts",
+  "src/integrations/pdf/render.ts",
+  "src/jobs/kpiThresholds.ts",
+];
+
+// Wave 2B-1 (2026-11-07): money correctness and security hardening. New whole files, gated at 100%.
+// tenant-provisioning.ts and tenant-prisma-manager.ts changed (schema-name guard, failed-migration report) and have
+// full test files, so they are gated too.
+const WAVE2B1_FILES = [
+  "src/lib/schema-name.ts",
+  "src/lib/request-id.ts",
+  "src/lib/outbound.ts",
+  "src/lib/rate-limit.ts",
+  "src/lib/permissions.ts",
+  "src/lib/idempotency.ts",
+  "src/lib/outbox-backoff.ts",
+  "src/lib/tenant-provisioning.ts",
+  "src/lib/tenant-prisma-manager.ts",
+  "src/middleware/requireAdmin.ts",
+  "src/services/payment-state.ts",
+  "src/services/direct-debit.ts",
+  "src/services/webhook-events.service.ts",
+  "src/jobs/webhookRetry.ts",
+  "src/jobs/overdueSweep.ts",
+  "src/routes/integrations.ts",
+  "src/server/shutdown.ts",
+];
+
+// Wave 2B-2 (2026-11-06): native tenant email (SES mailer, sender identity, branding, SNS events, sending domain).
+// New whole files, gated at 100%.
+const WAVE2B2_FILES = [
+  "src/lib/mailer/config.ts",
+  "src/lib/mailer/contrast.ts",
+  "src/lib/mailer/sender.ts",
+  "src/lib/mailer/template.ts",
+  "src/lib/mailer/ses.ts",
+  "src/lib/mailer/sns.ts",
+  "src/services/email.service.ts",
+  "src/services/email-events.service.ts",
+  "src/services/email-domain.service.ts",
+  "src/services/email-settings.service.ts",
+  "src/routes/sesWebhook.ts",
+  "src/routes/settings-email.ts",
+  "src/jobs/emailDomainRecheck.ts",
+  "src/lib/tenant-jobs.ts",
+];
+
+// Flo AI (2026-11-10): admin-only, read-only assistant. New whole files, gated at 100%. The orchestration, answer
+// builder, stream parser, figure check, SSE writer, service and routes append their own files to this list.
+const FLO_FILES = [
+  "src/integrations/anthropic/client.ts",
+  "src/jobs/floPurge.ts",
+  "src/services/flo/types.ts",
+  "src/services/flo/modes.ts",
+  "src/services/flo/limits.ts",
+  "src/services/flo/scope-gate.ts",
+  "src/services/flo/declines.ts",
+  "src/services/flo/prose-lint.ts",
+  "src/services/flo/system-prompt.ts",
+  "src/services/flo/tool-registry.ts",
+  "src/services/flo/tools/shared.ts",
+  "src/services/flo/tools/get-day-overview.ts",
+  "src/services/flo/tools/list-rounds-due.ts",
+  "src/services/flo/tools/list-debtors.ts",
+  "src/services/flo/tools/list-payments.ts",
+  "src/services/flo/tools/compare-technicians.ts",
+  "src/services/flo/tools/list-complaints.ts",
+  "src/services/flo/tools/list-at-risk-customers.ts",
+  "src/services/flo/tools/revenue-summary.ts",
+  "src/services/flo/tools/list-skipped-visits.ts",
+  "src/services/flo/tools/get-customer-summary.ts",
+  // B4-B6: answer contract and builders, stream parser, figure check, orchestrator, service, SSE writer, routes.
+  "src/services/flo/answer.ts",
+  "src/services/flo/stream-parser.ts",
+  "src/services/flo/figure-check.ts",
+  "src/services/flo/orchestrator.ts",
+  "src/services/flo/flo.service.ts",
+  "src/services/flo/sse.ts",
+  "src/routes/flo.ts",
+];
+
 export default defineConfig({
   test: {
     include: ["src/**/*.test.ts"],
@@ -126,7 +225,7 @@ export default defineConfig({
     coverage: {
       provider: "v8",
       reporter: ["text", "html", "lcov"],
-      include: [...PAYMENT_DOMAIN_FILES, ...AUDIT_REMEDIATION_FILES, ...GEOCODING_FILES, ...INVITE_FILES, ...PHASE1_AUDIT_FILES],
+      include: [...PAYMENT_DOMAIN_FILES, ...AUDIT_REMEDIATION_FILES, ...GEOCODING_FILES, ...INVITE_FILES, ...PHASE1_AUDIT_FILES, ...WAVE1_FILES, ...WAVE2A_FILES, ...WAVE2B1_FILES, ...WAVE2B2_FILES, ...FLO_FILES],
       thresholds: {
         100: true,
         perFile: true,

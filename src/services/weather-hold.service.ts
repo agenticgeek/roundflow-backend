@@ -4,8 +4,9 @@ import { CleaningFrequency, DayOfWeek, Prisma, VisitStatus } from "../generated/
 import { createMessageService, type BroadcastResult, type BroadcastTarget } from "./message.service";
 import { FALLBACK_BODIES, TEMPLATE_NAMES, formatTemplateDate, loadTemplate, renderTemplate } from "./message-templates";
 import { nextDueAfter, snapToWeekday, startOfUtcDay } from "../lib/schedule";
-import { tenantToday } from "./business-time";
+import { tenantToday, tenantWorkingDays } from "./business-time";
 import { REMINDER_MARKERS_RESET, assertDayNotClosed, cancelPendingVisitMessages } from "./visit-reschedule";
+import { notifyVisitTechnicians, visitCount } from "./notify";
 
 // Weather Hold (Round Planner): the office postpones one round-day because of
 // the weather. The round's SCHEDULED visits on that date are moved (or taken
@@ -83,13 +84,14 @@ function targetDateFor(
   rescheduling: WeatherRescheduling,
   day: Date,
   frequency: CleaningFrequency | null,
-  defaultDay: DayOfWeek | null
+  defaultDay: DayOfWeek | null,
+  workingDays: readonly string[] = []
 ): Date | null {
   if (rescheduling === "manual") return null;
   if (rescheduling === "next-cycle" && frequency) return nextDueAfter(day, frequency, defaultDay);
   const tomorrow = new Date(day);
   tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
-  return snapToWeekday(tomorrow);
+  return snapToWeekday(tomorrow, workingDays);
 }
 
 export function createWeatherHoldService(prisma: TenantPrismaClient) {
@@ -110,15 +112,18 @@ export function createWeatherHoldService(prisma: TenantPrismaClient) {
       orderBy: { id: "asc" },
       select: {
         id: true,
+        technicianId: true,
+        roundId: true,
         servicePlan: { select: { id: true, cleaningFrequency: true, nextDueDate: true } },
         technician: { select: { name: true } },
         property: { select: { addressLine: true, customer: { select: customerSelect } } },
       },
     });
 
+    const workingDays = await tenantWorkingDays(prisma);
     const items = visits.map((v) => {
       const frequency = v.servicePlan?.cleaningFrequency ?? round.frequency;
-      return { visit: v, frequency, target: targetDateFor(input.rescheduling, day, frequency, round.defaultDay) };
+      return { visit: v, frequency, target: targetDateFor(input.rescheduling, day, frequency, round.defaultDay, workingDays) };
     });
 
     const settings = await prisma.businessSettings.findFirst({ select: { businessName: true } });
@@ -155,7 +160,7 @@ export function createWeatherHoldService(prisma: TenantPrismaClient) {
     // A manual hold has no date to give: a tenant template that promises one ({{newDate}}) would
     // read nonsense, so the built-in "we'll be in touch" wording is used instead.
     if (manual && template.id && NEW_DATE_TOKEN_RE.test(template.body)) {
-      template = { id: null, body: FALLBACK_BODIES.WEATHER_HOLD_TBC };
+      template = { id: null, body: FALLBACK_BODIES.WEATHER_HOLD_TBC, subject: null };
     }
     const targetDates = items.flatMap((i) => (i.target ? [i.target] : [])).sort((a, b) => a.getTime() - b.getTime());
     return { round, day, items, targets: [...byCustomer.values()], template, newDate: targetDates[0] ?? null };
@@ -181,7 +186,7 @@ export function createWeatherHoldService(prisma: TenantPrismaClient) {
     apply: async (roundId: string, input: WeatherHoldApplyInput): Promise<WeatherHoldResult> => {
       const messages = createMessageService(prisma);
       // Fail before anything moves: a hold that cannot tell customers should be a conscious choice.
-      if (input.notifyCustomers) await messages.assertGhlConnected();
+      if (input.notifyCustomers) await messages.assertAnyChannelAvailable();
 
       const plan = await loadPlan(roundId, input);
       const { round, day, items, targets, template } = plan;
@@ -273,6 +278,19 @@ export function createWeatherHoldService(prisma: TenantPrismaClient) {
         newDate: plan.newDate ? isoDay(plan.newDate) : null,
         notification: null,
       };
+      // FLOW-03: technicians on the held visits are told (independent of notifyCustomers). Best effort.
+      await notifyVisitTechnicians(
+        prisma,
+        items.map(({ visit }) => ({ id: visit.id, technicianId: visit.technicianId, roundId: visit.roundId, date: day })),
+        ({ count, first }) => ({
+          type: "SCHEDULE",
+          title: `Weather hold: ${visitCount(count)} postponed`,
+          body:
+            input.rescheduling === "manual"
+              ? `${conditionLabel} on ${first}. The office will rebook these visits.`
+              : `${conditionLabel} on ${first}. Moved to ${result.newDate}.`,
+        })
+      );
       if (!input.notifyCustomers) return result;
 
       try {

@@ -257,3 +257,36 @@ it("POST /setup/step/9 (single) passes landline and serviceIds through", async (
     expect.objectContaining({ landline: "01234567890", serviceIds: ["svc-a", "svc-b"] })
   );
 });
+
+// BUG-003 / BUG-008: step 1 stored email "nope", timezone "Mars/Olympus", currency "ZZZZ", working days "MON".
+function appWithErrors() {
+  const app = makeApp();
+  // makeApp mounts only the router; errors from h() reach express default handling, so wrap to read the status
+  const outer = express();
+  outer.use("/", app);
+  outer.use((err: any, _req: any, res: any, _next: any) => res.status(err.statusCode ?? 500).json({ error: err.message, code: err.code, fields: err.fields }));
+  return outer;
+}
+
+it.each([
+  ["bad email", { email: "nope" }],
+  ["bad timezone", { timezone: "Mars/Olympus" }],
+  ["bad currency", { currency: "ZZZZ" }],
+  ["working days as a string", { defaultWorkingDays: "MON" }],
+  ["bad sort code", { bankDetails: { accountName: "A", accountNumber: "12345678", sortCode: "1" } }],
+  ["bad account number", { bankDetails: { accountName: "A", accountNumber: "x", sortCode: "12-34-56" } }],
+])("POST /setup/step/1 %s is a 400 and nothing is saved", async (_n, over) => {
+  mockSetupSvc.saveBusinessProfile.mockClear();
+  const res = await request(appWithErrors()).post("/setup/step/1").send({ businessName: "Acme", ...over });
+  expect(res.status).toBe(400);
+  expect(mockSetupSvc.saveBusinessProfile).not.toHaveBeenCalled();
+});
+
+it("POST /setup/step/1 accepts valid values", async () => {
+  const res = await request(appWithErrors()).post("/setup/step/1").send({
+    businessName: "Acme", email: "o@acme.co", timezone: "Europe/London", currency: "GBP", defaultWorkingDays: ["MON"],
+    bankDetails: { accountName: "A", accountNumber: "12345678", sortCode: "12-34-56" },
+  });
+  expect(res.status).toBe(200);
+  expect(mockSetupSvc.saveBusinessProfile).toHaveBeenCalledWith(expect.objectContaining({ email: "o@acme.co", timezone: "Europe/London", currency: "GBP" }));
+});

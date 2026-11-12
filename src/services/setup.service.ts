@@ -1,3 +1,4 @@
+import { invalidateCachedBusinessSettings } from "./settings.service";
 import {
   ServiceCategory,
   DayOfWeek,
@@ -362,6 +363,9 @@ class SetupService {
       create: { ...data },
     });
     this.settingsCache = result;
+    // Other services read BusinessSettings through the shared per-client cache (settings.service); drop it so a wizard
+    // save (working days, time zone, currency...) is visible immediately everywhere.
+    invalidateCachedBusinessSettings(this.prisma);
     return result;
   }
 
@@ -611,6 +615,8 @@ class SetupService {
     let technicians: Technician[];
     try {
       technicians = await this.prisma.$transaction(async (tx) => {
+        // BUG-011: the join rows reference the technicians being replaced; remove them first (no FK violation).
+        await tx.technicianServiceArea.deleteMany({ where: { technician: { profileId: null } } });
         await tx.technician.deleteMany({ where: { profileId: null } });
         if (rows.length > 0) {
           await tx.technician.createMany({
@@ -640,6 +646,10 @@ class SetupService {
       // @unique constraint and surfaced as a raw 500.
       if (err instanceof TenantPrisma.PrismaClientKnownRequestError && err.code === "P2002") {
         throw new AppError(409, "Two or more technicians share the same email address.");
+      }
+      // BUG-011: a replaced technician is still referenced (visits, availability, ...): a clean conflict, not a 500.
+      if (err instanceof TenantPrisma.PrismaClientKnownRequestError && err.code === "P2003") {
+        throw new AppError(409, "A technician being replaced is still in use. Remove them from rounds and visits first.", "TECHNICIAN_IN_USE");
       }
       throw err;
     }

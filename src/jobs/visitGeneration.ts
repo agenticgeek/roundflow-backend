@@ -4,13 +4,13 @@ import { CleaningFrequency, DayOfWeek, LifecycleStatus, RoundStatus, VisitStatus
 import { queueGhlEvent } from "../integrations/ghl/sync";
 import { nextDueAfter, nextOccurrenceOfDay, snapToWeekday, startOfUtcDay } from "../lib/schedule";
 import { resolveTechnicianForVisit, technicianIdsUnavailableOn } from "../services/visit-assignment";
-import { tenantToday } from "../services/business-time";
+import { tenantToday, tenantWorkingDays } from "../services/business-time";
 import { pausePlan, resumePlan } from "../services/service-plan-lifecycle";
 
 // Visit date for a due plan: the round day on or after nextDueDate, or the
 // nearest weekday when the round has no day.
-function visitDateFor(nextDueDate: Date, defaultDay: DayOfWeek | null | undefined): Date {
-  return defaultDay ? nextOccurrenceOfDay(nextDueDate, defaultDay) : snapToWeekday(startOfUtcDay(nextDueDate));
+function visitDateFor(nextDueDate: Date, defaultDay: DayOfWeek | null | undefined, workingDays: readonly string[]): Date {
+  return defaultDay ? nextOccurrenceOfDay(nextDueDate, defaultDay) : snapToWeekday(startOfUtcDay(nextDueDate), workingDays);
 }
 
 export async function runVisitGeneration(): Promise<void> {
@@ -34,7 +34,7 @@ async function generateForTenant(tp: TP, today: Date): Promise<void> {
   await applyPauseTransitions(tp, today);
 
   // B2: tenants that turned off "auto-create next visit" get no generation.
-  const settings = await tp.businessSettings.findFirst({ select: { autoCreateNextVisit: true } });
+  const settings = await tp.businessSettings.findFirst({ select: { autoCreateNextVisit: true, defaultWorkingDays: true } });
   if (settings?.autoCreateNextVisit === false) return;
 
   const rounds = await tp.round.findMany({
@@ -43,7 +43,7 @@ async function generateForTenant(tp: TP, today: Date): Promise<void> {
   });
 
   for (const round of rounds) {
-    await generateForRound(tp, round, today);
+    await generateForRound(tp, round, today, settings?.defaultWorkingDays ?? []);
   }
 }
 
@@ -83,9 +83,11 @@ export async function applyPauseTransitions(tp: TenantPrismaClient, today: Date)
 export async function generateForRound(
   tp: TenantPrismaClient,
   round: { id: string; frequency: CleaningFrequency | null; defaultDay?: DayOfWeek | null },
-  today: Date
+  today: Date,
+  workingDaysArg?: readonly string[]
 ): Promise<number> {
   let created = 0;
+  const workingDays = workingDaysArg ?? (await tenantWorkingDays(tp));
 
   const [properties, roundTechs] = await Promise.all([
     tp.property.findMany({
@@ -134,7 +136,7 @@ export async function generateForRound(
       });
       if (existing) continue;
 
-      const visitDate = visitDateFor(plan.nextDueDate, round.defaultDay);
+      const visitDate = visitDateFor(plan.nextDueDate, round.defaultDay, workingDays);
 
       // A4: a future-dated pause keeps the plan ACTIVE until its start date;
       // don't mint a visit inside the window (the nightly step flips it to
@@ -176,7 +178,7 @@ export async function generateForRound(
       const next = nextDueAfter(visitDate, freq, round.defaultDay);
       await tp.servicePlan.update({
         where: { id: plan.id },
-        data: { nextDueDate: round.defaultDay ? next : snapToWeekday(next) },
+        data: { nextDueDate: round.defaultDay ? next : snapToWeekday(next, workingDays) },
       });
     }
   }

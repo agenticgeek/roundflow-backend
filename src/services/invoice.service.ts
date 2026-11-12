@@ -8,7 +8,10 @@ import { queueGhlEvent } from "../integrations/ghl/sync";
 import { getCachedBusinessSettings } from "./settings.service";
 import { createMessageService } from "./message.service";
 import { releaseHoldIfSettled } from "./payment-hold";
+import { notifyInvoicePaid } from "./notify";
+import { MANUALLY_SETTLEABLE } from "./payment-state";
 import { FALLBACK_BODIES, TEMPLATE_NAMES, invoiceTemplateVars, loadTemplate, renderTemplate } from "./message-templates";
+import { renderHtmlToPdf, invoiceHtml } from "../integrations/pdf/render";
 import type { TenantDb } from "./visit-assignment";
 
 // ---------------------------------------------------------------------------
@@ -42,10 +45,23 @@ export interface InvoicePreview {
   total: number;
   amount: number;            // alias of total for convenience
   currency: string;          // business currency symbol, e.g. "£" / "€"
-  business: {
-    name: string | null;
-    email: string | null;
-  };
+  business: InvoiceBusiness;
+  /** GHL-10: what the customer quotes when paying (the invoice number). */
+  paymentReference: string;
+}
+
+// GHL-10: the supplier block printed on the invoice (PDF and, later, email).
+export interface InvoiceBusiness {
+  name: string | null;
+  email: string | null;
+  phone: string | null;
+  address: { line1: string | null; line2: string | null; town: string | null; postcode: string | null } | null;
+  vatNumber: string | null;
+  companyNumber: string | null;
+  bank: { accountName: string; bankName: string | null; sortCode: string; accountNumber: string } | null;
+  /** "Payment due within N days" unless the tenant set free-text paymentTerms. */
+  paymentTerms: string;
+  invoiceFooter: string | null;
 }
 
 // Full data needed to render a saved invoice (PDF). Same shape as the preview
@@ -105,6 +121,41 @@ function vatWithin(total: number, settings: BusinessSettings | null): number {
   return settings?.vatInInvoices ? round2(total - total / (1 + vatRateOf(settings) / 100)) : 0;
 }
 
+const clean = (v: string | null | undefined): string | null => (v && v.trim() !== "" ? v.trim() : null);
+
+/** BusinessSettings.bankDetails is Json ({ accountName, bankName?, accountNumber, sortCode }); anything else prints nothing. */
+function bankOf(raw: unknown): InvoiceBusiness["bank"] {
+  if (!raw || typeof raw !== "object") return null;
+  const b = raw as Record<string, unknown>;
+  const str = (v: unknown) => (typeof v === "string" && v.trim() !== "" ? v.trim() : null);
+  const accountName = str(b.accountName);
+  const accountNumber = str(b.accountNumber);
+  const sortCode = str(b.sortCode);
+  if (!accountName || !accountNumber || !sortCode) return null;
+  return { accountName, bankName: str(b.bankName), sortCode, accountNumber };
+}
+
+export function invoiceBusiness(settings: BusinessSettings | null): InvoiceBusiness {
+  const address = {
+    line1: clean(settings?.addressLine1),
+    line2: clean(settings?.addressLine2),
+    town: clean(settings?.town),
+    postcode: clean(settings?.postcode),
+  };
+  return {
+    name: settings?.businessName ?? null,
+    email: settings?.email ?? null,
+    phone: clean(settings?.phone),
+    address: Object.values(address).some(Boolean) ? address : null,
+    // Wave 2B-1: the supplier VAT number prints only when the business is VAT registered AND a number is stored.
+    vatNumber: settings?.vatRegistered ? clean(settings?.vatRegistration) : null,
+    companyNumber: clean(settings?.companyNumber),
+    bank: bankOf(settings?.bankDetails),
+    paymentTerms: clean(settings?.paymentTerms) ?? `Payment due within ${settings?.invoiceDueDays ?? 7} days`,
+    invoiceFooter: clean(settings?.invoiceFooter),
+  };
+}
+
 // GAP-032: due date defaults to the issue date + BusinessSettings.invoiceDueDays.
 function defaultDueDate(settings: BusinessSettings | null, now: Date = new Date()): Date {
   return new Date(startOfUtcDay(now).getTime() + (settings?.invoiceDueDays ?? 7) * DAY_MS);
@@ -158,8 +209,11 @@ export interface CreateInvoiceInput {
   sendEmail: boolean;
 }
 
+/** OVERDUE is a derived filter: SENT with a due date before today. */
+export type InvoiceStatusFilter = InvoiceStatus | "OVERDUE";
+
 export interface InvoiceListFilters {
-  status?: InvoiceStatus;
+  status?: InvoiceStatusFilter;
   from?: Date;
   to?: Date;          // inclusive day
   customerId?: string;
@@ -167,6 +221,7 @@ export interface InvoiceListFilters {
 }
 
 export type ManualPaymentMethod = "BACS" | "CHEQUE" | "CASH";
+export const MANUAL_PAYMENT_METHODS: ManualPaymentMethod[] = ["BACS", "CHEQUE", "CASH"];
 
 export interface MarkPaidInput {
   method: ManualPaymentMethod;
@@ -177,9 +232,14 @@ export interface MarkPaidInput {
 
 export type BulkSkipReason = "ALREADY_INVOICED" | "NOT_COMPLETED" | "ON_HOLD";
 
-function invoiceWhere(f: InvoiceListFilters): Prisma.InvoiceWhereInput {
+export function invoiceWhere(f: InvoiceListFilters, now: Date = new Date()): Prisma.InvoiceWhereInput {
   const where: Prisma.InvoiceWhereInput = {};
-  if (f.status) where.status = f.status;
+  if (f.status === "OVERDUE") {
+    where.status = InvoiceStatus.SENT;
+    where.dueDate = { lt: startOfUtcDay(now) };
+  } else if (f.status) {
+    where.status = f.status;
+  }
   if (f.customerId) where.customerId = f.customerId;
   if (f.from || f.to) {
     where.createdAt = {
@@ -218,6 +278,10 @@ class InvoiceService {
   }
 
   async listCustomerInvoices(customerId: string) {
+    // BUG-009: an unknown customer is a 404, not an empty list.
+    if (!(await this.prisma.customer.findUnique({ where: { id: customerId }, select: { id: true } }))) {
+      throw new AppError(404, "Customer not found");
+    }
     const invoices = await this.prisma.invoice.findMany({
       where: { customerId },
       orderBy: { createdAt: "desc" },
@@ -258,6 +322,7 @@ class InvoiceService {
         customer: { id: inv.customer.id, name: inv.customer.name },
         total: inv.amount.toNumber(),
         status: inv.status,
+        overdue: inv.status === InvoiceStatus.SENT && inv.dueDate != null && inv.dueDate < startOfUtcDay(new Date()),
         issuedAt: inv.createdAt,
         dueDate: inv.dueDate,
         paidAt: inv.paidAt,
@@ -360,7 +425,7 @@ class InvoiceService {
     }
 
     const messages = createMessageService(this.prisma);
-    const prep = await messages.prepare(invoice.customerId, opts.channel);
+    const prep = await messages.prepare(invoice.customerId, opts.channel, { preferred: MessageChannel.EMAIL });
     const settings = await getCachedBusinessSettings(this.prisma);
     const template = await loadTemplate(this.prisma, TEMPLATE_NAMES.INVOICE, FALLBACK_BODIES.INVOICE);
     const body = renderTemplate(
@@ -374,7 +439,50 @@ class InvoiceService {
         businessName: settings?.businessName,
       })
     );
-    const sent = await messages.deliver(prep, body, { templateId: template.id });
+    // EMAIL: tenant subject, inline summary with payment details and reference, PDF attached when it can be rendered.
+    // Without Gotenberg the email still goes out (summary only) and `pdfAttached` is false.
+    let emailOpts: Record<string, unknown> = {};
+    let pdfAttached: boolean | undefined;
+    if (prep.channel === MessageChannel.EMAIL) {
+      const money = `${settings?.currency ?? "£"}${invoice.amount.toNumber().toFixed(2)}`;
+      const summary: Array<[string, string]> = [
+        ["Invoice", invoice.invoiceNumber],
+        ["Amount", money],
+        ["Due", invoice.dueDate ? toDateStr(invoice.dueDate) : ""],
+        ["Payment reference", invoice.invoiceNumber],
+      ].filter(([, v]) => v) as Array<[string, string]>;
+      let attachments: Array<{ filename: string; contentType: string; content: Buffer }> | undefined;
+      pdfAttached = false;
+      try {
+        const data = await this.getRenderData(invoiceId);
+        const bank = data.business.bank;
+        if (bank) {
+          summary.push(["Account name", bank.accountName], ["Sort code", bank.sortCode], ["Account number", bank.accountNumber]);
+        }
+        const pdf = await renderHtmlToPdf(invoiceHtml(data));
+        attachments = [{ filename: `${invoice.invoiceNumber}.pdf`, contentType: "application/pdf", content: pdf }];
+        pdfAttached = true;
+      } catch (err) {
+        console.error(`[invoices] invoice ${invoice.invoiceNumber} emailed without the PDF:`, (err as Error).message);
+      }
+      const vars = invoiceTemplateVars({
+        customerName: invoice.customer.name,
+        invoiceNumber: invoice.invoiceNumber,
+        amount: invoice.amount.toNumber(),
+        dueDate: invoice.dueDate,
+        currency: settings?.currency,
+        businessName: settings?.businessName,
+      });
+      emailOpts = {
+        subject: template.subject
+          ? renderTemplate(template.subject, vars)
+          : `Invoice ${invoice.invoiceNumber} from ${settings?.businessName ?? "your service provider"}`,
+        transactional: true,
+        summary,
+        ...(attachments ? { attachments } : {}),
+      };
+    }
+    const sent = await messages.deliver(prep, body, { templateId: template.id, ...emailOpts });
 
     const updated = await this.prisma.invoice.update({
       where: { id: invoiceId },
@@ -389,6 +497,7 @@ class InvoiceService {
       sentAt: updated.sentAt,
       messageId: sent.messageId,
       channel: sent.channel,
+      ...(pdfAttached === undefined ? {} : { pdfAttached }),
     };
   }
 
@@ -398,6 +507,10 @@ class InvoiceService {
   async markPaid(invoiceId: string, input: MarkPaidInput, actor?: { id?: string; role?: string }) {
     const invoice = await this.prisma.invoice.findUnique({ where: { id: invoiceId } });
     if (!invoice) throw new AppError(404, "Invoice not found");
+    // BUG-009: validated after the lookup, so an unknown invoice is a 404 whatever the body says.
+    if (!MANUAL_PAYMENT_METHODS.includes(input.method)) {
+      throw new AppError(400, `method must be one of: ${MANUAL_PAYMENT_METHODS.join(", ")}`);
+    }
     if (invoice.status === InvoiceStatus.PAID) throw new AppError(409, "Invoice is already paid", "INVOICE_ALREADY_PAID");
     if (invoice.status === InvoiceStatus.VOID) throw new AppError(409, "Invoice is void", "INVOICE_VOID");
 
@@ -412,20 +525,38 @@ class InvoiceService {
     const paidAt = input.paidAt ?? new Date();
     const method = input.method as PaymentMethod;
 
+    // BE-07: the status checks live INSIDE the transaction as conditional updates, so two concurrent "mark paid"
+    // clicks (or a click racing a Stripe webhook) cannot both settle the invoice or write two payments.
     const { updatedInvoice, payment } = await this.prisma.$transaction(async (tx) => {
+      const claimed = await tx.invoice.updateMany({
+        where: { id: invoice.id, status: { in: [InvoiceStatus.DRAFT, InvoiceStatus.SENT] } },
+        data: { status: InvoiceStatus.PAID, paidAt },
+      });
+      if (claimed.count === 0) {
+        const fresh = await tx.invoice.findUnique({ where: { id: invoice.id }, select: { status: true } });
+        if (fresh?.status === InvoiceStatus.VOID) throw new AppError(409, "Invoice is void", "INVOICE_VOID");
+        throw new AppError(409, "Invoice is already paid", "INVOICE_ALREADY_PAID");
+      }
+
       const existing = invoice.visitId
         ? await tx.payment.findUnique({ where: { visitId: invoice.visitId } })
         : null;
       const paymentData = { amount: invoice.amount, method, status: PaymentStatus.PAID, paidAt, reference: input.reference ?? null };
-      const payment = existing
-        ? await tx.payment.update({ where: { id: existing.id }, data: paymentData })
-        : await tx.payment.create({
-            data: { ...paymentData, customerId: invoice.customerId, visitId: invoice.visitId ?? undefined },
-          });
-      const updatedInvoice = await tx.invoice.update({
-        where: { id: invoice.id },
-        data: { status: InvoiceStatus.PAID, paidAt },
-      });
+      let payment;
+      if (!existing) {
+        payment = await tx.payment.create({
+          data: { ...paymentData, customerId: invoice.customerId, visitId: invoice.visitId ?? undefined },
+        });
+      } else if (existing.status === PaymentStatus.PAID) {
+        payment = existing; // already settled elsewhere (e.g. Stripe): keep its method and reference
+      } else if (!MANUALLY_SETTLEABLE.includes(existing.status)) {
+        throw new AppError(409, `A ${existing.status} payment cannot be marked paid`, "PAYMENT_NOT_SETTLEABLE");
+      } else {
+        const won = await tx.payment.updateMany({ where: { id: existing.id, status: existing.status }, data: paymentData });
+        if (won.count === 0) throw new AppError(409, "The payment changed while you were saving. Reload and try again.", "PAYMENT_CHANGED");
+        payment = (await tx.payment.findUnique({ where: { id: existing.id } }))!;
+      }
+      const updatedInvoice = (await tx.invoice.findUnique({ where: { id: invoice.id } }))!;
       const ref = input.reference ? `, ref ${input.reference}` : "";
       await tx.activityLog.create({
         data: {
@@ -440,6 +571,8 @@ class InvoiceService {
 
     queueGhlEvent(this.prisma, "payment.collected", invoice.customerId).catch(console.error);
     await releaseHoldIfSettled(this.prisma, invoice.customerId);
+    // NOTIF-03: the other office users see it too (not the person who clicked).
+    await notifyInvoicePaid(this.prisma, invoice, actor?.id);
 
     return {
       invoice: {
@@ -501,7 +634,8 @@ class InvoiceService {
       vatAmount,
       total,
       amount: total,
-      business: { name: settings?.businessName ?? null, email: settings?.email ?? null },
+      business: invoiceBusiness(settings),
+      paymentReference: invoice.invoiceNumber,
     };
   }
 
@@ -604,10 +738,8 @@ class InvoiceService {
       total,
       amount: total,
       currency: settings?.currency ?? "£",
-      business: {
-        name: settings?.businessName ?? null,
-        email: settings?.email ?? null,
-      },
+      business: invoiceBusiness(settings),
+      paymentReference: invoiceNumber,
     };
   }
 

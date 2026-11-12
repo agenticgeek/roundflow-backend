@@ -2,6 +2,7 @@ import { IssueType, NoteType, PhotoType, VisitStatus } from "../../generated/ten
 import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
 import { AppError } from "../../lib/app-error";
 import { evaluateDebtGate } from "./debt-gate";
+import { notifyAdmins } from "../../services/notify";
 
 class JobTrackerService {
   constructor(private readonly prisma: TenantPrismaClient) {}
@@ -47,6 +48,18 @@ class JobTrackerService {
     if (visit.status === VisitStatus.SKIPPED) return;
     const skipReason = description ? `${reason}: ${description}` : reason;
     await this.prisma.visit.update({ where: { id: visitId }, data: { status: VisitStatus.SKIPPED, skipReason } });
+    // NOTIF-03: the office sees why a visit was skipped. Best effort.
+    await notifyAdmins(this.prisma, {
+      type: "SCHEDULE",
+      title: "Visit skipped",
+      body: skipReason,
+      data: {
+        visitId,
+        propertyId: visit.propertyId,
+        ...(visit.roundId ? { roundId: visit.roundId } : {}),
+        date: visit.date.toISOString().slice(0, 10),
+      },
+    });
   }
 
   // photoPaths: storage paths from POST /photos/upload-url (type ACCESS_ISSUE),
@@ -86,6 +99,13 @@ class JobTrackerService {
         },
       }),
     ]);
+    // NOTIF-03: access problems need the office's attention. Best effort.
+    await notifyAdmins(this.prisma, {
+      type: "ACCESS_ISSUE",
+      title: "Access problem reported",
+      body: `${who}: ${issueType} - ${description.length > 120 ? `${description.slice(0, 117)}...` : description}`,
+      data: { visitId, propertyId: visit.propertyId, ...(visit.roundId ? { roundId: visit.roundId } : {}) },
+    });
     return { id: issue.id };
   }
 
