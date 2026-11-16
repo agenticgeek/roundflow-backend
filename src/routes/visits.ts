@@ -12,6 +12,7 @@ import { createVisitPhotosService } from "../services/visit-photos.service";
 import { createVisitRescheduleService } from "../services/visit-reschedule";
 import { createCarryoverService } from "../services/carryover.service";
 import { parseOptionalDateOnly } from "../lib/validation";
+import { technicianLabel, visitLabel } from "../lib/activity-labels";
 
 export const visitsRouter = Router();
 visitsRouter.use(requireAuth);
@@ -117,7 +118,9 @@ visitsRouter.patch(
     const result = await svc(req).assignVisit(req.params.id, technicianId);
     void createReportsService(req.tenantPrisma!).logActivity(
       "VISIT_ASSIGNED",
-      technicianId ? `Visit ${req.params.id} assigned to technician ${technicianId}` : `Visit ${req.params.id} unassigned`,
+      technicianId
+        ? `Visit for ${await visitLabel(req.tenantPrisma!, req.params.id)} assigned to ${await technicianLabel(req.tenantPrisma!, technicianId)}`
+        : `Visit for ${await visitLabel(req.tenantPrisma!, req.params.id)} unassigned`,
       req.profile?.id,
       req.profile?.role ?? undefined,
     );

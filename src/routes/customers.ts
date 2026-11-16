@@ -35,6 +35,7 @@ import {
   CustomerUpdateInput,
   PropertyAddInput,
 } from "../services/customer.service";
+import { customerLabel } from "../lib/activity-labels";
 
 export const customersRouter = Router();
 customersRouter.use(requireAuth);
@@ -228,7 +229,7 @@ customersRouter.patch(
     void createReportsService(req.tenantPrisma!)
       .logActivity(
         flag ? "CUSTOMER_BAD_DEBT_FLAGGED" : "CUSTOMER_BAD_DEBT_CLEARED",
-        `Customer ${req.params.id} ${flag ? "flagged as" : "cleared of"} bad debt${reason ? `: ${reason}` : ""}`,
+        `Customer ${await customerLabel(req.tenantPrisma!, req.params.id)} ${flag ? "flagged as" : "cleared of"} bad debt${reason ? `: ${reason}` : ""}`,
         req.profile?.id,
         req.profile?.role ?? undefined
       )

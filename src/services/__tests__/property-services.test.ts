@@ -29,6 +29,7 @@ function makeTp(opts: { plans?: Plan[]; after?: Plan[]; catalogue?: unknown[]; p
       updateMany: vi.fn().mockResolvedValue({ count: 2 }),
     },
     activityLog: { create: vi.fn().mockResolvedValue({}) },
+    property: { findUnique: vi.fn().mockResolvedValue({ addressLine: "1 High St", propertyName: null, customer: { name: "Jo Bloggs" } }) },
   };
   const tp: any = {
     property: { findUnique: vi.fn().mockResolvedValue(opts.property === undefined ? { id: "p1", status: "ACTIVE" } : opts.property) },

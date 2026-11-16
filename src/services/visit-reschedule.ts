@@ -7,6 +7,7 @@ import { getCachedBusinessSettings } from "./settings.service";
 import { notifyVisitTechnicians } from "./notify";
 import { closureWarnings, loadActiveClosures } from "./closure-warnings";
 import type { ClosureWarning } from "../lib/closure-types";
+import { visitLabel } from "../lib/activity-labels";
 
 export const ACTIVITY_VISIT_RESCHEDULED = "VISIT_RESCHEDULED";
 
@@ -64,6 +65,7 @@ export function createVisitRescheduleService(prisma: TenantPrismaClient) {
       if (day < today) throw new AppError(400, '"date" must be today or later');
       await assertDayNotClosed(prisma, day);
 
+      const label = await visitLabel(prisma, visitId);
       const from = visit.date.toISOString().slice(0, 10);
       const to = day.toISOString().slice(0, 10);
       await prisma.$transaction(async (tx) => {
@@ -75,7 +77,7 @@ export function createVisitRescheduleService(prisma: TenantPrismaClient) {
         await tx.activityLog.create({
           data: {
             type: ACTIVITY_VISIT_RESCHEDULED,
-            message: `Visit ${visitId} rescheduled from ${from} to ${to}`,
+            message: `Visit for ${label} rescheduled from ${from} to ${to}`,
             actorId: input.actor?.id ?? null,
             actorRole: input.actor?.role ?? null,
             entityId: visitId,

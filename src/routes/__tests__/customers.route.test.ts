@@ -34,7 +34,7 @@ function makeApp(profile: any = { id: "prof1", role: "ADMIN" }) {
   const app = express();
   app.use(express.json());
   app.use((req: any, _res, next) => {
-    req.tenantPrisma = {};
+    req.tenantPrisma = { customer: { findUnique: vi.fn().mockResolvedValue({ name: "Jo Bloggs" }) } };
     req.profile = profile;
     next();
   });
@@ -99,7 +99,7 @@ it("PATCH /customers/:id/bad-debt sets the flag and logs the reason", async () =
   expect(setBadDebt).toHaveBeenCalledWith("c1", true);
   expect(logActivity).toHaveBeenCalledWith(
     "CUSTOMER_BAD_DEBT_FLAGGED",
-    "Customer c1 flagged as bad debt: Moved away",
+    "Customer Jo Bloggs flagged as bad debt: Moved away",
     "prof1",
     "ADMIN"
   );
@@ -111,7 +111,7 @@ it("PATCH /customers/:id/bad-debt clearing without a reason or profile; a loggin
   const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
   const res = await request(makeApp(null)).patch("/customers/c1/bad-debt").send({ flag: false });
   expect(res.status).toBe(200);
-  expect(logActivity).toHaveBeenCalledWith("CUSTOMER_BAD_DEBT_CLEARED", "Customer c1 cleared of bad debt", undefined, undefined);
+  expect(logActivity).toHaveBeenCalledWith("CUSTOMER_BAD_DEBT_CLEARED", "Customer Jo Bloggs cleared of bad debt", undefined, undefined);
   await new Promise((r) => setImmediate(r));
   expect(errSpy).toHaveBeenCalled();
   errSpy.mockRestore();

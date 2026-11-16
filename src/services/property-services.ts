@@ -215,10 +215,15 @@ export function createPropertyServicesService(tp: TenantPrismaClient) {
         const newServices = after.map(snapshot);
         const removed = removedPlans.map((p) => p.serviceId as string);
 
+        const propRow = await tx.property.findUnique({
+          where: { id: propertyId },
+          select: { addressLine: true, propertyName: true, customer: { select: { name: true } } },
+        });
+        const propLabel = [propRow?.customer?.name, propRow?.propertyName ?? propRow?.addressLine].filter(Boolean).join(", ") || "a property";
         await tx.activityLog.create({
           data: {
             type: ACTIVITY_PROPERTY_SERVICES_CHANGED,
-            message: `Services changed on property ${propertyId}: ${[
+            message: `Services changed on property ${propLabel}: ${[
               ...addedIds.map((id) => `+${byId.get(id)!.name}`),
               ...removedPlans.map((p) => `-${p.service?.name ?? p.serviceId}`),
             ].join(", ") || "prices updated"}`,
