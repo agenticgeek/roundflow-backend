@@ -132,7 +132,7 @@ describe("orchestrator: caps", () => {
       answerTurn("<intro>You have 2 skips.</intro><insight>Round 7 was hit and then the answ", 5, "max_tokens"),
     ]);
     const { events, result } = await drain({ provider: s.provider }, inputFor());
-    expect(names(events)).toEqual(["status", "status", "text"]);
+    expect(names(events)).toEqual(["status", "status", "text", "follow_ups"]);
     expect(result.kind).toBe("answered");
     if (result.kind === "answered") expect(result.answer.insights).toEqual([]);
   });

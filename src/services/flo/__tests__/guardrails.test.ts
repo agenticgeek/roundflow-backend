@@ -182,7 +182,7 @@ describe("golden questions through the real pipeline: classified IN_SCOPE, the m
     }));
     const turns = [toolTurn({ id: "t", name: golden.tool }), answerTurn("<intro>There are 4 results.</intro>")];
     const { db, s, events } = await runChat(golden.question, "IN_SCOPE", turns, execute as never);
-    expect(events.map((e) => e.event)).toEqual(["start", "status", "status", "text", "done"]);
+    expect(events.map((e) => e.event)).toEqual(["start", "status", "status", "text", "follow_ups", "done"]);
     expect(execute).toHaveBeenCalledTimes(1);
     expect(execute.mock.calls[0][0]).toBe(golden.tool);
     expect(s.streamCalls.length).toBe(2);

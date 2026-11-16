@@ -177,3 +177,12 @@ describe("resolveScopeOutcome", () => {
     expect(resolveScopeOutcome({ verdict: "CAPABILITY_QUESTION", source: "classifier" })).toMatchObject({ decline: { reason: "CAPABILITY" } });
   });
 });
+
+describe("greetings", () => {
+  it.each(["Hello", "hi", "Hey Flo!", "Good morning", "thanks", "Thank you so much!"])("%s is a GREETING decided without a model call", (m) => {
+    expect(precheck(m)).toEqual({ verdict: "GREETING" });
+  });
+  it("a greeting with a real question is not pre-decided", () => {
+    expect(precheck("Hello, who owes me money?")).toBeNull();
+  });
+});

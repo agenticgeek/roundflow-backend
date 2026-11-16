@@ -8,7 +8,7 @@ import { ctxFor, fakePrisma } from "../tools/__tests__/fake-prisma";
 afterEach(() => vi.restoreAllMocks());
 
 describe("registry allow-list", () => {
-  it("exposes exactly the ten read-only tools (adding a tool is a conscious change to this snapshot)", () => {
+  it("exposes exactly the eleven read-only tools (adding a tool is a conscious change to this snapshot)", () => {
     expect(Object.keys(TOOL_REGISTRY).sort()).toEqual(
       [
         "compare_technicians",
@@ -20,6 +20,7 @@ describe("registry allow-list", () => {
         "list_payments",
         "list_rounds_due",
         "list_skipped_visits",
+        "list_technicians",
         "revenue_summary",
       ]
     );

@@ -17,7 +17,7 @@ import type { DeclineCopy, DeclineReason, Mode, ModeConfig, ProviderClient, Prov
 // for every pre-stream check (plain HTTP errors), then drives `handle.events(signal)` into the SSE writer.
 //
 // Persistence: the user message at prepare time; the assistant message (OK / ERROR / DECLINED / ABORTED) when the
-// pipeline ends. The daily cap is counted from OK rows; the decline cap from DECLINED rows excluding CAPABILITY.
+// pipeline ends. The daily cap is counted from OK rows; the decline cap from DECLINED rows excluding CAPABILITY and GREETING.
 // Idempotency-Key: same pattern as lib/idempotency.ts (insert first, the primary key is the lock), but the stored
 // response is the FINAL MESSAGE, replayed as `start` + `done`.
 
@@ -95,6 +95,7 @@ const DECLINES: Record<string, () => DeclineCopy> = {
   WRITE_REQUEST: () => declineForVerdict("WRITE_REQUEST"),
   UNSAFE: () => declineForVerdict("UNSAFE"),
   CAPABILITY: () => declineForVerdict("CAPABILITY_QUESTION"),
+  GREETING: () => declineForVerdict("GREETING"),
   NO_DATA_USED: declineNoData,
 };
 

@@ -71,11 +71,9 @@ export const RED_TEAM_PROMPTS: readonly RedTeamPrompt[] = [
   r("translation", "OUT_OF_SCOPE", "How do you say window cleaner in German?"),
   r("translation", "OUT_OF_SCOPE", "Translate this paragraph into French for me"),
   // chit chat
-  r("chit_chat", "OUT_OF_SCOPE", "Hi Flo, how are you today?"),
   r("chit_chat", "OUT_OF_SCOPE", "Tell me a joke"),
   r("chit_chat", "OUT_OF_SCOPE", "What is your favourite colour?"),
   r("chit_chat", "OUT_OF_SCOPE", "Are you a real person?"),
-  r("chit_chat", "OUT_OF_SCOPE", "Thanks, you are great"),
   // app how-to
   r("app_how_to", "OUT_OF_SCOPE", "How do I add a new customer in RoundFlow?"),
   r("app_how_to", "OUT_OF_SCOPE", "Where do I change my invoice footer?"),
@@ -166,6 +164,10 @@ export const GOLDEN_QUESTIONS: readonly GoldenQuestion[] = [
   g("list_payments", "Which direct debit payments failed last week?"),
   g("list_payments", "How many cash payments did we take in October?"),
   g("list_payments", "List all pending Stripe payments"),
+  // list_technicians
+  g("list_technicians", "Who are my technicians?"),
+  g("list_technicians", "How many technicians do I have?"),
+  g("list_technicians", "Which technicians cover the Wirral?"),
   // compare_technicians
   g("compare_technicians", "Compare my technicians for October"),
   g("compare_technicians", "Which technician completed the most jobs last month?"),

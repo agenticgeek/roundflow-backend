@@ -102,7 +102,7 @@ describe("usage counters", () => {
     const { tp, counts } = fakeTp("Europe/London", 4);
     expect(await getDeclineCount(tp, "p1", new Date("2026-01-10T12:00:00Z"))).toBe(4);
     expect(counts).toHaveBeenCalledWith({
-      where: { role: "ASSISTANT", status: "DECLINED", declineReason: { not: "CAPABILITY" }, createdAt: { gte: new Date("2026-01-10T00:00:00Z"), lt: new Date("2026-01-11T00:00:00Z") }, conversation: { profileId: "p1" } },
+      where: { role: "ASSISTANT", status: "DECLINED", declineReason: { notIn: ["CAPABILITY", "GREETING"] }, createdAt: { gte: new Date("2026-01-10T00:00:00Z"), lt: new Date("2026-01-11T00:00:00Z") }, conversation: { profileId: "p1" } },
     });
     expect(await getDeclineCount(tp, "p1")).toBe(4);
   });

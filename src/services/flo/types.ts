@@ -70,6 +70,7 @@ export const TOOL_NAMES = [
   "list_debtors",
   "list_payments",
   "compare_technicians",
+  "list_technicians",
   "list_complaints",
   "list_at_risk_customers",
   "revenue_summary",
@@ -159,10 +160,10 @@ export type ProviderErrorCode = "PROVIDER_UNAVAILABLE" | "PROVIDER_TIMEOUT" | "P
 
 // ---- scope gate -------------------------------------------------------------------
 
-export const SCOPE_VERDICTS = ["IN_SCOPE", "OUT_OF_SCOPE", "WRITE_REQUEST", "CAPABILITY_QUESTION", "UNSAFE"] as const;
+export const SCOPE_VERDICTS = ["IN_SCOPE", "OUT_OF_SCOPE", "WRITE_REQUEST", "CAPABILITY_QUESTION", "GREETING", "UNSAFE"] as const;
 export type ScopeVerdict = (typeof SCOPE_VERDICTS)[number];
 
-export type DeclineReason = "OUT_OF_SCOPE" | "WRITE_REQUEST" | "UNSAFE" | "NO_DATA_USED" | "CAPABILITY";
+export type DeclineReason = "OUT_OF_SCOPE" | "WRITE_REQUEST" | "UNSAFE" | "NO_DATA_USED" | "CAPABILITY" | "GREETING";
 
 export interface ScopeDecision {
   verdict: ScopeVerdict;

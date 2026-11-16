@@ -270,11 +270,12 @@ describe("AnswerBuilder", () => {
     );
   });
 
-  it("finishes a clean answer with no warning, no follow-ups and the first result's date range", () => {
+  it("finishes a clean answer with no warning, fallback follow-ups and the first result's date range", () => {
     const { builder } = setup("BALANCED", [techResult({ truncated: true })]);
     builder.accept({ kind: "intro", text: "All good." });
     const { events, answer, warnings } = builder.finish();
-    expect(events).toEqual([]);
+    expect(events).toEqual([{ event: "follow_ups", data: { items: expect.any(Array) } }]);
+    expect(answer.followUps.length).toBeGreaterThan(0);
     expect(warnings).toEqual([]);
     expect(answer).toMatchObject({ introUnverified: false, truncated: true, dateRange: { from: "2026-10-01" } });
   });

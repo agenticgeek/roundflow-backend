@@ -1,3 +1,4 @@
+import { fallbackFollowUps } from "./declines";
 import { createFigureChecker } from "./figure-check";
 import { lintProse, PROSE_LIMITS } from "./prose-lint";
 import type { ParsedElement } from "./stream-parser";
@@ -366,6 +367,8 @@ export class AnswerBuilder {
     const unverified = this.intro.some((p) => p.unverified) || this.insights.some((p) => p.unverified);
     const warnings = unverified ? ["UNVERIFIED_FIGURES"] : [];
     const events: FloEvent[] = [];
+    // The model sometimes writes no follow-ups (or lint rejects them all): never leave the admin at a dead end.
+    if (this.followUps.length === 0) this.followUps = fallbackFollowUps([...new Set(results.map((r) => r.tool))]);
     if (this.followUps.length > 0) events.push({ event: "follow_ups", data: { items: [...this.followUps] } });
     if (unverified) events.push({ event: "warning", data: { code: "UNVERIFIED_FIGURES" } });
     const cited = this.blocks.flatMap((b) => (b.type === "table" ? [this.deps.results.get(b.sourceId)] : []));

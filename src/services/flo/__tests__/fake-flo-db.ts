@@ -37,6 +37,7 @@ function compare(value: any, cond: any, db: FakeFloDb, row: Row): boolean { // e
       if (op === "gte") return value >= (v as Date);
       if (op === "lt") return value < (v as Date);
       if (op === "not") return value !== v;
+      if (op === "notIn") return !(v as unknown[]).includes(value);
       return false;
     });
   }

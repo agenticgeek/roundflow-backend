@@ -18,6 +18,14 @@ const releaseHoldIfSettled = vi.fn();
 vi.mock("../payment-hold", () => ({ releaseHoldIfSettled: (...a: unknown[]) => releaseHoldIfSettled(...a) }));
 
 vi.mock("../notify", async () => (await import("../../test/notify-mock.js")).notifyMockModule());
+vi.mock("../../lib/prisma", () => ({ prisma: { tenant: { findUnique: vi.fn() } } }));
+// Real behaviour by default (bank rows etc.); the Stripe-link test overrides it per call.
+const payInfo = vi.hoisted(() => vi.fn());
+vi.mock("../invoice-payment-info", async (orig) => {
+  const actual = await orig<typeof import("../invoice-payment-info")>();
+  payInfo.mockImplementation((...a: Parameters<typeof actual.invoicePaymentInfo>) => actual.invoicePaymentInfo(...a));
+  return { invoicePaymentInfo: (...a: unknown[]) => payInfo(...a) };
+});
 
 import { createInvoiceService, invoiceWhere } from "../invoice.service";
 import { notifyInvoicePaid } from "../notify";
@@ -375,6 +383,21 @@ describe("A5 sendInvoice", () => {
       const summary = Object.fromEntries(opts.summary);
       expect(summary).toMatchObject({ Invoice: "INV-1", Amount: "£30.00", Due: "2026-11-06", "Payment reference": "INV-1", "Account name": "Coates", "Sort code": "10-20-30", "Account number": "12345678" });
       expect(res).toMatchObject({ messageId: "m1", pdfAttached: true });
+    });
+
+    it("passes the payment link to the email as a button and to the template, and drops the bank rows for a Stripe customer", async () => {
+      const { svc, p } = setup("EMAIL");
+      p.invoice.findUnique.mockResolvedValue({ ...invoice("DRAFT"), customer: { name: "Jo Bloggs", paymentMethod: "STRIPE" } });
+      p.businessSettings.findFirst.mockResolvedValue({ currency: "£", businessName: "Coates Windows", stripeConnected: true, stripeConnectAccountId: "acct_1" });
+      p.messageTemplate.findFirst.mockResolvedValue({ id: "tpl", body: "Hi", subject: "Pay here {{paymentLink}}" });
+      payInfo.mockResolvedValueOnce({ rows: [], cta: { label: "Pay online", url: "https://pay.test/x" } });
+      renderHtmlToPdf.mockResolvedValue(Buffer.from("%PDF"));
+      await svc.sendInvoice("i1");
+      expect(payInfo).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ method: "STRIPE", bank: renderData.business.bank }));
+      const opts = deliver.mock.calls[0][2];
+      expect(opts.cta).toEqual({ label: "Pay online", url: "https://pay.test/x" });
+      expect(opts.subject).toBe("Pay here https://pay.test/x");
+      expect(Object.fromEntries(opts.summary)).not.toHaveProperty("Account name");
     });
 
     it("sends without the PDF when rendering is unavailable and flags it", async () => {

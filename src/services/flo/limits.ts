@@ -71,11 +71,11 @@ export async function getDailyUsage(tp: TenantPrismaClient, now: Date = new Date
   return { used, limit, remaining: Math.max(0, limit - used), resetsAt: end };
 }
 
-/** Declined messages by this admin today (tenant-local day). A CAPABILITY reply ("what can you do?") is not a refusal and does not count. */
+/** Declined messages by this admin today (tenant-local day). A CAPABILITY or GREETING reply ("what can you do?", "hello") is not a refusal and does not count. */
 export async function getDeclineCount(tp: TenantPrismaClient, profileId: string, now: Date = new Date()): Promise<number> {
   const tz = await tenantTimeZone(tp);
   const { start, end } = tenantDayWindow(tz, now);
   return tp.floMessage.count({
-    where: { role: "ASSISTANT", status: "DECLINED", declineReason: { not: "CAPABILITY" }, createdAt: { gte: start, lt: end }, conversation: { profileId } },
+    where: { role: "ASSISTANT", status: "DECLINED", declineReason: { notIn: ["CAPABILITY", "GREETING"] }, createdAt: { gte: start, lt: end }, conversation: { profileId } },
   });
 }

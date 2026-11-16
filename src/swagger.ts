@@ -1046,7 +1046,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
 
   OccurrenceSummary: {
     type: "object",
-    description: "One calendar day's aggregate stats for a round (planner calendar view).",
+    description: "One calendar day's aggregate stats for a round (planner calendar view). May be a forecast (see `projected`).",
     required: ["date", "stopCount", "totalValue", "completedCount", "completionPct", "holdCount", "issueCount", "technicians"],
     properties: {
       date: { type: "string", format: "date", description: "UTC calendar date (YYYY-MM-DD)." },
@@ -1057,6 +1057,14 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       holdCount: { type: "integer" },
       issueCount: { type: "integer" },
       technicians: { type: "array", items: ref("OccurrenceTechnicianRef"), description: "Every distinct technician with ≥ 1 stop on this date, deduped by id." },
+      projected: {
+        type: "boolean",
+        enum: [true],
+        description:
+          "Present (true) only on a forecast entry: the date is projected from the round's frequency, no visits exist yet, stopCount and totalValue are estimates, " +
+          "and technicians is empty. Real entries omit it. Forecasts run up to 13 weeks past the round's next date, at most 4 entries per round in total (real and projected), " +
+          "only for ACTIVE rounds and only inside the requested date window. Display-only: nothing is created.",
+      },
     },
   },
 

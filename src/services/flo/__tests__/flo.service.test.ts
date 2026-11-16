@@ -214,8 +214,8 @@ describe("chat: persistence and event order", () => {
     const { db: db2, s: s2, svc: svc2 } = setup();
     const conv2 = db2.seed.conversation();
     db2.seed.message({ conversationId: conv2.id, role: "ASSISTANT", text: "Starts with assistant", answer: { intro: 5 } });
-    await collect(await chat(svc2, { message: "Hello again", conversationId: conv2.id }));
-    expect(s2.streamCalls[0].messages.map((m) => m.content)).toEqual(["Hello again"]);
+    await collect(await chat(svc2, { message: "What is on today", conversationId: conv2.id }));
+    expect(s2.streamCalls[0].messages.map((m) => m.content)).toEqual(["What is on today"]);
     expect(s2.classifierCalls[0].messages[0].content).not.toContain("previous_answer");
   });
 

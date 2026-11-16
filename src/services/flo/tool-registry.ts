@@ -7,6 +7,7 @@ import { listDebtors } from "./tools/list-debtors";
 import { listPayments } from "./tools/list-payments";
 import { listRoundsDue } from "./tools/list-rounds-due";
 import { listSkippedVisits } from "./tools/list-skipped-visits";
+import { listTechnicians } from "./tools/list-technicians";
 import { revenueSummary } from "./tools/revenue-summary";
 import { MAX_LIMIT, ToolInputError } from "./tools/shared";
 import { TOOL_NAMES, type ToolContext, type ToolDefinition, type ToolName, type ToolOutcome, type ToolResult, type ToolSpec } from "./types";
@@ -27,6 +28,7 @@ export const TOOL_REGISTRY: Readonly<Record<ToolName, AnyTool>> = Object.freeze(
   list_debtors: listDebtors,
   list_payments: listPayments,
   compare_technicians: compareTechnicians,
+  list_technicians: listTechnicians,
   list_complaints: listComplaints,
   list_at_risk_customers: listAtRiskCustomers,
   revenue_summary: revenueSummary,

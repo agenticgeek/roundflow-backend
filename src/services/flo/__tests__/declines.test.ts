@@ -12,7 +12,7 @@ describe("declines (fixed copy)", () => {
     expect(u.text).toBe(o.text);
     expect(u.reason).toBe("UNSAFE");
     expect(OUT_OF_SCOPE_TEXT).toBe(
-      "I can only answer questions about your own RoundFlow data: rounds, jobs, payments, complaints and technicians."
+      "That's outside what I can help with. I'm Flo, and I look things up in your own RoundFlow data: rounds, jobs, payments, complaints and technicians."
     );
   });
 

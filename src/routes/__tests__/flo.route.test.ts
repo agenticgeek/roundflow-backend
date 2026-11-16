@@ -161,7 +161,7 @@ describe("POST /flo/chat: the stream", () => {
     expect(res.status).toBe(200);
     const { frames } = parseSse(res.text);
     expect(frames.map((f) => f.event)).toEqual(["start", "declined", "done"]);
-    expect(frames[1].data).toEqual({ reason: "OUT_OF_SCOPE", text: expect.stringContaining("only answer questions about your own RoundFlow data"), suggestions: expect.any(Array) });
+    expect(frames[1].data).toEqual({ reason: "OUT_OF_SCOPE", text: expect.stringContaining("look things up in your own RoundFlow data"), suggestions: expect.any(Array) });
     expect(frames[2].data.message).toMatchObject({ status: "DECLINED", answer: null });
     expect(s.streamCalls).toHaveLength(0);
   });
