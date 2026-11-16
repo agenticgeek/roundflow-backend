@@ -2735,7 +2735,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     type: "object",
     required: ["id", "role"],
     description:
-      "`role: USER` messages carry `text` and `createdAt`. `role: ASSISTANT` messages carry `mode`, `model`, `status`, `declined`, `answer`, `warnings` (and `errorCode` when ERROR). " +
+      "`role: USER` messages carry `text` and `createdAt`. `role: ASSISTANT` messages carry `mode`, `model`, `status`, `declined`, `answer`, `warnings`, `rating` (and `errorCode` when ERROR). " +
       "The same shape is the `message` of the `done` event.",
     properties: {
       id: { type: "string" },
@@ -2749,6 +2749,30 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       answer: { allOf: [ref("FloAnswer")], nullable: true },
       warnings: { type: "array", items: { type: "string", enum: ["UNVERIFIED_FIGURES"] } },
       errorCode: { type: "string" },
+      rating: { type: "string", enum: ["UP", "DOWN"], nullable: true, description: "ASSISTANT messages only: the admin's thumbs rating, null until rated (POST /flo/messages/{id}/feedback)." },
+    },
+  },
+  FloFeedbackRequest: {
+    type: "object",
+    required: ["rating"],
+    properties: {
+      rating: { type: "string", enum: ["UP", "DOWN"] },
+      comment: { type: "string", maxLength: 500, description: "Optional. Trimmed; an empty comment clears the previous one." },
+    },
+  },
+  FloGapList: {
+    type: "object",
+    required: ["items"],
+    properties: {
+      items: {
+        type: "array",
+        description: "Questions Flo could not answer (NO_DATA_USED), newest first, for the whole business (all admins).",
+        items: {
+          type: "object",
+          required: ["question", "at", "reason"],
+          properties: { question: { type: "string", description: "The admin's own question text (max 500 characters)." }, at: { type: "string", format: "date-time" }, reason: { type: "string", enum: ["NO_DATA_USED"] } },
+        },
+      },
     },
   },
   FloStatus: {
@@ -8884,6 +8908,33 @@ const paths: OpenAPIV3.PathsObject = {
           content: { "application/json": { schema: { allOf: [ref("Error")], properties: { resetsAt: { type: "string", format: "date-time" } } }, example: { error: "Flo has reached today's limit. It resets at midnight.", code: "FLO_DAILY_LIMIT", resetsAt: "2026-11-11T00:00:00.000Z" } } },
         },
         "503": errorResponse("Flo is switched off or has no API key (code FLO_UNAVAILABLE).", "Flo is not switched on for this account."),
+      },
+    },
+  },
+  "/flo/gaps": {
+    get: {
+      tags: ["Flo AI"],
+      summary: "Flo AI: questions Flo could not answer (what to build next)",
+      description:
+        "ADMIN only. The questions Flo declined as `NO_DATA_USED` (no tool could answer, or it answered \"I can't look that up yet\"), newest first, across the whole business. `limit` defaults to 20 and is clamped to 50.",
+      parameters: [{ name: "limit", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 50 }, description: "How many to return, 20 when omitted. Values above the maximum are clamped to it (no error)." }],
+      responses: { "200": jsonResponse("Unanswered questions.", ref("FloGapList")), "400": errorResponse("Bad limit (code INVALID_LIMIT).", "limit must be a positive whole number."), "401": ERR[401], "403": ERR[403] },
+    },
+  },
+  "/flo/messages/{id}/feedback": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    post: {
+      tags: ["Flo AI"],
+      summary: "Flo AI: rate an answer (thumbs up or down)",
+      description:
+        "ADMIN only. Rates one ASSISTANT message in one of the caller's own conversations. Rating again overwrites the earlier rating and comment. The rating then appears as `rating` on the message in `done` and in GET /flo/conversations/{id}.",
+      requestBody: jsonBody(ref("FloFeedbackRequest")),
+      responses: {
+        "204": { description: "Saved." },
+        "400": errorResponse("Missing or invalid rating, or a comment over 500 characters (code INVALID_FEEDBACK).", "rating must be UP or DOWN."),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": errorResponse("Not an ASSISTANT message in one of the caller's conversations (code FLO_MESSAGE_NOT_FOUND).", "Message not found."),
       },
     },
   },

@@ -24,7 +24,10 @@ export const listRoundsDue: ToolDefinition<Args> = {
   label: "Rounds due",
   readOnly: true,
   description:
-    "Rounds with scheduled visits in a date range (YYYY-MM-DD, inclusive, max 366 days) with stop count and total value in pounds. Defaults: today to 6 days ahead. Use for 'which rounds are due next week and what are they worth'.",
+    "Rounds with scheduled visits in a date range (YYYY-MM-DD, inclusive, max 366 days) with stop count and total value in pounds. Defaults: today to 6 days ahead. Use for 'which rounds are due next week and what are they worth'. " +
+    "Do NOT use for what happened on a past day (use get_day_overview), for completed revenue (use revenue_summary) or for per-round performance such as skip rate (use round_performance). " +
+    "Example: {\"from\":\"2026-11-16\",\"to\":\"2026-11-22\",\"limit\":10}. " +
+    "Fields: stops = visits still scheduled or in progress in the range; value = pounds stamped on those visits; firstDate and lastDate = earliest and latest of them; totals add rounds = number of rounds listed. Completed, skipped and cancelled visits are not counted.",
   inputSchema: {
     type: "object",
     properties: {

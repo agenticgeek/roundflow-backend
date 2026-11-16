@@ -215,6 +215,23 @@ const FLO_FILES = [
   "src/services/flo/flo.service.ts",
   "src/services/flo/sse.ts",
   "src/routes/flo.ts",
+  // Flo v2 (2026-11-17): history data summary, 13 new tools and their helpers.
+  "src/services/flo/data-summary.ts",
+  "src/services/flo/tools/e1-helpers.ts",
+  "src/services/flo/tools/e2-helpers.ts",
+  "src/services/flo/tools/get-business-snapshot.ts",
+  "src/services/flo/tools/list-invoices.ts",
+  "src/services/flo/tools/service-plan-health.ts",
+  "src/services/flo/tools/revenue-leakage.ts",
+  "src/services/flo/tools/backlog-and-carryover.ts",
+  "src/services/flo/tools/calculate.ts",
+  "src/services/flo/tools/round-performance.ts",
+  "src/services/flo/tools/technician-workload.ts",
+  "src/services/flo/tools/technician-incidents.ts",
+  "src/services/flo/tools/list-messages-delivery.ts",
+  "src/services/flo/tools/list-issues-photos.ts",
+  "src/services/flo/tools/forecast-schedule.ts",
+  "src/services/flo/tools/closures-and-weather.ts",
 ];
 
 // Business closures (2026-11-16): whole new files, gated at 100% per file. Plan: docs/handoff/backend/2026-11-16-business-closures-backend-plan.md.

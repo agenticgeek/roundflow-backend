@@ -17,7 +17,7 @@ export interface SuggestionGroup {
 
 /** Static suggested questions by area. Served by GET /flo/suggestions and used as the "what can you do" reply. */
 export const SUGGESTION_GROUPS: readonly SuggestionGroup[] = [
-  { area: "Today", items: ["What is on today and who is behind?", "Summarise yesterday"] },
+  { area: "Today", items: ["Give me my morning briefing", "What is on today and who is behind?", "Summarise yesterday"] },
   { area: "Rounds", items: ["Which rounds are due next week and what are they worth?", "Show the skipped visits this week with reasons"] },
   { area: "Money owed", items: ["Who owes me more than £50 and for how long?", "What does Mrs Smith owe?"] },
   { area: "Payments", items: ["Show failed payments this month"] },
@@ -52,6 +52,19 @@ export const FOLLOW_UPS_BY_TOOL: Readonly<Record<string, readonly string[]>> = {
   revenue_summary: ["Compare my technicians for last month", "Who owes me more than £50 and for how long?"],
   list_skipped_visits: ["Which customers skipped twice in a row?", "What is on today and who is behind?"],
   get_customer_summary: ["Show failed payments this month", "Which rounds are due next week and what are they worth?"],
+  get_business_snapshot: ["What is on today and who is behind?", "Where am I losing money?"],
+  list_invoices: ["Who owes me more than £50 and for how long?", "Show failed payments this month"],
+  service_plan_health: ["Which customers are at risk of leaving?", "Which rounds are due next week and what are they worth?"],
+  revenue_leakage: ["Who owes me more than £50 and for how long?", "Show failed payments this month"],
+  backlog_and_carryover: ["Show the skipped visits this week with reasons", "What is on today and who is behind?"],
+  round_performance: ["Which rounds are due next week and what are they worth?", "Compare my technicians for last month"],
+  technician_workload: ["Compare my technicians for last month", "Show technician incidents this quarter"],
+  technician_incidents: ["Compare my technicians for last month", "Show open complaints by severity, oldest first"],
+  list_messages_delivery: ["Show open complaints by severity, oldest first", "Which customers are at risk of leaving?"],
+  list_issues_photos: ["Show open complaints by severity, oldest first", "What is on today and who is behind?"],
+  forecast_schedule: ["Which rounds are due next week and what are they worth?", "Did the weather affect last week's jobs?"],
+  closures_and_weather: ["Show the skipped visits this week with reasons", "Which rounds are due next week and what are they worth?"],
+  calculate: ["Revenue by service area, this month vs last", "Compare my technicians for last month"],
 };
 
 export function fallbackFollowUps(tools: readonly string[], max = 3): string[] {

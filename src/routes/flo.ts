@@ -10,9 +10,9 @@ import { createFloService, type FloServiceDeps } from "../services/flo/flo.servi
 import { floLimiterConfig } from "../services/flo/limits";
 import { streamEvents } from "../services/flo/sse";
 
-// Flo AI (plan 3.6). ADMIN only: the six routes are in ADMIN_ONLY_ROUTES (src/lib/permissions.ts) and enforced here.
+// Flo AI (plan 3.6). ADMIN only: the eight routes are in ADMIN_ONLY_ROUTES (src/lib/permissions.ts) and enforced here.
 // POST /flo/chat answers text/event-stream; every error before the first byte is a normal JSON HTTP error.
-// Literal paths (/status, /suggestions, /conversations) come before the templated /conversations/:id.
+// Literal paths (/status, /suggestions, /gaps, /conversations) come before the templated /conversations/:id.
 
 export interface FloRouterOptions {
   env?: NodeJS.ProcessEnv;
@@ -73,6 +73,26 @@ export function createFloRouter(opts: FloRouterOptions = {}): Router {
 
   // GET /flo/conversations/:id -> { id, title, messages }; another admin's id is 404
   router.get("/conversations/:id", h(async (req, res) => res.json(await service(req).getConversation(req.profile!.id, req.params.id))));
+
+  // GET /flo/gaps?limit= -> { items: [{ question, at, reason }] }: what Flo could not answer, newest first (max 50)
+  router.get(
+    "/gaps",
+    h(async (req, res) => {
+      const { limit } = req.query;
+      const n = limit === undefined ? undefined : Number(limit);
+      if (n !== undefined && (typeof limit !== "string" || !Number.isInteger(n) || n < 1)) throw new AppError(400, "limit must be a positive whole number.", "INVALID_LIMIT");
+      res.json(await service(req).listGaps(n));
+    })
+  );
+
+  // POST /flo/messages/:id/feedback { rating: UP|DOWN, comment? } -> 204; not your assistant message is 404
+  router.post(
+    "/messages/:id/feedback",
+    h(async (req, res) => {
+      await service(req).rateMessage(req.profile!.id, req.params.id, req.body);
+      res.status(204).end();
+    })
+  );
 
   // DELETE /flo/conversations/:id -> 204
   router.delete(

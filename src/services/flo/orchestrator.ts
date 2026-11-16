@@ -1,10 +1,11 @@
 import { ProviderError } from "../../integrations/anthropic/client";
 import { AnswerBuilder, type FinalAnswer, type FloErrorCode, type FloEvent } from "./answer";
+import { buildDataSummary, type DataSummaryEntry } from "./data-summary";
 import { declineNoData } from "./declines";
 import { floTimeoutMs } from "./modes";
 import { resolveScopeOutcome, runScopeGate } from "./scope-gate";
 import { AnswerStreamParser, type ParsedElement } from "./stream-parser";
-import { buildSystemPrompt, type FloContext } from "./system-prompt";
+import { buildSystemParts, type FloContext } from "./system-prompt";
 import { executeTool, isToolName, TOOL_REGISTRY, toolErrorForModel, toolResultForModel, toolSpecs } from "./tool-registry";
 import type {
   DeclineCopy,
@@ -12,6 +13,7 @@ import type {
   ProviderClient,
   ProviderContentBlock,
   ProviderMessage,
+  ProviderRequest,
   ProviderUsage,
   ToolContext,
   ToolOutcome,
@@ -41,7 +43,7 @@ export interface ToolAudit {
 
 export type OrchestratorResult =
   | { kind: "declined"; decline: DeclineCopy; usage: ProviderUsage; toolCalls: ToolAudit[]; model: string | null }
-  | { kind: "answered"; answer: FinalAnswer; warnings: string[]; usage: ProviderUsage; toolCalls: ToolAudit[]; model: string }
+  | { kind: "answered"; answer: FinalAnswer; warnings: string[]; usage: ProviderUsage; toolCalls: ToolAudit[]; model: string; dataSummary: DataSummaryEntry[] }
   | { kind: "failed"; code: FloErrorCode; message: string; retryable: boolean; usage: ProviderUsage; toolCalls: ToolAudit[] }
   | { kind: "aborted"; usage: ProviderUsage; toolCalls: ToolAudit[] };
 
@@ -77,6 +79,16 @@ export const ERROR_COPY: Record<FloErrorCode, { message: string; retryable: bool
 };
 
 class Interrupted extends Error {}
+
+/** Sent to the model for an infrastructure failure (a query error, not bad arguments): retrying only wastes a round. */
+export const INFRA_ERROR_FOR_MODEL =
+  "This lookup failed because of a system problem, not because of your arguments. Do not retry it. Tell the user plainly that this part could not be looked up, and answer from the other data you have.";
+/** Appended to the per-request system text on the last allowed round (tool_choice none), so gathered data is never thrown away. */
+export const FINAL_ROUND_NOTE = "This is your last turn and no more lookups are possible. Answer now from the data you have already gathered, and say plainly what you could not check.";
+
+/** The model's own dead end ("I can't look that up yet.") with nothing else in the answer. */
+const CANT_LOOK_UP = /^\s*i can[’']?t look that up(?: yet)?[.!]?\s*$/i;
+const isCantLookUp = (a: FinalAnswer): boolean => a.blocks.length === 0 && a.insights.length === 0 && CANT_LOOK_UP.test(a.intro);
 
 /** The human label of a registry tool; an unknown tool name is never echoed. */
 const labelOf = (name: string): string => (isToolName(name) ? TOOL_REGISTRY[name].label : "Lookup");
@@ -135,8 +147,10 @@ export async function* runOrchestrator(deps: OrchestratorDeps, input: Orchestrat
   const results = new Map<string, ToolResult>();
   const knownIds = new Set<string>();
   const builder = new AnswerBuilder(mode, { results, knownIds });
-  const system = buildSystemPrompt(input.context, mode);
+  const { stable: system, dynamic: systemDynamic } = buildSystemParts(input.context, mode);
   const tools = toolSpecs();
+  const toolCtx: ToolContext = { ...input.toolCtx, results };
+  let forcedFinal = false;
   const messages: ProviderMessage[] = [...input.history, { role: "user", content: input.message }];
   let counter = 0;
 
@@ -146,20 +160,33 @@ export async function* runOrchestrator(deps: OrchestratorDeps, input: Orchestrat
 
   try {
     for (let round = 0; round < mode.maxRounds; round++) {
+      const last = round === mode.maxRounds - 1;
+      const dynamic = last ? [systemDynamic, FINAL_ROUND_NOTE].filter(Boolean).join("\n\n") : systemDynamic;
+      const request: ProviderRequest = {
+        model: mode.model,
+        system,
+        messages,
+        tools,
+        maxTokens: mode.maxOutputTokens,
+        signal,
+        systemDynamic: dynamic,
+        ...(last ? { toolChoice: "none" as const } : {}),
+        ...(mode.temperature !== undefined ? { temperature: mode.temperature } : {}),
+        ...(mode.thinking !== undefined ? { thinking: mode.thinking } : {}),
+      };
       const parser = new AnswerStreamParser();
       const pending: PendingTool[] = [];
       let content: ProviderContentBlock[] = [];
 
-      for await (const ev of provider.streamMessage({ model: mode.model, system, messages, tools, maxTokens: mode.maxOutputTokens, signal })) {
+      for await (const ev of provider.streamMessage(request)) {
         if (ev.type === "text_delta") {
           // Text is only shown once a tool result exists, and never from a turn that has started calling tools.
           if (results.size > 0 && pending.length === 0) yield* flush(parser.push(ev.text));
         } else if (ev.type === "tool_use") {
+          if (last) continue; // tool_choice is "none" on the last round: a stray call is ignored, never run
           const sourceId = `r${++counter}`;
           yield { event: "status", data: { phase: "checking", tool: ev.name.slice(0, 40), label: labelOf(ev.name) } };
-          const run = execute(ev.name, ev.input, input.toolCtx, sourceId).catch(
-            (): ToolOutcome => ({ ok: false, error: "The lookup failed. Try a narrower question.", ms: 0 })
-          );
+          const run = execute(ev.name, ev.input, toolCtx, sourceId).catch((): ToolOutcome => ({ ok: false, error: INFRA_ERROR_FOR_MODEL, kind: "infrastructure", ms: 0 }));
           pending.push({ id: ev.id, name: ev.name, sourceId, run });
         } else {
           content = ev.content;
@@ -171,9 +198,9 @@ export async function* runOrchestrator(deps: OrchestratorDeps, input: Orchestrat
 
       if (pending.length === 0) {
         yield* flush(parser.end());
+        forcedFinal = last && round > 0;
         break;
       }
-      if (round === mode.maxRounds - 1) return failed("FLO_NO_ANSWER"); // still asking for tools on the last round
 
       const outcomes = await abortable(Promise.all(pending.map((p) => p.run)), signal);
       const resultBlocks: ProviderContentBlock[] = [];
@@ -198,7 +225,7 @@ export async function* runOrchestrator(deps: OrchestratorDeps, input: Orchestrat
         resultBlocks.push({
           type: "tool_result",
           tool_use_id: p.id,
-          content: o.ok ? toolResultForModel(o.result) : toolErrorForModel(o.error),
+          content: o.ok ? toolResultForModel(o.result) : toolErrorForModel(o.kind === "infrastructure" ? INFRA_ERROR_FOR_MODEL : o.error),
           ...(o.ok ? {} : { is_error: true }),
         });
       }
@@ -209,13 +236,21 @@ export async function* runOrchestrator(deps: OrchestratorDeps, input: Orchestrat
   }
 
   if (!builder.hasContent()) {
+    // The forced last turn still produced nothing usable after tools ran: the only case that is a failure, not a decline.
+    if (forcedFinal) return failed("FLO_NO_ANSWER");
     const copy = declineNoData();
     yield decline(copy);
     return { kind: "declined", decline: copy, usage, toolCalls, model: mode.model };
   }
   const done = builder.finish();
+  if (isCantLookUp(done.answer)) {
+    // Same dead end as NO_DATA_USED, so the unanswered-question log (GET /flo/gaps) lists it.
+    const copy = declineNoData();
+    yield decline(copy);
+    return { kind: "declined", decline: copy, usage, toolCalls, model: mode.model };
+  }
   yield* done.events;
-  return { kind: "answered", answer: done.answer, warnings: done.warnings, usage, toolCalls, model: mode.model };
+  return { kind: "answered", answer: done.answer, warnings: done.warnings, usage, toolCalls, model: mode.model, dataSummary: buildDataSummary(results, toolCalls) };
 }
 
 function providerFailure(err: unknown, failed: (code: FloErrorCode, retryable?: boolean) => OrchestratorResult): OrchestratorResult {

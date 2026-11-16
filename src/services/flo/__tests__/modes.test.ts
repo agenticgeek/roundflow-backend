@@ -15,6 +15,15 @@ describe("modes", () => {
     expect([t.label, b.label, q.label]).toEqual(["Thorough", "Balanced", "Quick"]);
   });
 
+  it("caps charts per mode and leaves temperature and thinking unset (the default models reject / already run them)", () => {
+    const [t, b, q] = listModes(env({}));
+    expect([t.maxCharts, b.maxCharts, q.maxCharts]).toEqual([2, 1, 0]);
+    for (const m of [t, b, q]) {
+      expect(m.temperature).toBeUndefined();
+      expect(m.thinking).toBeUndefined();
+    }
+  });
+
   it("env overrides the model id; blank falls back; defaults to process.env", () => {
     expect(getModeConfig("QUICK", env({ FLO_MODEL_QUICK: " my-haiku " })).model).toBe("my-haiku");
     expect(getModeConfig("QUICK", env({ FLO_MODEL_QUICK: "  " })).model).toBe("claude-haiku-5-5");

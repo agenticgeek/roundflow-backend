@@ -66,4 +66,10 @@ describe("list_rounds_due", () => {
     expect(out).toMatchObject({ rows: [], totals: null, truncated: false });
     expect(calls.some((c) => c.path === "round.findMany")).toBe(false);
   });
+
+  it("describes when not to use it, an example and the output fields", () => {
+    expect(listRoundsDue.description).toMatch(/Do NOT use/);
+    expect(listRoundsDue.description).toMatch(/Example: \{/);
+    expect(listRoundsDue.description).toMatch(/Fields:/);
+  });
 });

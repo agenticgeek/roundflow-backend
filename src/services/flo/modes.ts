@@ -19,6 +19,11 @@ const MODE_ENV: Record<Mode, string> = {
   QUICK: "FLO_MODEL_QUICK",
 };
 
+// Sampling and reasoning: temperature and thinking are intentionally NOT set here. The default models (Opus 5.5, Sonnet 5.5,
+// Haiku 5.5) reject non-default temperature with a 400, and already run adaptive thinking (Opus 5.5 and Sonnet 5.5 cannot
+// turn it off). Low-variance data answers therefore come from the prompt and from grounding in tool results. The
+// ModeConfig fields exist so a mode can opt in if the model env override points at a model that accepts them
+// (the client drops temperature for models that reject it).
 const STATIC: Record<Mode, Omit<ModeConfig, "model">> = {
   THOROUGH: {
     key: "THOROUGH",
@@ -30,6 +35,7 @@ const STATIC: Record<Mode, Omit<ModeConfig, "model">> = {
     maxCards: 2,
     maxInsights: 6,
     maxIntroSentences: 2,
+    maxCharts: 2,
   },
   BALANCED: {
     key: "BALANCED",
@@ -41,6 +47,7 @@ const STATIC: Record<Mode, Omit<ModeConfig, "model">> = {
     maxCards: 2,
     maxInsights: 4,
     maxIntroSentences: 2,
+    maxCharts: 1,
   },
   QUICK: {
     key: "QUICK",
@@ -52,6 +59,7 @@ const STATIC: Record<Mode, Omit<ModeConfig, "model">> = {
     maxCards: 1,
     maxInsights: 0,
     maxIntroSentences: 1,
+    maxCharts: 0,
   },
 };
 

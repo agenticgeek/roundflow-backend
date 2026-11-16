@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { listTechnicians } from "../list-technicians";
 import { executeTool } from "../../tool-registry";
 import { ctxFor, fakePrisma } from "./fake-prisma";
 
@@ -29,5 +30,11 @@ describe("list_technicians", () => {
     expect(out.ok && out.result.rows).toEqual([]);
     expect((calls.find((c) => c.path === "technician.findMany")?.args as { where: unknown }).where).toEqual({ active: true });
     expect((await executeTool("list_technicians", { status: "x" }, ctxFor(tp), "r2")).ok).toBe(false);
+  });
+
+  it("describes when not to use it, an example and the output fields", () => {
+    expect(listTechnicians.description).toMatch(/Do NOT use/);
+    expect(listTechnicians.description).toMatch(/Example: \{/);
+    expect(listTechnicians.description).toMatch(/Fields:/);
   });
 });

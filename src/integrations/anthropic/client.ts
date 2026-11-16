@@ -98,18 +98,41 @@ function toUsage(usage: RawUsage | undefined, base?: ProviderUsage): ProviderUsa
   };
 }
 
+// Models that reject non-default sampling parameters (400): the 5.x families, Fable/Mythos and Opus 4.7/4.8.
+const SAMPLING_REJECTED = /fable|mythos|(?:opus|sonnet|haiku)-5(?:-\d+)?$|opus-4-[78]/;
+
+/** True when the model id accepts a `temperature` value. */
+export function supportsTemperature(model: string): boolean {
+  return !SAMPLING_REJECTED.test(model);
+}
+
 function buildParams(req: ProviderRequest): Record<string, unknown> {
   const cache = req.cache !== false;
+  const dynamic = req.systemDynamic?.trim() ? req.systemDynamic : undefined;
+  // Block 1 is the stable prefix with the cache breakpoint; block 2 (mode guidance, dates) is deliberately UNCACHED so a
+  // new day or mode never invalidates the stable block.
+  let system: unknown;
+  if (cache) {
+    system = [{ type: "text", text: req.system, cache_control: { type: "ephemeral" } }, ...(dynamic ? [{ type: "text", text: dynamic }] : [])];
+  } else {
+    system = dynamic ? [{ type: "text", text: req.system }, { type: "text", text: dynamic }] : req.system;
+  }
   const params: Record<string, unknown> = {
     model: req.model,
     max_tokens: req.maxTokens,
-    system: cache ? [{ type: "text", text: req.system, cache_control: { type: "ephemeral" } }] : req.system,
+    system,
     messages: req.messages,
   };
   if (req.tools && req.tools.length > 0) {
     const last = req.tools.length - 1;
     params.tools = req.tools.map((t, i) => (cache && i === last ? { ...t, cache_control: { type: "ephemeral" } } : t));
+    // tool_choice "none" keeps the tool definitions in the request (so the cached tools+system prefix stays identical)
+    // and only stops the model calling them. It is only valid when tools are present.
+    if (req.toolChoice === "none") params.tool_choice = { type: "none" };
   }
+  if (req.temperature !== undefined && supportsTemperature(req.model)) params.temperature = req.temperature;
+  // Adaptive thinking is the only on-mode on current models; the API rejects budget_tokens there.
+  if (req.thinking) params.thinking = { type: "adaptive" };
   return params;
 }
 

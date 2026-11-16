@@ -24,7 +24,10 @@ export const listTechnicians: ToolDefinition<Args> = {
   label: "Technician roster",
   readOnly: true,
   description:
-    "The list of technicians the business has: name, role, active or inactive, how many rounds each is assigned to and their service areas. Use for 'who are my technicians', 'how many technicians do I have' and 'who is on which round'. This is the roster and does not depend on any date range. For performance or revenue use compare_technicians. status defaults to ACTIVE; use ALL to include inactive technicians.",
+    "The list of technicians the business has: name, role, active or inactive, how many rounds each is assigned to and their service areas. Use for 'who are my technicians', 'how many technicians do I have' and 'who is on which round'. This is the roster and does not depend on any date range. For performance or revenue use compare_technicians. status defaults to ACTIVE; use ALL to include inactive technicians. " +
+    "Do NOT use for jobs, revenue, skips or complaints (use compare_technicians) or for who is off or free next week (use technician_workload). " +
+    "Example: {\"status\":\"ALL\"}. " +
+    "Fields: rounds = number of rounds the technician is assigned to; serviceAreas = comma-separated area names; status is Active or Inactive; totals.technicians = how many are listed.",
   inputSchema: {
     type: "object",
     properties: { status: { type: "string", enum: [...STATUSES], description: "Default ACTIVE" } },

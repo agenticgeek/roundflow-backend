@@ -202,6 +202,41 @@ export const GOLDEN_QUESTIONS: readonly GoldenQuestion[] = [
   g("get_customer_summary", "Give me a summary of customer Hannah Cole"),
 ] as const;
 
+/**
+ * Golden in-scope questions for the Flo AI v2 tools. `tool` is a plain string because TOOL_NAMES is extended by the
+ * integrator; once it is, merge this list into GOLDEN_QUESTIONS (guardrails.test.ts requires GOLDEN to cover TOOL_NAMES exactly).
+ */
+export interface NewToolGoldenQuestion {
+  question: string;
+  tool: string;
+}
+
+const n = (tool: string, question: string): NewToolGoldenQuestion => ({ question, tool });
+
+export const NEW_TOOL_GOLDEN_QUESTIONS: readonly NewToolGoldenQuestion[] = [
+  n("get_business_snapshot", "Give me my morning briefing"),
+  n("get_business_snapshot", "How are we doing this month?"),
+  n("list_invoices", "Which invoices are still unpaid and how old are they?"),
+  n("list_invoices", "Show me the invoices we sent last week"),
+  n("service_plan_health", "Which service plans are about to lapse?"),
+  n("service_plan_health", "Is anyone about to leave us?"),
+  n("revenue_leakage", "Where am I losing money?"),
+  n("revenue_leakage", "How much work did we skip without billing this quarter?"),
+  n("backlog_and_carryover", "How big is my backlog of carried over visits?"),
+  n("backlog_and_carryover", "Which visits were moved from their original date last week?"),
+  n("round_performance", "How is Round 7 performing compared with the others?"),
+  n("technician_workload", "Is any technician carrying too much work this week?"),
+  n("technician_incidents", "Has any technician had a strike or caused damage this year?"),
+  n("technician_incidents", "Who sold the most upsells last month?"),
+  n("list_messages_delivery", "Did the reminder messages we sent yesterday get delivered?"),
+  n("list_issues_photos", "Show the issues reported with photos this week"),
+  n("forecast_schedule", "How much work do we have booked over the next four weeks?"),
+  n("closures_and_weather", "Did the weather affect last week's jobs?"),
+  n("closures_and_weather", "Which visits were rained off this month?"),
+  n("calculate", "What percentage of this month's revenue came from Round 3?"),
+  n("calculate", "What is the average revenue per technician last month?"),
+] as const;
+
 /** Questions that ask what Flo can do. A correct classifier answers CAPABILITY_QUESTION (served from fixed data). */
 export const CAPABILITY_QUESTIONS: readonly string[] = [
   "What can you do?",

@@ -1085,6 +1085,11 @@ model FloMessage {
   status         FloMessageStatus @default(OK)
   declineReason  String?
   errorCode      String?
+  // Flo v2 (2026-11-17): thumbs rating from the admin ("UP" | "DOWN"), an optional comment, and the compact summary of the
+  // data an answer was built from (replayed as untrusted history on the next turn).
+  rating         String?
+  ratingComment  String?
+  dataSummary    Json?
   createdAt      DateTime         @default(now()) @db.Timestamptz
 
   @@index([conversationId, createdAt])

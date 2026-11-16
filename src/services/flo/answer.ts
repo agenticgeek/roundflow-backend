@@ -45,7 +45,24 @@ export interface TableBlock {
   link?: FloLink;
 }
 
-export type AnswerBlock = CardsBlock | TableBlock;
+export interface ChartAxis {
+  key: string;
+  label: string;
+  format: ColumnFormat;
+}
+
+export interface ChartBlock {
+  type: "chart";
+  kind: "bar" | "line";
+  title: string;
+  sourceId: string;
+  x: ChartAxis;
+  series: ChartAxis[];
+  rows: Array<Record<string, AnswerCell>>;
+  link?: FloLink;
+}
+
+export type AnswerBlock = CardsBlock | TableBlock | ChartBlock;
 
 export interface AnswerInsight {
   text: string;
@@ -240,11 +257,99 @@ function buildTable(raw: Record<string, unknown>, ctx: BuildContext): BuildOutco
   return { ok: true, block };
 }
 
+const MAX_CHART_ROWS = 24;
+const MAX_CHART_SERIES = 3;
+const NUMERIC_FORMATS: readonly ColumnFormat[] = ["integer", "currency", "percent"];
+
+function buildChart(raw: Record<string, unknown>, ctx: BuildContext): BuildOutcome {
+  const result = typeof raw.sourceId === "string" ? ctx.results.get(raw.sourceId) : undefined;
+  if (!result) return { ok: false, reason: "UNKNOWN_SOURCE" };
+  const ys = Array.isArray(raw.y) && raw.y.every((k) => typeof k === "string") ? (raw.y as string[]) : [];
+  if ((raw.kind !== "bar" && raw.kind !== "line") || typeof raw.x !== "string") return { ok: false, reason: "INVALID" };
+  if (ys.length === 0 || ys.length > MAX_CHART_SERIES || new Set(ys).size !== ys.length || ys.includes(raw.x)) return { ok: false, reason: "INVALID" };
+  const x = result.columns.find((c) => c.key === raw.x);
+  const series = ys.map((k) => result.columns.find((c) => c.key === k));
+  if (!x || series.some((c) => !c)) return { ok: false, reason: "UNKNOWN_COLUMN" };
+  const ySeries = series as ResultColumn[];
+  if (ySeries.some((c) => !NUMERIC_FORMATS.includes(c.format))) return { ok: false, reason: "INVALID" };
+  if (result.rows.length === 0) return { ok: false, reason: "EMPTY" };
+  const title = typeof raw.title === "string" ? lintProse(raw.title, "follow_up") : null;
+  const axis = (c: ResultColumn): ChartAxis => ({ key: c.key, label: c.label, format: c.format });
+  const block: ChartBlock = {
+    type: "chart",
+    kind: raw.kind,
+    title: title?.ok ? title.text : result.label,
+    sourceId: result.sourceId,
+    x: axis(x),
+    series: ySeries.map(axis),
+    rows: result.rows.slice(0, MAX_CHART_ROWS).map((r) => project(r, [x.key, ...ys])),
+  };
+  const link = buildLink(raw.link, ctx.isKnownId);
+  if (link) block.link = link;
+  return { ok: true, block };
+}
+
+/** The screen a result's tool belongs to (spec "Auto deep links"). Unmapped tools get no automatic link. */
+const AUTO_LINK_SCREEN: Record<string, LinkScreen> = {
+  list_debtors: "DEBT_PAYMENT",
+  list_complaints: "COMPLAINTS",
+  compare_technicians: "TECHNICIANS",
+  list_technicians: "TECHNICIANS",
+  technician_workload: "TECHNICIANS",
+  technician_incidents: "TECHNICIANS",
+  revenue_summary: "REPORTS",
+  revenue_leakage: "REPORTS",
+  get_business_snapshot: "REPORTS",
+  list_invoices: "INVOICES",
+  get_day_overview: "TODAYS_WORK",
+  list_skipped_visits: "TODAYS_WORK",
+  backlog_and_carryover: "TODAYS_WORK",
+  round_performance: "ROUND",
+  list_rounds_due: "ROUND",
+  forecast_schedule: "ROUND",
+  get_customer_summary: "CUSTOMERS",
+  list_at_risk_customers: "CUSTOMERS",
+  service_plan_health: "CUSTOMERS",
+  list_messages_delivery: "CUSTOMERS",
+  list_issues_photos: "TODAYS_WORK",
+  closures_and_weather: "ROUND",
+};
+
+/** The default link for a block built from `result`. Only a single-day result passes `date` (the one param that is safe to derive). */
+export function autoLink(result: ToolResult): FloLink | undefined {
+  const screen = own(AUTO_LINK_SCREEN, result.tool) ? AUTO_LINK_SCREEN[result.tool] : undefined;
+  if (!screen) return undefined;
+  const day = result.dateRange && result.dateRange.from === result.dateRange.to && DATE_RE.test(result.dateRange.from) ? result.dateRange.from : null;
+  return screen === "TODAYS_WORK" && day ? { screen, params: { date: day } } : { screen };
+}
+
+function withAutoLink(outcome: BuildOutcome, ctx: BuildContext): BuildOutcome {
+  if (!outcome.ok || outcome.block.type === "cards" || outcome.block.link) return outcome;
+  const link = autoLink(ctx.results.get(outcome.block.sourceId) as ToolResult);
+  if (link) outcome.block.link = link;
+  return outcome;
+}
+
+/** Cards carry no sourceId of their own: the link comes from the first item's source that exists. */
+function withCardsLink(outcome: BuildOutcome, raw: Record<string, unknown>, ctx: BuildContext): BuildOutcome {
+  if (!outcome.ok || outcome.block.type !== "cards" || outcome.block.link) return outcome;
+  for (const item of raw.items as unknown[]) {
+    const result = isRecord(item) && typeof item.sourceId === "string" ? ctx.results.get(item.sourceId) : undefined;
+    const link = result ? autoLink(result) : undefined;
+    if (link) {
+      outcome.block.link = link;
+      break;
+    }
+  }
+  return outcome;
+}
+
 /** Validates a `<block>` JSON object and builds the block from stored results. Never trusts a model-supplied value. */
 export function buildBlock(raw: unknown, ctx: BuildContext): BuildOutcome {
   if (!isRecord(raw)) return { ok: false, reason: "INVALID" };
-  if (raw.type === "cards") return buildCards(raw, ctx);
-  if (raw.type === "table") return buildTable(raw, ctx);
+  if (raw.type === "cards") return withCardsLink(buildCards(raw, ctx), raw, ctx);
+  if (raw.type === "table") return withAutoLink(buildTable(raw, ctx), ctx);
+  if (raw.type === "chart") return withAutoLink(buildChart(raw, ctx), ctx);
   return { ok: false, reason: "INVALID" };
 }
 
@@ -271,6 +376,7 @@ export class AnswerBuilder {
   private followUps: string[] = [];
   private tables = 0;
   private cards = 0;
+  private charts = 0;
   private checker: ((s: string) => { ok: boolean }) | null = null;
   private checkerSize = -1;
   /** Elements rejected by lint, validation or mode limits (audit only). */
@@ -320,13 +426,17 @@ export class AnswerBuilder {
       return [];
     }
     const type = isRecord(raw) ? raw.type : undefined;
-    const withinLimit = type === "table" ? this.tables < this.mode.maxTables : type === "cards" ? this.cards < this.mode.maxCards : true;
+    // `maxCharts` is added to ModeConfig by the prompts agent; until then a mode without it allows no charts.
+    const maxCharts = (this.mode as ModeConfig & { maxCharts?: number }).maxCharts ?? 0;
+    const withinLimit =
+      type === "table" ? this.tables < this.mode.maxTables : type === "cards" ? this.cards < this.mode.maxCards : type === "chart" ? this.charts < maxCharts : true;
     const built = withinLimit ? buildBlock(raw, { results: this.deps.results, isKnownId: this.isKnownId, figuresOk: this.figuresOk }) : null;
     if (!built || !built.ok) {
       this.rejected++;
       return [];
     }
     if (built.block.type === "table") this.tables++;
+    else if (built.block.type === "chart") this.charts++;
     else this.cards++;
     this.blocks.push(built.block);
     return [{ event: "block", data: { index: this.blocks.length - 1, block: built.block } }];
@@ -371,7 +481,7 @@ export class AnswerBuilder {
     if (this.followUps.length === 0) this.followUps = fallbackFollowUps([...new Set(results.map((r) => r.tool))]);
     if (this.followUps.length > 0) events.push({ event: "follow_ups", data: { items: [...this.followUps] } });
     if (unverified) events.push({ event: "warning", data: { code: "UNVERIFIED_FIGURES" } });
-    const cited = this.blocks.flatMap((b) => (b.type === "table" ? [this.deps.results.get(b.sourceId)] : []));
+    const cited = this.blocks.flatMap((b) => (b.type !== "cards" ? [this.deps.results.get(b.sourceId)] : []));
     const dateRange = [...cited, ...results].find((r) => r?.dateRange)?.dateRange ?? undefined;
     const answer: FinalAnswer = {
       intro: this.intro.map((p) => p.text).join(" "),

@@ -28,6 +28,11 @@
 > `/flo/*` routes, the scope gate and guardrails, the ten lookup tools, the streamed answer pipeline, two new tenant
 > tables and the `FLO_FILES` coverage gate (§22, §12, §16). Handoffs:
 > `docs/handoff/backend/2026-11-10-flo-ai-backend.md` and `docs/handoff/frontend/2026-11-10-flo-ai-frontend-contract.md`.
+>
+> **2026-11-17 update (Flo AI v2):** 24 tools (13 new), derived metrics computed on the server, a `calculate` tool,
+> charts, auto deep links, answer feedback, an unanswered-question log, follow-up memory, a forced final answer and a
+> reworked prompt (§22.9). One new tenant migration (§12). Handoffs: `docs/handoff/backend/2026-11-17-flo-ai-v2-backend.md`
+> and `docs/handoff/frontend/2026-11-17-flo-ai-v2-frontend-contract.md`.
 
 ## 1. Overview
 
@@ -791,6 +796,7 @@ it everywhere.
 | `20261108110000_email_identity_delivery` | Wave 2B-2 (§21): `EmailDomainStatus` and `MessageDeliveryStatus` enums; `BusinessSettings.email*` identity/limits/pause, `logoPath`, `logoAltText`, `brandColour`; `Message.deliveryStatus/deliveryUpdatedAt/deliveryError` + index on `externalId`; `Customer.emailInvalidAt`; one-off cleanup parking GHL-only outbox rows of tenants without GHL as `dropped`. |
 
 | `20261110100000_flo_ai` | Flo AI (§22): new tables `FloConversation` (per admin profile) and `FloMessage` (role, mode, model, text, answer JSON, tool-call audit, token counts, duration, status `OK/ERROR/DECLINED/ABORTED`, decline reason, error code) with indexes on `(profileId, updatedAt)` and `(conversationId, createdAt)`. Additive and idempotent. |
+| `20261117100000_flo_feedback` | Flo AI v2 (§22.9): `FloMessage.rating`, `ratingComment` and `dataSummary` (JSONB), all `ADD COLUMN IF NOT EXISTS`. Not applied by the build; ships with the normal tenant migration run. |
 
 The three 2026-10-30 migrations are additive (new enum values, nullable columns, new tables). They are paired with idempotent, per-tenant backfill scripts that support `--dry-run`: `scripts/backfill-visit-technicians.ts`, `backfill-next-due-date.ts` and `backfill-completed-steps.ts`, with their logic in `src/jobs/backfills.ts`. Run them after the deploy has migrated the tenants, dry-run first.
 
@@ -1052,7 +1058,7 @@ Three gates run in CI and locally. They exist so this class of problem is caught
 
 Also: openapi-typescript marks any schema field that has a `default` as *required* in the generated frontend and app types, so optional request fields must not carry a swagger `default` (describe it in the text instead).
 
-**Flo AI gate (2026-11-10).** `FLO_FILES` in `vitest.config.ts` lists every Flo file (`services/flo/*`, `services/flo/tools/*`, `integrations/anthropic/client.ts`, `routes/flo.ts`, `jobs/floPurge.ts`) at 100% line, branch, function and statement coverage per file. `bootstrap.ts`, `swagger.ts`, `permissions.ts` and `rate-limit.ts` stay at 100% with the Flo changes. Guardrail fixtures (`services/flo/__tests__/guardrails.fixtures.ts`: 75 red-team prompts, 43 golden questions, 3 capability questions) run through the real pipeline in unit tests. A live-API eval with pass thresholds (all red-team prompts declined with no tool call, at least 95% of golden questions answered correctly) is planned but **not yet written or run**.
+**Flo AI gate (2026-11-10).** `FLO_FILES` in `vitest.config.ts` lists every Flo file (`services/flo/*`, `services/flo/tools/*`, `integrations/anthropic/client.ts`, `routes/flo.ts`, `jobs/floPurge.ts`) at 100% line, branch, function and statement coverage per file. `bootstrap.ts`, `swagger.ts`, `permissions.ts` and `rate-limit.ts` stay at 100% with the Flo changes. Guardrail fixtures (`services/flo/__tests__/guardrails.fixtures.ts`: 75 red-team prompts, 43 golden questions, 3 capability questions) run through the real pipeline in unit tests. As of 2026-11-17 the list also holds `data-summary.ts`, the 13 v2 tools and their two helper files (`e1-helpers.ts`, `e2-helpers.ts`), all at 100% per file. A live-API eval with pass thresholds (all red-team prompts declined with no tool call, at least 95% of golden questions answered correctly) is planned but **not yet written or run**.
 
 **End-to-end regression suite.** `roundflow-e2e/` (a sibling folder, not part of this package) runs one Playwright spec per audit gap against a local Docker Postgres, a locally started backend (port 3100) and web app (port 5173). The integration gaps use real Stripe test-mode, GoCardless sandbox and GHL sandbox credentials. It creates a fresh tenant per run and deletes the test users afterwards. Its first runs found a real defect: `GET /settings/stripe/callback` returned 500 when Stripe rejected a code. It is now `400 STRIPE_CONNECT_FAILED` or `502 STRIPE_UNAVAILABLE` (defect D-11).
 
@@ -1300,13 +1306,14 @@ An AI assistant in the admin web app ("Flo AI", from `FloAI.pdf`). The admin ask
 
 | Path | Role |
 |---|---|
-| `src/routes/flo.ts` | The six endpoints; ADMIN-only; per-profile rate limiter |
+| `src/routes/flo.ts` | The eight endpoints (22.7); ADMIN-only; per-profile rate limiter |
 | `src/services/flo/flo.service.ts` | Conversations, history, caps, idempotency, persistence; runs the orchestrator as an event generator |
 | `src/services/flo/orchestrator.ts` | Scope gate, tool loop, streamed answer, abort and failure handling |
 | `src/services/flo/scope-gate.ts`, `declines.ts` | Pre-checks, Haiku classifier (fails closed), fixed decline and capability copy |
-| `src/services/flo/tool-registry.ts`, `tools/*` | Ten read-only lookups with fixed column lists |
+| `src/services/flo/tool-registry.ts`, `tools/*` | 24 read-only lookups with fixed column lists (22.6, 22.9) |
 | `src/services/flo/answer.ts`, `stream-parser.ts` | Block builders and the incremental parser for the tagged answer |
 | `src/services/flo/figure-check.ts`, `prose-lint.ts` | Per-sentence number grounding and text lint |
+| `src/services/flo/data-summary.ts` | Compact data summary stored per answered turn and replayed as fenced history (22.9) |
 | `src/services/flo/system-prompt.ts`, `modes.ts`, `limits.ts`, `sse.ts`, `types.ts` | Prompt and tenant context, mode config, caps, SSE writer, shared types |
 | `src/integrations/anthropic/client.ts` | Injectable wrapper over `@anthropic-ai/sdk` (pinned 1.3.0): streaming, timeout, one retry before the first byte, error mapping |
 | `src/jobs/floPurge.ts` | Nightly (`30 3 * * *`) purge by `FLO_RETENTION_DAYS` (90) through the tenant fan-out |
@@ -1316,7 +1323,7 @@ An AI assistant in the admin web app ("Flo AI", from `FloAI.pdf`). The admin ask
 1. HTTP checks before any byte is sent (plain JSON errors): auth, admin, validation, rate limit, daily cap, decline cap, `Idempotency-Key` (claimed as `flo:<profileId>:<key>`; a replay streams the stored result).
 2. The stream opens (`text/event-stream`, `no-transform`, `X-Accel-Buffering: no`, a `: ping` every 15 s).
 3. **Scope gate.** Not `IN_SCOPE` means no main-model call and no tool run.
-4. **Tool loop** with history of the last 10 turns (assistant turns stored as final text only). Tool results are returned to the model wrapped as untrusted data. Caps: 8, 6 and 3 rounds for Thorough, Balanced and Quick, tokens per call, 90 s total.
+4. **Tool loop** with history of the last 10 turns (assistant turns are their text plus a fenced `<previous_data>` summary, 22.9). Tool results are returned to the model wrapped as untrusted data. Caps: 8, 6 and 3 rounds for Thorough, Balanced and Quick, tokens per call, 90 s total.
 5. **Streamed answer** in a closed tag grammar (`intro`, `block` JSON, `insight`, `follow_up`). Text outside the tags is discarded.
 6. Persist, then `done`. A client disconnect aborts the provider call and persists ABORTED.
 
@@ -1334,12 +1341,40 @@ Known limit: model text before a `tool_use` in the same turn is released once to
 
 ### 22.6 Tools
 
-`get_day_overview`, `list_rounds_due`, `list_debtors`, `list_payments`, `compare_technicians`, `list_complaints`, `list_at_risk_customers`, `revenue_summary`, `list_skipped_visits`, `get_customer_summary`. Money is decimal GBP rounded to 2 dp; `percent` columns hold percentages. Rows are capped at 200 and date ranges at 366 days; the tenant client comes from the request, never an id from the model. Several use small direct queries because the existing services could not provide the shape (the Today service handles only "today"; `listComplaints` cannot sort by severity). A new tool needs: a file, a registry entry (the allow-list snapshot test fails until updated on purpose), the no-write and no-secrets tests, a golden fixture, and a place in `FLO_FILES`.
+`get_day_overview`, `list_rounds_due`, `list_debtors`, `list_payments`, `compare_technicians`, `list_technicians`, `list_complaints`, `list_at_risk_customers`, `revenue_summary`, `list_skipped_visits`, `get_customer_summary`, plus the v2 set `get_business_snapshot`, `list_invoices`, `service_plan_health`, `revenue_leakage`, `backlog_and_carryover`, `round_performance`, `technician_workload`, `technician_incidents`, `list_messages_delivery`, `list_issues_photos`, `forecast_schedule`, `closures_and_weather` and `calculate` (24 in all). Money is decimal GBP rounded to 2 dp; `percent` columns hold percentages. Rows are capped at 200 and date ranges at 366 days; the tenant client comes from the request, never an id from the model. Several use small direct queries because the existing services could not provide the shape (the Today service handles only "today"; `listComplaints` cannot sort by severity). A new tool needs: a file, a registry entry (the allow-list snapshot test fails until updated on purpose), the no-write and no-secrets tests, a golden fixture, and a place in `FLO_FILES`.
 
 ### 22.7 Endpoints and data
 
-`GET /flo/status`, `GET /flo/suggestions`, `POST /flo/chat` (SSE), `GET /flo/conversations`, `GET /flo/conversations/{id}`, `DELETE /flo/conversations/{id}` (204). Conversations belong to the admin profile that created them (others get 404). SSE events: `start`, `status`, `block`, `text`, `follow_ups`, `declined`, `warning`, `done`, `error` (shapes in the frontend contract). The daily cap is counted from `FloMessage` rows with status OK in the tenant-local day; the decline cap from DECLINED rows (capability replies excluded). Errors after the first byte are `error` events (`FLO_PROVIDER_ERROR`, `FLO_TIMEOUT`, `FLO_NO_ANSWER`, `FLO_INTERNAL_ERROR`).
+`GET /flo/status`, `GET /flo/suggestions`, `POST /flo/chat` (SSE), `GET /flo/conversations`, `GET /flo/conversations/{id}`, `DELETE /flo/conversations/{id}` (204), and from v2 `POST /flo/messages/{id}/feedback` (204) and `GET /flo/gaps`. Conversations belong to the admin profile that created them (others get 404). SSE events: `start`, `status`, `block`, `text`, `follow_ups`, `declined`, `warning`, `done`, `error` (shapes in the frontend contract). The daily cap is counted from `FloMessage` rows with status OK in the tenant-local day; the decline cap from DECLINED rows (capability replies excluded). Errors after the first byte are `error` events (`FLO_PROVIDER_ERROR`, `FLO_TIMEOUT`, `FLO_NO_ANSWER`, `FLO_INTERNAL_ERROR`).
 
 ### 22.8 Operations and open items
 
 Env vars: `ANTHROPIC_API_KEY` (recommended; unset disables Flo, 503 `FLO_UNAVAILABLE`), `ANTHROPIC_BASE_URL`, `FLO_ENABLED` (kill switch), `FLO_MODEL_THOROUGH/_BALANCED/_QUICK/_SCOPE`, `FLO_DAILY_LIMIT_PER_TENANT`, `FLO_DECLINE_LIMIT_PER_DAY`, `RATE_LIMIT_FLO_PER_MIN` (20, per profile), `FLO_TIMEOUT_MS` (90000), `FLO_RETENTION_DAYS`. As of 2026-11-10 these were **not yet done**: the live-API eval (the system and classifier prompts are untuned first drafts), a check that the stream is not buffered on the deployed AWS path, a run of the web app against this backend, a cumulative token cap across tool rounds (only per-call caps exist), and e2e scenarios (deferred by the owner). The app's generated `types.gen.ts` was left unchanged because it was already stale for unrelated reasons.
+
+### 22.9 Flo AI v2: decisions taken (2026-11-17)
+
+Why: an audit (`docs/FLO_AI_AUDIT_2026-11-17.md`) found the trust model strong but the insight thin. Build contracts: `docs/FLO_AI_V2_BUILD_SPEC.md`. Handoffs: `docs/handoff/backend/2026-11-17-flo-ai-v2-backend.md`, `docs/handoff/frontend/2026-11-17-flo-ai-v2-frontend-contract.md`.
+
+**Arithmetic: the model never calculates, the server does.** Rule 6 of the prompt now says so. Three layers, in order of preference: (1) tools return derived fields in rows and totals (rates, deltas, shares, averages), so most questions need no calculation; (2) a `calculate` tool does fixed operations (`sum`, `difference`, `percent_change`, `percent_of`, `ratio`, `average`, `rank`) over references to stored results (`sourceId` plus a path), with no expression strings and no `eval`, so nothing the model types is ever evaluated; (3) the figure check also accepts a number that equals the sum, difference, ratio or percent of any two known result values. Anything else is still flagged `unverified`. This keeps "the AI explains the numbers, it does not invent them" true. `ToolContext.results` gives a tool the live results of the current request.
+
+**Headline totals must be exact.** Tools use database aggregates (`groupBy`, `aggregate`, `count`) for totals instead of summing a capped row scan, so "total owed" is right even when the list is truncated. Where a filter forces a scan, the description says the totals describe the scanned rows and `truncated` stays honest.
+
+**Reads only, still enforced by the registry.** The 13 new tools follow the same rules: fixed columns, no secrets, provider ids, notes or message bodies, each with a no-write run and a no-secrets check. The cross-tool safety test covers the original eleven in one fake world; the v2 tools carry their own tests beside their code. Weather holds are read from the activity log rows the weather-hold service writes (never the log message). There is no "damage" photo type in the schema, so photo questions cover review status, access issues and complaint photos.
+
+**Prompt design.** A stable cached prefix (role, rules, glossary, seven worked examples, routing for all tools, multi-tool recipes, answer grammar) and a small uncached dynamic block (mode guidance, date anchors, context) sent as a second system block, so a new day or mode does not bust the cache. Date anchors (this and last week Monday to Sunday, this and last month, quarter, year, next Monday) are precomputed on the server because relative dates were the likeliest source of wrong answers. Modes differ by behaviour, not only by caps (Thorough compares with the previous period and cross-checks; Quick gives one fact). Insights recommend the next thing to look at and name the entity. The classifier treats weather holds and closures as in scope; only general forecasts are out.
+
+**Sampling and thinking.** The 5.x models reject a custom temperature and already run adaptive thinking, so no mode sets either. The client accepts both and drops `temperature` for models that reject it, so it can never cause a 400.
+
+**Never throw away gathered data.** On the last allowed round the model is called with `tool_choice: none` (the tool list stays in the request so the cached prefix is unchanged) and told to answer from what it has and say what it could not check. `FLO_NO_ANSWER` is returned only if that forced turn still yields nothing. Tool failures are classed as `validation` (the model may correct and retry) or `infrastructure` (do not retry, say that part could not be looked up).
+
+**Follow-ups keep their data.** History used to be text only, so a follow-up such as "tell me more about the third one" had nothing to work with. Each answered turn now stores a `dataSummary` (tool, validated args, row count, first 5 rows of the first 6 columns, values cut to 60 characters, at most 6 sources) and the next turn gets it fenced as untrusted `<previous_data>`, capped at 2,400 characters, with closing tags defused. Old rows without a summary behave as before.
+
+**Charts are server-built like tables.** The model names a `sourceId`, an x column and one to three numeric y columns; the server reads every value from the stored result, takes at most 24 rows, and limits charts by mode (2, 1, 0). The model never types a chart value.
+
+**Deep links are attached by the server.** A table, cards or chart block built from tool T gets the link for T's screen when the model supplied none (a valid model link wins). Only `TODAYS_WORK` carries a param (`date`, single-day results); ids and periods are not derived because they cannot be derived reliably.
+
+**Learning loop.** `POST /flo/messages/{id}/feedback` stores a thumbs rating and an optional comment on the assistant message (admin only, the caller's own conversations). `GET /flo/gaps` lists questions that ended as a no-data decline, including the model's own "I can't look that up yet", so the owner can see which tool to build next. Both read `FloMessage`; there is no new table.
+
+**Risk score.** `list_at_risk_customers` now scores each customer 0 to 100 from consecutive skips, open complaints, overdue debt, a failed direct debit and contact opt-outs (constants documented at the top of the file) and returns one row per customer. `minScore` replaces the skip filter when given.
+
+**Still open after v2:** the live-API eval has not been run, so prompt quality, latency, cost per answer and cache hits are unmeasured; the deployed-path streaming check; a cumulative token cap across rounds; the `behindBy` pace assumption (an even pace across 08:00 to 17:00, because visits have no scheduled time); and the approximate `cancellationsInPeriod` in `service_plan_health` (plans have no cancel date).

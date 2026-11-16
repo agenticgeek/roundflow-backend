@@ -44,3 +44,24 @@ describe("20261110100000_flo_ai migration", () => {
     expect(sql).not.toMatch(/"[a-zA-Z]*(secret|apiKey|password)[a-zA-Z]*"|"(access|refresh|auth)?[Tt]oken"/i);
   });
 });
+
+describe("20261117100000_flo_feedback migration", () => {
+  const feedbackSql = fs.readFileSync(path.join(process.cwd(), "prisma", "tenant", "migrations", "20261117100000_flo_feedback", "migration.sql"), "utf8");
+  const statements = feedbackSql.split("\n").filter((l) => l.trim() !== "" && !l.startsWith("--"));
+
+  it("is additive and idempotent: only ADD COLUMN IF NOT EXISTS on FloMessage", () => {
+    expect(feedbackSql).not.toMatch(/DROP|TRUNCATE|DELETE FROM|UPDATE\s+"|NOT NULL|DEFAULT/i);
+    expect(statements).toHaveLength(3);
+    for (const st of statements) expect(st).toMatch(/^ALTER TABLE "FloMessage" ADD COLUMN IF NOT EXISTS "\w+" (TEXT|JSONB);$/);
+  });
+
+  it("adds exactly the columns the Prisma schema declares, with matching types", () => {
+    const model = schema.slice(schema.indexOf("model FloMessage {"), schema.indexOf("model FloMessage {") + 1500);
+    expect(model).toMatch(/rating\s+String\?/);
+    expect(model).toMatch(/ratingComment\s+String\?/);
+    expect(model).toMatch(/dataSummary\s+Json\?/);
+    expect(feedbackSql).toContain('"rating" TEXT;');
+    expect(feedbackSql).toContain('"ratingComment" TEXT;');
+    expect(feedbackSql).toContain('"dataSummary" JSONB;');
+  });
+});

@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { ProviderError } from "../../../integrations/anthropic/client";
 import { getModeConfig } from "../modes";
-import { ERROR_COPY } from "../orchestrator";
-import type { ToolOutcome } from "../types";
+import { ERROR_COPY, FINAL_ROUND_NOTE, INFRA_ERROR_FOR_MODEL } from "../orchestrator";
+import type { ToolContext, ToolOutcome, ToolResult } from "../types";
 import { fakePrisma } from "../tools/__tests__/fake-prisma";
 import {
   answerTurn, drain, failTurn, GOOD_ANSWER, hangTurn, inputFor, names, scripted, skippedVisit, tenantWithSkips, toolTurn, USAGE,
@@ -58,7 +58,7 @@ describe("orchestrator: tool -> tool -> tagged answer", () => {
     expect(s.streamCalls).toHaveLength(3);
     const first = s.streamCalls[0];
     expect(first).toMatchObject({ model: "claude-sonnet-5-5", maxTokens: 2000 });
-    expect(first.system).toContain("Today: Tuesday 2026-11-10");
+    expect(first.systemDynamic).toContain("Today: Tuesday 2026-11-10");
     expect(first.tools?.map((t) => t.name)).toContain("list_skipped_visits");
     expect(first.messages).toEqual([
       { role: "user", content: "hi" },
@@ -361,5 +361,112 @@ describe("orchestrator: abort and provider failures", () => {
     expect(await run(new ProviderError("PROVIDER_TIMEOUT", "t", undefined, true))).toMatchObject({ code: "FLO_TIMEOUT", retryable: true });
     expect(await run(new ProviderError("PROVIDER_REJECTED", "r", 400))).toMatchObject({ code: "FLO_PROVIDER_ERROR", retryable: false });
     expect(await run(new Error("boom"))).toMatchObject({ code: "FLO_INTERNAL_ERROR", retryable: true });
+  });
+});
+
+const okResult = (sourceId: string): ToolResult => ({ sourceId, tool: "list_skipped_visits", label: "Skipped visits", dateRange: null, rows: [{ name: "Mrs Smith" }], totals: null, truncated: false, columns: [{ key: "name", label: "Name", format: "text", align: "left" }] });
+const TOOL = toolTurn({ id: "t", name: "list_skipped_visits" });
+const INTRO = answerTurn("<intro>You have 2 skipped visits.</intro>");
+
+describe("orchestrator: the last round forces an answer (O1)", () => {
+  it("calls the model with toolChoice none and the answer-now note on the last round, and keeps the gathered data", async () => {
+    const s = scripted([TOOL, TOOL, INTRO]);
+    const { result } = await drain({ provider: s.provider }, inputFor({ mode: mode("QUICK") }));
+    expect(s.streamCalls).toHaveLength(3);
+    expect(s.streamCalls[0].toolChoice).toBeUndefined();
+    expect(s.streamCalls[1].toolChoice).toBeUndefined();
+    expect(s.streamCalls[2].toolChoice).toBe("none");
+    expect(s.streamCalls[2].systemDynamic).toContain(FINAL_ROUND_NOTE);
+    expect(s.streamCalls[0].systemDynamic).not.toContain(FINAL_ROUND_NOTE);
+    expect(s.streamCalls[0].systemDynamic).toContain("Today: Tuesday 2026-11-10"); // the per-request block is sent as systemDynamic
+    expect(s.streamCalls[2].tools?.length).toBeGreaterThan(0); // tool definitions stay: the history holds tool_use blocks
+    expect(result).toMatchObject({ kind: "answered", answer: { intro: "You have 2 skipped visits." } });
+  });
+
+  it("still fails FLO_NO_ANSWER when the forced turn yields no valid content (garbage, or a stray tool call that is never run)", async () => {
+    const execute = vi.fn(async (_n: string, _i: unknown, _c: ToolContext, id: string): Promise<ToolOutcome> => ({ ok: true, result: okResult(id), args: {}, ms: 1 }));
+    const garbage = scripted([TOOL, TOOL, answerTurn("plain text, no tags")]);
+    expect((await drain({ provider: garbage.provider, execute }, inputFor({ mode: mode("QUICK") }))).result).toMatchObject({ kind: "failed", code: "FLO_NO_ANSWER" });
+    execute.mockClear();
+    const stray = scripted([TOOL]);
+    expect((await drain({ provider: stray.provider, execute }, inputFor({ mode: mode("QUICK") }))).result).toMatchObject({ kind: "failed", code: "FLO_NO_ANSWER" });
+    expect(execute).toHaveBeenCalledTimes(2); // rounds 1 and 2 only; the stray call on round 3 is ignored
+  });
+
+  it("a single-round mode with no lookups declines (NO_DATA) instead of failing", async () => {
+    const s = scripted([answerTurn("<intro>Paris.</intro>")]);
+    const { result } = await drain({ provider: s.provider }, inputFor({ mode: { ...mode("QUICK"), maxRounds: 1 } }));
+    expect(s.streamCalls[0].toolChoice).toBe("none");
+    expect(result.kind).toBe("declined");
+  });
+
+  it("passes temperature and thinking from the mode when present, and omits them otherwise", async () => {
+    const s = scripted([TOOL, INTRO]);
+    await drain({ provider: s.provider }, inputFor({ mode: { ...mode("BALANCED"), temperature: 0.2, thinking: true } }));
+    expect(s.streamCalls[0]).toMatchObject({ temperature: 0.2, thinking: true });
+    const plain = scripted([TOOL, INTRO]);
+    await drain({ provider: plain.provider }, inputFor({ mode: { ...mode("BALANCED"), temperature: undefined, thinking: undefined } }));
+    expect("temperature" in plain.streamCalls[0]).toBe(false);
+    expect("thinking" in plain.streamCalls[0]).toBe(false);
+  });
+});
+
+describe("orchestrator: tool context and errors (O6)", () => {
+  it("gives every tool the live results map of the request", async () => {
+    const seen: Array<{ id: string; keys: string[]; same: boolean }> = [];
+    let map: ReadonlyMap<string, ToolResult> | undefined;
+    const execute = vi.fn(async (_n: string, _i: unknown, c: ToolContext, id: string): Promise<ToolOutcome> => {
+      map ??= c.results;
+      seen.push({ id, keys: [...(c.results?.keys() ?? [])], same: c.results === map });
+      return { ok: true, result: okResult(id), args: {}, ms: 1 };
+    });
+    const s = scripted([TOOL, TOOL, INTRO]);
+    await drain({ provider: s.provider, execute }, inputFor());
+    expect(seen).toEqual([{ id: "r1", keys: [], same: true }, { id: "r2", keys: ["r1"], same: true }]);
+  });
+
+  it("tells the model not to retry an infrastructure failure, but lets it fix a validation error", async () => {
+    const infra = vi.fn(async (): Promise<ToolOutcome> => ({ ok: false, error: "The lookup failed.", kind: "infrastructure", ms: 1 }));
+    const a = scripted([TOOL, INTRO]);
+    await drain({ provider: a.provider, execute: infra }, inputFor());
+    const back = a.streamCalls[1].messages[2].content as Array<{ content: string; is_error?: boolean }>;
+    expect(back[0]).toMatchObject({ is_error: true, content: expect.stringContaining(INFRA_ERROR_FOR_MODEL) });
+    expect(back[0].content).not.toContain("narrower");
+
+    const validation = vi.fn(async (): Promise<ToolOutcome> => ({ ok: false, error: "Use a date like 2026-11-01.", kind: "validation", ms: 1 }));
+    const b = scripted([TOOL, INTRO]);
+    await drain({ provider: b.provider, execute: validation }, inputFor());
+    expect((b.streamCalls[1].messages[2].content as Array<{ content: string }>)[0].content).toContain("Use a date like 2026-11-01.");
+  });
+
+  it("a rejected tool promise is an infrastructure failure too", async () => {
+    const s = scripted([TOOL, INTRO]);
+    await drain({ provider: s.provider, execute: vi.fn().mockRejectedValue(new Error("x")) }, inputFor());
+    expect((s.streamCalls[1].messages[2].content as Array<{ content: string }>)[0].content).toContain(INFRA_ERROR_FOR_MODEL);
+  });
+});
+
+describe("orchestrator: the unanswered log and the data summary", () => {
+  it("an answer that is only the model's \"I can't look that up yet.\" is the NO_DATA decline (also with a curly apostrophe)", async () => {
+    for (const text of ["I can't look that up yet.", "I can’t look that up yet."]) {
+      const s = scripted([TOOL, answerTurn(`<intro>${text}</intro>`)]);
+      const { result, events } = await drain({ provider: s.provider }, inputFor());
+      expect(result).toMatchObject({ kind: "declined", decline: { reason: "NO_DATA_USED" } });
+      expect(names(events)).toContain("declined");
+      expect(names(events)).not.toContain("follow_ups");
+    }
+  });
+
+  it("an answer that merely starts that way but carries other words is kept", async () => {
+    const s = scripted([TOOL, answerTurn("<intro>I can't look that up yet, but you have 2 skipped visits.</intro>")]);
+    expect((await drain({ provider: s.provider }, inputFor())).result.kind).toBe("answered");
+  });
+
+  it("an answered result carries the data summary of its lookups (tool, args, rows, first rows)", async () => {
+    const s = scripted([toolTurn({ id: "t", name: "list_skipped_visits" }), answerTurn(GOOD_ANSWER)]);
+    const { result } = await drain({ provider: s.provider }, inputFor());
+    expect(result.kind).toBe("answered");
+    if (result.kind !== "answered") return;
+    expect(result.dataSummary).toEqual([expect.objectContaining({ sourceId: "r1", tool: "list_skipped_visits", rows: 2, sample: expect.any(Array) })]);
   });
 });

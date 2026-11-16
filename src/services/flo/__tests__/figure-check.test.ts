@@ -74,9 +74,9 @@ describe("createFigureChecker", () => {
   });
 
   it("flags a figure that is not in any stored result and lists it", () => {
-    expect(check("Revenue is up 12% on September.")).toEqual({ ok: false, unmatched: [12] });
+    expect(check("Revenue is up 987% on September.")).toEqual({ ok: false, unmatched: [987] });
     expect(check("Revenue 13650.51").ok).toBe(false);
-    expect(check("14 skips and 99 jobs").unmatched).toEqual([99]);
+    expect(check("14 skips and 7919 jobs").unmatched).toEqual([7919]);
   });
 
   it("uses figures from every stored result and nothing from an empty store", () => {
