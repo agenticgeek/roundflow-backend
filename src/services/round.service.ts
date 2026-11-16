@@ -3,6 +3,7 @@ import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 import { getCachedBusinessSettings } from "./settings.service";
 import { tenantTodayRange, tenantToday } from "./business-time";
+import { now as clockNow } from "../lib/clock";
 import { createMessageService } from "./message.service";
 import { generateForRound } from "../jobs/visitGeneration";
 import { projectOccurrences } from "./round-projection";
@@ -968,7 +969,7 @@ class RoundService {
       throw new AppError(400, "Round must be ACTIVE to generate visits");
     }
 
-    const today = new Date();
+    const today = clockNow();
     today.setUTCHours(0, 0, 0, 0);
 
     const visitsGenerated = await generateForRound(this.prisma, round, today);
@@ -1082,7 +1083,7 @@ class RoundService {
     });
     if (!round) throw new AppError(404, "Round not found");
 
-    const start = new Date();
+    const start = clockNow();
     start.setUTCHours(0, 0, 0, 0);
     const end = new Date(start.getTime() + 86_400_000);
 
@@ -1258,7 +1259,7 @@ class RoundService {
     await this.assertRoundExists(roundId);
     await this.assertDayNotClosed();
 
-    const start = new Date();
+    const start = clockNow();
     start.setUTCHours(0, 0, 0, 0);
     const end = new Date(start.getTime() + 86_400_000);
 

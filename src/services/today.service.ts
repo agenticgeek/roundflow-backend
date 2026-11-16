@@ -3,6 +3,8 @@ import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 import { tenantTodayRange } from "./business-time";
 import { getCachedBusinessSettings, invalidateCachedBusinessSettings } from "./settings.service";
+import { closureWarnings, loadActiveClosures } from "./closure-warnings";
+import type { ClosureWarning } from "../lib/closure-types";
 import { carryOverVisits, notifyCarryoverCustomers, notifyCarryoverTechnicians, pickTarget, type MovedVisit } from "./carryover.service";
 
 // ---------------------------------------------------------------------------
@@ -88,6 +90,8 @@ export interface CloseDaySummary {
   notifiedCustomers: number;
   /** Set when notifyCustomers was requested but the message step failed (the close itself succeeded). */
   customerNotificationError?: string;
+  /** DATE_IN_CLOSURE for the carried-to day (push_to_tomorrow, non-blocking); absent when no active closure covers it. */
+  warnings?: ClosureWarning[];
 }
 
 // ---- Prisma payload ---------------------------------------------------------
@@ -224,6 +228,8 @@ class TodayService {
     if (carried) {
       const { moved, targetDate } = carried as { moved: MovedVisit[]; targetDate: Date };
       result.carriedToDate = targetDate.toISOString().slice(0, 10);
+      const warnings = closureWarnings(targetDate, moved.map((m) => m.roundId), await loadActiveClosures(this.prisma, start));
+      if (warnings) (result as CloseDaySummary).warnings = warnings;
       await notifyCarryoverTechnicians(this.prisma, moved, start, targetDate);
       if (opts.notifyCustomers) {
         const sent = await notifyCarryoverCustomers(this.prisma, moved, start, targetDate);

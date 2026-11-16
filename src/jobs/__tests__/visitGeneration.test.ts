@@ -29,6 +29,8 @@ function makeTp(overrides: Record<string, unknown> = {}) {
     property: { findMany: vi.fn().mockResolvedValue([]) },
     roundTechnician: { findMany: vi.fn().mockResolvedValue([]) },
     technicianAvailability: { findMany: vi.fn().mockResolvedValue([]) },
+    businessClosure: { findMany: vi.fn().mockResolvedValue([]) },
+    activityLog: { create: vi.fn().mockResolvedValue({}) },
     businessSettings: { findFirst: vi.fn().mockResolvedValue(null) },
     visit: {
       findFirst: vi.fn().mockResolvedValue(null),

@@ -11,6 +11,12 @@
 export type AccessClass = "PUBLIC" | "AUTHENTICATED" | "TENANT_MEMBER" | "BUSINESS" | "ADMIN" | "TECHNICIAN";
 
 export const ROLE_MATRIX: Record<string, AccessClass> = {
+  "DELETE /closures/{id}": "BUSINESS",
+  "GET /closures": "BUSINESS",
+  "PATCH /closures/{id}": "BUSINESS",
+  "POST /closures": "BUSINESS",
+  "POST /closures/{id}/apply": "BUSINESS",
+  "POST /closures/{id}/apply/preview": "BUSINESS",
   "DELETE /customers/{id}": "BUSINESS",
   "DELETE /flo/conversations/{id}": "ADMIN",
   "DELETE /invites/{token}": "BUSINESS",

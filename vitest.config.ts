@@ -217,6 +217,17 @@ const FLO_FILES = [
   "src/routes/flo.ts",
 ];
 
+// Business closures (2026-11-16): whole new files, gated at 100% per file. Plan: docs/handoff/backend/2026-11-16-business-closures-backend-plan.md.
+// Files that already exist and are gated (visitGeneration.ts, schedule.ts, working-days.ts, carryover.service.ts) must stay at 100%.
+const CLOSURE_FILES = [
+  "src/lib/closures.ts",
+  "src/lib/clock.ts",
+  "src/routes/test-hooks.ts",
+  "src/services/closure.service.ts",
+  "src/routes/closures.ts",
+  "src/services/closure-apply.service.ts",
+];
+
 export default defineConfig({
   test: {
     include: ["src/**/*.test.ts"],
@@ -225,7 +236,7 @@ export default defineConfig({
     coverage: {
       provider: "v8",
       reporter: ["text", "html", "lcov"],
-      include: [...PAYMENT_DOMAIN_FILES, ...AUDIT_REMEDIATION_FILES, ...GEOCODING_FILES, ...INVITE_FILES, ...PHASE1_AUDIT_FILES, ...WAVE1_FILES, ...WAVE2A_FILES, ...WAVE2B1_FILES, ...WAVE2B2_FILES, ...FLO_FILES],
+      include: [...PAYMENT_DOMAIN_FILES, ...AUDIT_REMEDIATION_FILES, ...GEOCODING_FILES, ...INVITE_FILES, ...PHASE1_AUDIT_FILES, ...WAVE1_FILES, ...WAVE2A_FILES, ...WAVE2B1_FILES, ...WAVE2B2_FILES, ...FLO_FILES, ...CLOSURE_FILES],
       thresholds: {
         100: true,
         perFile: true,

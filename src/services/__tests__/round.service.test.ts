@@ -37,6 +37,7 @@ function makePrisma() {
     visit: { findMany: vi.fn(), updateMany: vi.fn(), findFirst: vi.fn().mockResolvedValue(null), create: vi.fn(), count: vi.fn().mockResolvedValue(0) },
     roundTechnician: { findMany: vi.fn().mockResolvedValue([]), deleteMany: vi.fn(), createMany: vi.fn() },
     technicianAvailability: { findMany: vi.fn().mockResolvedValue([]) },
+    businessClosure: { findMany: vi.fn().mockResolvedValue([]) },
     // Defaults to "no settings row" (day not closed) so pre-existing tests
     // that don't care about Close Day behave the same as before it existed.
     businessSettings: { findFirst: vi.fn().mockResolvedValue(null) },

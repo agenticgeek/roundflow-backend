@@ -5,6 +5,8 @@ import { startOfUtcDay } from "../lib/schedule";
 import { tenantToday, tenantTodayRange } from "./business-time";
 import { getCachedBusinessSettings } from "./settings.service";
 import { notifyVisitTechnicians } from "./notify";
+import { closureWarnings, loadActiveClosures } from "./closure-warnings";
+import type { ClosureWarning } from "../lib/closure-types";
 
 export const ACTIVITY_VISIT_RESCHEDULED = "VISIT_RESCHEDULED";
 
@@ -48,7 +50,7 @@ export function createVisitRescheduleService(prisma: TenantPrismaClient) {
     reschedule: async (
       visitId: string,
       input: { date: Date; actor?: { id?: string; role?: string } }
-    ): Promise<{ id: string; status: VisitStatus; date: string }> => {
+    ): Promise<{ id: string; status: VisitStatus; date: string; warnings?: ClosureWarning[] }> => {
       const visit = await prisma.visit.findUnique({
         where: { id: visitId },
         select: { id: true, status: true, date: true, technicianId: true, roundId: true, propertyId: true },
@@ -58,7 +60,8 @@ export function createVisitRescheduleService(prisma: TenantPrismaClient) {
         throw new AppError(409, "Only scheduled or skipped visits can be rescheduled", "VISIT_NOT_RESCHEDULABLE");
       }
       const day = startOfUtcDay(input.date);
-      if (day < (await tenantToday(prisma))) throw new AppError(400, '"date" must be today or later');
+      const today = await tenantToday(prisma);
+      if (day < today) throw new AppError(400, '"date" must be today or later');
       await assertDayNotClosed(prisma, day);
 
       const from = visit.date.toISOString().slice(0, 10);
@@ -86,7 +89,9 @@ export function createVisitRescheduleService(prisma: TenantPrismaClient) {
         [{ ...visit, date: day }],
         () => ({ type: "SCHEDULE", title: "A visit was rescheduled", body: `Moved from ${from} to ${to}.` })
       );
-      return { id: visitId, status: VisitStatus.SCHEDULED, date: to };
+      // Closures rules s7: a target inside an active closure for the visit's round warns, never blocks.
+      const warnings = closureWarnings(day, [visit.roundId], await loadActiveClosures(prisma, today));
+      return { id: visitId, status: VisitStatus.SCHEDULED, date: to, ...(warnings ? { warnings } : {}) };
     },
   };
 }
