@@ -1,9 +1,14 @@
 import { createDebtService, DEBT_BUCKETS } from "../../debt.service";
+import { NOT_COLLECTING_INVOICE } from "../../direct-debit";
 import type { ResultRow, ToolDefinition } from "../types";
-import { columns, daysBetween, dateToDay, optEnum, optNumber, optInt, parseArgs, parseLimit, round2, tenantClock } from "./shared";
+import { columns, daysBetween, dateToDay, optEnum, optNumber, optInt, parseArgs, parseLimit, pct, round2, tenantClock } from "./shared";
 
 // list_debtors(minBalance?, minDaysOverdue?, bucket?, limit?): customers with unpaid SENT invoices, built on
 // debt.service.getBoard (the same buckets as the Debt screen). Balances are summed per customer.
+// O4: with no filter the headline totals (total owed, customers, invoices, aging buckets, shares, average days overdue)
+// come from database aggregates over EVERY unpaid sent invoice, so they are exact even when the list is capped. With a
+// bucket / minBalance / minDaysOverdue filter the totals describe the scanned, filtered customers and `truncated` says
+// when the scan did not cover everything.
 
 interface Args {
   minBalance?: number;
@@ -29,9 +34,17 @@ const COLUMNS = columns(
   ["flag", "Status", "text"]
 );
 
+/** One slice of debt: `amount` pounds across `n` invoices that fall due on `due` (null = no due date). */
+interface Slice {
+  amount: number;
+  n: number;
+  due: string | null;
+}
+
 interface Agg {
   customer: string;
   address: string;
+  slices: Slice[];
   balance: number;
   invoices: number;
   oldestDue: string | null;
@@ -40,12 +53,47 @@ interface Agg {
   hold: boolean;
 }
 
+/** Aging totals. Days overdue = tenant-local today minus the due date; due today or later (or no due date) is "not overdue". */
+function agingTotals(slices: Slice[], today: string): ResultRow {
+  const bucket = { notOverdue: 0, d1to30: 0, d31to60: 0, d61to90: 0, over90: 0 };
+  let overdueInvoices = 0;
+  let overdueDays = 0;
+  for (const s of slices) {
+    const d = s.due ? daysBetween(s.due, today) : 0;
+    if (d <= 0) bucket.notOverdue += s.amount;
+    else if (d <= 30) bucket.d1to30 += s.amount;
+    else if (d <= 60) bucket.d31to60 += s.amount;
+    else if (d <= 90) bucket.d61to90 += s.amount;
+    else bucket.over90 += s.amount;
+    if (d > 0) {
+      overdueInvoices += s.n;
+      overdueDays += d * s.n;
+    }
+  }
+  const total = slices.reduce((n, s) => n + s.amount, 0);
+  return {
+    avgDaysOverdue: overdueInvoices === 0 ? null : Math.round(overdueDays / overdueInvoices),
+    balanceNotOverdue: round2(bucket.notOverdue),
+    balance1To30: round2(bucket.d1to30),
+    balance31To60: round2(bucket.d31to60),
+    balance61To90: round2(bucket.d61to90),
+    balanceOver90: round2(bucket.over90),
+    shareOver30: pct(bucket.d31to60 + bucket.d61to90 + bucket.over90, total),
+    shareOver60: pct(bucket.d61to90 + bucket.over90, total),
+  };
+}
+
 export const listDebtors: ToolDefinition<Args> = {
   name: "list_debtors",
   label: "Debt",
   readOnly: true,
   description:
-    "Customers who owe money (unpaid sent invoices), largest balance first, with balance in pounds, number of invoices and days overdue. Optional filters: minBalance (pounds), minDaysOverdue, bucket (BAD_DEBT, ON_HOLD, FAILED_GC, DUE_BEFORE_CLEAN, SEVEN_DAYS_OVER, FOURTEEN_DAYS_OVER, ALL). Use for 'who owes me more than 50 pounds and for how long'.",
+    "Customers who owe money (unpaid sent invoices), largest balance first, with balance in pounds, number of invoices and days overdue. Optional filters: minBalance (pounds), minDaysOverdue, bucket (BAD_DEBT, ON_HOLD, FAILED_GC, DUE_BEFORE_CLEAN, SEVEN_DAYS_OVER, FOURTEEN_DAYS_OVER, ALL). Use for 'who owes me more than 50 pounds and for how long' and 'how much is overdue by more than 30 days'. " +
+    "Do NOT use for payments taken or failed (use list_payments), for invoices by status such as draft or not yet sent (use list_invoices), or for one named customer's balance (use get_customer_summary). " +
+    "Example: {\"minBalance\":50,\"minDaysOverdue\":30,\"limit\":10}. " +
+    "Totals (exact over all unpaid sent invoices when no filter is given): balance = total owed, customers, invoices, balanceNotOverdue / balance1To30 / balance31To60 / balance61To90 / balanceOver90 = pounds by days past due date, " +
+    "shareOver30 and shareOver60 = percentage of the balance more than 30 or 60 days past due, avgDaysOverdue = mean days past due over overdue invoices (null when none). " +
+    "Rows: daysOverdue = days since the customer's oldest unpaid invoice was due. Invoices being collected by direct debit are not counted as debt. With a filter the totals cover only the matching scanned customers.",
   inputSchema: {
     type: "object",
     properties: {
@@ -67,8 +115,17 @@ export const listDebtors: ToolDefinition<Args> = {
   },
   async run(args, ctx) {
     const clock = await tenantClock(ctx);
-    const board = createDebtService(ctx.tenantPrisma);
+    const tp = ctx.tenantPrisma;
+    const board = createDebtService(tp);
     const buckets = args.bucket ? [args.bucket] : DEFAULT_BUCKETS;
+    const unfiltered = args.bucket === undefined && args.minBalance === undefined && args.minDaysOverdue === undefined;
+    const unpaid = { status: "SENT" as const, ...NOT_COLLECTING_INVOICE };
+    const exactPromise = unfiltered
+      ? Promise.all([
+          tp.invoice.groupBy({ by: ["dueDate"], where: unpaid, _sum: { amount: true }, _count: true }),
+          tp.customer.count({ where: { invoices: { some: unpaid } } }),
+        ])
+      : null;
     const seen = new Set<string>();
     const byCustomer = new Map<string, Agg>();
     let truncated = false;
@@ -83,6 +140,7 @@ export const listDebtors: ToolDefinition<Args> = {
           const a = byCustomer.get(row.customerId) ?? {
             customer: row.customerName,
             address: row.addressLine,
+            slices: [],
             balance: 0,
             invoices: 0,
             oldestDue: null,
@@ -93,41 +151,58 @@ export const listDebtors: ToolDefinition<Args> = {
           byCustomer.set(row.customerId, a);
           a.balance += row.amount;
           a.invoices += row.invoiceId ? 1 : 0;
+          a.slices.push({ amount: row.amount, n: row.invoiceId ? 1 : 0, due });
           if (due && (a.oldestDue === null || due < a.oldestDue)) a.oldestDue = due;
         }
         if (page >= res.pagination.totalPages) break;
         if (page === MAX_PAGES) truncated = true;
       }
     }
-    const all: ResultRow[] = [...byCustomer.values()]
+    const passing = [...byCustomer.values()]
       .map((a) => ({
-        customer: a.customer,
-        address: a.address,
-        balance: round2(a.balance),
-        invoices: a.invoices,
-        daysOverdue: a.oldestDue ? Math.max(0, daysBetween(a.oldestDue, clock.today)) : 0,
-        oldestDueDate: a.oldestDue,
-        paymentMethod: a.paymentMethod,
-        flag: a.badDebt ? "Bad debt" : a.hold ? "On hold" : null,
+        a,
+        row: {
+          customer: a.customer,
+          address: a.address,
+          balance: round2(a.balance),
+          invoices: a.invoices,
+          daysOverdue: a.oldestDue ? Math.max(0, daysBetween(a.oldestDue, clock.today)) : 0,
+          oldestDueDate: a.oldestDue,
+          paymentMethod: a.paymentMethod,
+          flag: a.badDebt ? "Bad debt" : a.hold ? "On hold" : null,
+        } as ResultRow,
       }))
-      .filter((r) => (args.minBalance === undefined || (r.balance as number) >= args.minBalance) && (args.minDaysOverdue === undefined || (r.daysOverdue as number) >= args.minDaysOverdue))
-      .sort((a, b) => (b.balance as number) - (a.balance as number) || (a.customer as string).localeCompare(b.customer as string));
+      .filter(({ row }) => (args.minBalance === undefined || (row.balance as number) >= args.minBalance) && (args.minDaysOverdue === undefined || (row.daysOverdue as number) >= args.minDaysOverdue))
+      .sort((x, y) => (y.row.balance as number) - (x.row.balance as number) || (x.row.customer as string).localeCompare(y.row.customer as string));
+    const all = passing.map((p) => p.row);
     const rows = all.slice(0, args.limit);
-    return {
-      dateRange: null,
-      rows,
-      totals: all.length === 0 ? null : {
+
+    // Exact headline figures from the database when unfiltered (and the database has any debt); otherwise the scanned set.
+    const [dueGroups, customerCount] = exactPromise ? await exactPromise : [[], 0];
+    const exactInvoices = dueGroups.reduce((n, g) => n + (g._count as unknown as number), 0);
+    const exact = exactInvoices > 0;
+    const slices: Slice[] = exact
+      ? dueGroups.map((g) => ({ amount: Number(g._sum.amount ?? 0), n: g._count as unknown as number, due: g.dueDate ? dateToDay(g.dueDate) : null }))
+      : passing.flatMap((p) => p.a.slices);
+    const customers = exact ? customerCount : all.length;
+    const totals: ResultRow | null =
+      !exact && all.length === 0 ? null : {
         customer: "Total",
-        customers: all.length,
+        customers,
         address: null,
-        balance: round2(all.reduce((n, r) => n + (r.balance as number), 0)),
-        invoices: all.reduce((n, r) => n + (r.invoices as number), 0),
+        balance: round2(slices.reduce((n, s) => n + s.amount, 0)),
+        invoices: exact ? exactInvoices : all.reduce((n, r) => n + (r.invoices as number), 0),
         daysOverdue: null,
         oldestDueDate: null,
         paymentMethod: null,
         flag: null,
-      },
-      truncated: truncated || all.length > rows.length,
+        ...agingTotals(slices, clock.today),
+      };
+    return {
+      dateRange: null,
+      rows,
+      totals,
+      truncated: truncated || customers > rows.length,
       columns: COLUMNS,
     };
   },

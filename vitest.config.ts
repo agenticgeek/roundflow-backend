@@ -215,6 +215,34 @@ const FLO_FILES = [
   "src/services/flo/flo.service.ts",
   "src/services/flo/sse.ts",
   "src/routes/flo.ts",
+  // Flo v2 (2026-11-17): history data summary, 13 new tools and their helpers.
+  "src/services/flo/data-summary.ts",
+  "src/services/flo/tools/e1-helpers.ts",
+  "src/services/flo/tools/e2-helpers.ts",
+  "src/services/flo/tools/get-business-snapshot.ts",
+  "src/services/flo/tools/list-invoices.ts",
+  "src/services/flo/tools/service-plan-health.ts",
+  "src/services/flo/tools/revenue-leakage.ts",
+  "src/services/flo/tools/backlog-and-carryover.ts",
+  "src/services/flo/tools/calculate.ts",
+  "src/services/flo/tools/round-performance.ts",
+  "src/services/flo/tools/technician-workload.ts",
+  "src/services/flo/tools/technician-incidents.ts",
+  "src/services/flo/tools/list-messages-delivery.ts",
+  "src/services/flo/tools/list-issues-photos.ts",
+  "src/services/flo/tools/forecast-schedule.ts",
+  "src/services/flo/tools/closures-and-weather.ts",
+];
+
+// Business closures (2026-11-16): whole new files, gated at 100% per file. Plan: docs/handoff/backend/2026-11-16-business-closures-backend-plan.md.
+// Files that already exist and are gated (visitGeneration.ts, schedule.ts, working-days.ts, carryover.service.ts) must stay at 100%.
+const CLOSURE_FILES = [
+  "src/lib/closures.ts",
+  "src/lib/clock.ts",
+  "src/routes/test-hooks.ts",
+  "src/services/closure.service.ts",
+  "src/routes/closures.ts",
+  "src/services/closure-apply.service.ts",
 ];
 
 export default defineConfig({
@@ -225,7 +253,7 @@ export default defineConfig({
     coverage: {
       provider: "v8",
       reporter: ["text", "html", "lcov"],
-      include: [...PAYMENT_DOMAIN_FILES, ...AUDIT_REMEDIATION_FILES, ...GEOCODING_FILES, ...INVITE_FILES, ...PHASE1_AUDIT_FILES, ...WAVE1_FILES, ...WAVE2A_FILES, ...WAVE2B1_FILES, ...WAVE2B2_FILES, ...FLO_FILES],
+      include: [...PAYMENT_DOMAIN_FILES, ...AUDIT_REMEDIATION_FILES, ...GEOCODING_FILES, ...INVITE_FILES, ...PHASE1_AUDIT_FILES, ...WAVE1_FILES, ...WAVE2A_FILES, ...WAVE2B1_FILES, ...WAVE2B2_FILES, ...FLO_FILES, ...CLOSURE_FILES],
       thresholds: {
         100: true,
         perFile: true,

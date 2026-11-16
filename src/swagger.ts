@@ -536,6 +536,147 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     },
   },
 
+  // ---- Business closures (2026-11-16) — mirrors src/lib/closure-types.ts ----
+  ClosureMode: { type: "string", enum: ["MOVE", "SKIP"], description: "MOVE: visits due in the closure move to the next open round day. SKIP: those cycles are dropped." },
+
+  Closure: {
+    type: "object",
+    required: ["id", "label", "startDate", "endDate", "mode", "notifyCustomers", "roundIds", "appliedAt", "createdAt", "updatedAt"],
+    properties: {
+      id: { type: "string" },
+      label: { type: "string", minLength: 1, maxLength: 80, description: "Trimmed plain text." },
+      startDate: { type: "string", format: "date", description: "YYYY-MM-DD, inclusive." },
+      endDate: { type: "string", format: "date", description: "YYYY-MM-DD, inclusive; >= startDate; at most 366 days in total." },
+      mode: ref("ClosureMode"),
+      notifyCustomers: { type: "boolean" },
+      roundIds: { type: "array", items: { type: "string" }, description: "Empty = every round." },
+      appliedAt: { type: "string", format: "date-time", nullable: true, description: "Last successful apply to existing visits." },
+      createdAt: dateTime,
+      updatedAt: dateTime,
+    },
+    example: {
+      id: "clx1", label: "Christmas", startDate: "2026-12-24", endDate: "2027-01-03", mode: "MOVE",
+      notifyCustomers: false, roundIds: [], appliedAt: null, createdAt: "2026-11-16T09:00:00.000Z", updatedAt: "2026-11-16T09:00:00.000Z",
+    },
+  },
+
+  ClosureCreateInput: {
+    type: "object",
+    additionalProperties: false,
+    required: ["label", "startDate", "endDate", "mode"],
+    properties: {
+      label: { type: "string", minLength: 1, maxLength: 80, description: "Trimmed; no control characters." },
+      startDate: { type: "string", format: "date" },
+      endDate: { type: "string", format: "date" },
+      mode: ref("ClosureMode"),
+      notifyCustomers: { type: "boolean", default: false },
+      roundIds: { type: "array", items: { type: "string" }, description: "Every id must be an existing round (400 UNKNOWN_ROUND). Duplicates are collapsed. Empty or omitted = every round." },
+    },
+  },
+
+  ClosureUpdateInput: {
+    type: "object",
+    additionalProperties: false,
+    description: "Any subset of the create fields. `endDate` must not be in the past only when `startDate` or `endDate` is supplied.",
+    properties: {
+      label: { type: "string", minLength: 1, maxLength: 80 },
+      startDate: { type: "string", format: "date" },
+      endDate: { type: "string", format: "date" },
+      mode: ref("ClosureMode"),
+      notifyCustomers: { type: "boolean" },
+      roundIds: { type: "array", items: { type: "string" } },
+    },
+  },
+
+  ClosureListResult: {
+    type: "object",
+    required: ["closures"],
+    properties: { closures: { type: "array", items: ref("Closure") } },
+  },
+
+  ClosureConflict: {
+    type: "object",
+    required: ["visitId", "technicianId", "reason"],
+    properties: {
+      visitId: { type: "string" },
+      technicianId: { type: "string" },
+      reason: { type: "string", enum: ["TECHNICIAN_UNAVAILABLE", "TECHNICIAN_INACTIVE"] },
+    },
+  },
+
+  ClosureApplyPreview: {
+    type: "object",
+    required: ["closureId", "mode", "totals", "rounds", "conflicts", "customerMessage"],
+    properties: {
+      closureId: { type: "string" },
+      mode: ref("ClosureMode"),
+      totals: {
+        type: "object",
+        required: ["visits", "rounds", "customers", "technicianConflicts"],
+        properties: { visits: { type: "integer" }, rounds: { type: "integer" }, customers: { type: "integer" }, technicianConflicts: { type: "integer" } },
+      },
+      rounds: {
+        type: "array",
+        items: {
+          type: "object",
+          required: ["roundId", "roundName", "visitCount", "groups"],
+          properties: {
+            roundId: { type: "string" },
+            roundName: { type: "string" },
+            visitCount: { type: "integer" },
+            groups: {
+              type: "array",
+              description: "One entry per (from, to); `to` is null for SKIP. Never one row per visit.",
+              items: {
+                type: "object",
+                required: ["from", "to", "count"],
+                properties: { from: { type: "string", format: "date" }, to: { type: "string", format: "date", nullable: true }, count: { type: "integer" } },
+              },
+            },
+          },
+        },
+      },
+      conflicts: { type: "array", items: ref("ClosureConflict") },
+      customerMessage: { type: "string" },
+    },
+  },
+
+  ClosureApplyResult: {
+    type: "object",
+    required: ["closureId", "mode", "moved", "skipped", "conflicts", "notifiedTechnicians", "notifiedCustomers", "appliedAt"],
+    properties: {
+      closureId: { type: "string" },
+      mode: ref("ClosureMode"),
+      moved: { type: "integer" },
+      skipped: { type: "integer" },
+      conflicts: { type: "array", items: ref("ClosureConflict") },
+      notifiedTechnicians: { type: "integer" },
+      notifiedCustomers: { type: "integer" },
+      customerNotificationError: { type: "string", description: "Set when the customer step failed; the visits ARE already changed." },
+      appliedAt: dateTime,
+    },
+  },
+
+  ClosureWarning: {
+    type: "object",
+    required: ["code", "closureId", "label", "startDate", "endDate"],
+    properties: {
+      code: { type: "string", enum: ["DATE_IN_CLOSURE"] },
+      closureId: { type: "string" },
+      label: { type: "string" },
+      startDate: { type: "string", format: "date" },
+      endDate: { type: "string", format: "date" },
+    },
+  },
+
+  ClosureErrorCode: {
+    type: "string",
+    enum: ["VALIDATION_FAILED", "INVALID_CLOSURE_RANGE", "UNKNOWN_ROUND", "CLOSURE_NOT_FOUND", "CLOSURE_ENDED", "CLOSURE_RESOLUTION_LIMIT"],
+    description:
+      "Stable `code` values of the closures endpoints: VALIDATION_FAILED (400), INVALID_CLOSURE_RANGE (400: end before start, longer than 366 days, or ends in the past), " +
+      "UNKNOWN_ROUND (400), CLOSURE_NOT_FOUND (404), CLOSURE_ENDED (409, apply only), CLOSURE_RESOLUTION_LIMIT (500, internal guard).",
+  },
+
   ProviderStatusResult: {
     type: "object",
     required: ["status"],
@@ -1046,7 +1187,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
 
   OccurrenceSummary: {
     type: "object",
-    description: "One calendar day's aggregate stats for a round (planner calendar view).",
+    description: "One calendar day's aggregate stats for a round (planner calendar view). May be a forecast (see `projected`).",
     required: ["date", "stopCount", "totalValue", "completedCount", "completionPct", "holdCount", "issueCount", "technicians"],
     properties: {
       date: { type: "string", format: "date", description: "UTC calendar date (YYYY-MM-DD)." },
@@ -1057,6 +1198,14 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       holdCount: { type: "integer" },
       issueCount: { type: "integer" },
       technicians: { type: "array", items: ref("OccurrenceTechnicianRef"), description: "Every distinct technician with ≥ 1 stop on this date, deduped by id." },
+      projected: {
+        type: "boolean",
+        enum: [true],
+        description:
+          "Present (true) only on a forecast entry: the date is projected from the round's frequency, no visits exist yet, stopCount and totalValue are estimates, " +
+          "and technicians is empty. Real entries omit it. Forecasts run up to 13 weeks past the round's next date, at most 4 entries per round in total (real and projected), " +
+          "only for ACTIVE rounds and only inside the requested date window. Display-only: nothing is created.",
+      },
     },
   },
 
@@ -1321,6 +1470,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       carriedToDate: { type: "string", format: "date", nullable: true, description: "ACT-02..04: the day the unfinished visits were carried to (push_to_tomorrow); null otherwise." },
       notifiedCustomers: { type: "integer", description: "Customers messaged about the carryover (notifyCustomers); 0 otherwise." },
       customerNotificationError: { type: "string", description: "Set when notifyCustomers was requested but messaging failed; the close itself succeeded." },
+      warnings: { type: "array", items: ref("ClosureWarning"), description: "Closures: present only when push_to_tomorrow carried visits to a day inside an active closure (non-blocking)." },
     },
   },
 
@@ -1546,6 +1696,12 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       date: { type: "string", format: "date" },
       label: { type: "string", example: "Monday 9 Nov" },
       default: { type: "boolean" },
+      closure: {
+        type: "object",
+        description: "Closures: present only when this option's date is inside an active business closure.",
+        required: ["closureId", "label"],
+        properties: { closureId: { type: "string" }, label: { type: "string" } },
+      },
     },
   },
 
@@ -1592,6 +1748,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       },
       dryRun: { type: "boolean" },
       customerNotificationError: { type: "string", description: "Present when notifyCustomers failed; the carryover itself is done." },
+      warnings: { type: "array", items: ref("ClosureWarning"), description: "Closures: present only when the target day is inside an active closure for a round of the moved visits (non-blocking; also on dryRun)." },
     },
   },
 
@@ -1698,6 +1855,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       id: { type: "string" },
       status: { type: "string", enum: ["SCHEDULED"] },
       date: { type: "string", format: "date" },
+      warnings: { type: "array", items: ref("ClosureWarning"), description: "Closures: present only when the new date is inside an active business closure that applies to the visit's round (non-blocking)." },
     },
   },
 
@@ -2577,7 +2735,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     type: "object",
     required: ["id", "role"],
     description:
-      "`role: USER` messages carry `text` and `createdAt`. `role: ASSISTANT` messages carry `mode`, `model`, `status`, `declined`, `answer`, `warnings` (and `errorCode` when ERROR). " +
+      "`role: USER` messages carry `text` and `createdAt`. `role: ASSISTANT` messages carry `mode`, `model`, `status`, `declined`, `answer`, `warnings`, `rating` (and `errorCode` when ERROR). " +
       "The same shape is the `message` of the `done` event.",
     properties: {
       id: { type: "string" },
@@ -2591,6 +2749,30 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       answer: { allOf: [ref("FloAnswer")], nullable: true },
       warnings: { type: "array", items: { type: "string", enum: ["UNVERIFIED_FIGURES"] } },
       errorCode: { type: "string" },
+      rating: { type: "string", enum: ["UP", "DOWN"], nullable: true, description: "ASSISTANT messages only: the admin's thumbs rating, null until rated (POST /flo/messages/{id}/feedback)." },
+    },
+  },
+  FloFeedbackRequest: {
+    type: "object",
+    required: ["rating"],
+    properties: {
+      rating: { type: "string", enum: ["UP", "DOWN"] },
+      comment: { type: "string", maxLength: 500, description: "Optional. Trimmed; an empty comment clears the previous one." },
+    },
+  },
+  FloGapList: {
+    type: "object",
+    required: ["items"],
+    properties: {
+      items: {
+        type: "array",
+        description: "Questions Flo could not answer (NO_DATA_USED), newest first, for the whole business (all admins).",
+        items: {
+          type: "object",
+          required: ["question", "at", "reason"],
+          properties: { question: { type: "string", description: "The admin's own question text (max 500 characters)." }, at: { type: "string", format: "date-time" }, reason: { type: "string", enum: ["NO_DATA_USED"] } },
+        },
+      },
     },
   },
   FloStatus: {
@@ -5533,6 +5715,118 @@ const paths: OpenAPIV3.PathsObject = {
       },
     },
   },
+
+  // =====================================================================
+  // Business closures (2026-11-16) — ADMIN/MANAGER only (reads and writes).
+  // The apply endpoints (POST /closures/{id}/apply/preview and /apply) are added with their routes (B6).
+  // =====================================================================
+  "/closures": {
+    get: {
+      tags: ["Closures"],
+      summary: "List business closures",
+      description:
+        "ADMIN/MANAGER. Default: closures whose `endDate` is today or later (tenant-local today). With `from` and/or `to`: closures overlapping that window. Sorted by `startDate`.",
+      parameters: [
+        { name: "from", in: "query", required: false, schema: { type: "string", format: "date" }, description: "YYYY-MM-DD; closures ending on or after this day." },
+        { name: "to", in: "query", required: false, schema: { type: "string", format: "date" }, description: "YYYY-MM-DD; closures starting on or before this day. Not before `from`." },
+      ],
+      responses: {
+        "200": jsonResponse("Closures.", ref("ClosureListResult")),
+        "400": errorResponse("VALIDATION_FAILED: bad date or `to` before `from`.", "\"from\" must be a valid date in YYYY-MM-DD format."),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+    post: {
+      parameters: [IDEMPOTENCY_KEY_PARAM],
+      tags: ["Closures"],
+      summary: "Create a business closure",
+      description:
+        "ADMIN/MANAGER. Unknown body fields are rejected. Errors (400, `code`): VALIDATION_FAILED, INVALID_CLOSURE_RANGE (end before start, over 366 days, or ends in the past), UNKNOWN_ROUND. " +
+        "Creating a closure changes no existing visit; later visit generation and the planner honour it.",
+      requestBody: jsonBody(ref("ClosureCreateInput")),
+      responses: {
+        "201": jsonResponse("Created.", ref("Closure")),
+        "400": errorResponse("VALIDATION_FAILED, INVALID_CLOSURE_RANGE or UNKNOWN_ROUND.", "endDate must be on or after startDate."),
+        "401": ERR[401],
+        "403": ERR[403],
+      },
+    },
+  },
+
+  "/closures/{id}": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    patch: {
+      parameters: [IDEMPOTENCY_KEY_PARAM],
+      tags: ["Closures"],
+      summary: "Update a business closure",
+      description:
+        "ADMIN/MANAGER. Any subset of the create fields; the merged dates are re-validated. The \"ends in the past\" check runs only when `startDate` or `endDate` is supplied. " +
+        "Editing never restores visits that were already moved or skipped.",
+      requestBody: jsonBody(ref("ClosureUpdateInput")),
+      responses: {
+        "200": jsonResponse("Updated.", ref("Closure")),
+        "400": errorResponse("VALIDATION_FAILED, INVALID_CLOSURE_RANGE or UNKNOWN_ROUND.", "endDate must be on or after startDate."),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": errorResponse("CLOSURE_NOT_FOUND.", "Closure not found"),
+      },
+    },
+    delete: {
+      parameters: [IDEMPOTENCY_KEY_PARAM],
+      tags: ["Closures"],
+      summary: "Delete a business closure",
+      description: "ADMIN/MANAGER. Never restores visits that were already moved or skipped.",
+      responses: {
+        "204": { description: "Deleted." },
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": errorResponse("CLOSURE_NOT_FOUND.", "Closure not found"),
+      },
+    },
+  },
+
+  // closures: apply paths (B6)
+  "/closures/{id}/apply/preview": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    post: {
+      tags: ["Closures"],
+      summary: "Preview applying a closure to existing visits (no writes)",
+      description:
+        "ADMIN/MANAGER. The same selection and computation as apply, without any write: SCHEDULED, non-one-off visits inside the window (today or later) of the closure's rounds, each resolved against every active closure. " +
+        "Returns groups per round (`from`, `to`, `count`; `to` is null for SKIP), never one row per visit, plus technician conflicts and the default customer message for the mode.",
+      responses: {
+        "200": jsonResponse("Preview.", ref("ClosureApplyPreview")),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": errorResponse("CLOSURE_NOT_FOUND.", "Closure not found"),
+        "409": errorResponse("CLOSURE_ENDED: the closure's window is entirely in the past; CARRYOVER_TARGET_CLOSED: a target day has already been closed.", "This closure has already ended"),
+      },
+    },
+  },
+
+  "/closures/{id}/apply": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    post: {
+      parameters: [IDEMPOTENCY_KEY_PARAM],
+      tags: ["Closures"],
+      summary: "Apply a closure to existing visits",
+      description:
+        "ADMIN/MANAGER. MOVE moves each selected visit to the first open round day (carryover rules, one transaction, `nextDueDate` untouched); SKIP marks them SKIPPED with the closure label. " +
+        "Technicians are told once each; customers only when `notifyCustomers` is true (default: the closure's own flag) and a failure there is reported as `customerNotificationError` without undoing the visits. " +
+        "Safe to run twice: only visits still inside the window are touched. Never restores earlier moves.",
+      requestBody: { required: false, content: { "application/json": { schema: { type: "object", additionalProperties: false, properties: { notifyCustomers: { type: "boolean" } } } } } },
+      responses: {
+        "200": jsonResponse("Applied.", ref("ClosureApplyResult")),
+        "400": errorResponse("VALIDATION_FAILED: body is not `{ notifyCustomers?: boolean }`.", "\"notifyCustomers\" must be a boolean."),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": errorResponse("CLOSURE_NOT_FOUND.", "Closure not found"),
+        "409": errorResponse("CLOSURE_ENDED: the closure's window is entirely in the past; CARRYOVER_TARGET_CLOSED: a target day has already been closed.", "This closure has already ended"),
+      },
+    },
+  },
+  // closures: end apply paths
 
   // =====================================================================
   // Customers (M2) — ADMIN/MANAGER only (reads and mutations)
@@ -8617,6 +8911,33 @@ const paths: OpenAPIV3.PathsObject = {
       },
     },
   },
+  "/flo/gaps": {
+    get: {
+      tags: ["Flo AI"],
+      summary: "Flo AI: questions Flo could not answer (what to build next)",
+      description:
+        "ADMIN only. The questions Flo declined as `NO_DATA_USED` (no tool could answer, or it answered \"I can't look that up yet\"), newest first, across the whole business. `limit` defaults to 20 and is clamped to 50.",
+      parameters: [{ name: "limit", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 50 }, description: "How many to return, 20 when omitted. Values above the maximum are clamped to it (no error)." }],
+      responses: { "200": jsonResponse("Unanswered questions.", ref("FloGapList")), "400": errorResponse("Bad limit (code INVALID_LIMIT).", "limit must be a positive whole number."), "401": ERR[401], "403": ERR[403] },
+    },
+  },
+  "/flo/messages/{id}/feedback": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    post: {
+      tags: ["Flo AI"],
+      summary: "Flo AI: rate an answer (thumbs up or down)",
+      description:
+        "ADMIN only. Rates one ASSISTANT message in one of the caller's own conversations. Rating again overwrites the earlier rating and comment. The rating then appears as `rating` on the message in `done` and in GET /flo/conversations/{id}.",
+      requestBody: jsonBody(ref("FloFeedbackRequest")),
+      responses: {
+        "204": { description: "Saved." },
+        "400": errorResponse("Missing or invalid rating, or a comment over 500 characters (code INVALID_FEEDBACK).", "rating must be UP or DOWN."),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": errorResponse("Not an ASSISTANT message in one of the caller's conversations (code FLO_MESSAGE_NOT_FOUND).", "Message not found."),
+      },
+    },
+  },
   "/flo/conversations": {
     get: {
       tags: ["Flo AI"],
@@ -9009,6 +9330,7 @@ export const openApiDocument: OpenAPIV3.Document = {
     { name: "Notifications", description: "Admin/manager notification feed (list, unread count, mark read). Technicians use /mobile/notifications. ADMIN/MANAGER only." },
     { name: "Rounds", description: "Round CRUD, the planner (calendar + list/map views, including batched multi-round variants), the Today panel, reassign, push-missed, weather hold (preview + apply), and on-demand visit generation. ADMIN/MANAGER only." },
     { name: "Technicians", description: "Technician directory — list/detail/create/update with round names and today's job stats. Distinct from Settings → /settings/technicians, which is the invite-pending-only editor. ADMIN/MANAGER only." },
+    { name: "Closures", description: "Business closures (holidays, shutdowns): list, create, update, delete. ADMIN/MANAGER only." },
     { name: "Messages", description: "Direct GoHighLevel-backed messaging — send to a single customer, or broadcast to every customer in a round. ADMIN/MANAGER only." },
     { name: "Debt", description: "Collections — the debt board (paginated, bucketed), bucket counts, invoice detail, reminders, payment links, and bad-debt/hold flags. ADMIN/MANAGER only." },
     { name: "Reports", description: "Activity log and visit/technician/revenue reporting, plus a CSV export. ADMIN/MANAGER only." },

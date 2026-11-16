@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  addDays, checkRange, columns, dateToDay, dayToDate, daysBetween, instantRange, localDayBounds, localDayOf, optDate, optEnum, optId, optInt,
-  optNumber, optString, parseArgs, parseLimit, rangeLabel, reqString, resolveRange, round2, tenantClock, toDateRange, ToolInputError, visitDateWhere,
+  addDays, breakdownText, checkRange, columns, dateToDay, dayToDate, daysBetween, instantRange, localDayBounds, localDayOf, optDate, optEnum, optId, optInt,
+  optNumber, optString, parseArgs, parseLimit, pct, previousWindow, rangeLabel, reqString, resolveRange, round2, safeDiv, localTimeOf, tenantClock, toDateRange, ToolInputError, topEntry, visitDateWhere, weekStartOf,
 } from "../shared";
 import { ctxFor, fakePrisma } from "./fake-prisma";
 
@@ -135,5 +135,46 @@ describe("misc", () => {
     expect(columns(["a", "A", "text"], ["b", "B", "date"], ["c", "C", "currency"], ["d", "D", "integer"], ["e", "E", "percent"]).map((c) => c.align)).toEqual([
       "left", "left", "right", "right", "right",
     ]);
+  });
+});
+
+describe("derived-metric helpers", () => {
+  it("pct and safeDiv return null instead of NaN or Infinity when the divisor is zero", () => {
+    expect(pct(1, 8)).toBe(12.5);
+    expect(pct(0, 5)).toBe(0);
+    expect(pct(5, 0)).toBeNull();
+    expect(pct(0, 0)).toBeNull();
+    expect(safeDiv(10, 4)).toBe(2.5);
+    expect(safeDiv(10, 0)).toBeNull();
+  });
+
+  it("topEntry picks the largest count, breaking ties by name, and is null when empty", () => {
+    expect(topEntry(new Map())).toBeNull();
+    expect(topEntry(new Map([["b", 2], ["a", 2], ["c", 1]]))).toEqual({ name: "a", count: 2 });
+    expect(topEntry(new Map([["a", 1], ["b", 3]]))).toEqual({ name: "b", count: 3 });
+  });
+
+  it("breakdownText lists counts largest first, folds the tail into Other and is null when empty", () => {
+    expect(breakdownText(new Map())).toBeNull();
+    expect(breakdownText(new Map([["b", 1], ["a", 1], ["c", 5]]))).toBe("c: 5; a: 1; b: 1");
+    expect(breakdownText(new Map([["a", 5], ["b", 4], ["c", 3], ["d", 2]]), 2)).toBe("a: 5; b: 4; Other: 5");
+  });
+
+  it("localTimeOf renders the tenant-local wall clock time", () => {
+    expect(localTimeOf(new Date("2026-07-14T23:30:00Z"), "Europe/London")).toBe("00:30");
+    expect(localTimeOf(new Date("2026-11-10T23:30:00Z"), "Europe/London")).toBe("23:30");
+  });
+
+  it("weekStartOf returns the Monday of the ISO week (Sunday belongs to the week before)", () => {
+    expect(weekStartOf("2026-11-09")).toBe("2026-11-09"); // Monday
+    expect(weekStartOf("2026-11-10")).toBe("2026-11-09");
+    expect(weekStartOf("2026-11-15")).toBe("2026-11-09"); // Sunday
+    expect(weekStartOf("2026-11-16")).toBe("2026-11-16");
+    expect(weekStartOf("2026-01-01")).toBe("2025-12-29");
+  });
+
+  it("previousWindow is the same number of days immediately before the range", () => {
+    expect(previousWindow("2026-11-01", "2026-11-10")).toEqual({ from: "2026-10-22", to: "2026-10-31" });
+    expect(previousWindow("2026-11-05", "2026-11-05")).toEqual({ from: "2026-11-04", to: "2026-11-04" });
   });
 });

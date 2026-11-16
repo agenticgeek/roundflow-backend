@@ -1,5 +1,6 @@
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { localDay, resolveTimeZone, todayRange } from "../lib/dates";
+import { now as clockNow } from "../lib/clock";
 import { getCachedBusinessSettings } from "./settings.service";
 
 // EMU-6: "today" for scheduling, jobs and Today's Work follows the tenant's
@@ -15,7 +16,7 @@ export async function tenantTimeZone(tp: TenantPrismaClient): Promise<string> {
   }
 }
 
-export async function tenantTodayRange(tp: TenantPrismaClient, now: Date = new Date()): Promise<{ start: Date; end: Date }> {
+export async function tenantTodayRange(tp: TenantPrismaClient, now: Date = clockNow()): Promise<{ start: Date; end: Date }> {
   return todayRange(await tenantTimeZone(tp), now);
 }
 
@@ -29,6 +30,6 @@ export async function tenantWorkingDays(tp: TenantPrismaClient): Promise<string[
 }
 
 /** UTC-midnight Date of the tenant-local "today". */
-export async function tenantToday(tp: TenantPrismaClient, now: Date = new Date()): Promise<Date> {
+export async function tenantToday(tp: TenantPrismaClient, now: Date = clockNow()): Promise<Date> {
   return localDay(await tenantTimeZone(tp), now);
 }

@@ -4,7 +4,8 @@ import type { DeclineCopy, ScopeVerdict } from "./types";
 // of text a decline can show, so a jailbreak cannot turn a refusal into an answer.
 
 export const OUT_OF_SCOPE_TEXT =
-  "I can only answer questions about your own RoundFlow data: rounds, jobs, payments, complaints and technicians.";
+  "That's outside what I can help with. I'm Flo, and I look things up in your own RoundFlow data: rounds, jobs, payments, complaints and technicians.";
+export const GREETING_TEXT = "Hello! I'm Flo. I can look things up in your RoundFlow data. Here are a few places to start.";
 export const WRITE_REQUEST_TEXT = "Flo can only look things up for now. I can't change anything.";
 export const NO_DATA_TEXT = "I couldn't find that in your RoundFlow data. Try one of these instead.";
 export const CAPABILITY_TEXT = "I can look things up in your own RoundFlow data. Here are some questions to try.";
@@ -16,7 +17,7 @@ export interface SuggestionGroup {
 
 /** Static suggested questions by area. Served by GET /flo/suggestions and used as the "what can you do" reply. */
 export const SUGGESTION_GROUPS: readonly SuggestionGroup[] = [
-  { area: "Today", items: ["What is on today and who is behind?", "Summarise yesterday"] },
+  { area: "Today", items: ["Give me my morning briefing", "What is on today and who is behind?", "Summarise yesterday"] },
   { area: "Rounds", items: ["Which rounds are due next week and what are they worth?", "Show the skipped visits this week with reasons"] },
   { area: "Money owed", items: ["Who owes me more than £50 and for how long?", "What does Mrs Smith owe?"] },
   { area: "Payments", items: ["Show failed payments this month"] },
@@ -38,6 +39,40 @@ function capabilitySuggestions(): string[] {
   return SUGGESTION_GROUPS.map((g) => g.items[0]);
 }
 
+/** Follow-up questions offered under an answer when the model wrote none, keyed by the tool that produced the data. */
+export const FOLLOW_UPS_BY_TOOL: Readonly<Record<string, readonly string[]>> = {
+  get_day_overview: ["Show the skipped visits today with reasons", "Which rounds are due next week?"],
+  list_rounds_due: ["What is on today and who is behind?", "Show the skipped visits this week with reasons"],
+  list_debtors: ["Show failed payments this month", "Which customers are at risk of leaving?"],
+  list_payments: ["Who owes me more than £50 and for how long?", "Revenue by service area, this month vs last"],
+  compare_technicians: ["Show open complaints by severity, oldest first", "Revenue by technician, this month vs last"],
+  list_technicians: ["Compare my technicians for last month", "What is on today and who is behind?"],
+  list_complaints: ["Compare my technicians for last month", "Which customers skipped twice in a row?"],
+  list_at_risk_customers: ["Who owes me more than £50 and for how long?", "Show open complaints by severity, oldest first"],
+  revenue_summary: ["Compare my technicians for last month", "Who owes me more than £50 and for how long?"],
+  list_skipped_visits: ["Which customers skipped twice in a row?", "What is on today and who is behind?"],
+  get_customer_summary: ["Show failed payments this month", "Which rounds are due next week and what are they worth?"],
+  get_business_snapshot: ["What is on today and who is behind?", "Where am I losing money?"],
+  list_invoices: ["Who owes me more than £50 and for how long?", "Show failed payments this month"],
+  service_plan_health: ["Which customers are at risk of leaving?", "Which rounds are due next week and what are they worth?"],
+  revenue_leakage: ["Who owes me more than £50 and for how long?", "Show failed payments this month"],
+  backlog_and_carryover: ["Show the skipped visits this week with reasons", "What is on today and who is behind?"],
+  round_performance: ["Which rounds are due next week and what are they worth?", "Compare my technicians for last month"],
+  technician_workload: ["Compare my technicians for last month", "Show technician incidents this quarter"],
+  technician_incidents: ["Compare my technicians for last month", "Show open complaints by severity, oldest first"],
+  list_messages_delivery: ["Show open complaints by severity, oldest first", "Which customers are at risk of leaving?"],
+  list_issues_photos: ["Show open complaints by severity, oldest first", "What is on today and who is behind?"],
+  forecast_schedule: ["Which rounds are due next week and what are they worth?", "Did the weather affect last week's jobs?"],
+  closures_and_weather: ["Show the skipped visits this week with reasons", "Which rounds are due next week and what are they worth?"],
+  calculate: ["Revenue by service area, this month vs last", "Compare my technicians for last month"],
+};
+
+export function fallbackFollowUps(tools: readonly string[], max = 3): string[] {
+  const out: string[] = [];
+  for (const t of tools) for (const q of FOLLOW_UPS_BY_TOOL[t] ?? []) if (!out.includes(q) && out.length < max) out.push(q);
+  return out;
+}
+
 export type DeclineVerdict = Exclude<ScopeVerdict, "IN_SCOPE">;
 
 /** The fixed decline for a non-IN_SCOPE verdict. UNSAFE reads exactly like OUT_OF_SCOPE (no hint about why). */
@@ -47,6 +82,8 @@ export function declineForVerdict(verdict: DeclineVerdict): DeclineCopy {
       return { reason: "WRITE_REQUEST", text: WRITE_REQUEST_TEXT, suggestions: [...DECLINE_SUGGESTIONS] };
     case "CAPABILITY_QUESTION":
       return { reason: "CAPABILITY", text: CAPABILITY_TEXT, suggestions: capabilitySuggestions() };
+    case "GREETING":
+      return { reason: "GREETING", text: GREETING_TEXT, suggestions: capabilitySuggestions() };
     case "UNSAFE":
       return { reason: "UNSAFE", text: OUT_OF_SCOPE_TEXT, suggestions: [...DECLINE_SUGGESTIONS] };
     case "OUT_OF_SCOPE":

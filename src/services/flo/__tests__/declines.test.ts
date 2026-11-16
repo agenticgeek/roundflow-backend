@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  CAPABILITY_TEXT, declineForVerdict, declineNoData, NO_DATA_TEXT, OUT_OF_SCOPE_TEXT, SUGGESTION_GROUPS, WRITE_REQUEST_TEXT,
+  CAPABILITY_TEXT, declineForVerdict, fallbackFollowUps, FOLLOW_UPS_BY_TOOL, declineNoData, NO_DATA_TEXT, OUT_OF_SCOPE_TEXT, SUGGESTION_GROUPS, WRITE_REQUEST_TEXT,
 } from "../declines";
 
 describe("declines (fixed copy)", () => {
@@ -12,7 +12,7 @@ describe("declines (fixed copy)", () => {
     expect(u.text).toBe(o.text);
     expect(u.reason).toBe("UNSAFE");
     expect(OUT_OF_SCOPE_TEXT).toBe(
-      "I can only answer questions about your own RoundFlow data: rounds, jobs, payments, complaints and technicians."
+      "That's outside what I can help with. I'm Flo, and I look things up in your own RoundFlow data: rounds, jobs, payments, complaints and technicians."
     );
   });
 
@@ -28,6 +28,28 @@ describe("declines (fixed copy)", () => {
     expect(c.reason).toBe("CAPABILITY");
     expect(c.text).toBe(CAPABILITY_TEXT);
     expect(c.suggestions).toEqual(SUGGESTION_GROUPS.map((g) => g.items[0]));
+  });
+
+  it("the morning briefing is the first chip of the first group and in the capability suggestions", () => {
+    expect(SUGGESTION_GROUPS[0].items[0]).toBe("Give me my morning briefing");
+    expect(declineForVerdict("CAPABILITY_QUESTION").suggestions[0]).toBe("Give me my morning briefing");
+    expect(declineForVerdict("GREETING").suggestions[0]).toBe("Give me my morning briefing");
+  });
+
+  it("has follow-ups for the 13 new tools", () => {
+    const names = ["get_business_snapshot", "list_invoices", "service_plan_health", "revenue_leakage", "backlog_and_carryover", "round_performance",
+      "technician_workload", "technician_incidents", "list_messages_delivery", "list_issues_photos", "forecast_schedule", "closures_and_weather", "calculate"];
+    for (const t of names) {
+      expect(FOLLOW_UPS_BY_TOOL[t], t).toHaveLength(2);
+      expect(fallbackFollowUps([t]).length, t).toBeGreaterThan(0);
+      for (const q of FOLLOW_UPS_BY_TOOL[t]) expect(q.length).toBeLessThanOrEqual(80);
+    }
+  });
+
+  it("fallbackFollowUps skips unknown tools, de-duplicates and caps at max", () => {
+    expect(fallbackFollowUps(["nope"])).toEqual([]);
+    expect(fallbackFollowUps(["list_debtors", "list_debtors", "list_payments"], 3)).toHaveLength(3);
+    expect(fallbackFollowUps(["list_debtors"], 1)).toHaveLength(1);
   });
 
   it("NO_DATA_USED has its own fixed copy", () => {

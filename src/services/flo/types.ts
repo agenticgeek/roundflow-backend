@@ -18,6 +18,12 @@ export interface ModeConfig {
   maxCards: number;
   maxInsights: number;
   maxIntroSentences: number;
+  /** Chart blocks allowed per answer (THOROUGH 2, BALANCED 1, QUICK 0). */
+  maxCharts: number;
+  /** Sampling temperature for the main model. Unset for the default 5.x models, which reject non-default values. */
+  temperature?: number;
+  /** Adaptive thinking on/off for the main model. Unset: the default 5.x models already think adaptively and cannot disable it. */
+  thinking?: boolean;
 }
 
 // ---- tools ------------------------------------------------------------------
@@ -29,6 +35,8 @@ export type ToolContext = {
   profileId: string;
   /** Injectable clock for tests; defaults to `new Date()`. */
   now?: Date;
+  /** Stored results of the current request, live (the orchestrator adds each one as it completes). For the `calculate` tool. */
+  results?: ReadonlyMap<string, ToolResult>;
 };
 
 export type ColumnFormat = "text" | "integer" | "currency" | "percent" | "date";
@@ -70,11 +78,25 @@ export const TOOL_NAMES = [
   "list_debtors",
   "list_payments",
   "compare_technicians",
+  "list_technicians",
   "list_complaints",
   "list_at_risk_customers",
   "revenue_summary",
   "list_skipped_visits",
   "get_customer_summary",
+  "get_business_snapshot",
+  "list_invoices",
+  "service_plan_health",
+  "revenue_leakage",
+  "backlog_and_carryover",
+  "round_performance",
+  "technician_workload",
+  "technician_incidents",
+  "list_messages_delivery",
+  "list_issues_photos",
+  "forecast_schedule",
+  "closures_and_weather",
+  "calculate",
 ] as const;
 export type ToolName = (typeof TOOL_NAMES)[number];
 
@@ -95,7 +117,8 @@ export interface ToolDefinition<A = unknown> {
 /** executeTool never throws. args = the validated arguments (for the audit trail), ms = the run time. */
 export type ToolOutcome =
   | { ok: true; result: ToolResult; args: unknown; ms: number }
-  | { ok: false; error: string; args?: unknown; ms: number };
+  /** kind "infrastructure" = a system failure the model must not retry; anything else (or absent) = a validation error it may fix. */
+  | { ok: false; error: string; args?: unknown; ms: number; kind?: "validation" | "infrastructure" };
 
 export interface ToolSpec {
   name: string;
@@ -126,6 +149,14 @@ export interface ProviderRequest {
   signal?: AbortSignal;
   /** Cache the system prompt and tool definitions (default true). */
   cache?: boolean;
+  /** Per-request system text (mode guidance, today's date). Sent as a second, UNCACHED system block after `system`. */
+  systemDynamic?: string;
+  /** "none" forces a text answer (used on the last round so gathered data is never thrown away). Default "auto". */
+  toolChoice?: "auto" | "none";
+  /** Sampling temperature. Omit to use the provider default. */
+  temperature?: number;
+  /** Enable extended/adaptive thinking (THOROUGH). The wrapper decides the exact parameter for the model in use. */
+  thinking?: boolean;
 }
 
 export interface ProviderUsage {
@@ -159,10 +190,10 @@ export type ProviderErrorCode = "PROVIDER_UNAVAILABLE" | "PROVIDER_TIMEOUT" | "P
 
 // ---- scope gate -------------------------------------------------------------------
 
-export const SCOPE_VERDICTS = ["IN_SCOPE", "OUT_OF_SCOPE", "WRITE_REQUEST", "CAPABILITY_QUESTION", "UNSAFE"] as const;
+export const SCOPE_VERDICTS = ["IN_SCOPE", "OUT_OF_SCOPE", "WRITE_REQUEST", "CAPABILITY_QUESTION", "GREETING", "UNSAFE"] as const;
 export type ScopeVerdict = (typeof SCOPE_VERDICTS)[number];
 
-export type DeclineReason = "OUT_OF_SCOPE" | "WRITE_REQUEST" | "UNSAFE" | "NO_DATA_USED" | "CAPABILITY";
+export type DeclineReason = "OUT_OF_SCOPE" | "WRITE_REQUEST" | "UNSAFE" | "NO_DATA_USED" | "CAPABILITY" | "GREETING";
 
 export interface ScopeDecision {
   verdict: ScopeVerdict;

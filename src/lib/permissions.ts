@@ -46,6 +46,8 @@ export const ADMIN_ONLY_ROUTES: ReadonlyArray<readonly [string, string]> = [
   ["GET", "/flo/conversations"],
   ["GET", "/flo/conversations/:id"],
   ["DELETE", "/flo/conversations/:id"],
+  ["GET", "/flo/gaps"],
+  ["POST", "/flo/messages/:id/feedback"],
 ];
 
 /** PATCH /settings/business-profile fields a MANAGER may not touch (bank and VAT). */

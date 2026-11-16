@@ -10,6 +10,8 @@ import { REMINDER_MARKERS_RESET, cancelPendingVisitMessages } from "./visit-resc
 import { notifyVisitTechnicians, visitCount } from "./notify";
 import { createMessageService, type BroadcastTarget } from "./message.service";
 import { formatTemplateDate } from "./message-templates";
+import { closureMarker, closureWarnings, loadActiveClosures } from "./closure-warnings";
+import type { ClosureWarning } from "../lib/closure-types";
 
 // ACT-02..04: carry unfinished visits of a day to a later working day. Shared by
 // POST /visits/carryover and POST /today/close (push_to_tomorrow).
@@ -34,7 +36,7 @@ export interface CarryoverConflict {
 
 export interface CarryoverOptionsResult {
   date: string;
-  options: CarryoverOption[];
+  options: (CarryoverOption & { closure?: { closureId: string; label: string } })[];
 }
 
 export interface CarryoverResult {
@@ -47,6 +49,8 @@ export interface CarryoverResult {
   dryRun: boolean;
   /** Set when notifyCustomers was requested but the customer message step failed (the carryover itself is done). */
   customerNotificationError?: string;
+  /** DATE_IN_CLOSURE for the target day (non-blocking); absent when no active closure covers it. */
+  warnings?: ClosureWarning[];
 }
 
 export interface MovedVisit {
@@ -81,7 +85,7 @@ export async function carryOverVisits(
     visitIds?: string[];
     dryRun?: boolean;
     actor?: { id?: string | null; role?: string | null };
-    via: "carryover" | "close-day";
+    via: "carryover" | "close-day" | "closure";
   }
 ): Promise<CoreResult> {
   const { fromDate, targetDate } = input;
@@ -252,7 +256,12 @@ export function createCarryoverService(prisma: TenantPrismaClient) {
     options: async (date: Date): Promise<CarryoverOptionsResult> => {
       const cfg = await workingConfig(prisma);
       const day = startOfUtcDay(date);
-      return { date: iso(day), options: carryoverOptions(day, { workingDays: cfg.workingDays, tz: cfg.tz }) };
+      const closures = await loadActiveClosures(prisma, await tenantToday(prisma));
+      const options = carryoverOptions(day, { workingDays: cfg.workingDays, tz: cfg.tz }).map((o) => {
+        const closure = closureMarker(startOfUtcDay(new Date(o.date)), closures);
+        return closure ? { ...o, closure } : o;
+      });
+      return { date: iso(day), options };
     },
 
     carryover: async (input: {
@@ -287,6 +296,11 @@ export function createCarryoverService(prisma: TenantPrismaClient) {
         skipped: core.skipped,
         dryRun,
       };
+      if (core.moved.length > 0) {
+        const today = await tenantToday(prisma);
+        const warnings = closureWarnings(targetDate, core.moved.map((m) => m.roundId), await loadActiveClosures(prisma, today));
+        if (warnings) result.warnings = warnings;
+      }
       if (dryRun || core.moved.length === 0) return result;
 
       result.notifiedTechnicians = await notifyCarryoverTechnicians(prisma, core.moved, fromDate, targetDate);

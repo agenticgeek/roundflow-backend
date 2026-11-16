@@ -7,6 +7,7 @@ import { round2, vatOn, vatRateOf } from "../lib/vat";
 import { queueGhlEvent } from "../integrations/ghl/sync";
 import { getCachedBusinessSettings } from "./settings.service";
 import { createMessageService } from "./message.service";
+import { invoicePaymentInfo, type InvoicePayBank } from "./invoice-payment-info";
 import { releaseHoldIfSettled } from "./payment-hold";
 import { notifyInvoicePaid } from "./notify";
 import { MANUALLY_SETTLEABLE } from "./payment-state";
@@ -414,7 +415,7 @@ class InvoiceService {
   async sendInvoice(invoiceId: string, opts: { channel?: MessageChannel; resend?: boolean } = {}) {
     const invoice = await this.prisma.invoice.findUnique({
       where: { id: invoiceId },
-      include: { customer: { select: { name: true } } },
+      include: { customer: { select: { name: true, paymentMethod: true } } },
     });
     if (!invoice) throw new AppError(404, "Invoice not found");
     if (invoice.status === InvoiceStatus.PAID || invoice.status === InvoiceStatus.VOID) {
@@ -453,18 +454,19 @@ class InvoiceService {
       ].filter(([, v]) => v) as Array<[string, string]>;
       let attachments: Array<{ filename: string; contentType: string; content: Buffer }> | undefined;
       pdfAttached = false;
+      let bank: InvoicePayBank | null = null;
       try {
         const data = await this.getRenderData(invoiceId);
-        const bank = data.business.bank;
-        if (bank) {
-          summary.push(["Account name", bank.accountName], ["Sort code", bank.sortCode], ["Account number", bank.accountNumber]);
-        }
+        bank = data.business.bank;
         const pdf = await renderHtmlToPdf(invoiceHtml(data));
         attachments = [{ filename: `${invoice.invoiceNumber}.pdf`, contentType: "application/pdf", content: pdf }];
         pdfAttached = true;
       } catch (err) {
         console.error(`[invoices] invoice ${invoice.invoiceNumber} emailed without the PDF:`, (err as Error).message);
       }
+      // How to pay depends on the customer's payment method: Stripe link, bank details, or neither (see invoice-payment-info).
+      const pay = await invoicePaymentInfo(this.prisma, { invoice, method: invoice.customer.paymentMethod ?? null, bank, settings });
+      summary.push(...pay.rows);
       const vars = invoiceTemplateVars({
         customerName: invoice.customer.name,
         invoiceNumber: invoice.invoiceNumber,
@@ -472,6 +474,7 @@ class InvoiceService {
         dueDate: invoice.dueDate,
         currency: settings?.currency,
         businessName: settings?.businessName,
+        paymentLink: pay.cta?.url,
       });
       emailOpts = {
         subject: template.subject
@@ -479,6 +482,7 @@ class InvoiceService {
           : `Invoice ${invoice.invoiceNumber} from ${settings?.businessName ?? "your service provider"}`,
         transactional: true,
         summary,
+        ...(pay.cta ? { cta: pay.cta } : {}),
         ...(attachments ? { attachments } : {}),
       };
     }

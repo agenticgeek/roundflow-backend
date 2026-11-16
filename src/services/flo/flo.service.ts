@@ -5,6 +5,7 @@ import { AppError } from "../../lib/app-error";
 import { IDEMPOTENCY_STALE_MS, MAX_IDEMPOTENCY_KEY_LENGTH } from "../../lib/idempotency";
 import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
 import { answerText, type FinalAnswer, type FinalMessage, type FloEvent, type UserMessage } from "./answer";
+import { renderPreviousData } from "./data-summary";
 import { declineForVerdict, declineNoData, SUGGESTION_GROUPS } from "./declines";
 import { declineLimitPerDay, floEnabled, getDailyUsage, getDeclineCount } from "./limits";
 import { DEFAULT_MODE, getModeConfig, isMode, listModes } from "./modes";
@@ -17,7 +18,7 @@ import type { DeclineCopy, DeclineReason, Mode, ModeConfig, ProviderClient, Prov
 // for every pre-stream check (plain HTTP errors), then drives `handle.events(signal)` into the SSE writer.
 //
 // Persistence: the user message at prepare time; the assistant message (OK / ERROR / DECLINED / ABORTED) when the
-// pipeline ends. The daily cap is counted from OK rows; the decline cap from DECLINED rows excluding CAPABILITY.
+// pipeline ends. The daily cap is counted from OK rows; the decline cap from DECLINED rows excluding CAPABILITY and GREETING.
 // Idempotency-Key: same pattern as lib/idempotency.ts (insert first, the primary key is the lock), but the stored
 // response is the FINAL MESSAGE, replayed as `start` + `done`.
 
@@ -95,6 +96,7 @@ const DECLINES: Record<string, () => DeclineCopy> = {
   WRITE_REQUEST: () => declineForVerdict("WRITE_REQUEST"),
   UNSAFE: () => declineForVerdict("UNSAFE"),
   CAPABILITY: () => declineForVerdict("CAPABILITY_QUESTION"),
+  GREETING: () => declineForVerdict("GREETING"),
   NO_DATA_USED: declineNoData,
 };
 
@@ -109,15 +111,20 @@ interface MessageRow {
   status: "OK" | "ERROR" | "DECLINED" | "ABORTED";
   declineReason: string | null;
   errorCode: string | null;
+  rating?: string | null;
   createdAt: Date;
 }
 
+export type FloRating = "UP" | "DOWN";
+/** The final message plus the admin's thumbs rating (null until rated). */
+export type RatedFinalMessage = FinalMessage & { rating: FloRating | null };
+
 /** The shape of one message in `done` and in GET /flo/conversations/{id}. */
-export function toMessage(row: MessageRow): UserMessage | FinalMessage {
+export function toMessage(row: MessageRow): UserMessage | RatedFinalMessage {
   return row.role === "USER" ? { id: row.id, role: "USER", text: row.text, createdAt: row.createdAt.toISOString() } : toAssistantMessage(row);
 }
 
-function toAssistantMessage(row: MessageRow): FinalMessage {
+function toAssistantMessage(row: MessageRow): RatedFinalMessage {
   const reason = row.declineReason ?? "OUT_OF_SCOPE";
   const declined: DeclineCopy | null =
     row.status === "DECLINED" ? { reason: reason as DeclineReason, text: row.text, suggestions: (DECLINES[reason] ?? DECLINES.OUT_OF_SCOPE)().suggestions } : null;
@@ -131,8 +138,26 @@ function toAssistantMessage(row: MessageRow): FinalMessage {
     declined,
     answer: row.status === "OK" ? (row.answer as FinalAnswer) : null,
     warnings: row.warnings,
+    rating: row.rating === "UP" || row.rating === "DOWN" ? row.rating : null,
     ...(row.errorCode ? { errorCode: row.errorCode } : {}),
   };
+}
+
+export const MAX_GAPS = 50;
+export const DEFAULT_GAPS = 20;
+export const MAX_FEEDBACK_COMMENT = 500;
+const MAX_GAP_QUESTION_CHARS = 500;
+const invalidFeedback = (message: string) => new FloError(400, message, "INVALID_FEEDBACK");
+
+/** Validates the POST /flo/messages/{id}/feedback body. The comment is trimmed; an empty one is stored as none. */
+export function parseFeedbackBody(body: unknown): { rating: FloRating; comment: string | null } {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) throw invalidFeedback("Send a JSON object with a rating.");
+  const { rating, comment } = body as Record<string, unknown>;
+  if (rating !== "UP" && rating !== "DOWN") throw invalidFeedback("rating must be UP or DOWN.");
+  if (comment !== undefined && comment !== null && typeof comment !== "string") throw invalidFeedback("comment must be text.");
+  const text = (comment ?? "").trim();
+  if (text.length > MAX_FEEDBACK_COMMENT) throw invalidFeedback(`Keep the comment under ${MAX_FEEDBACK_COMMENT} characters.`);
+  return { rating, comment: text === "" ? null : text };
 }
 
 const isUniqueViolation = (err: unknown) => err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002";
@@ -233,6 +258,39 @@ export function createFloService(tp: TenantPrismaClient, deps: FloServiceDeps = 
     if (count === 0) throw notFound();
   }
 
+  // ---- feedback and the unanswered-question log ----------------------------------------------------------------------
+
+  /** Thumbs up/down on one of the caller's own ASSISTANT messages. Re-rating overwrites (the comment too). */
+  async function rateMessage(profileId: string, messageId: string, body: unknown): Promise<void> {
+    const { rating, comment } = parseFeedbackBody(body);
+    const { count } = await tp.floMessage.updateMany({
+      where: { id: messageId, role: "ASSISTANT", conversation: { profileId } },
+      data: { rating, ratingComment: comment },
+    });
+    if (count === 0) throw new FloError(404, "Message not found.", "FLO_MESSAGE_NOT_FOUND");
+  }
+
+  /** Questions Flo could not answer (NO_DATA_USED declines) in this business, newest first, with the asking text. */
+  async function listGaps(limit: number = DEFAULT_GAPS): Promise<{ items: Array<{ question: string; at: string; reason: string }> }> {
+    const declined = await tp.floMessage.findMany({
+      where: { role: "ASSISTANT", status: "DECLINED", declineReason: "NO_DATA_USED" },
+      orderBy: { createdAt: "desc" },
+      take: Math.min(limit, MAX_GAPS),
+      select: { conversationId: true, createdAt: true },
+    });
+    const asked = await Promise.all(
+      declined.map((d) =>
+        tp.floMessage.findFirst({ where: { conversationId: d.conversationId, role: "USER", createdAt: { lt: d.createdAt } }, orderBy: { createdAt: "desc" }, select: { text: true } })
+      )
+    );
+    return {
+      items: declined.flatMap((d, i) => {
+        const question = asked[i]?.text.replace(/\s+/g, " ").trim().slice(0, MAX_GAP_QUESTION_CHARS);
+        return question ? [{ question, at: d.createdAt.toISOString(), reason: "NO_DATA_USED" }] : [];
+      }),
+    };
+  }
+
   // ---- chat ----------------------------------------------------------------------------------------------------------
 
   async function checkCaps(profileId: string): Promise<void> {
@@ -319,14 +377,18 @@ export function createFloService(tp: TenantPrismaClient, deps: FloServiceDeps = 
       },
       orderBy: { createdAt: "desc" },
       take: HISTORY_TURNS,
-      select: { role: true, text: true, answer: true },
+      select: { role: true, text: true, answer: true, dataSummary: true },
     });
     const lastAnswer = rows.find((r) => r.role === "ASSISTANT")?.answer as { intro?: unknown } | null | undefined;
     const previousIntro = typeof lastAnswer?.intro === "string" && lastAnswer.intro !== "" ? lastAnswer.intro : undefined;
     const turns: ProviderMessage[] = rows
       .reverse()
       .filter((r) => r.text.trim() !== "")
-      .map((r) => ({ role: r.role === "USER" ? ("user" as const) : ("assistant" as const), content: r.text }));
+      .map((r) => {
+        // An earlier answer carries the data it was built from (old rows have none), fenced as untrusted.
+        const data = r.role === "ASSISTANT" ? renderPreviousData(r.dataSummary) : null;
+        return { role: r.role === "USER" ? ("user" as const) : ("assistant" as const), content: data ? `${r.text}\n\n${data}` : r.text };
+      });
     if (turns[0]?.role === "assistant") turns.shift(); // a conversation sent to the provider must start with the user
     return { history: turns, previousIntro };
   }
@@ -365,7 +427,10 @@ export function createFloService(tp: TenantPrismaClient, deps: FloServiceDeps = 
     let data: Prisma.FloMessageUncheckedCreateInput;
     switch (result.kind) {
       case "answered":
-        data = { ...base, status: "OK", text: answerText(result.answer), answer: JSON.parse(JSON.stringify(result.answer)) as Prisma.InputJsonValue, warnings: result.warnings };
+        data = { ...base, status: "OK", text: answerText(result.answer), answer: JSON.parse(JSON.stringify(result.answer)) as Prisma.InputJsonValue, warnings: result.warnings,
+          // An answer is only ever shown after a tool returned data, so the summary is never empty here.
+          dataSummary: JSON.parse(JSON.stringify(result.dataSummary)) as Prisma.InputJsonValue,
+        };
         break;
       case "declined":
         data = { ...base, status: "DECLINED", text: result.decline.text, declineReason: result.decline.reason };
@@ -413,7 +478,7 @@ export function createFloService(tp: TenantPrismaClient, deps: FloServiceDeps = 
     if (result.kind === "failed") yield { event: "error", data: { code: result.code, message: result.message, retryable: result.retryable } };
   }
 
-  return { status, suggestions, listConversations, getConversation, deleteConversation, prepare };
+  return { status, suggestions, listConversations, getConversation, deleteConversation, rateMessage, listGaps, prepare };
 }
 
 export type FloService = ReturnType<typeof createFloService>;

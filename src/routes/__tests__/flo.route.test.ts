@@ -74,16 +74,18 @@ const post = (app: express.Express, body: unknown, role = "ADMIN", extra: Record
   request(app).post("/flo/chat").set({ ...as(role), ...extra }).send(body as object);
 
 describe("access control: ADMIN only", () => {
-  const six: Array<[string, string, string]> = [
+  const eight: Array<[string, string, string]> = [
     ["get", "/flo/status", ""],
     ["get", "/flo/suggestions", ""],
     ["post", "/flo/chat", "x"],
     ["get", "/flo/conversations", ""],
     ["get", "/flo/conversations/c1", ""],
     ["delete", "/flo/conversations/c1", ""],
+    ["get", "/flo/gaps", ""],
+    ["post", "/flo/messages/m1/feedback", "x"],
   ];
 
-  it.each(six)("%s %s: anonymous 401, TECHNICIAN 403, MANAGER 403 ADMIN_ONLY", async (method, path) => {
+  it.each(eight)("%s %s: anonymous 401, TECHNICIAN 403, MANAGER 403 ADMIN_ONLY", async (method, path) => {
     const { app } = appWith();
     const call = (headers: Record<string, string>) => (request(app) as any)[method](path).set(headers).send({ message: "hi" });
     expect((await call({})).status).toBe(401);
@@ -161,7 +163,7 @@ describe("POST /flo/chat: the stream", () => {
     expect(res.status).toBe(200);
     const { frames } = parseSse(res.text);
     expect(frames.map((f) => f.event)).toEqual(["start", "declined", "done"]);
-    expect(frames[1].data).toEqual({ reason: "OUT_OF_SCOPE", text: expect.stringContaining("only answer questions about your own RoundFlow data"), suggestions: expect.any(Array) });
+    expect(frames[1].data).toEqual({ reason: "OUT_OF_SCOPE", text: expect.stringContaining("look things up in your own RoundFlow data"), suggestions: expect.any(Array) });
     expect(frames[2].data.message).toMatchObject({ status: "DECLINED", answer: null });
     expect(s.streamCalls).toHaveLength(0);
   });
@@ -322,6 +324,62 @@ describe("conversations", () => {
     expect(del.status).toBe(204);
     expect(del.text).toBe("");
     expect(db.conversations.map((c) => c.id)).toEqual([theirs.id]);
+  });
+});
+
+describe("GET /flo/gaps", () => {
+  it("lists the unanswered questions (newest first, limit validated and clamped)", async () => {
+    const { app } = appWith();
+    const conv = db.seed.conversation({ profileId: "p2" });
+    db.seed.message({ conversationId: conv.id, role: "USER", text: "Margin by postcode?", createdAt: new Date("2026-11-09T10:00:00Z") });
+    db.seed.message({ conversationId: conv.id, status: "DECLINED", declineReason: "NO_DATA_USED", createdAt: new Date("2026-11-09T10:00:05Z") });
+    const res = await request(app).get("/flo/gaps").set(as("ADMIN"));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ items: [{ question: "Margin by postcode?", at: "2026-11-09T10:00:05.000Z", reason: "NO_DATA_USED" }] });
+    expect((await request(app).get("/flo/gaps?limit=5000").set(as("ADMIN"))).body.items).toHaveLength(1);
+    for (const bad of ["0", "x", "1.5", "-2"]) {
+      const r = await request(app).get(`/flo/gaps?limit=${bad}`).set(as("ADMIN"));
+      expect([r.status, r.body.code]).toEqual([400, "INVALID_LIMIT"]);
+    }
+    expect((await request(app).get("/flo/gaps?limit=1&limit=2").set(as("ADMIN"))).status).toBe(400);
+  });
+});
+
+describe("POST /flo/messages/:id/feedback", () => {
+  const rated = (m: { id?: string }) => db.messages.find((r) => r.id === m.id)!;
+  const own = () => db.seed.message({ conversationId: db.seed.conversation().id, role: "ASSISTANT", text: "A", answer: { intro: "A" } });
+
+  it("204 for your own assistant message; re-rating overwrites; the rating shows in GET /flo/conversations/{id}", async () => {
+    const { app } = appWith();
+    const m = own();
+    const res = await request(app).post(`/flo/messages/${m.id}/feedback`).set(as("ADMIN")).send({ rating: "DOWN", comment: "Wrong round" });
+    expect(res.status).toBe(204);
+    expect(res.text).toBe("");
+    expect(rated(m)).toMatchObject({ rating: "DOWN", ratingComment: "Wrong round" });
+    expect((await request(app).post(`/flo/messages/${m.id}/feedback`).set(as("ADMIN")).send({ rating: "UP" })).status).toBe(204);
+    expect(rated(m)).toMatchObject({ rating: "UP", ratingComment: null });
+    const got = await request(app).get(`/flo/conversations/${m.conversationId}`).set(as("ADMIN"));
+    expect(got.body.messages[0].rating).toBe("UP");
+  });
+
+  it("404 FLO_MESSAGE_NOT_FOUND for another admin's message and for an unknown id", async () => {
+    const { app } = appWith();
+    const theirs = db.seed.message({ conversationId: db.seed.conversation({ profileId: "p2" }).id, role: "ASSISTANT" });
+    for (const id of [theirs.id, "nope"]) {
+      const res = await request(app).post(`/flo/messages/${id}/feedback`).set(as("ADMIN")).send({ rating: "UP" });
+      expect([res.status, res.body.code]).toEqual([404, "FLO_MESSAGE_NOT_FOUND"]);
+    }
+    expect(rated(theirs).rating).toBeNull();
+  });
+
+  it("400 INVALID_FEEDBACK for a bad rating or an over-long comment", async () => {
+    const { app } = appWith();
+    const m = own();
+    for (const body of [{}, { rating: "MEH" }, { rating: "UP", comment: "x".repeat(501) }]) {
+      const res = await request(app).post(`/flo/messages/${m.id}/feedback`).set(as("ADMIN")).send(body);
+      expect([res.status, res.body.code]).toEqual([400, "INVALID_FEEDBACK"]);
+    }
+    expect(rated(m).rating).toBeNull();
   });
 });
 

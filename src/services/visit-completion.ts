@@ -6,6 +6,7 @@ import { TEMPLATE_NAMES } from "./message-templates";
 import { getCachedBusinessSettings } from "./settings.service";
 import { createInvoiceService } from "./invoice.service";
 import { grossOf } from "../lib/vat";
+import { visitLabelFrom } from "../lib/activity-labels";
 
 // Shared visit completion used by PATCH /visits/:id/complete (web) and
 // PATCH /mobile/visits/:id/complete (technician app).
@@ -217,7 +218,7 @@ export function createVisitCompletionService(tp: TenantPrismaClient) {
             tp.activityLog.create({
               data: {
                 type: "CHEQUE_RECEIVED",
-                message: `Cheque ${planned.chequeNumber} received for visit ${visit.id} (£${Number(planned.amount).toFixed(2)}) — ${customer.name}`,
+                message: `Cheque ${planned.chequeNumber} received (£${Number(planned.amount).toFixed(2)}) for ${visitLabelFrom(customer.name, visit.property.addressLine)}`,
                 actorId: opts.actorProfileId ?? null,
                 actorRole: opts.actorRole ?? null,
               },
@@ -270,7 +271,7 @@ export function createVisitCompletionService(tp: TenantPrismaClient) {
           tp.activityLog.create({
             data: {
               type: "PAYMENT_METHOD_RECORDED",
-              message: `Technician recorded ${chosen} for visit ${visit.id} — ${customer.name}`,
+              message: `Technician recorded ${chosen} for visit ${visitLabelFrom(customer.name, visit.property.addressLine)}`,
               actorId: opts.actorProfileId ?? null,
               actorRole: opts.actorRole ?? null,
             },

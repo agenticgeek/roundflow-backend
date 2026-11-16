@@ -8,19 +8,33 @@ import { ctxFor, fakePrisma } from "../tools/__tests__/fake-prisma";
 afterEach(() => vi.restoreAllMocks());
 
 describe("registry allow-list", () => {
-  it("exposes exactly the ten read-only tools (adding a tool is a conscious change to this snapshot)", () => {
+  it("exposes exactly the 24 read-only tools (adding a tool is a conscious change to this snapshot)", () => {
     expect(Object.keys(TOOL_REGISTRY).sort()).toEqual(
       [
+        "backlog_and_carryover",
+        "calculate",
+        "closures_and_weather",
         "compare_technicians",
+        "forecast_schedule",
+        "get_business_snapshot",
         "get_customer_summary",
         "get_day_overview",
         "list_at_risk_customers",
         "list_complaints",
         "list_debtors",
+        "list_invoices",
+        "list_issues_photos",
+        "list_messages_delivery",
         "list_payments",
         "list_rounds_due",
         "list_skipped_visits",
+        "list_technicians",
+        "revenue_leakage",
         "revenue_summary",
+        "round_performance",
+        "service_plan_health",
+        "technician_incidents",
+        "technician_workload",
       ]
     );
     expect([...TOOL_NAMES].sort()).toEqual(Object.keys(TOOL_REGISTRY).sort());
@@ -29,7 +43,7 @@ describe("registry allow-list", () => {
   });
 
   it("only read-style tool names", () => {
-    for (const n of Object.keys(TOOL_REGISTRY)) expect(n).toMatch(/^(get|list|compare|revenue)_/);
+    for (const n of Object.keys(TOOL_REGISTRY)) expect(n).not.toMatch(/^(send|create|update|delete|set|write|remove|add|pay|refund|assign|schedule|move|cancel)_/);
   });
 
   it("builds provider tool specs in a stable order with closed schemas", () => {
@@ -65,7 +79,7 @@ describe("executeTool", () => {
       if (!out.ok) {
         expect(out.error).toMatch(/^Unknown tool "/);
         expect(out.error).toContain("list_debtors");
-        expect(out.error.length).toBeLessThan(400);
+        expect(out.error.length).toBeLessThan(700);
       }
     }
     expect(calls).toEqual([]);
@@ -113,7 +127,7 @@ describe("executeTool", () => {
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
     vi.spyOn(TOOL_REGISTRY.list_complaints, "run").mockRejectedValue(new TypeError("password=hunter2 in query"));
     const out = await executeTool("list_complaints", {}, ctxFor(tp), "r1");
-    expect(out).toMatchObject({ ok: false, error: expect.stringContaining("The lookup failed") });
+    expect(out).toMatchObject({ ok: false, kind: "infrastructure", error: expect.stringContaining("could not be looked up") });
     expect(JSON.stringify(out)).not.toContain("hunter2");
     expect(spy).toHaveBeenCalledWith("[flo] tool list_complaints failed (TypeError)");
     vi.spyOn(TOOL_REGISTRY.list_payments, "run").mockRejectedValue("a string");

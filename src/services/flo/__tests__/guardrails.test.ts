@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { CAPABILITY_QUESTIONS, GOLDEN_QUESTIONS, RED_TEAM_PROMPTS, type RedTeamCategory } from "./guardrails.fixtures";
+import { CAPABILITY_QUESTIONS, GOLDEN_QUESTIONS, NEW_TOOL_GOLDEN_QUESTIONS, RED_TEAM_PROMPTS, type RedTeamCategory } from "./guardrails.fixtures";
 import { precheck, resolveScopeOutcome, runScopeGate } from "../scope-gate";
 import { declineForVerdict, OUT_OF_SCOPE_TEXT, WRITE_REQUEST_TEXT } from "../declines";
 import { createFloService } from "../flo.service";
@@ -45,7 +45,7 @@ describe("fixtures are big enough and cover every category", () => {
       expect(cats.has(c), c).toBe(true);
     }
     expect(GOLDEN_QUESTIONS.length).toBeGreaterThanOrEqual(40);
-    expect(new Set(GOLDEN_QUESTIONS.map((q) => q.tool))).toEqual(new Set(TOOL_NAMES));
+    expect(new Set([...GOLDEN_QUESTIONS, ...NEW_TOOL_GOLDEN_QUESTIONS].map((q) => q.tool))).toEqual(new Set(TOOL_NAMES));
     expect(new Set(RED_TEAM_PROMPTS.map((p) => p.prompt)).size).toBe(RED_TEAM_PROMPTS.length);
   });
 });
@@ -94,6 +94,27 @@ describe("red-team prompts: declined with fixed copy, no main-model call, no too
 
 describe("golden questions: pass the pre-checks and proceed when classified IN_SCOPE", () => {
   it.each(GOLDEN_QUESTIONS.map((q) => [q.tool, q.question, q] as const))("%s: %s", async (_t, _q, golden) => {
+    expect(precheck(golden.question)).toBeNull();
+    const { provider, calls } = spyProvider("IN_SCOPE");
+    const decision = await runScopeGate({ provider }, { message: golden.question });
+    expect(decision).toEqual({ verdict: "IN_SCOPE", source: "classifier" });
+    expect(resolveScopeOutcome(decision)).toEqual({ kind: "proceed" });
+    expect(calls).toHaveLength(1);
+  });
+});
+
+describe("golden questions for the v2 tools: pass the pre-checks and proceed when classified IN_SCOPE", () => {
+  it("covers every new tool at least once, with 20+ questions", () => {
+    expect(NEW_TOOL_GOLDEN_QUESTIONS.length).toBeGreaterThanOrEqual(20);
+    expect(new Set(NEW_TOOL_GOLDEN_QUESTIONS.map((q) => q.tool))).toEqual(new Set([
+      "get_business_snapshot", "list_invoices", "service_plan_health", "revenue_leakage", "backlog_and_carryover", "round_performance",
+      "technician_workload", "technician_incidents", "list_messages_delivery", "list_issues_photos", "forecast_schedule", "closures_and_weather", "calculate",
+    ]));
+    const all = [...GOLDEN_QUESTIONS.map((q) => q.question), ...NEW_TOOL_GOLDEN_QUESTIONS.map((q) => q.question)];
+    expect(new Set(all).size).toBe(all.length);
+  });
+
+  it.each(NEW_TOOL_GOLDEN_QUESTIONS.map((q) => [q.tool, q.question, q] as const))("%s: %s", async (_t, _q, golden) => {
     expect(precheck(golden.question)).toBeNull();
     const { provider, calls } = spyProvider("IN_SCOPE");
     const decision = await runScopeGate({ provider }, { message: golden.question });
@@ -182,7 +203,7 @@ describe("golden questions through the real pipeline: classified IN_SCOPE, the m
     }));
     const turns = [toolTurn({ id: "t", name: golden.tool }), answerTurn("<intro>There are 4 results.</intro>")];
     const { db, s, events } = await runChat(golden.question, "IN_SCOPE", turns, execute as never);
-    expect(events.map((e) => e.event)).toEqual(["start", "status", "status", "text", "done"]);
+    expect(events.map((e) => e.event)).toEqual(["start", "status", "status", "text", "follow_ups", "done"]);
     expect(execute).toHaveBeenCalledTimes(1);
     expect(execute.mock.calls[0][0]).toBe(golden.tool);
     expect(s.streamCalls.length).toBe(2);

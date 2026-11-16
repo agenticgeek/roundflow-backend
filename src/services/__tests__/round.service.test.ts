@@ -17,9 +17,14 @@ vi.mock("../visit-assignment", async (importOriginal) => ({
   restampFutureVisits: (...args: unknown[]) => restampFutureVisits(...args),
 }));
 
+// The forecast entries are round-projection's own concern (tested there); here it returns nothing by default.
+const projectOccurrences = vi.fn();
+vi.mock("../round-projection", () => ({ projectOccurrences: (...a: unknown[]) => projectOccurrences(...a) }));
+
 beforeEach(() => {
   sendMessage.mockReset();
   restampFutureVisits.mockReset().mockResolvedValue(0);
+  projectOccurrences.mockReset().mockResolvedValue(new Map());
 });
 
 function makePrisma() {
@@ -32,6 +37,7 @@ function makePrisma() {
     visit: { findMany: vi.fn(), updateMany: vi.fn(), findFirst: vi.fn().mockResolvedValue(null), create: vi.fn(), count: vi.fn().mockResolvedValue(0) },
     roundTechnician: { findMany: vi.fn().mockResolvedValue([]), deleteMany: vi.fn(), createMany: vi.fn() },
     technicianAvailability: { findMany: vi.fn().mockResolvedValue([]) },
+    businessClosure: { findMany: vi.fn().mockResolvedValue([]) },
     // Defaults to "no settings row" (day not closed) so pre-existing tests
     // that don't care about Close Day behave the same as before it existed.
     businessSettings: { findFirst: vi.fn().mockResolvedValue(null) },
@@ -266,6 +272,49 @@ it("listOccurrencesForRounds returns an empty technicians array for a round with
     new Date("2026-01-05T00:00:00.000Z"),
   );
   expect(result[0].occurrences).toEqual([]);
+});
+
+const projectedEntry = (date: string) => ({ date, stopCount: 2, totalValue: 54.5, completedCount: 0, completionPct: 0, holdCount: 0, issueCount: 0, technicians: [], projected: true });
+
+it("listOccurrencesForRounds merges forecast entries after the real ones, in date order, asking for the same window", async () => {
+  const prisma = makePrisma();
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    makeVisit({ roundId: "r1", date: new Date("2026-11-16T00:00:00.000Z"), price: { toNumber: () => 10 } }),
+  ]);
+  projectOccurrences.mockResolvedValue(new Map([["r1", [projectedEntry("2027-01-11")]], ["r3", [projectedEntry("2026-12-01")]]]));
+  const from = new Date("2026-11-05T00:00:00.000Z");
+  const to = new Date("2027-01-31T00:00:00.000Z");
+
+  const result = await createRoundService(prisma).listOccurrencesForRounds(["r1", "r2", "r3"], from, to);
+
+  expect(projectOccurrences).toHaveBeenCalledWith(prisma, ["r1", "r2", "r3"], expect.any(Date), from, to);
+  expect(result[0].occurrences.map((o) => [o.date, o.projected])).toEqual([["2026-11-16", undefined], ["2027-01-11", true]]);
+  expect(result[1].occurrences).toEqual([]);
+  expect(result[2].occurrences).toEqual([projectedEntry("2026-12-01")]);
+});
+
+it("a real entry never carries the projected flag", async () => {
+  const prisma = makePrisma();
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([makeVisit({ roundId: "r1" })]);
+  const result = await createRoundService(prisma).listOccurrencesForRounds(["r1"], new Date("2026-01-01T00:00:00.000Z"), new Date("2026-01-31T00:00:00.000Z"));
+  expect(result[0].occurrences[0]).not.toHaveProperty("projected");
+});
+
+it("listOccurrences (single round) merges the forecast too and sorts real and projected by date", async () => {
+  const prisma = makePrisma();
+  (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1" });
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
+    makeVisit({ date: new Date("2026-12-10T00:00:00.000Z") }),
+    makeVisit({ date: new Date("2026-11-12T00:00:00.000Z") }),
+  ]);
+  projectOccurrences.mockResolvedValue(new Map([["r1", [projectedEntry("2026-11-12"), projectedEntry("2027-01-07")]]]));
+  const from = new Date("2026-11-05T00:00:00.000Z");
+  const to = new Date("2027-01-31T00:00:00.000Z");
+
+  const result = await createRoundService(prisma).listOccurrences("r1", from, to);
+
+  expect(projectOccurrences).toHaveBeenCalledWith(prisma, ["r1"], expect.any(Date), from, to);
+  expect(result.map((o) => [o.date, o.projected])).toEqual([["2026-11-12", undefined], ["2026-11-12", true], ["2026-12-10", undefined], ["2027-01-07", true]]);
 });
 
 // ---- listOccurrences (single round) ----------------------------------------

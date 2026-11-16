@@ -1,7 +1,8 @@
 import type { ToolResult } from "./types";
 
 // Per-sentence grounding check (plan 3.5 / D4). Every number in a prose sentence must equal a value in a stored tool
-// result (compared after rounding to the precision the sentence shows), or be a date, a year, a time, an ordinal or a
+// result, or a sum, difference, ratio or percent (change) of two of them (compared after rounding to the precision the
+// sentence shows), or be a date, a year, a time, an ordinal or a
 // rank (whitelisted). A sentence that fails is still sent, flagged `unverified`.
 
 const MONTH =
@@ -48,6 +49,26 @@ function collectNumbers(result: ToolResult, into: Set<number>): void {
 
 const at = (n: number, decimals: number): number => Number(n.toFixed(decimals));
 
+/** Pair search is capped so a big answer cannot make the check expensive: 400 values = 160,000 ordered pairs at most. */
+export const MAX_PAIR_VALUES = 400;
+
+/** True when `target` (at `decimals`) equals sum, difference, ratio, percent-of or percent-change of any two known values. */
+function isDerived(values: readonly number[], target: number, decimals: number): boolean {
+  const scale = 10 ** decimals;
+  const want = Math.round(target * scale); // integer compare is far cheaper than toFixed in a 160k-pair loop
+  const hit = (n: number): boolean => Math.round(n * scale) === want;
+  const n = Math.min(values.length, MAX_PAIR_VALUES);
+  for (let i = 0; i < n; i++) {
+    const a = values[i];
+    for (let j = 0; j < n; j++) {
+      const b = values[j];
+      if (hit(a + b) || hit(Math.abs(a - b))) return true;
+      if (b !== 0 && (hit(a / b) || hit((a / b) * 100) || hit(((a - b) / b) * 100) || hit((Math.abs(a - b) / b) * 100))) return true;
+    }
+  }
+  return false;
+}
+
 export interface FigureCheck {
   ok: boolean;
   unmatched: number[];
@@ -60,7 +81,7 @@ export function createFigureChecker(results: Iterable<ToolResult>): (sentence: s
   const values = [...known];
   return (sentence) => {
     const unmatched = extractFigures(sentence)
-      .filter((f) => !values.some((v) => at(v, f.decimals) === at(f.value, f.decimals)))
+      .filter((f) => !values.some((v) => at(v, f.decimals) === at(f.value, f.decimals)) && !isDerived(values, f.value, f.decimals))
       .map((f) => f.value);
     return { ok: unmatched.length === 0, unmatched };
   };

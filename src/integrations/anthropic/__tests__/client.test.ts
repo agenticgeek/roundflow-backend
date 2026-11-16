@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createAnthropicProvider, ProviderError, type SdkLike } from "../client";
+import { createAnthropicProvider, ProviderError, supportsTemperature, type SdkLike } from "../client";
 import type { ProviderRequest, ProviderStreamEvent } from "../../../services/flo/types";
 
 const SECRET = "sk-ant-test-CANARY-SECRET";
@@ -189,6 +189,77 @@ describe("createMessage", () => {
     const { sdk } = sdkWith(async () => ({ model: "m", stop_reason: "end_turn", content: [] }));
     await expect(createAnthropicProvider({ sdk, env: { FLO_TIMEOUT_MS: "20000" } as NodeJS.ProcessEnv }).createMessage(BASE)).resolves.toBeTruthy();
     await expect(createAnthropicProvider({ sdk, retryDelayMs: undefined }).createMessage(BASE)).resolves.toBeTruthy();
+  });
+});
+
+describe("request parameters", () => {
+  const ok = async () => ({ model: "m", stop_reason: "end_turn", content: [] });
+
+  it("sends systemDynamic as a second UNCACHED system block after the cached stable block", async () => {
+    const { sdk, create } = sdkWith(ok);
+    await provider(sdk).createMessage({ ...BASE, systemDynamic: "MODE+CONTEXT" });
+    const [params] = create.mock.calls[0] as [Record<string, unknown>];
+    expect(params.system).toEqual([
+      { type: "text", text: "SYSTEM", cache_control: { type: "ephemeral" } },
+      { type: "text", text: "MODE+CONTEXT" },
+    ]);
+  });
+
+  it("keeps the dynamic block uncached too when caching is off, and ignores a blank dynamic block", async () => {
+    const off = sdkWith(ok);
+    await provider(off.sdk).createMessage({ ...BASE, cache: false, systemDynamic: "DYN" });
+    expect((off.create.mock.calls[0] as [Record<string, unknown>])[0].system).toEqual([{ type: "text", text: "SYSTEM" }, { type: "text", text: "DYN" }]);
+    const blank = sdkWith(ok);
+    await provider(blank.sdk).createMessage({ ...BASE, systemDynamic: "  " });
+    expect((blank.create.mock.calls[0] as [Record<string, unknown>])[0].system).toEqual([{ type: "text", text: "SYSTEM", cache_control: { type: "ephemeral" } }]);
+  });
+
+  it("toolChoice none sends tool_choice none and keeps the tools (cached prefix unchanged); auto and omitted send nothing", async () => {
+    const none = sdkWith(ok);
+    await provider(none.sdk).createMessage({ ...BASE, tools: TOOLS, toolChoice: "none" });
+    const [p] = none.create.mock.calls[0] as [Record<string, unknown>];
+    expect(p.tool_choice).toEqual({ type: "none" });
+    expect((p.tools as unknown[]).length).toBe(2);
+    expect((p.tools as Array<Record<string, unknown>>)[1].cache_control).toEqual({ type: "ephemeral" });
+    for (const toolChoice of ["auto", undefined] as const) {
+      const s = sdkWith(ok);
+      await provider(s.sdk).createMessage({ ...BASE, tools: TOOLS, toolChoice });
+      expect((s.create.mock.calls[0] as [Record<string, unknown>])[0].tool_choice).toBeUndefined();
+    }
+    const noTools = sdkWith(ok);
+    await provider(noTools.sdk).createMessage({ ...BASE, toolChoice: "none" });
+    expect((noTools.create.mock.calls[0] as [Record<string, unknown>])[0].tool_choice).toBeUndefined();
+  });
+
+  it("passes temperature only to models that accept it (5.x, Fable, Mythos and Opus 4.7/4.8 reject it)", async () => {
+    expect(supportsTemperature("claude-sonnet-4-6")).toBe(true);
+    expect(supportsTemperature("claude-haiku-4-5")).toBe(true);
+    for (const m of ["claude-sonnet-5-5", "claude-opus-5", "claude-haiku-5-5", "claude-fable-5-2", "claude-mythos-5-1", "claude-opus-4-8", "claude-opus-4-7"]) expect(supportsTemperature(m), m).toBe(false);
+    const old = sdkWith(ok);
+    await provider(old.sdk).createMessage({ ...BASE, model: "claude-sonnet-4-6", temperature: 0.2 });
+    expect((old.create.mock.calls[0] as [Record<string, unknown>])[0].temperature).toBe(0.2);
+    const zero = sdkWith(ok);
+    await provider(zero.sdk).createMessage({ ...BASE, model: "claude-sonnet-4-6", temperature: 0 });
+    expect((zero.create.mock.calls[0] as [Record<string, unknown>])[0].temperature).toBe(0);
+    const modern = sdkWith(ok);
+    await provider(modern.sdk).createMessage({ ...BASE, temperature: 0.2 });
+    expect((modern.create.mock.calls[0] as [Record<string, unknown>])[0].temperature).toBeUndefined();
+  });
+
+  it("thinking true sends adaptive thinking; false or omitted sends nothing; streaming gets the same params", async () => {
+    const on = sdkWith(ok);
+    await provider(on.sdk).createMessage({ ...BASE, thinking: true });
+    expect((on.create.mock.calls[0] as [Record<string, unknown>])[0].thinking).toEqual({ type: "adaptive" });
+    for (const thinking of [false, undefined]) {
+      const s = sdkWith(ok);
+      await provider(s.sdk).createMessage({ ...BASE, thinking });
+      expect((s.create.mock.calls[0] as [Record<string, unknown>])[0].thinking).toBeUndefined();
+    }
+    const st = sdkWith(async () => events([{ type: "message_stop" }]));
+    await collect(provider(st.sdk).streamMessage({ ...BASE, tools: TOOLS, toolChoice: "none", thinking: true, systemDynamic: "D" }));
+    const [sp] = st.create.mock.calls[0] as [Record<string, unknown>];
+    expect(sp).toMatchObject({ stream: true, thinking: { type: "adaptive" }, tool_choice: { type: "none" } });
+    expect((sp.system as unknown[]).length).toBe(2);
   });
 });
 

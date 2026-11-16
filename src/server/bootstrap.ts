@@ -33,6 +33,10 @@ import { chatRouter } from "../routes/chat";
 import { notificationsRouter } from "../routes/notifications";
 import { integrationsRouter } from "../routes/integrations";
 import { floRouter } from "../routes/flo";
+import { closuresRouter } from "../routes/closures"; // closures:
+// test-clock:
+import { testClockEnabled, testClockMiddleware } from "../lib/clock";
+import { createTestHooksRouter } from "../routes/test-hooks";
 import { mobileRouter } from "../mobile";
 import { openApiDocument } from "../swagger";
 import { errorHandler } from "../lib/error-handler";
@@ -152,6 +156,8 @@ export function createApp({ allowedOrigins, readiness, env = process.env, pingDb
   // BE-09: request id first (every response, error bodies included), then security headers. Swagger UI needs
   // inline scripts, so /docs gets helmet without its Content-Security-Policy.
   app.use(requestId());
+  // test-clock: X-Test-Now is honoured only when ALLOW_TEST_CLOCK=1 and NODE_ENV!=production (inert otherwise).
+  app.use(testClockMiddleware);
   const apiHelmet = helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } });
   const docsHelmet = helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: { policy: "cross-origin" } });
   app.use((req: Request, res: Response, next: NextFunction) => (req.path.startsWith("/docs") ? docsHelmet : apiHelmet)(req, res, next));
@@ -260,7 +266,10 @@ export function createApp({ allowedOrigins, readiness, env = process.env, pingDb
   app.use("/integrations", integrationsRouter);
   // Flo AI (admin only). Literal paths are registered before /conversations/:id inside the router.
   app.use("/flo", floRouter);
+  app.use("/closures", closuresRouter); // closures:
   app.use("/mobile", mobileRouter);
+  // test-clock: mounted only when enabled; otherwise the path does not exist (404).
+  if (testClockEnabled()) app.use("/test-hooks", createTestHooksRouter());
 
   // API docs — interactive UI at /docs, raw spec at /openapi.json. Public
   // outside production; in production only when EXPOSE_API_DOCS=true (BE-25).

@@ -189,3 +189,45 @@ type ColumnSpec = [key: string, label: string, format: ResultColumn["format"]];
 export function columns(...specs: ColumnSpec[]): ResultColumn[] {
   return specs.map(([key, label, format]) => ({ key, label, format, align: format === "text" || format === "date" ? "left" : "right" }));
 }
+
+// ---- derived-metric helpers ----------------------------------------------------------------------------------------
+
+/** part / whole as a percentage to 2 dp (12.5 = 12.5%); null (never NaN or Infinity) when whole is 0. */
+export const pct = (part: number, whole: number): number | null => (whole === 0 ? null : round2((part / whole) * 100));
+
+/** a / b to 2 dp; null when b is 0. */
+export const safeDiv = (a: number, b: number): number | null => (b === 0 ? null : round2(a / b));
+
+/** The largest entry of a count map (ties broken by name), or null when empty. */
+export function topEntry(counts: ReadonlyMap<string, number>): { name: string; count: number } | null {
+  let best: { name: string; count: number } | null = null;
+  for (const [name, count] of counts) {
+    if (best === null || count > best.count || (count === best.count && name.localeCompare(best.name) < 0)) best = { name, count };
+  }
+  return best;
+}
+
+/** "Liam: 3; Ana: 1; Other: 2": a count map largest first, at most `top` names, the rest folded into "Other". null when empty. */
+export function breakdownText(counts: ReadonlyMap<string, number>, top = 10): string | null {
+  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  if (sorted.length === 0) return null;
+  const shown = sorted.slice(0, top).map(([k, n]) => `${k}: ${n}`);
+  const rest = sorted.slice(top).reduce((n, [, c]) => n + c, 0);
+  if (rest > 0) shown.push(`Other: ${rest}`);
+  return shown.join("; ");
+}
+
+/** Local wall-clock "HH:mm" of an instant in the tenant's zone. */
+export const localTimeOf = (d: Date, tz: string): string => localDateTime(d, tz).time;
+
+/** Monday (YYYY-MM-DD) of the ISO week containing `day`. */
+export function weekStartOf(day: string): string {
+  const dow = dayToDate(day).getUTCDay(); // 0 = Sunday
+  return addDays(day, -((dow + 6) % 7));
+}
+
+/** The equivalent previous window of an inclusive day range: the same number of days immediately before it. */
+export function previousWindow(from: string, to: string): { from: string; to: string } {
+  const n = daysBetween(from, to) + 1;
+  return { from: addDays(from, -n), to: addDays(from, -1) };
+}

@@ -1,3 +1,16 @@
+import { getBusinessSnapshot } from "./tools/get-business-snapshot";
+import { listInvoices } from "./tools/list-invoices";
+import { servicePlanHealth } from "./tools/service-plan-health";
+import { revenueLeakage } from "./tools/revenue-leakage";
+import { backlogAndCarryover } from "./tools/backlog-and-carryover";
+import { roundPerformance } from "./tools/round-performance";
+import { technicianWorkload } from "./tools/technician-workload";
+import { technicianIncidents } from "./tools/technician-incidents";
+import { listMessagesDelivery } from "./tools/list-messages-delivery";
+import { listIssuesPhotos } from "./tools/list-issues-photos";
+import { forecastSchedule } from "./tools/forecast-schedule";
+import { closuresAndWeather } from "./tools/closures-and-weather";
+import { calculate } from "./tools/calculate";
 import { compareTechnicians } from "./tools/compare-technicians";
 import { getCustomerSummary } from "./tools/get-customer-summary";
 import { getDayOverview } from "./tools/get-day-overview";
@@ -7,6 +20,7 @@ import { listDebtors } from "./tools/list-debtors";
 import { listPayments } from "./tools/list-payments";
 import { listRoundsDue } from "./tools/list-rounds-due";
 import { listSkippedVisits } from "./tools/list-skipped-visits";
+import { listTechnicians } from "./tools/list-technicians";
 import { revenueSummary } from "./tools/revenue-summary";
 import { MAX_LIMIT, ToolInputError } from "./tools/shared";
 import { TOOL_NAMES, type ToolContext, type ToolDefinition, type ToolName, type ToolOutcome, type ToolResult, type ToolSpec } from "./types";
@@ -27,11 +41,25 @@ export const TOOL_REGISTRY: Readonly<Record<ToolName, AnyTool>> = Object.freeze(
   list_debtors: listDebtors,
   list_payments: listPayments,
   compare_technicians: compareTechnicians,
+  list_technicians: listTechnicians,
   list_complaints: listComplaints,
   list_at_risk_customers: listAtRiskCustomers,
   revenue_summary: revenueSummary,
   list_skipped_visits: listSkippedVisits,
   get_customer_summary: getCustomerSummary,
+  get_business_snapshot: getBusinessSnapshot,
+  list_invoices: listInvoices,
+  service_plan_health: servicePlanHealth,
+  revenue_leakage: revenueLeakage,
+  backlog_and_carryover: backlogAndCarryover,
+  round_performance: roundPerformance,
+  technician_workload: technicianWorkload,
+  technician_incidents: technicianIncidents,
+  list_messages_delivery: listMessagesDelivery,
+  list_issues_photos: listIssuesPhotos,
+  forecast_schedule: forecastSchedule,
+  closures_and_weather: closuresAndWeather,
+  calculate: calculate,
 });
 
 /** Throws if any registered tool is not read-only or is filed under the wrong name. Runs when the module loads. */
@@ -52,7 +80,7 @@ export function toolSpecs(): ToolSpec[] {
   return TOOL_NAMES.map((n) => ({ name: n, description: TOOL_REGISTRY[n].description, input_schema: TOOL_REGISTRY[n].inputSchema }));
 }
 
-const FAILED = "The lookup failed. Try a narrower question or answer from the other data you already have.";
+const FAILED = "That part could not be looked up right now. Do not retry it; answer from the other data you have and say plainly what could not be checked.";
 
 /**
  * Validates and runs one tool call. Never throws: bad input, an unknown tool, a failing query all come back as
@@ -85,7 +113,7 @@ export async function executeTool(name: string, rawInput: unknown, ctx: ToolCont
     if (err instanceof ToolInputError) return { ok: false, error: err.message, args, ms: ms() };
     // Prisma errors can echo query values, so only the error class is logged, never the message.
     console.error(`[flo] tool ${name} failed (${err instanceof Error ? err.name : "unknown"})`);
-    return { ok: false, error: FAILED, args, ms: ms() };
+    return { ok: false, error: FAILED, kind: "infrastructure", args, ms: ms() };
   }
 }
 

@@ -29,6 +29,7 @@ import {
   type WeatherHoldInput,
   type WeatherRescheduling,
 } from "../services/weather-hold.service";
+import { roundLabel } from "../lib/activity-labels";
 
 export const roundsRouter = Router();
 roundsRouter.use(requireAuth);
@@ -197,7 +198,7 @@ roundsRouter.patch(
     const result = await svc(req).updateRound(req.params.id, input);
     void createReportsService(req.tenantPrisma!).logActivity(
       "ROUND_UPDATED",
-      `Round updated: ${req.params.id}`,
+      `Round updated: ${await roundLabel(req.tenantPrisma!, req.params.id)}`,
       req.profile?.id,
       req.profile?.role ?? undefined,
     );
@@ -257,7 +258,7 @@ roundsRouter.put(
     if (!dryRun) {
       void createReportsService(req.tenantPrisma!).logActivity(
         "TECHNICIAN_ASSIGNED",
-        `Technicians assigned to round: ${req.params.id}`,
+        `Technicians assigned to round: ${await roundLabel(req.tenantPrisma!, req.params.id)}`,
         req.profile?.id,
         req.profile?.role ?? undefined,
       );
@@ -313,7 +314,7 @@ roundsRouter.post(
     const result = await svc(req).reassignTechnician(req.params.id, input);
     void createReportsService(req.tenantPrisma!).logActivity(
       "TECHNICIAN_REASSIGNED",
-      `Technician reassigned in round: ${req.params.id}`,
+      `Technician reassigned in round: ${await roundLabel(req.tenantPrisma!, req.params.id)}`,
       req.profile?.id,
       req.profile?.role ?? undefined,
     );
@@ -343,7 +344,7 @@ roundsRouter.post(
     const result = await svc(req).pushMissedJobs(req.params.id, input);
     void createReportsService(req.tenantPrisma!).logActivity(
       "VISITS_PUSHED",
-      `Visits pushed to ${input.newDate.toISOString().slice(0, 10)} in round: ${req.params.id}`,
+      `Visits pushed to ${input.newDate.toISOString().slice(0, 10)} in round: ${await roundLabel(req.tenantPrisma!, req.params.id)}`,
       req.profile?.id,
       req.profile?.role ?? undefined,
     );
@@ -413,7 +414,7 @@ roundsRouter.post(
     const result = await svc(req).generateVisitsNow(req.params.id);
     void createReportsService(req.tenantPrisma!).logActivity(
       "VISITS_GENERATED",
-      `Generated ${result.visitsGenerated} visit(s) for round: ${req.params.id}`,
+      `Generated ${result.visitsGenerated} visit(s) for round: ${await roundLabel(req.tenantPrisma!, req.params.id)}`,
       req.profile?.id,
       req.profile?.role ?? undefined,
     );

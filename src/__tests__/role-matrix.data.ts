@@ -11,6 +11,12 @@
 export type AccessClass = "PUBLIC" | "AUTHENTICATED" | "TENANT_MEMBER" | "BUSINESS" | "ADMIN" | "TECHNICIAN";
 
 export const ROLE_MATRIX: Record<string, AccessClass> = {
+  "DELETE /closures/{id}": "BUSINESS",
+  "GET /closures": "BUSINESS",
+  "PATCH /closures/{id}": "BUSINESS",
+  "POST /closures": "BUSINESS",
+  "POST /closures/{id}/apply": "BUSINESS",
+  "POST /closures/{id}/apply/preview": "BUSINESS",
   "DELETE /customers/{id}": "BUSINESS",
   "DELETE /flo/conversations/{id}": "ADMIN",
   "DELETE /invites/{token}": "BUSINESS",
@@ -51,6 +57,7 @@ export const ROLE_MATRIX: Record<string, AccessClass> = {
   "GET /emergencies/{id}/available-technicians": "BUSINESS",
   "GET /flo/conversations": "ADMIN",
   "GET /flo/conversations/{id}": "ADMIN",
+  "GET /flo/gaps": "ADMIN",
   "GET /flo/status": "ADMIN",
   "GET /flo/suggestions": "ADMIN",
   "GET /health": "PUBLIC",
@@ -189,6 +196,7 @@ export const ROLE_MATRIX: Record<string, AccessClass> = {
   "POST /debt/{id}/remind": "BUSINESS",
   "POST /emergencies": "TENANT_MEMBER",
   "POST /flo/chat": "ADMIN",
+  "POST /flo/messages/{id}/feedback": "ADMIN",
   "POST /emergencies/{id}/reassign": "BUSINESS",
   "POST /invites": "BUSINESS",
   "POST /invites/{id}/resend": "BUSINESS",

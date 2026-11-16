@@ -3,8 +3,10 @@ import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 import { getCachedBusinessSettings } from "./settings.service";
 import { tenantTodayRange, tenantToday } from "./business-time";
+import { now as clockNow } from "../lib/clock";
 import { createMessageService } from "./message.service";
 import { generateForRound } from "../jobs/visitGeneration";
+import { projectOccurrences } from "./round-projection";
 import { notifyEvent } from "./notify";
 import { autoSplit, resolveTechnicianForVisit, restampFutureVisits, type TenantDb } from "./visit-assignment";
 import { startOfUtcDay } from "../lib/schedule";
@@ -98,6 +100,8 @@ export interface OccurrenceSummary {
   issueCount: number;
   // Every distinct technician with at least one stop on this date, deduped by id.
   technicians: OccurrenceTechnicianRef[];
+  // Only present (true) on a forecast entry: no visits exist yet, the figures are estimates (see round-projection).
+  projected?: true;
 }
 
 export interface PlannerStop {
@@ -783,7 +787,7 @@ class RoundService {
       bucket.push(v);
     }
 
-    return Array.from(byDate.entries()).map(([date, vs]) =>
+    const real = Array.from(byDate.entries()).map(([date, vs]) =>
       this.aggregateStats(date, vs.length, {
         completedCount: vs.filter((v) => v.status === VisitStatus.COMPLETED).length,
         totalValue: vs.reduce((acc, v) => acc + v.price.toNumber(), 0),
@@ -792,6 +796,13 @@ class RoundService {
         technicians: this.dedupeTechnicians(vs, (v) => v.technician),
       })
     );
+    return this.withProjection(real, (await projectOccurrences(this.prisma, [roundId], await tenantToday(this.prisma), from, to)).get(roundId));
+  }
+
+  // Real entries plus the display-only forecast entries (flagged `projected: true`), in date order.
+  private withProjection(real: OccurrenceSummary[], projected: OccurrenceSummary[] | undefined): OccurrenceSummary[] {
+    if (!projected) return real;
+    return [...real, ...projected].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
   }
 
   // ---- planner — batched occurrence list across multiple rounds ----
@@ -856,9 +867,10 @@ class RoundService {
       bucket.push(v);
     }
 
+    const projected = await projectOccurrences(this.prisma, roundIds, await tenantToday(this.prisma), from, to);
     return roundIds.map((roundId) => {
       const byDate = byRound.get(roundId);
-      const occurrences = byDate
+      const real = byDate
         ? Array.from(byDate.entries()).map(([date, vs]) =>
             this.aggregateStats(date, vs.length, {
               completedCount: vs.filter((v) => v.status === VisitStatus.COMPLETED).length,
@@ -869,7 +881,7 @@ class RoundService {
             })
           )
         : [];
-      return { roundId, occurrences };
+      return { roundId, occurrences: this.withProjection(real, projected.get(roundId)) };
     });
   }
 
@@ -957,7 +969,7 @@ class RoundService {
       throw new AppError(400, "Round must be ACTIVE to generate visits");
     }
 
-    const today = new Date();
+    const today = clockNow();
     today.setUTCHours(0, 0, 0, 0);
 
     const visitsGenerated = await generateForRound(this.prisma, round, today);
@@ -1071,7 +1083,7 @@ class RoundService {
     });
     if (!round) throw new AppError(404, "Round not found");
 
-    const start = new Date();
+    const start = clockNow();
     start.setUTCHours(0, 0, 0, 0);
     const end = new Date(start.getTime() + 86_400_000);
 
@@ -1247,7 +1259,7 @@ class RoundService {
     await this.assertRoundExists(roundId);
     await this.assertDayNotClosed();
 
-    const start = new Date();
+    const start = clockNow();
     start.setUTCHours(0, 0, 0, 0);
     const end = new Date(start.getTime() + 86_400_000);
 

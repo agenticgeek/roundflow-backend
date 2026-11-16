@@ -115,7 +115,7 @@ describe("buildBlock: cards", () => {
       },
       ctxOf([result], { figuresOk: (t) => !t.includes("12") })
     );
-    expect(out).toEqual({ ok: true, block: { type: "cards", items: [{ label: "Odd", value: 1.5, format: "text" }, { label: "Count", value: 4, format: "integer" }] } });
+    expect(out).toEqual({ ok: true, block: { type: "cards", items: [{ label: "Odd", value: 1.5, format: "text" }, { label: "Count", value: 4, format: "integer" }], link: { screen: "TECHNICIANS" } } });
   });
 
   it("skips bad items and rejects the block when none survive", () => {
@@ -136,7 +136,7 @@ describe("buildBlock: cards", () => {
     ];
     expect(buildBlock({ type: "cards", items }, ctx)).toEqual({
       ok: true,
-      block: { type: "cards", items: [{ label: "x", value: "2026-10-29", format: "date" }] },
+      block: { type: "cards", items: [{ label: "x", value: "2026-10-29", format: "date" }], link: { screen: "TECHNICIANS" } },
     });
     expect(buildBlock({ type: "cards", items: items.filter((_, i) => i !== 5) }, ctx)).toEqual({ ok: false, reason: "INVALID" });
     expect(buildBlock({ type: "cards" }, ctx)).toEqual({ ok: false, reason: "INVALID" });
@@ -226,10 +226,10 @@ describe("AnswerBuilder", () => {
   it("emits per-target indexes, flags unverified sentences and assembles the final answer", () => {
     const { builder } = setup();
     expect(builder.hasContent()).toBe(false);
-    const e1 = builder.accept({ kind: "intro", text: "Here is October across 2 technicians. Revenue is up 12% on September." });
+    const e1 = builder.accept({ kind: "intro", text: "Here is October across 2 technicians. Revenue is up 987% on September." });
     expect(e1).toEqual([
       { event: "text", data: { target: "intro", index: 0, text: "Here is October across 2 technicians." } },
-      { event: "text", data: { target: "intro", index: 1, text: "Revenue is up 12% on September.", unverified: true } },
+      { event: "text", data: { target: "intro", index: 1, text: "Revenue is up 987% on September.", unverified: true } },
     ]);
     const e2 = builder.accept({ kind: "block", text: cards });
     expect(e2).toMatchObject([{ event: "block", data: { index: 0, block: { type: "cards" } } }]);
@@ -253,7 +253,7 @@ describe("AnswerBuilder", () => {
     ]);
     expect(warnings).toEqual(["UNVERIFIED_FIGURES"]);
     expect(answer).toMatchObject({
-      intro: "Here is October across 2 technicians. Revenue is up 12% on September.",
+      intro: "Here is October across 2 technicians. Revenue is up 987% on September.",
       introUnverified: true,
       dateRange: { from: "2026-10-01", to: "2026-10-30", label: "1 to 30 Oct 2026" },
       insights: [
@@ -266,15 +266,16 @@ describe("AnswerBuilder", () => {
     expect(answer.blocks).toHaveLength(2);
     expect(builder.hasContent()).toBe(true);
     expect(answerText(answer)).toBe(
-      "Here is October across 2 technicians. Revenue is up 12% on September. Liam Walsh led on revenue (8190). Check the table."
+      "Here is October across 2 technicians. Revenue is up 987% on September. Liam Walsh led on revenue (8190). Check the table."
     );
   });
 
-  it("finishes a clean answer with no warning, no follow-ups and the first result's date range", () => {
+  it("finishes a clean answer with no warning, fallback follow-ups and the first result's date range", () => {
     const { builder } = setup("BALANCED", [techResult({ truncated: true })]);
     builder.accept({ kind: "intro", text: "All good." });
     const { events, answer, warnings } = builder.finish();
-    expect(events).toEqual([]);
+    expect(events).toEqual([{ event: "follow_ups", data: { items: expect.any(Array) } }]);
+    expect(answer.followUps.length).toBeGreaterThan(0);
     expect(warnings).toEqual([]);
     expect(answer).toMatchObject({ introUnverified: false, truncated: true, dateRange: { from: "2026-10-01" } });
   });

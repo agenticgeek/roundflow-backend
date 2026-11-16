@@ -37,6 +37,7 @@ function compare(value: any, cond: any, db: FakeFloDb, row: Row): boolean { // e
       if (op === "gte") return value >= (v as Date);
       if (op === "lt") return value < (v as Date);
       if (op === "not") return value !== v;
+      if (op === "notIn") return !(v as unknown[]).includes(value);
       return false;
     });
   }
@@ -89,7 +90,7 @@ export function fakeFloDb(opts: { timezone?: string; start?: string } = {}): Fak
         const m = {
           id: `m${++seq}`, role: "ASSISTANT", mode: "BALANCED", model: "claude-sonnet-5-5", text: "", answer: null, toolCalls: null, warnings: [],
           inputTokens: null, outputTokens: null, cachedTokens: null, durationMs: null, status: "OK", declineReason: null, errorCode: null,
-          createdAt: db.clock(), ...over,
+          rating: null, ratingComment: null, dataSummary: null, createdAt: db.clock(), ...over,
         };
         db.messages.push(m);
         return m;
@@ -145,6 +146,7 @@ export function fakeFloDb(opts: { timezone?: string; start?: string } = {}): Fak
       guard("floMessage.create");
       const m = {
         text: "", answer: null, toolCalls: null, warnings: [], mode: null, model: null, status: "OK", declineReason: null, errorCode: null,
+        rating: null, ratingComment: null, dataSummary: null,
         inputTokens: null, outputTokens: null, cachedTokens: null, durationMs: null, createdAt: db.clock(), id: `m${++seq}`, ...a.data,
       };
       db.messages.push(m);
@@ -154,6 +156,17 @@ export function fakeFloDb(opts: { timezone?: string; start?: string } = {}): Fak
       guard("floMessage.findMany");
       const rows = db.messages.filter((r) => matches(r, a.where, db)).sort((x, y) => +y.createdAt - +x.createdAt);
       return rows.slice(0, a.take).map((r) => pick(r, a.select));
+    },
+    async findFirst(a: Row) {
+      guard("floMessage.findFirst");
+      const rows = db.messages.filter((r) => matches(r, a.where, db)).sort((x, y) => +y.createdAt - +x.createdAt);
+      return rows[0] ? pick(rows[0], a.select) : null;
+    },
+    async updateMany(a: Row) {
+      guard("floMessage.updateMany");
+      const hit = db.messages.filter((r) => matches(r, a.where, db));
+      for (const m of hit) Object.assign(m, a.data);
+      return { count: hit.length };
     },
     async count(a: Row) {
       guard("floMessage.count");
@@ -198,10 +211,20 @@ export function fakeFloDb(opts: { timezone?: string; start?: string } = {}): Fak
     async count() {
       return db.visits.length;
     },
+    async groupBy(a: Row) {
+      const key = (a.by as string[])[0];
+      const counts = new Map<unknown, number>();
+      for (const v of db.visits) counts.set(v[key] ?? null, (counts.get(v[key] ?? null) ?? 0) + 1);
+      return [...counts].map(([value, n]) => ({ [key]: value, _count: n }));
+    },
   };
   const round = {
     async findUnique(a: Row) {
       return db.rounds.includes(a.where.id) ? { id: a.where.id } : null;
+    },
+    async findMany(a: Row) {
+      const ids: string[] = a.where?.id?.in ?? [];
+      return ids.map((id) => ({ id, name: db.visits.find((v) => v.roundId === id)?.round?.name ?? id }));
     },
   };
 
@@ -219,6 +242,7 @@ export function fakeFloDb(opts: { timezone?: string; start?: string } = {}): Fak
 export const skip = (date: string, reason: string, round = "Round 7") => ({
   date: new Date(`${date}T00:00:00Z`),
   skipReason: reason,
+  roundId: "round-7",
   round: { name: round },
   technician: { name: "Liam" },
   property: { addressLine: "12 Oak Road", customer: { name: "Mrs Smith" } },

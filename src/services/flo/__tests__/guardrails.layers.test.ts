@@ -116,7 +116,8 @@ describe("layer 5: output lint drops the sentence, never repairs it", () => {
       '<block>{"type":"table","sourceId":"r1","columns":["date"],"link":{"screen":"ROUND","params":{"roundId":"other-tenant-round"}}}</block>';
     const { events } = await attack(answer);
     const links = events.filter((e) => e.event === "block").map((e) => (e.data as { block: { link?: unknown } }).block.link);
-    expect(links).toEqual([undefined, { screen: "ROUND" }]);
+    // A model-supplied link that fails validation is dropped and replaced by the server's automatic link for the source tool.
+    expect(links).toEqual([{ screen: "TODAYS_WORK" }, { screen: "ROUND" }]);
   });
 });
 
