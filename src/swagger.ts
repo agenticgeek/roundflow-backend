@@ -32,9 +32,11 @@ import type { OpenAPIV3 } from "openapi-types";
 // The anon key is the PUBLIC (publishable) key — safe to expose, NOT a secret.
 // ---------------------------------------------------------------------------
 
-const SUPABASE_URL = "https://suspoztkyfnnuyodbxov.supabase.co";
-const SUPABASE_ANON_KEY =
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN1c3BvenRreWZubnV5b2RieG92Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcwNzkwODEsImV4cCI6MjEwMjY1NTA4MX0.cQsgFPWRXpITMwIvy7gi2zdfnLaV-jwzJAZY1iNi25k";
+// Taken from the environment so the docs always point at the project this
+// deployment verifies tokens against. SUPABASE_ANON_KEY is optional: without
+// it the apikey field is left blank in Swagger UI.
+const SUPABASE_URL = (process.env.SUPABASE_URL || process.env.SUPABASE_ISSUER?.replace(/\/auth\/v1\/?$/, "") || "").replace(/\/$/, "");
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY ?? "";
 
 // ---------------------------------------------------------------------------
 // Helpers
