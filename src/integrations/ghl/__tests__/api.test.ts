@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { __clearGhlCustomFieldCache, sendGhlMessage, setGhlContactCustomFields } from "../api";
+import { __clearGhlCustomFieldCache, createGhlContact, sendGhlMessage, setGhlContactCustomFields } from "../api";
 
 const fetchMock = vi.fn();
 vi.stubGlobal("fetch", fetchMock);
@@ -110,6 +110,36 @@ describe("setGhlContactCustomFields", () => {
     await expect(setGhlContactCustomFields(ctx, "contact-1", { balance_owed: 1 })).rejects.toThrow(
       /setCustomFields failed \(400\)/
     );
+  });
+});
+
+describe("createGhlContact", () => {
+  const customer = { name: "Amelia Jones", phone: "+447700900123", email: null };
+
+  it("returns the new contact id", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ contact: { id: "new-1" } }));
+    await expect(createGhlContact(ctx, customer)).resolves.toBe("new-1");
+  });
+
+  it("adopts the existing contact when the location forbids duplicates", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      statusCode: 400,
+      message: "This location does not allow duplicated contacts.",
+      meta: { contactName: "Amelia Jones", contactId: "existing-1", matchingField: "phone" },
+    }, false, 400));
+    await expect(createGhlContact(ctx, customer)).resolves.toBe("existing-1");
+  });
+
+  it("still throws on any other 400", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ statusCode: 400, message: "phone is invalid" }, false, 400));
+    await expect(createGhlContact(ctx, customer)).rejects.toThrow("GHL createContact failed (400): ");
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 400, text: () => Promise.resolve("not json") });
+    await expect(createGhlContact(ctx, customer)).rejects.toThrow("not json");
+  });
+
+  it("throws on non-400 failures", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ message: "boom" }, false, 500));
+    await expect(createGhlContact(ctx, customer)).rejects.toThrow("GHL createContact failed (500)");
   });
 });
 

@@ -51,8 +51,24 @@ export async function syncCustomerToGhl(tp: TP, customerId: string): Promise<voi
     await updateGhlContact(ctx, customer.ghlContactId, customer);
   } else {
     const contactId = await createGhlContact(ctx, customer);
-    await tp.customer.update({ where: { id: customerId }, data: { ghlContactId: contactId } });
+    await linkGhlContact(tp, customerId, contactId);
   }
+}
+
+// Saves the GHL contact id on the customer. createGhlContact may hand back an existing contact (GHL de-duplicates on
+// phone/email), and ghlContactId is unique, so a contact already linked to another customer gets a clear error.
+export async function linkGhlContact(tp: TP, customerId: string, contactId: string): Promise<void> {
+  const owner = await tp.customer.findFirst({
+    where: { ghlContactId: contactId, id: { not: customerId } },
+    select: { name: true },
+  });
+  if (owner) {
+    throw new Error(
+      `GHL contact ${contactId} is already linked to customer "${owner.name}" (same phone or email in GoHighLevel). ` +
+      "Give each customer their own phone and email, then try again."
+    );
+  }
+  await tp.customer.update({ where: { id: customerId }, data: { ghlContactId: contactId } });
 }
 
 // Called by the outbox worker for tag-based events.

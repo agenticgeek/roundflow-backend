@@ -20,7 +20,7 @@ import { bestChannel, createMessageService, optOutboundChannel, pickChannel, res
 function makePrisma() {
   return {
     property: { findUnique: vi.fn(), findMany: vi.fn() },
-    customer: { findUnique: vi.fn(), update: vi.fn() },
+    customer: { findUnique: vi.fn(), findFirst: vi.fn().mockResolvedValue(null), update: vi.fn() },
     message: { create: vi.fn().mockResolvedValue({ id: "msg-1" }) },
     round: { findUnique: vi.fn().mockResolvedValue({ name: "Alnwick Fri" }) },
     businessSettings: { findFirst: vi.fn().mockResolvedValue({ businessName: "Shine Ltd", currency: "£" }) },

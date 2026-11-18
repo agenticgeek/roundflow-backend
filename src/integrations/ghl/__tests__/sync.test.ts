@@ -12,15 +12,34 @@ vi.mock("../api", () => ({
   removeGhlTags: vi.fn(),
 }));
 
-import { queueGhlEvent, applyGhlCustomFields } from "../sync";
+import { queueGhlEvent, applyGhlCustomFields, linkGhlContact } from "../sync";
 
 function makeTp() {
   return {
     integrationOutbox: { create: vi.fn().mockResolvedValue({}) },
     businessSettings: { findFirst: vi.fn().mockResolvedValue({ ghlConnected: true }) },
-    customer: { findUnique: vi.fn() },
+    customer: { findUnique: vi.fn(), findFirst: vi.fn().mockResolvedValue(null), update: vi.fn().mockResolvedValue({}) },
   };
 }
+
+describe("linkGhlContact", () => {
+  it("saves the contact id on the customer", async () => {
+    const tp: any = makeTp();
+    await linkGhlContact(tp, "cust-1", "contact-1");
+    expect(tp.customer.findFirst).toHaveBeenCalledWith({
+      where: { ghlContactId: "contact-1", id: { not: "cust-1" } },
+      select: { name: true },
+    });
+    expect(tp.customer.update).toHaveBeenCalledWith({ where: { id: "cust-1" }, data: { ghlContactId: "contact-1" } });
+  });
+
+  it("refuses a contact already linked to another customer", async () => {
+    const tp: any = makeTp();
+    tp.customer.findFirst.mockResolvedValue({ name: "Bob Smith" });
+    await expect(linkGhlContact(tp, "cust-1", "contact-1")).rejects.toThrow('already linked to customer "Bob Smith"');
+    expect(tp.customer.update).not.toHaveBeenCalled();
+  });
+});
 
 beforeEach(() => {
   vi.clearAllMocks();
