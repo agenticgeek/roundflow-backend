@@ -7,6 +7,7 @@ import { getCachedBusinessSettings } from "./settings.service";
 import { createInvoiceService } from "./invoice.service";
 import { grossOf } from "../lib/vat";
 import { visitLabelFrom } from "../lib/activity-labels";
+import { DD_SETUP_LINK_EVENT, MANDATE_IN_PLACE } from "./direct-debit.service";
 
 // Shared visit completion used by PATCH /visits/:id/complete (web) and
 // PATCH /mobile/visits/:id/complete (technician app).
@@ -43,6 +44,9 @@ export interface CompleteVisitResult {
   // created: customer/visit on payment hold, already invoiced, or a
   // best-effort failure — the office can still invoice the visit by hand).
   invoice: { id: string; status: InvoiceStatus } | null;
+  // Direct Debit was the method but the customer has no mandate yet, so nothing was collected and a GoCardless setup
+  // link was queued for them (sent by the outbox worker). Absent/false otherwise.
+  directDebitSetupLinkQueued?: boolean;
 }
 
 // Outbox event for the "Visit completed" customer message (A5). The outbox
@@ -140,7 +144,13 @@ export function createVisitCompletionService(tp: TenantPrismaClient) {
           ? chosen
           : (visit.paymentMethod ?? visit.servicePlan?.paymentMethod ?? customer.paymentMethod)) as PaymentMethod | null;
       // A3: money is taken at the VAT-inclusive total (the invoice amount).
-      const gross = grossOf(visit.price.toNumber(), await getCachedBusinessSettings(tp));
+      const settings = await getCachedBusinessSettings(tp);
+      const gross = grossOf(visit.price.toNumber(), settings);
+      // Direct Debit with no mandate in place: nothing can be collected, so the customer is sent a setup link instead.
+      const queueDdSetupLink =
+        effectiveMethod === PaymentMethod.GOCARDLESS &&
+        !!settings?.gocardlessConnected &&
+        !(customer.gocardlessMandateStatus && MANDATE_IN_PLACE.has(customer.gocardlessMandateStatus));
 
       // ---- 1. Decide the payment (validation only, no writes) -------------
       let planned: PlannedPayment | null = null;
@@ -253,6 +263,9 @@ export function createVisitCompletionService(tp: TenantPrismaClient) {
       ops.push(
         tp.integrationOutbox.create({ data: { eventType: "visit.completed", payload: { customerId, visitId: visit.id } } }),
       );
+      if (queueDdSetupLink) {
+        ops.push(tp.integrationOutbox.create({ data: { eventType: DD_SETUP_LINK_EVENT, payload: { customerId, visitId: visit.id } } }));
+      }
       if (!customer.messagesOptOut) {
         ops.push(
           tp.integrationOutbox.create({
@@ -317,6 +330,7 @@ export function createVisitCompletionService(tp: TenantPrismaClient) {
           ? { id: payment.id, method: payment.method, status: payment.status, amount: Number(payment.amount) }
           : null,
         invoice,
+        ...(queueDdSetupLink ? { directDebitSetupLinkQueued: true } : {}),
       };
     },
   };

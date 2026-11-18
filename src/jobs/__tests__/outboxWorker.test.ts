@@ -39,6 +39,12 @@ vi.mock("../../services/invoice-send-batch.service", () => ({
 const notifyIntegrationDead = vi.fn().mockResolvedValue(undefined);
 vi.mock("../../services/notify", () => ({ notifyIntegrationDead: (...a: unknown[]) => notifyIntegrationDead(...a) }));
 
+const ddSendLink = vi.fn();
+vi.mock("../../services/direct-debit.service", () => ({
+  DD_SETUP_LINK_EVENT: "dd.setup_link",
+  createDirectDebitService: () => ({ sendLink: (...a: unknown[]) => ddSendLink(...a) }),
+}));
+
 import { runOutboxWorker } from "../outboxWorker";
 
 type Row = { id: string; eventType: string; payload: unknown; attempts: number };
@@ -380,6 +386,32 @@ describe("runOutboxWorker", () => {
     );
     expect(notifyIntegrationDead).toHaveBeenCalledWith(tp, { id: "row-1", eventType: "visit.completed", lastError: expect.stringContaining("payload missing customerId") });
     errorSpy.mockRestore();
+  });
+
+  describe("dd.setup_link (Direct Debit setup link)", () => {
+    const run = async () => {
+      tenantFindMany.mockResolvedValue([{ schemaName: "t_1" }]);
+      const tp = makeTp([{ id: "row-dd", eventType: "dd.setup_link", payload: { customerId: "cust-1" }, attempts: 0 }]);
+      getTenantPrismaForSchema.mockReturnValue(tp);
+      await runOutboxWorker();
+      return tp;
+    };
+
+    it("sends the link as an automated send and marks the row sent", async () => {
+      ddSendLink.mockResolvedValueOnce({ status: "sent", channel: "EMAIL" });
+      const tp = await run();
+      expect(ddSendLink).toHaveBeenCalledWith("cust-1", { automated: true });
+      expect(tp.integrationOutbox.update).toHaveBeenCalledWith({ where: { id: "row-dd" }, data: SENT });
+    });
+
+    it("records a skip reason", async () => {
+      ddSendLink.mockResolvedValueOnce({ status: "skipped", reason: "RECENTLY_SENT" });
+      const tp = await run();
+      expect(tp.integrationOutbox.update).toHaveBeenCalledWith({
+        where: { id: "row-dd" },
+        data: { status: "skipped", lastError: "RECENTLY_SENT", processedAt: expect.any(Date) },
+      });
+    });
   });
 
   describe("message.send (pre-clean reminders)", () => {

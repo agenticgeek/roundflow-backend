@@ -9,6 +9,7 @@ import { VisitStatus } from "../generated/tenant-client";
 import { INVOICE_SEND_EVENT, processInvoiceSendRow } from "../services/invoice-send-batch.service";
 import { OUTBOX_MAX_ATTEMPTS, outboxBackoffMs } from "../lib/outbox-backoff";
 import { notifyIntegrationDead } from "../services/notify";
+import { DD_SETUP_LINK_EVENT, createDirectDebitService } from "../services/direct-debit.service";
 
 const BATCH = 20;
 
@@ -198,6 +199,12 @@ async function processTenant(tp: TenantPrismaClient): Promise<void> {
         case "message.visit_completed":
           skipReason = await sendVisitCompletedMessage(tp, customerId, payload);
           break;
+        case DD_SETUP_LINK_EVENT: {
+          // Technician chose Direct Debit for a customer with no mandate (or the setup wizard asked for a link).
+          const res = await createDirectDebitService(tp).sendLink(customerId, { automated: true });
+          if (res.status === "skipped") skipReason = res.reason;
+          break;
+        }
         default:
           unknownType = true;
       }

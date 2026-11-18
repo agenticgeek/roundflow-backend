@@ -25,6 +25,8 @@ const svc = {
 const replaceTemplates = vi.fn().mockResolvedValue([{ id: "t1" }]);
 
 vi.mock("../../services/setup.service", () => ({ createSetupService: vi.fn(() => svc) }));
+const queueDdSetupLink = vi.fn();
+vi.mock("../../services/direct-debit.service", () => ({ queueDdSetupLink: (...a: unknown[]) => queueDdSetupLink(...a) }));
 vi.mock("../../services/settings.service", () => ({ createSettingsService: vi.fn(() => ({ replaceTemplates })) }));
 vi.mock("../../middleware/requireAuth", () => ({ requireAuth: (_q: any, _s: any, n: any) => n() }));
 vi.mock("../../middleware/requireTenantAccess", () => ({ requireTenantAccess: (q: any, _s: any, n: any) => { q.profile = { role: "ADMIN" }; n(); } }));
@@ -165,4 +167,22 @@ it("GET /setup/step/11/preview validates the query and returns the service previ
   expect((await request(makeApp()).get("/setup/step/11/preview?cycleWeeks=4")).status).toBe(400);
   expect((await request(makeApp()).get("/setup/step/11/preview?startDate=2026-10-30")).status).toBe(400);
   expect((await request(makeApp()).get("/setup/step/11/preview?startDate=2026-10-30&cycleWeeks=four")).status).toBe(400);
+});
+
+it("POST /setup/step/9 queues a Direct Debit setup link only when asked, for a Direct Debit customer", async () => {
+  svc.addSetupProperty.mockResolvedValueOnce({ customer: { id: "c9" }, customerMatched: false });
+  queueDdSetupLink.mockResolvedValueOnce("queued");
+  const res = await request(makeApp()).post("/setup/step/9").send({ ...row, paymentMethod: "GOCARDLESS", sendDdLink: true });
+  expect(res.status).toBe(201);
+  expect(res.body).toEqual({ customer: { id: "c9" }, customerMatched: false, ddSetupLink: "queued" });
+  expect(queueDdSetupLink).toHaveBeenCalledWith(expect.anything(), "c9");
+
+  queueDdSetupLink.mockClear();
+  await request(makeApp()).post("/setup/step/9").send({ ...row, paymentMethod: "CASH", sendDdLink: true }).expect(201);
+  await request(makeApp()).post("/setup/step/9").send({ ...row, paymentMethod: "GOCARDLESS", sendDdLink: false }).expect(201);
+  await request(makeApp()).post("/setup/step/9").send({ ...row, sendDdLink: true }).expect(201);
+  expect(queueDdSetupLink).not.toHaveBeenCalled();
+
+  const bad = await request(makeApp()).post("/setup/step/9").send({ ...row, sendDdLink: "yes" });
+  expect(bad.status).toBe(400);
 });

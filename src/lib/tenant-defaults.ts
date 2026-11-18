@@ -22,6 +22,7 @@ export const DEFAULT_MESSAGE_TEMPLATES = [
   { name: "Complaint Acknowledgement", channel: "EMAIL", subject: "We've received your message", body: "Hi [Customer Name], we've logged your complaint and will be in touch shortly." },
   { name: "Visit completed", channel: "SMS", subject: null, body: "Hi [Customer Name], your window clean at {{address}} was completed today. Thank you, {{businessName}}." },
   { name: "Welcome / Service Confirmation", channel: "SMS", subject: null, body: "Hi [Customer Name], welcome to our round! Your first visit is confirmed." },
+  { name: "Direct Debit setup link", channel: "EMAIL", subject: "Set up your Direct Debit", body: "Hi [Customer Name], set up a Direct Debit for your window cleaning and you'll never need to pay by hand: {{paymentLink}} Thanks, {{businessName}}." },
 ] as const;
 
 // Idempotent: each table is seeded only if it is currently empty, so this is

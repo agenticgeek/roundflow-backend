@@ -30,6 +30,11 @@ vi.mock("../../services/payment.service", () => ({
   createPaymentService: () => ({ transition: (...args: unknown[]) => transition(...args) }),
 }));
 
+const handleBillingRequestFulfilled = vi.fn().mockResolvedValue(undefined);
+vi.mock("../../services/direct-debit.service", () => ({
+  createDirectDebitService: () => ({ handleBillingRequestFulfilled: (...args: unknown[]) => handleBillingRequestFulfilled(...args) }),
+}));
+
 function makeTenantPrisma() {
   return {
     businessSettings: { findFirst: vi.fn() },
@@ -354,7 +359,7 @@ describe("POST /webhooks/gocardless — event processing", () => {
       expect(tp.customer.updateMany).not.toHaveBeenCalled();
     });
 
-    it.each(["active", "cancelled", "failed", "expired"])("maps action '%s' to the matching mandate status", async (action) => {
+    it.each(["submitted", "active", "cancelled", "failed", "expired"])("maps action '%s' to the matching mandate status", async (action) => {
       const tp = setupMandate(action);
       await send("?tenantId=tenant-1&secret=abc");
       expect(tp.customer.updateMany).toHaveBeenCalledWith({
@@ -370,6 +375,24 @@ describe("POST /webhooks/gocardless — event processing", () => {
       await send("?tenantId=tenant-1&secret=abc");
       expect(tp.customer.updateMany).not.toHaveBeenCalled();
       expect(tp2.customer.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("billing_requests resource (Direct Debit setup link)", () => {
+    it("links the mandate when a billing request is fulfilled", async () => {
+      setup([{ id: "ev_1", resource_type: "billing_requests", action: "fulfilled", links: { billing_request: "BRQ1" } }]);
+      const res = await send("?tenantId=tenant-1&secret=abc");
+      expect(res.status).toBe(200);
+      expect(handleBillingRequestFulfilled).toHaveBeenCalledWith("BRQ1");
+    });
+
+    it("ignores other billing request actions and a missing link", async () => {
+      setup([
+        { id: "ev_1", resource_type: "billing_requests", action: "created", links: { billing_request: "BRQ1" } },
+        { id: "ev_2", resource_type: "billing_requests", action: "fulfilled", links: {} },
+      ]);
+      await send("?tenantId=tenant-1&secret=abc");
+      expect(handleBillingRequestFulfilled).not.toHaveBeenCalled();
     });
   });
 

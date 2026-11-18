@@ -322,6 +322,52 @@ describe("completeVisit", () => {
     expect(tp.propertyNote.create).toHaveBeenCalledWith({ data: { propertyId: "prop-1", body: "Side gate stiff", type: "INTERNAL" } });
   });
 
+  describe("Direct Debit with no mandate (setup link)", () => {
+    const noMandate = (status: string | null = null, paymentMethod: PaymentMethod | null = null) =>
+      baseVisit({
+        paymentMethod,
+        property: { customer: { id: "cust-1", name: "Tom", paymentMethod: null, gocardlessMandateId: null, gocardlessMandateStatus: status } },
+      });
+    const ddRow = (tp: ReturnType<typeof makeTp>) =>
+      tp.integrationOutbox.create.mock.calls.find((c: any[]) => c[0].data.eventType === "dd.setup_link");
+
+    it("queues a setup link when the technician picks Direct Debit and GoCardless is connected", async () => {
+      const tp = makeTp();
+      tp.visit.findUnique.mockResolvedValue(noMandate());
+      tp.businessSettings.findFirst.mockResolvedValue({ gocardlessConnected: true });
+      const res = await createVisitCompletionService(tp as any).completeVisit("v1", { payment: { method: "GOCARDLESS" } });
+      expect(ddRow(tp)?.[0]).toEqual({ data: { eventType: "dd.setup_link", payload: { customerId: "cust-1", visitId: "visit-12345678" } } });
+      expect(res.directDebitSetupLinkQueued).toBe(true);
+      expect(res.payment).toBeNull();
+      expect(createGcPayment).not.toHaveBeenCalled();
+    });
+
+    it("also queues one for a customer whose usual method is Direct Debit, or whose mandate has ended", async () => {
+      const tp = makeTp();
+      tp.visit.findUnique.mockResolvedValue(noMandate("cancelled", PaymentMethod.GOCARDLESS));
+      tp.businessSettings.findFirst.mockResolvedValue({ gocardlessConnected: true });
+      const res = await createVisitCompletionService(tp as any).completeVisit("v1");
+      expect(ddRow(tp)).toBeTruthy();
+      expect(res.directDebitSetupLinkQueued).toBe(true);
+    });
+
+    it("queues nothing when GoCardless is not connected, a mandate is pending, or the method is not Direct Debit", async () => {
+      for (const [visit, settings, payment] of [
+        [noMandate(), { gocardlessConnected: false }, { method: "GOCARDLESS" }],
+        [noMandate(), null, { method: "GOCARDLESS" }],
+        [noMandate("pending_submission"), { gocardlessConnected: true }, { method: "GOCARDLESS" }],
+        [noMandate(), { gocardlessConnected: true }, { method: "STRIPE" }],
+      ] as const) {
+        const tp = makeTp();
+        tp.visit.findUnique.mockResolvedValue(visit);
+        tp.businessSettings.findFirst.mockResolvedValue(settings);
+        const res = await createVisitCompletionService(tp as any).completeVisit("v1", { payment: payment as any });
+        expect(ddRow(tp)).toBeUndefined();
+        expect(res.directDebitSetupLinkQueued).toBeUndefined();
+      }
+    });
+  });
+
   describe("GOCARDLESS", () => {
     const gcVisit = (customer: Record<string, unknown> = {}) =>
       baseVisit({

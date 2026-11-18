@@ -1967,6 +1967,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       servicePlan: ref("ServicePlan"),
       servicePlans: { type: "array", items: ref("ServicePlan"), description: "Every plan created for this row — length > 1 only when serviceIds had more than one entry. servicePlan above is always servicePlans[0] (kept for backward compatibility)." },
       customerMatched: { type: "boolean", description: "GAP-010: true when the property was attached to an existing customer (explicit customerId, or matched by mobile/email) instead of creating one." },
+      ddSetupLink: { type: "string", enum: ["queued", "not_connected", "mandate_exists"], description: "Present only when sendDdLink was true for a GOCARDLESS customer: queued, or why no link was queued." },
     },
   },
 
@@ -2485,6 +2486,10 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
         required: ["id", "method", "status", "amount"],
         properties: { id: { type: "string" }, method: ref("PaymentMethod"), status: ref("PaymentStatus"), amount: { type: "number" } },
       },
+      directDebitSetupLinkQueued: {
+        type: "boolean",
+        description: "true when Direct Debit was the method but the customer has no mandate yet: nothing was collected and a GoCardless setup link was queued for the customer. Absent otherwise.",
+      },
     },
     example: { id: "vis_example", status: "COMPLETED", payment: { id: "pay_1", method: "CASH", status: "PAID", amount: 18 } },
   },
@@ -2547,20 +2552,91 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     },
   },
 
-  MandateRedirectResult: {
+  DirectDebitStatus: {
     type: "object",
-    required: ["url"],
+    required: ["gocardlessConnected", "mandateStatus", "mandateId", "linkSentAt", "linkUrl", "linkExpiresAt"],
     properties: {
-      url: { type: "string", description: "GoCardless hosted redirect-flow URL to send the customer to." },
+      gocardlessConnected: { type: "boolean" },
+      mandateStatus: { type: "string", nullable: true, description: "GoCardless mandate status (pending_customer_approval, pending_submission, submitted, active, cancelled, failed, expired, ...); null = no mandate." },
+      mandateId: { type: "string", nullable: true },
+      linkSentAt: { type: "string", format: "date-time", nullable: true, description: "When a setup link was last sent." },
+      linkUrl: { type: "string", nullable: true, description: "The current setup link while it is still valid." },
+      linkExpiresAt: { type: "string", format: "date-time", nullable: true },
     },
   },
 
-  MandateCompleteResult: {
+  DirectDebitLink: {
     type: "object",
-    required: ["mandateId", "status"],
+    required: ["url", "expiresAt"],
     properties: {
-      mandateId: { type: "string" },
-      status: { type: "string", enum: ["pending_customer_approval"] },
+      url: { type: "string", description: "GoCardless-hosted Direct Debit sign-up link." },
+      expiresAt: { type: "string", format: "date-time", nullable: true },
+    },
+  },
+
+  DirectDebitSendResult: {
+    type: "object",
+    required: ["status", "channel", "url", "expiresAt"],
+    properties: {
+      status: { type: "string", enum: ["sent"] },
+      channel: { type: "string", enum: ["EMAIL", "SMS", "WHATSAPP"] },
+      url: { type: "string" },
+      expiresAt: { type: "string", format: "date-time", nullable: true },
+    },
+  },
+
+  GcMandateImportCandidates: {
+    type: "object",
+    required: ["rows"],
+    properties: {
+      rows: {
+        type: "array",
+        items: {
+          type: "object",
+          required: ["mandateId", "status", "gcCustomerId", "name", "linkedCustomerId", "suggestion", "ambiguous"],
+          properties: {
+            mandateId: { type: "string" },
+            status: { type: "string", enum: ["active", "pending_submission", "submitted"] },
+            reference: { type: "string", nullable: true },
+            createdAt: { type: "string", nullable: true },
+            gcCustomerId: { type: "string" },
+            name: { type: "string" },
+            email: { type: "string", nullable: true },
+            phone: { type: "string", nullable: true },
+            postcode: { type: "string", nullable: true },
+            linkedCustomerId: { type: "string", nullable: true, description: "RoundFlow customer already linked to this mandate." },
+            suggestion: {
+              type: "object",
+              nullable: true,
+              required: ["customerId", "customerName", "matchedBy"],
+              properties: { customerId: { type: "string" }, customerName: { type: "string" }, matchedBy: { type: "string", enum: ["email", "phone"] } },
+            },
+            ambiguous: { type: "boolean", description: "More than one RoundFlow customer matched, so nothing is suggested." },
+          },
+        },
+      },
+    },
+  },
+
+  GcMandateImportResult: {
+    type: "object",
+    required: ["linked", "failed", "results"],
+    properties: {
+      linked: { type: "integer" },
+      failed: { type: "integer" },
+      results: {
+        type: "array",
+        items: {
+          type: "object",
+          required: ["mandateId", "customerId", "status"],
+          properties: {
+            mandateId: { type: "string" },
+            customerId: { type: "string" },
+            status: { type: "string", enum: ["linked", "failed"] },
+            error: { type: "string" },
+          },
+        },
+      },
     },
   },
 
@@ -3984,6 +4060,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       roundId: { type: "string", description: "Required during setup so the property is schedulable. Must reference an ACTIVE round." },
       customerId: { type: "string", nullable: true, description: "GAP-010: attach to this existing customer (404 / row error if unknown). Omitted = match by mobile/email, else create." },
       lastCleanedDate: { type: "string", format: "date", nullable: true, description: "ISO date; seeds nextDueDate = one cycle later on the round day. 400 / row error if invalid." },
+      sendDdLink: { type: "boolean", description: "Step 9 only: with paymentMethod GOCARDLESS, queue a GoCardless Direct Debit setup link to the customer (see ddSetupLink in the result)." },
     },
     example: {
       customerName: "John Smith",
@@ -4448,10 +4525,22 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     example: { addressLine: "3 Bondgate Within", postcode: "NE66 1SX", price: 30, serviceAreaId: "csa_example", roundId: null },
   },
 
-  MandateCompleteInput: {
+  DirectDebitSendInput: {
     type: "object",
-    required: ["redirectFlowId"],
-    properties: { redirectFlowId: { type: "string", description: "The GoCardless redirect flow id returned to the success URL." } },
+    properties: { channel: { type: "string", enum: ["AUTO", "EMAIL", "SMS", "WHATSAPP"], description: "Omitted or AUTO = best available (SMS via GHL when connected and the customer has a mobile, else email)." } },
+  },
+
+  GcMandateImportInput: {
+    type: "object",
+    required: ["links"],
+    properties: {
+      links: {
+        type: "array",
+        minItems: 1,
+        maxItems: 500,
+        items: { type: "object", required: ["mandateId", "customerId"], properties: { mandateId: { type: "string" }, customerId: { type: "string" } } },
+      },
+    },
   },
 
   // ---- Payments / visits ----
@@ -6011,37 +6100,48 @@ const paths: OpenAPIV3.PathsObject = {
       },
     },
   },
-  "/customers/{id}/mandate": {
+  "/customers/{id}/direct-debit": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Customers"],
+      summary: "Direct Debit status for a customer",
+      description: "Mandate status plus the current GoCardless setup link (while it is still valid) and when a link was last sent.",
+      responses: { "200": jsonResponse("Status.", ref("DirectDebitStatus")), "401": ERR[401], "403": ERR[403], "404": ERR[404] },
+    },
+  },
+  "/customers/{id}/direct-debit/link": {
     parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
     post: {
       tags: ["Customers"],
-      summary: "Start a GoCardless Direct Debit mandate (redirect flow)",
+      summary: "Get a Direct Debit setup link to copy",
       description:
-        "Creates a GoCardless redirect flow using the tenant's stored GoCardless token and returns its URL. The customer is sent back to `${FRONTEND_URL}/customers/{id}/mandate/success`, after which the frontend calls POST /customers/{id}/mandate/complete.",
+        "Returns the customer's GoCardless setup link (a billing request flow), reusing a stored one with more than an hour left, else making a new one. Sends nothing. " +
+        "When the customer completes it, the `billing_requests.fulfilled` webhook links the new mandate.",
       responses: {
-        "200": jsonResponse("Redirect-flow URL.", ref("MandateRedirectResult")),
+        "200": jsonResponse("Link.", ref("DirectDebitLink")),
         "401": ERR[401],
         "403": ERR[403],
         "404": ERR[404],
-        "409": errorResponse("Customer already has an active mandate, or GoCardless is not connected.", "GoCardless is not connected for this account"),
+        "409": errorResponse("`GOCARDLESS_NOT_CONNECTED`, or `MANDATE_EXISTS` (the customer already has an active or pending mandate).", "This customer already has a Direct Debit set up."),
       },
     },
   },
-  "/customers/{id}/mandate/complete": {
+  "/customers/{id}/direct-debit/send": {
     parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
     post: {
       tags: ["Customers"],
-      summary: "Complete the GoCardless redirect flow",
+      summary: "Send the Direct Debit setup link to the customer",
       description:
-        "Completes `redirectFlowId` with GoCardless and stores the GoCardless customer + mandate ids on the customer with `gocardlessMandateStatus = pending_customer_approval`. The status moves to `active` (etc.) via POST /webhooks/gocardless mandate events.",
-      requestBody: jsonBody(ref("MandateCompleteInput")),
+        "Renders the tenant's 'Direct Debit setup link' template (`{{paymentLink}}` = the link) and sends it by the chosen channel (or the best available). Records the send time and an activity log entry.",
+      requestBody: { required: false, content: { "application/json": { schema: ref("DirectDebitSendInput") } } },
       responses: {
-        "200": jsonResponse("Mandate created.", ref("MandateCompleteResult")),
+        "200": jsonResponse("Sent.", ref("DirectDebitSendResult")),
         "400": ERR[400],
         "401": ERR[401],
         "403": ERR[403],
         "404": ERR[404],
-        "409": errorResponse("GoCardless is not connected.", "GoCardless is not connected"),
+        "409": errorResponse("`GOCARDLESS_NOT_CONNECTED`, `MANDATE_EXISTS`, or the channel cannot be used.", "GoCardless is not connected. Connect it in Settings > Payments first."),
+        "502": errorResponse("The message provider rejected the send.", "GoHighLevel could not send the message"),
       },
     },
   },
@@ -8797,6 +8897,36 @@ const paths: OpenAPIV3.PathsObject = {
       tags: ["Notifications"],
       summary: "Unread notification count (header bell)",
       responses: { "200": jsonResponse("Count.", { type: "object", required: ["unreadCount"], properties: { unreadCount: { type: "integer" } } }), "401": ERR[401], "403": ERR[403] },
+    },
+  },
+  "/integrations/gocardless/mandates/import": {
+    get: {
+      tags: ["Integrations"],
+      summary: "Existing GoCardless mandates to link to customers",
+      description:
+        "ADMIN only. Lists the account's active / pending GoCardless mandates with their GoCardless customer's details, the RoundFlow customer each is already linked to, " +
+        "and a suggested match (unique email match, else unique UK-normalised phone match). Nothing is changed.",
+      responses: {
+        "200": jsonResponse("Candidates.", ref("GcMandateImportCandidates")),
+        "401": ERR[401],
+        "403": ERR[403],
+        "409": errorResponse("`GOCARDLESS_NOT_CONNECTED`.", "GoCardless is not connected. Connect it in Settings > Payments first."),
+      },
+    },
+    post: {
+      tags: ["Integrations"],
+      summary: "Link existing GoCardless mandates to customers",
+      description:
+        "ADMIN only. Links each confirmed mandate -> customer pair after re-checking it: the mandate must still be collectable in GoCardless, not linked to another customer, " +
+        "and the customer must not already have a different active or pending mandate. Per-pair results; one failure does not stop the rest.",
+      requestBody: jsonBody(ref("GcMandateImportInput")),
+      responses: {
+        "200": jsonResponse("Results.", ref("GcMandateImportResult")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "409": errorResponse("`GOCARDLESS_NOT_CONNECTED`.", "GoCardless is not connected. Connect it in Settings > Payments first."),
+      },
     },
   },
   "/integrations/outbox": {

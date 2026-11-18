@@ -12,6 +12,7 @@ export const TEMPLATE_NAMES = {
   INVOICE: "Invoice Ready",
   VISIT_COMPLETED: "Visit completed",
   WEATHER_HOLD: "Weather Hold",
+  DD_SETUP_LINK: "Direct Debit setup link",
 } as const;
 
 export const FALLBACK_BODIES = {
@@ -22,6 +23,7 @@ export const FALLBACK_BODIES = {
   WEATHER_HOLD: "Hi {{firstName}}, due to {{condition}} we've had to postpone your window clean at {{address}}. Your new date is {{newDate}}. Thanks for understanding, {{businessName}}.",
   // Used instead when the office will pick the new date later (no date to give).
   WEATHER_HOLD_TBC: "Hi {{firstName}}, due to {{condition}} we've had to postpone your window clean at {{address}}. We'll be in touch shortly with a new date. Thanks for understanding, {{businessName}}.",
+  DD_SETUP_LINK: "Hi {{firstName}}, set up a Direct Debit for your window cleaning and you'll never need to pay by hand: {{paymentLink}} Thanks, {{businessName}}.",
 } as const;
 
 export type TemplateVars = Record<string, string>;

@@ -37,6 +37,8 @@ export const ADMIN_ONLY_ROUTES: ReadonlyArray<readonly [string, string]> = [
   ["POST", "/settings/email/logo/upload-url"],
   ["PUT", "/settings/email/logo"],
   ["DELETE", "/settings/email/logo"],
+  ["GET", "/integrations/gocardless/mandates/import"],
+  ["POST", "/integrations/gocardless/mandates/import"],
   ["GET", "/integrations/outbox"],
   ["POST", "/integrations/outbox/:id/replay"],
   // Flo AI (2026-11): admin-only assistant (plan D3). Enforced by enforceAdminOnlyRoutes() on the flo router.

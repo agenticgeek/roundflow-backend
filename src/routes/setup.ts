@@ -64,6 +64,7 @@ import {
   MessageTemplateInput,
 } from "../services/settings.service";
 import { requireMessageChannel } from "../lib/validation";
+import { queueDdSetupLink } from "../services/direct-debit.service";
 
 export const setupRouter = Router();
 setupRouter.use(requireAuth);
@@ -395,7 +396,14 @@ setupRouter.post(
       lastCleanedDate: optString(body.lastCleanedDate, "lastCleanedDate") ?? null,
     };
 
-    res.status(201).json(await svc(req).addSetupProperty(input));
+    const sendDdLink = optBool(body.sendDdLink, "sendDdLink") ?? false;
+    const result = await svc(req).addSetupProperty(input);
+    // "Send a Direct Debit setup link now" (wizard checkbox): only for a Direct Debit customer; queued, never blocking.
+    const ddSetupLink =
+      sendDdLink && input.paymentMethod?.toUpperCase() === "GOCARDLESS"
+        ? await queueDdSetupLink(req.tenantPrisma!, result.customer.id)
+        : undefined;
+    res.status(201).json(ddSetupLink ? { ...result, ddSetupLink } : result);
   })
 );
 

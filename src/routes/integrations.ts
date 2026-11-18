@@ -4,7 +4,8 @@ import { requireTenantAccess } from "../middleware/requireTenantAccess";
 import { requireBusinessAccess } from "../middleware/requireRole";
 import { enforceAdminOnlyRoutes } from "../middleware/requireAdmin";
 import { AppError } from "../lib/app-error";
-import { h, parsePageParams } from "../lib/http";
+import { asObject, h, parsePageParams, requireString } from "../lib/http";
+import { createDirectDebitService } from "../services/direct-debit.service";
 
 // BE-12: dead-letter view and replay for the integration outbox (GHL sends, invoice.send). ADMIN only
 // (src/lib/permissions.ts): rows reference customers and can re-send customer messages.
@@ -79,5 +80,29 @@ integrationsRouter.post(
       },
     });
     res.json({ id: row.id, status: "pending" });
+  })
+);
+
+// GET /integrations/gocardless/mandates/import — existing GoCardless mandates with a suggested customer each (ADMIN)
+integrationsRouter.get(
+  "/gocardless/mandates/import",
+  h(async (req, res) => {
+    res.json(await createDirectDebitService(req.tenantPrisma!).importCandidates());
+  })
+);
+
+// POST /integrations/gocardless/mandates/import { links: [{ mandateId, customerId }] } — link the confirmed pairs (ADMIN)
+integrationsRouter.post(
+  "/gocardless/mandates/import",
+  h(async (req, res) => {
+    const body = asObject(req.body);
+    if (!Array.isArray(body.links) || body.links.length === 0 || body.links.length > 500) {
+      throw new AppError(400, '"links" must be an array of 1 to 500 { mandateId, customerId } pairs.');
+    }
+    const links = body.links.map((raw, i) => {
+      const item = asObject(raw);
+      return { mandateId: requireString(item.mandateId, `links[${i}].mandateId`), customerId: requireString(item.customerId, `links[${i}].customerId`) };
+    });
+    res.json(await createDirectDebitService(req.tenantPrisma!, { id: req.profile?.id, role: req.profile?.role }).importMandates(links));
   })
 );

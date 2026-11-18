@@ -354,6 +354,12 @@ model Customer {
   gocardlessCustomerId         String?
   gocardlessMandateId          String?
   gocardlessMandateStatus      String?
+  // Direct Debit setup link (GoCardless billing request flow): the request a new mandate will come from, and the link
+  // last made for the customer, so it can be copied again until it expires.
+  gocardlessBillingRequestId   String?   @unique
+  ddSetupLinkUrl               String?
+  ddSetupLinkSentAt            DateTime? @db.Timestamptz
+  ddSetupLinkExpiresAt         DateTime? @db.Timestamptz
   paymentMethod                PaymentMethod?
   badDebt       Boolean         @default(false)
   holdNextClean Boolean         @default(false)
