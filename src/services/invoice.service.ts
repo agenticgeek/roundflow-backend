@@ -93,14 +93,14 @@ const visitInvoiceInclude = {
   service: { select: { name: true } },
   servicePlan: { select: { service: { select: { name: true } } } },
   invoice: { select: { id: true } },
-  payment: { select: { status: true, paidAt: true } },
+  payment: { select: { status: true, paidAt: true, method: true } },
 } satisfies Prisma.VisitInclude;
 
 type InvoiceVisit = Prisma.VisitGetPayload<{ include: typeof visitInvoiceInclude }>;
 
 const invoiceListInclude = {
   customer: { select: { id: true, name: true, paymentMethod: true } },
-  visit: { select: { paymentMethod: true, payment: { select: { method: true } } } },
+  visit: { select: { paymentMethod: true, collectedVia: true, payment: { select: { method: true } } } },
 } satisfies Prisma.InvoiceInclude;
 
 type InvoiceListRow = Prisma.InvoiceGetPayload<{ include: typeof invoiceListInclude }>;
@@ -197,8 +197,13 @@ async function lockInvoiceNumbering(tx: Prisma.TransactionClient): Promise<void>
   await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(current_schema() || ':invoice-number'))`;
 }
 
-function invoicePaymentMethod(inv: InvoiceListRow): PaymentMethod | null {
-  return inv.visit?.payment?.method ?? inv.visit?.paymentMethod ?? inv.customer.paymentMethod ?? null;
+// How this invoice is paid: the recorded payment, else what the technician chose on site (e.g. card, which records no
+// payment), else the visit's planned method, else the customer's usual one.
+function invoicePaymentMethod(inv: {
+  customer: { paymentMethod: PaymentMethod | null };
+  visit?: { paymentMethod: PaymentMethod | null; collectedVia?: PaymentMethod | null; payment?: { method: PaymentMethod } | null } | null;
+}): PaymentMethod | null {
+  return inv.visit?.payment?.method ?? inv.visit?.collectedVia ?? inv.visit?.paymentMethod ?? inv.customer.paymentMethod ?? null;
 }
 
 // ---- contract ---------------------------------------------------------------
@@ -393,7 +398,7 @@ class InvoiceService {
       visitDate: visit?.date ?? null,
       technicianName: visit?.technician?.name ?? null,
       roundName: visit?.round?.name ?? null,
-      paymentMethod: visit?.paymentMethod ?? invoice.customer.paymentMethod ?? null,
+      paymentMethod: invoicePaymentMethod(invoice),
       customer: {
         name: invoice.customer.name,
         email: invoice.customer.email,
@@ -415,7 +420,7 @@ class InvoiceService {
   async sendInvoice(invoiceId: string, opts: { channel?: MessageChannel; resend?: boolean } = {}) {
     const invoice = await this.prisma.invoice.findUnique({
       where: { id: invoiceId },
-      include: { customer: { select: { name: true, paymentMethod: true } } },
+      include: { customer: { select: { name: true, paymentMethod: true } }, visit: invoiceListInclude.visit },
     });
     if (!invoice) throw new AppError(404, "Invoice not found");
     if (invoice.status === InvoiceStatus.PAID || invoice.status === InvoiceStatus.VOID) {
@@ -465,7 +470,7 @@ class InvoiceService {
         console.error(`[invoices] invoice ${invoice.invoiceNumber} emailed without the PDF:`, (err as Error).message);
       }
       // How to pay depends on the customer's payment method: Stripe link, bank details, or neither (see invoice-payment-info).
-      const pay = await invoicePaymentInfo(this.prisma, { invoice, method: invoice.customer.paymentMethod ?? null, bank, settings });
+      const pay = await invoicePaymentInfo(this.prisma, { invoice, method: invoicePaymentMethod(invoice), bank, settings });
       summary.push(...pay.rows);
       const vars = invoiceTemplateVars({
         customerName: invoice.customer.name,

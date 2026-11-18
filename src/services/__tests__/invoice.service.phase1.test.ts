@@ -400,6 +400,31 @@ describe("A5 sendInvoice", () => {
       expect(Object.fromEntries(opts.summary)).not.toHaveProperty("Account name");
     });
 
+    it("offers the card link when the technician chose card on site, even if the customer's usual method is cash", async () => {
+      const { svc, p } = setup("EMAIL");
+      p.invoice.findUnique.mockResolvedValue({
+        ...invoice("DRAFT"),
+        customer: { name: "Oliver Smith", paymentMethod: "CASH" },
+        visit: { paymentMethod: null, collectedVia: "STRIPE", payment: null },
+      });
+      p.businessSettings.findFirst.mockResolvedValue({ currency: "£", businessName: "Coates Windows", stripeConnected: true, stripeConnectAccountId: "acct_1" });
+      renderHtmlToPdf.mockResolvedValue(Buffer.from("%PDF"));
+      await svc.sendInvoice("i1");
+      expect(payInfo).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ method: "STRIPE" }));
+    });
+
+    it("prefers the recorded payment's method over the technician's choice", async () => {
+      const { svc, p } = setup("EMAIL");
+      p.invoice.findUnique.mockResolvedValue({
+        ...invoice("DRAFT"),
+        customer: { name: "Oliver Smith", paymentMethod: "CASH" },
+        visit: { paymentMethod: "BACS", collectedVia: "STRIPE", payment: { method: "CHEQUE" } },
+      });
+      renderHtmlToPdf.mockResolvedValue(Buffer.from("%PDF"));
+      await svc.sendInvoice("i1");
+      expect(payInfo).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ method: "CHEQUE" }));
+    });
+
     it("sends without the PDF when rendering is unavailable and flags it", async () => {
       const { svc, p } = setup("EMAIL");
       renderHtmlToPdf.mockRejectedValue(new Error("no gotenberg"));
