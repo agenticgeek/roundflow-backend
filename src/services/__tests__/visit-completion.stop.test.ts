@@ -318,7 +318,7 @@ describe("completeVisit with services (one stop)", () => {
   it("a listed service the office moved to another day (same property) is ignored, not an error", async () => {
     const tp = makeTp([visit("v1")]);
     const load = tp.visit.findUnique.getMockImplementation()!;
-    tp.visit.findUnique.mockImplementation(async (args: any) => (args.where.id === "moved" ? { propertyId: "prop-1" } : load(args)));
+    tp.visit.findUnique.mockImplementation(async (args: any) => (args.where.id === "moved" ? ({ propertyId: "prop-1" } as any) : load(args)));
     const result = await complete(tp, "v1", {
       payment: { method: "CASH" },
       services: [{ visitId: "v1", done: true }, { visitId: "moved", done: true }],
