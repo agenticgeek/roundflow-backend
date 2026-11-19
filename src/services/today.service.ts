@@ -1,4 +1,5 @@
 import { VisitStatus, Prisma } from "../generated/tenant-client";
+import { groupByStop, isOpenVisit, stopKeyOf, stopStatus } from "./stops";
 import type { TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { AppError } from "../lib/app-error";
 import { tenantTodayRange } from "./business-time";
@@ -107,6 +108,11 @@ type VisitToday = Prisma.VisitGetPayload<{ include: typeof visitTodayInclude }>;
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
+
+// The day's visits as stops (property + day + technician), each with its status.
+function stopsOf(visits: VisitToday[]) {
+  return groupByStop(visits, stopKeyOf).map((s) => ({ ...s, status: stopStatus(s.visits.map((v) => v.status)) }));
+}
 
 class TodayService {
   constructor(private readonly prisma: TenantPrismaClient) {}
@@ -248,15 +254,17 @@ class TodayService {
 
   // ---- private helpers ----
 
+  // Counts are stops (a property with several services is one door); values add up every service.
   private computeKpi(visits: VisitToday[]): TodayKpi {
+    const stops = stopsOf(visits);
     return {
-      totalStops: visits.length,
-      inProgress: visits.filter((v) => v.status === VisitStatus.IN_PROGRESS).length,
-      completed: visits.filter((v) => v.status === VisitStatus.COMPLETED).length,
-      skipped: visits.filter((v) => v.status === VisitStatus.SKIPPED).length,
-      issues: visits.filter((v) => v._count.issues > 0).length,
-      paymentHolds: visits.filter((v) => v.paymentHold).length,
-      carriedOver: visits.filter((v) => v.carriedOverFromDate != null).length,
+      totalStops: stops.length,
+      inProgress: stops.filter((s) => s.status === VisitStatus.IN_PROGRESS).length,
+      completed: stops.filter((s) => s.status === VisitStatus.COMPLETED).length,
+      skipped: stops.filter((s) => s.status === VisitStatus.SKIPPED).length,
+      issues: stops.filter((s) => s.visits.some((v) => v._count.issues > 0)).length,
+      paymentHolds: stops.filter((s) => s.visits.some((v) => v.paymentHold)).length,
+      carriedOver: stops.filter((s) => s.visits.some((v) => v.carriedOverFromDate != null)).length,
       valueCompleted: visits
         .filter((v) => v.status === VisitStatus.COMPLETED)
         .reduce((acc, v) => acc.add(v.price), new Prisma.Decimal(0))
@@ -281,9 +289,10 @@ class TodayService {
         vs.find((v) => v.status === VisitStatus.SCHEDULED) ??
         vs[0];
 
-      const completed = vs.filter((v) => v.status === VisitStatus.COMPLETED).length;
-      const skipped = vs.filter((v) => v.status === VisitStatus.SKIPPED).length;
-      const inProgress = vs.filter((v) => v.status === VisitStatus.IN_PROGRESS).length;
+      const stops = stopsOf(vs);
+      const completed = stops.filter((s) => s.status === VisitStatus.COMPLETED).length;
+      const skipped = stops.filter((s) => s.status === VisitStatus.SKIPPED).length;
+      const inProgress = stops.filter((s) => s.status === VisitStatus.IN_PROGRESS).length;
       const completedValue = vs
         .filter((v) => v.status === VisitStatus.COMPLETED)
         .reduce((acc, v) => acc + v.price.toNumber(), 0);
@@ -293,13 +302,13 @@ class TodayService {
         roundName: round.name,
         technicianId: primaryVisit.technicianId,
         technicianName: primaryVisit.technician?.name ?? null,
-        status: deriveRoundStatus(vs.length, completed, skipped, inProgress),
-        total: vs.length,
+        status: deriveRoundStatus(stops.length, completed, skipped, inProgress),
+        total: stops.length,
         completed,
         skipped,
         issueCount: vs.reduce((acc, v) => acc + v._count.issues, 0),
-        paymentHolds: vs.filter((v) => v.paymentHold).length,
-        carriedOver: vs.filter((v) => v.carriedOverFromDate != null).length,
+        paymentHolds: stops.filter((s) => s.visits.some((v) => v.paymentHold)).length,
+        carriedOver: stops.filter((s) => s.visits.some((v) => v.carriedOverFromDate != null)).length,
         scheduledValue: vs.reduce((acc, v) => acc + v.price.toNumber(), 0),
         completedValue,
         value: completedValue,
@@ -319,11 +328,9 @@ class TodayService {
 
     return Array.from(byTech.entries()).map(([technicianId, vs]) => {
       const tech = vs[0].technician!;
-      const completed = vs.filter((v) => v.status === VisitStatus.COMPLETED).length;
-      const remaining = vs.filter(
-        (v) =>
-          v.status === VisitStatus.SCHEDULED || v.status === VisitStatus.IN_PROGRESS
-      ).length;
+      const stops = stopsOf(vs);
+      const completed = stops.filter((s) => s.status === VisitStatus.COMPLETED).length;
+      const remaining = stops.filter((s) => isOpenVisit(s.status)).length;
       const issueCount = vs.reduce((acc, v) => acc + v._count.issues, 0);
 
       return {

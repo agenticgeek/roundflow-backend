@@ -27,7 +27,7 @@ function makePrisma(v: unknown) {
       findMany: vi.fn().mockResolvedValue([]),
       create: vi.fn().mockImplementation(({ data }: any) => Promise.resolve({ id: "inv1", invoiceNumber: "INV-1", sentToCustomer: false, sentAt: null, dueDate: data.dueDate, ...data })),
     },
-    visit: { findUnique: vi.fn().mockResolvedValue(v) },
+    visit: { findUnique: vi.fn().mockResolvedValue(v), findMany: vi.fn().mockResolvedValue([]) },
     businessSettings: { findFirst: vi.fn().mockResolvedValue({ vatInInvoices: true, vatRate: 20, invoiceDueDays: 7 }) },
     $executeRaw: vi.fn(),
     $transaction: vi.fn((fn: any) => fn(prisma)),

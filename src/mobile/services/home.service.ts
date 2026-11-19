@@ -3,6 +3,7 @@ import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
 import type { CompletionsSummary, MobileVisitRow, RoundSummary } from "../types";
 import { tenantTodayRange } from "../../services/business-time";
 import { isLocationApproximate } from "../../integrations/geocoding/client";
+import { groupByStop, stopKeyOf, stopStatus } from "../../services/stops";
 
 export const visitMobileInclude = {
   property: {
@@ -32,6 +33,9 @@ function effectiveMethod(v: VisitMobile): PaymentMethod | null {
 export function toRow(v: VisitMobile, position: number | null = null): MobileVisitRow {
   return {
     visitId: v.id,
+    // One stop per property per day per technician: the app shows one card per stopKey.
+    propertyId: v.propertyId,
+    stopKey: stopKeyOf(v),
     status: v.status,
     price: v.price.toNumber(),
     paymentMethod: effectiveMethod(v),
@@ -76,13 +80,19 @@ class HomeService {
       include: visitMobileInclude,
       orderBy: [{ date: "asc" }, { createdAt: "asc" }, { id: "asc" }],
     });
+    // Positions count stops within each round: every service at a property shares its stop's number.
     const roundCounters = new Map<string, number>();
+    const stopPositions = new Map<string, number>();
     return visits.map(v => {
       let position: number | null = null;
       if (v.roundId) {
-        const n = (roundCounters.get(v.roundId) ?? 0) + 1;
-        roundCounters.set(v.roundId, n);
-        position = n;
+        const key = stopKeyOf(v);
+        position = stopPositions.get(key) ?? null;
+        if (position === null) {
+          position = (roundCounters.get(v.roundId) ?? 0) + 1;
+          roundCounters.set(v.roundId, position);
+          stopPositions.set(key, position);
+        }
       }
       return toRow(v, position);
     });
@@ -103,7 +113,8 @@ class HomeService {
     });
 
     const completed = visits.filter(v => v.status === VisitStatus.COMPLETED);
-    const skipped = visits.filter(v => v.status === VisitStatus.SKIPPED);
+    // Counts are doors (stops), not services; revenue stays a money sum.
+    const stopStatuses = groupByStop(visits, stopKeyOf).map((s) => stopStatus(s.visits.map((v) => v.status)));
     const revenueToday = completed.reduce((sum, v) => sum + v.price.toNumber(), 0);
 
     // Split today's completed revenue by the effective payment method (Cash vs Direct Debit vs other).
@@ -131,9 +142,9 @@ class HomeService {
       revenueToday,
       revenueByMethod,
       revenueChangePercent,
-      completedCount: completed.length,
-      skippedCount: skipped.length,
-      totalCount: visits.length,
+      completedCount: stopStatuses.filter((s) => s === VisitStatus.COMPLETED).length,
+      skippedCount: stopStatuses.filter((s) => s === VisitStatus.SKIPPED).length,
+      totalCount: stopStatuses.length,
       roundName: visits[0]?.round?.name ?? null,
       visits: completed.map(toRow),
     };
@@ -149,16 +160,22 @@ class HomeService {
     const { start, end } = await tenantTodayRange(this.prisma);
     const visits = await this.prisma.visit.findMany({
       where: { technicianId: tech.id, date: { gte: start, lt: end }, status: NOT_CANCELLED },
-      select: { roundId: true, date: true, status: true, price: true, round: { select: { name: true } } },
+      select: {
+        id: true, createdAt: true, propertyId: true, technicianId: true,
+        roundId: true, date: true, status: true, price: true, round: { select: { name: true } },
+      },
       orderBy: [{ date: "asc" }, { createdAt: "asc" }],
     });
 
+    // Counts are stops (doors); revenue sums every service.
     const roundMap = new Map<string, RoundSummary>();
-    for (const v of visits) {
+    for (const { visits: stop } of groupByStop(visits, stopKeyOf)) {
+      const v = stop[0];
       if (!v.roundId || !v.round) continue;
+      const amt = stop.reduce((sum, s) => sum + s.price.toNumber(), 0);
+      const earned = stop.filter((s) => s.status === VisitStatus.COMPLETED).reduce((sum, s) => sum + s.price.toNumber(), 0);
+      const done = stopStatus(stop.map((s) => s.status)) === VisitStatus.COMPLETED;
       const existing = roundMap.get(v.roundId);
-      const amt = v.price.toNumber();
-      const done = v.status === VisitStatus.COMPLETED;
       if (!existing) {
         roundMap.set(v.roundId, {
           roundId: v.roundId,
@@ -166,13 +183,14 @@ class HomeService {
           totalCount: 1,
           completedCount: done ? 1 : 0,
           expectedRevenue: amt,
-          earnedRevenue: done ? amt : 0,
+          earnedRevenue: earned,
           date: v.date,
         });
       } else {
         existing.totalCount++;
         existing.expectedRevenue += amt;
-        if (done) { existing.completedCount++; existing.earnedRevenue += amt; }
+        existing.earnedRevenue += earned;
+        if (done) existing.completedCount++;
       }
     }
     return Array.from(roundMap.values());

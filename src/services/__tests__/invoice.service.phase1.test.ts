@@ -400,6 +400,31 @@ describe("A5 sendInvoice", () => {
       expect(Object.fromEntries(opts.summary)).not.toHaveProperty("Account name");
     });
 
+    it("offers the card link when the technician chose card on site, even if the customer's usual method is cash", async () => {
+      const { svc, p } = setup("EMAIL");
+      p.invoice.findUnique.mockResolvedValue({
+        ...invoice("DRAFT"),
+        customer: { name: "Oliver Smith", paymentMethod: "CASH" },
+        visit: { paymentMethod: null, collectedVia: "STRIPE", payment: null },
+      });
+      p.businessSettings.findFirst.mockResolvedValue({ currency: "£", businessName: "Coates Windows", stripeConnected: true, stripeConnectAccountId: "acct_1" });
+      renderHtmlToPdf.mockResolvedValue(Buffer.from("%PDF"));
+      await svc.sendInvoice("i1");
+      expect(payInfo).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ method: "STRIPE" }));
+    });
+
+    it("prefers the recorded payment's method over the technician's choice", async () => {
+      const { svc, p } = setup("EMAIL");
+      p.invoice.findUnique.mockResolvedValue({
+        ...invoice("DRAFT"),
+        customer: { name: "Oliver Smith", paymentMethod: "CASH" },
+        visit: { paymentMethod: "BACS", collectedVia: "STRIPE", payment: { method: "CHEQUE" } },
+      });
+      renderHtmlToPdf.mockResolvedValue(Buffer.from("%PDF"));
+      await svc.sendInvoice("i1");
+      expect(payInfo).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ method: "CHEQUE" }));
+    });
+
     it("sends without the PDF when rendering is unavailable and flags it", async () => {
       const { svc, p } = setup("EMAIL");
       renderHtmlToPdf.mockRejectedValue(new Error("no gotenberg"));
@@ -625,8 +650,8 @@ describe("B5 bulk invoices", () => {
       where: { date: { gte: day, lt: new Date("2026-10-31T00:00:00Z") }, status: { not: "CANCELLED" }, id: { notIn: ["zzz"] } },
     }));
     expect(result.items).toEqual([
-      { visitId: "ok1", customerName: "Jo Bloggs", address: "1 High St, NE66 1AA", amount: 20, vat: 4, total: 24, paymentMethod: "BACS" },
-      { visitId: "ok2", customerName: "Al", address: "2 Low St", amount: 20, vat: 4, total: 24, paymentMethod: null },
+      { visitId: "ok1", visitIds: ["ok1"], customerName: "Jo Bloggs", address: "1 High St, NE66 1AA", amount: 20, vat: 4, total: 24, paymentMethod: "BACS" },
+      { visitId: "ok2", visitIds: ["ok2"], customerName: "Al", address: "2 Low St", amount: 20, vat: 4, total: 24, paymentMethod: null },
     ]);
     expect(result.skipped).toEqual([
       { visitId: "inv", customerName: "Jo Bloggs", reason: "ALREADY_INVOICED" },
@@ -645,7 +670,8 @@ describe("B5 bulk invoices", () => {
 
   it("createBulk creates per item and reports a failure without stopping", async () => {
     const p = makePrisma();
-    p.visit.findMany.mockResolvedValue([visit({ id: "a" }), visit({ id: "b" })]);
+    // the day's visits, then each billing group (just the visit itself here)
+    p.visit.findMany.mockResolvedValueOnce([visit({ id: "a" }), visit({ id: "b" })]).mockResolvedValue([]);
     p.visit.findUnique
       .mockResolvedValueOnce(visit({ id: "a" }))
       .mockResolvedValueOnce(visit({ id: "b", invoice: { id: "raced" } }));
@@ -658,7 +684,8 @@ describe("B5 bulk invoices", () => {
 
   it("createBulk sendNow sends each invoice and reports created-but-unsent ones", async () => {
     const p = makePrisma();
-    p.visit.findMany.mockResolvedValue([visit({ id: "a" }), visit({ id: "b" })]);
+    // the day's visits, then each billing group (just the visit itself here)
+    p.visit.findMany.mockResolvedValueOnce([visit({ id: "a" }), visit({ id: "b" })]).mockResolvedValue([]);
     p.visit.findUnique.mockImplementation(({ where }: { where: { id: string } }) => Promise.resolve(visit({ id: where.id })));
     p.invoice.create
       .mockResolvedValueOnce({ id: "i-a", invoiceNumber: "INV-1", status: "DRAFT", sentToCustomer: false, sentAt: null })

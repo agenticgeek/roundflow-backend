@@ -80,6 +80,7 @@ it("getTodaysWork: builds KPI/round/technician aggregates from today's visits", 
   (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
     {
       id: "v1",
+      propertyId: "p-v1", date: new Date("2026-11-19T00:00:00Z"), createdAt: new Date("2026-11-01T00:00:00Z"),
       status: "COMPLETED",
       paymentHold: false,
       price: new Prisma.Decimal(25),
@@ -91,6 +92,7 @@ it("getTodaysWork: builds KPI/round/technician aggregates from today's visits", 
     },
     {
       id: "v2",
+      propertyId: "p-v2", date: new Date("2026-11-19T00:00:00Z"), createdAt: new Date("2026-11-01T00:00:00Z"),
       status: "SKIPPED",
       paymentHold: true,
       price: new Prisma.Decimal(10),
@@ -118,10 +120,11 @@ it("getTodaysWork: rounds carry scheduledValue/completedValue, value = completed
   const base = {
     paymentHold: false, roundId: "r1", round: { id: "r1", name: "Round 1" },
     technicianId: null, technician: null, _count: { issues: 0 },
+    date: new Date("2026-11-19T00:00:00Z"), createdAt: new Date("2026-11-01T00:00:00Z"),
   };
   (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
-    { ...base, id: "v1", status: "COMPLETED", price: new Prisma.Decimal(25) },
-    { ...base, id: "v2", status: "SCHEDULED", price: new Prisma.Decimal(12.5) },
+    { ...base, id: "v1", propertyId: "p1", status: "COMPLETED", price: new Prisma.Decimal(25) },
+    { ...base, id: "v2", propertyId: "p2", status: "SCHEDULED", price: new Prisma.Decimal(12.5) },
   ]);
 
   const before = Date.now();

@@ -32,9 +32,11 @@ import type { OpenAPIV3 } from "openapi-types";
 // The anon key is the PUBLIC (publishable) key — safe to expose, NOT a secret.
 // ---------------------------------------------------------------------------
 
-const SUPABASE_URL = "https://suspoztkyfnnuyodbxov.supabase.co";
-const SUPABASE_ANON_KEY =
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN1c3BvenRreWZubnV5b2RieG92Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcwNzkwODEsImV4cCI6MjEwMjY1NTA4MX0.cQsgFPWRXpITMwIvy7gi2zdfnLaV-jwzJAZY1iNi25k";
+// Taken from the environment so the docs always point at the project this
+// deployment verifies tokens against. SUPABASE_ANON_KEY is optional: without
+// it the apikey field is left blank in Swagger UI.
+const SUPABASE_URL = (process.env.SUPABASE_URL || process.env.SUPABASE_ISSUER?.replace(/\/auth\/v1\/?$/, "") || "").replace(/\/$/, "");
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY ?? "";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1219,12 +1221,25 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     },
   },
 
-  PlannerStop: {
+  StopServiceRef: {
     type: "object",
-    description: "One property stop within a planner occurrence (list/map view).",
-    required: ["visitId", "propertyId", "addressLine", "postcode", "price", "status", "paymentHold", "issues"],
+    required: ["visitId", "serviceName", "status", "price"],
     properties: {
       visitId: { type: "string" },
+      serviceName: { type: "string", nullable: true },
+      status: ref("VisitStatus"),
+      price: { type: "number" },
+    },
+  },
+
+  PlannerStop: {
+    type: "object",
+    description: "One property stop within a planner occurrence (list/map view): every service due there that day for one technician. The visit fields describe the first service; price, status, holds and issues cover them all.",
+    required: ["visitId", "stopKey", "services", "propertyId", "addressLine", "postcode", "price", "status", "paymentHold", "issues"],
+    properties: {
+      visitId: { type: "string" },
+      stopKey: { type: "string" },
+      services: { type: "array", items: ref("StopServiceRef") },
       propertyId: { type: "string" },
       propertyName: { type: "string", nullable: true },
       addressLine: { type: "string" },
@@ -1301,9 +1316,13 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
 
   TodayPanelStop: {
     type: "object",
-    required: ["visitId", "addressLine", "status", "paymentHold", "hasIssue"],
+    description: "One property stop (every service due there today for one technician).",
+    required: ["visitId", "stopKey", "price", "services", "addressLine", "status", "paymentHold", "hasIssue"],
     properties: {
       visitId: { type: "string" },
+      stopKey: { type: "string" },
+      price: { type: "number", description: "Total of the stop's services." },
+      services: { type: "array", items: ref("StopServiceRef") },
       customerName: { type: "string", nullable: true },
       addressLine: { type: "string" },
       latitude: { type: "number", nullable: true, description: "Null until the property is geocoded (on create/address change, or the backfill)." },
@@ -1965,6 +1984,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       servicePlan: ref("ServicePlan"),
       servicePlans: { type: "array", items: ref("ServicePlan"), description: "Every plan created for this row — length > 1 only when serviceIds had more than one entry. servicePlan above is always servicePlans[0] (kept for backward compatibility)." },
       customerMatched: { type: "boolean", description: "GAP-010: true when the property was attached to an existing customer (explicit customerId, or matched by mobile/email) instead of creating one." },
+      ddSetupLink: { type: "string", enum: ["queued", "not_connected", "mandate_exists"], description: "Present only when sendDdLink was true for a GOCARDLESS customer: queued, or why no link was queued." },
     },
   },
 
@@ -2323,10 +2343,13 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
   InvoiceLineItem: {
     type: "object",
     required: ["description", "amount"],
+    description: "One service. An invoice covers every service done at a property in one go (one line each); invoices made before 2026-11-19 have one line.",
     properties: {
       description: { type: "string" },
       technicianName: { type: "string", nullable: true },
-      amount: { type: "number" },
+      amount: { type: "number", description: "Net (before VAT)." },
+      visitId: { type: "string", nullable: true },
+      date: { type: "string", format: "date", nullable: true, description: "The service's visit day." },
     },
   },
 
@@ -2483,6 +2506,16 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
         required: ["id", "method", "status", "amount"],
         properties: { id: { type: "string" }, method: ref("PaymentMethod"), status: ref("PaymentStatus"), amount: { type: "number" } },
       },
+      directDebitSetupLinkQueued: {
+        type: "boolean",
+        description: "true when Direct Debit was the method but the customer has no mandate yet: nothing was collected and a GoCardless setup link was queued for the customer. Absent otherwise.",
+      },
+      services: {
+        type: "array",
+        description: "Stop completion only: every service in the stop after the call.",
+        items: { type: "object", required: ["visitId", "status"], properties: { visitId: { type: "string" }, status: ref("VisitStatus") } },
+      },
+      ignored: { type: "array", items: { type: "string" }, description: "Stop completion only: listed services that were no longer open (done, skipped, moved or cancelled meanwhile)." },
     },
     example: { id: "vis_example", status: "COMPLETED", payment: { id: "pay_1", method: "CASH", status: "PAID", amount: 18 } },
   },
@@ -2545,20 +2578,91 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     },
   },
 
-  MandateRedirectResult: {
+  DirectDebitStatus: {
     type: "object",
-    required: ["url"],
+    required: ["gocardlessConnected", "mandateStatus", "mandateId", "linkSentAt", "linkUrl", "linkExpiresAt"],
     properties: {
-      url: { type: "string", description: "GoCardless hosted redirect-flow URL to send the customer to." },
+      gocardlessConnected: { type: "boolean" },
+      mandateStatus: { type: "string", nullable: true, description: "GoCardless mandate status (pending_customer_approval, pending_submission, submitted, active, cancelled, failed, expired, ...); null = no mandate." },
+      mandateId: { type: "string", nullable: true },
+      linkSentAt: { type: "string", format: "date-time", nullable: true, description: "When a setup link was last sent." },
+      linkUrl: { type: "string", nullable: true, description: "The current setup link while it is still valid." },
+      linkExpiresAt: { type: "string", format: "date-time", nullable: true },
     },
   },
 
-  MandateCompleteResult: {
+  DirectDebitLink: {
     type: "object",
-    required: ["mandateId", "status"],
+    required: ["url", "expiresAt"],
     properties: {
-      mandateId: { type: "string" },
-      status: { type: "string", enum: ["pending_customer_approval"] },
+      url: { type: "string", description: "GoCardless-hosted Direct Debit sign-up link." },
+      expiresAt: { type: "string", format: "date-time", nullable: true },
+    },
+  },
+
+  DirectDebitSendResult: {
+    type: "object",
+    required: ["status", "channel", "url", "expiresAt"],
+    properties: {
+      status: { type: "string", enum: ["sent"] },
+      channel: { type: "string", enum: ["EMAIL", "SMS", "WHATSAPP"] },
+      url: { type: "string" },
+      expiresAt: { type: "string", format: "date-time", nullable: true },
+    },
+  },
+
+  GcMandateImportCandidates: {
+    type: "object",
+    required: ["rows"],
+    properties: {
+      rows: {
+        type: "array",
+        items: {
+          type: "object",
+          required: ["mandateId", "status", "gcCustomerId", "name", "linkedCustomerId", "suggestion", "ambiguous"],
+          properties: {
+            mandateId: { type: "string" },
+            status: { type: "string", enum: ["active", "pending_submission", "submitted"] },
+            reference: { type: "string", nullable: true },
+            createdAt: { type: "string", nullable: true },
+            gcCustomerId: { type: "string" },
+            name: { type: "string" },
+            email: { type: "string", nullable: true },
+            phone: { type: "string", nullable: true },
+            postcode: { type: "string", nullable: true },
+            linkedCustomerId: { type: "string", nullable: true, description: "RoundFlow customer already linked to this mandate." },
+            suggestion: {
+              type: "object",
+              nullable: true,
+              required: ["customerId", "customerName", "matchedBy"],
+              properties: { customerId: { type: "string" }, customerName: { type: "string" }, matchedBy: { type: "string", enum: ["email", "phone"] } },
+            },
+            ambiguous: { type: "boolean", description: "More than one RoundFlow customer matched, so nothing is suggested." },
+          },
+        },
+      },
+    },
+  },
+
+  GcMandateImportResult: {
+    type: "object",
+    required: ["linked", "failed", "results"],
+    properties: {
+      linked: { type: "integer" },
+      failed: { type: "integer" },
+      results: {
+        type: "array",
+        items: {
+          type: "object",
+          required: ["mandateId", "customerId", "status"],
+          properties: {
+            mandateId: { type: "string" },
+            customerId: { type: "string" },
+            status: { type: "string", enum: ["linked", "failed"] },
+            error: { type: "string" },
+          },
+        },
+      },
     },
   },
 
@@ -2855,9 +2959,11 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
 
   MobileVisitRow: {
     type: "object",
-    required: ["visitId", "status", "price", "paymentMethod", "paymentStatus", "customerName", "addressLine", "postcode", "latitude", "longitude", "geocodePrecision", "locationApproximate", "carriedOver", "carriedOverFromDate", "roundId", "roundName", "serviceName", "notes", "issueCount", "propertyNotes", "startedAt", "arrivedAt", "completedAt", "hasDebt", "position"],
+    required: ["visitId", "propertyId", "stopKey", "status", "price", "paymentMethod", "paymentStatus", "customerName", "addressLine", "postcode", "latitude", "longitude", "geocodePrecision", "locationApproximate", "carriedOver", "carriedOverFromDate", "roundId", "roundName", "serviceName", "notes", "issueCount", "propertyNotes", "startedAt", "arrivedAt", "completedAt", "hasDebt", "position"],
     properties: {
       visitId: { type: "string" },
+      propertyId: { type: "string" },
+      stopKey: { type: "string", description: "The visit's stop: every visit with the same property, day and technician (\"<propertyId>|<YYYY-MM-DD>|<technicianId or ->\"). The app shows one card per stop." },
       status: ref("VisitStatus"),
       price: { type: "number" },
       paymentMethod: { ...nullableRef("PaymentMethod"), description: "Effective method: visit override → service plan → customer default; null only when none of those is set." },
@@ -2884,7 +2990,38 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       arrivedAt: { ...dateTime, nullable: true, description: "Set by PATCH /mobile/visits/{id}/arrive." },
       completedAt: { ...dateTime, nullable: true },
       hasDebt: { type: "boolean", description: "Customer.badDebt." },
-      position: { type: "integer", nullable: true, description: "1-based order within its round today (date asc, createdAt asc); null for visits with no round." },
+      position: { type: "integer", nullable: true, description: "1-based order of the visit's stop within its round today (date asc, createdAt asc); every service at a property shares its stop's number. null for visits with no round." },
+    },
+  },
+
+  MobileStopService: {
+    type: "object",
+    required: ["visitId", "serviceName", "status", "price", "originalPrice", "priceAdjustmentReason", "grossTotal", "skipReason", "carriedOver", "carriedOverFromDate", "isOneOff"],
+    properties: {
+      visitId: { type: "string" },
+      serviceName: { type: "string", description: "\"Window clean\" when the visit has no service." },
+      status: ref("VisitStatus"),
+      price: { type: "number", description: "Net." },
+      originalPrice: { type: "number", nullable: true },
+      priceAdjustmentReason: { type: "string", nullable: true },
+      grossTotal: { type: "number", description: "price + VAT (when the business adds VAT)." },
+      skipReason: { type: "string", nullable: true },
+      carriedOver: { type: "boolean" },
+      carriedOverFromDate: { type: "string", format: "date", nullable: true },
+      isOneOff: { type: "boolean" },
+    },
+  },
+
+  MobileStop: {
+    type: "object",
+    description: "Every service due at the visit's property that day for this technician (one door). Complete them together with PATCH /mobile/visits/{id}/complete { services }.",
+    required: ["stopKey", "leadVisitId", "services", "price", "grossTotal"],
+    properties: {
+      stopKey: { type: "string" },
+      leadVisitId: { type: "string", description: "The stop's first visit (the one the app opens)." },
+      services: { type: "array", items: ref("MobileStopService") },
+      price: { type: "number", description: "Net total of the services not skipped." },
+      grossTotal: { type: "number", description: "The same, VAT included." },
     },
   },
 
@@ -2928,6 +3065,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       "The raw Visit row (Decimal fields as strings) with `property` (incl. customer + DRAFT/SENT invoices + notes), `round`, `service`, `technician`, `photos` and `_count.issues` included, plus the computed fields below.",
     additionalProperties: true,
     properties: {
+      stop: ref("MobileStop"),
       id: { type: "string" },
       date: dateTime,
       status: ref("VisitStatus"),
@@ -3025,16 +3163,18 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       date: { type: "string", format: "date", description: "Tenant-local day." },
       closed: { type: "boolean" },
       closedAt: { ...dateTime, nullable: true },
-      completedCount: { type: "integer", description: "Stored at close time once closed; live count otherwise." },
-      skippedCount: { type: "integer" },
+      completedCount: { type: "integer", description: "Stops (properties) completed. Stored at close time once closed; live count otherwise." },
+      skippedCount: { type: "integer", description: "Stops where every service was skipped." },
       remaining: {
         type: "array",
-        description: "The caller's visits still SCHEDULED or IN_PROGRESS that day (must be completed or skipped before closing).",
+        description: "The caller's stops still open that day (a property with several services is one entry; must be completed or skipped before closing).",
         items: {
           type: "object",
-          required: ["visitId", "status", "customerName", "addressLine", "roundName"],
+          required: ["visitId", "stopKey", "serviceNames", "status", "customerName", "addressLine", "roundName"],
           properties: {
-            visitId: { type: "string" },
+            visitId: { type: "string", description: "The stop's first visit." },
+            stopKey: { type: "string" },
+            serviceNames: { type: "array", items: { type: "string" }, description: "The services still open there." },
             status: { type: "string", enum: ["SCHEDULED", "IN_PROGRESS"] },
             customerName: { type: "string" },
             addressLine: { type: "string" },
@@ -3461,8 +3601,13 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       roundName: { type: "string", nullable: true },
       status: ref("VisitStatus"),
       cancelReason: { type: "string", nullable: true },
-      paymentStatus: nullableRef("PaymentStatus"),
+      paymentStatus: { ...nullableRef("PaymentStatus"), description: "The visit's payment, else (for a service billed with others) the shared payment." },
       notes: { type: "string", nullable: true },
+      serviceName: { type: "string", nullable: true, description: "GET /customers/{id}/visits only." },
+      price: { type: "number", description: "Net. GET /customers/{id}/visits only." },
+      stopKey: { type: "string", description: "GET /customers/{id}/visits only." },
+      invoiceId: { type: "string", nullable: true, description: "The invoice this visit is on (as its visit or as a line). GET /customers/{id}/visits only." },
+      billedWithVisitId: { type: "string", nullable: true, description: "Set on a service completed together with others: the visit carrying the shared payment and invoice. GET /customers/{id}/visits only." },
     },
   },
   CustomerVisitsPage: {
@@ -3982,6 +4127,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       roundId: { type: "string", description: "Required during setup so the property is schedulable. Must reference an ACTIVE round." },
       customerId: { type: "string", nullable: true, description: "GAP-010: attach to this existing customer (404 / row error if unknown). Omitted = match by mobile/email, else create." },
       lastCleanedDate: { type: "string", format: "date", nullable: true, description: "ISO date; seeds nextDueDate = one cycle later on the round day. 400 / row error if invalid." },
+      sendDdLink: { type: "boolean", description: "Step 9 only: with paymentMethod GOCARDLESS, queue a GoCardless Direct Debit setup link to the customer (see ddSetupLink in the result)." },
     },
     example: {
       customerName: "John Smith",
@@ -4176,8 +4322,10 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
         type: "array",
         items: {
           type: "object",
+          description: "One invoice to create: the services completed together at a property (one line each).",
           properties: {
-            visitId: { type: "string" },
+            visitId: { type: "string", description: "The first visit of the group." },
+            visitIds: { type: "array", items: { type: "string" }, description: "Every visit the invoice covers. Exclude them all to leave the invoice out." },
             customerName: { type: "string" },
             address: { type: "string" },
             amount: { type: "number" },
@@ -4446,10 +4594,22 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     example: { addressLine: "3 Bondgate Within", postcode: "NE66 1SX", price: 30, serviceAreaId: "csa_example", roundId: null },
   },
 
-  MandateCompleteInput: {
+  DirectDebitSendInput: {
     type: "object",
-    required: ["redirectFlowId"],
-    properties: { redirectFlowId: { type: "string", description: "The GoCardless redirect flow id returned to the success URL." } },
+    properties: { channel: { type: "string", enum: ["AUTO", "EMAIL", "SMS", "WHATSAPP"], description: "Omitted or AUTO = best available (SMS via GHL when connected and the customer has a mobile, else email)." } },
+  },
+
+  GcMandateImportInput: {
+    type: "object",
+    required: ["links"],
+    properties: {
+      links: {
+        type: "array",
+        minItems: 1,
+        maxItems: 500,
+        items: { type: "object", required: ["mandateId", "customerId"], properties: { mandateId: { type: "string" }, customerId: { type: "string" } } },
+      },
+    },
   },
 
   // ---- Payments / visits ----
@@ -4460,11 +4620,28 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     example: { status: "PAID" },
   },
 
+  StopServiceInput: {
+    type: "object",
+    required: ["visitId", "done"],
+    properties: {
+      visitId: { type: "string" },
+      done: { type: "boolean" },
+      skipReason: { type: "string", maxLength: 200, description: "Required when done is false. The service is SKIPPED with this reason and comes round next cycle." },
+    },
+  },
+
   VisitCompleteInput: {
     type: "object",
     properties: {
       payment: ref("CompletionPaymentInput"),
       cashConfirmed: { type: "boolean", deprecated: true, description: "Deprecated alias for payment { method: \"CASH\" }." },
+      services: {
+        type: "array",
+        minItems: 1,
+        maxItems: 20,
+        items: ref("StopServiceInput"),
+        description: "Complete the visit's whole stop (every service at the property that day) in one go: one payment for the total of the done services on the first done visit, one invoice with a line per service, one customer message. Open services not listed are left alone; listed services no longer open are reported in `ignored`. 400 INVALID_SERVICES / NOT_IN_STOP. Omit to complete just this visit.",
+      },
     },
   },
 
@@ -4545,6 +4722,7 @@ const inputSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     properties: {
       reason: { type: "string", minLength: 1 },
       description: { type: "string", nullable: true, description: "Appended to the stored skipReason as `<reason>: <description>`." },
+      stop: { type: "boolean", description: "true skips every open service at the property that day (the whole stop); otherwise just this visit." },
     },
   },
 
@@ -6009,37 +6187,48 @@ const paths: OpenAPIV3.PathsObject = {
       },
     },
   },
-  "/customers/{id}/mandate": {
+  "/customers/{id}/direct-debit": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Customers"],
+      summary: "Direct Debit status for a customer",
+      description: "Mandate status plus the current GoCardless setup link (while it is still valid) and when a link was last sent.",
+      responses: { "200": jsonResponse("Status.", ref("DirectDebitStatus")), "401": ERR[401], "403": ERR[403], "404": ERR[404] },
+    },
+  },
+  "/customers/{id}/direct-debit/link": {
     parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
     post: {
       tags: ["Customers"],
-      summary: "Start a GoCardless Direct Debit mandate (redirect flow)",
+      summary: "Get a Direct Debit setup link to copy",
       description:
-        "Creates a GoCardless redirect flow using the tenant's stored GoCardless token and returns its URL. The customer is sent back to `${FRONTEND_URL}/customers/{id}/mandate/success`, after which the frontend calls POST /customers/{id}/mandate/complete.",
+        "Returns the customer's GoCardless setup link (a billing request flow), reusing a stored one with more than an hour left, else making a new one. Sends nothing. " +
+        "When the customer completes it, the `billing_requests.fulfilled` webhook links the new mandate.",
       responses: {
-        "200": jsonResponse("Redirect-flow URL.", ref("MandateRedirectResult")),
+        "200": jsonResponse("Link.", ref("DirectDebitLink")),
         "401": ERR[401],
         "403": ERR[403],
         "404": ERR[404],
-        "409": errorResponse("Customer already has an active mandate, or GoCardless is not connected.", "GoCardless is not connected for this account"),
+        "409": errorResponse("`GOCARDLESS_NOT_CONNECTED`, or `MANDATE_EXISTS` (the customer already has an active or pending mandate).", "This customer already has a Direct Debit set up."),
       },
     },
   },
-  "/customers/{id}/mandate/complete": {
+  "/customers/{id}/direct-debit/send": {
     parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
     post: {
       tags: ["Customers"],
-      summary: "Complete the GoCardless redirect flow",
+      summary: "Send the Direct Debit setup link to the customer",
       description:
-        "Completes `redirectFlowId` with GoCardless and stores the GoCardless customer + mandate ids on the customer with `gocardlessMandateStatus = pending_customer_approval`. The status moves to `active` (etc.) via POST /webhooks/gocardless mandate events.",
-      requestBody: jsonBody(ref("MandateCompleteInput")),
+        "Renders the tenant's 'Direct Debit setup link' template (`{{paymentLink}}` = the link) and sends it by the chosen channel (or the best available). Records the send time and an activity log entry.",
+      requestBody: { required: false, content: { "application/json": { schema: ref("DirectDebitSendInput") } } },
       responses: {
-        "200": jsonResponse("Mandate created.", ref("MandateCompleteResult")),
+        "200": jsonResponse("Sent.", ref("DirectDebitSendResult")),
         "400": ERR[400],
         "401": ERR[401],
         "403": ERR[403],
         "404": ERR[404],
-        "409": errorResponse("GoCardless is not connected.", "GoCardless is not connected"),
+        "409": errorResponse("`GOCARDLESS_NOT_CONNECTED`, `MANDATE_EXISTS`, or the channel cannot be used.", "GoCardless is not connected. Connect it in Settings > Payments first."),
+        "502": errorResponse("The message provider rejected the send.", "GoHighLevel could not send the message"),
       },
     },
   },
@@ -8795,6 +8984,36 @@ const paths: OpenAPIV3.PathsObject = {
       tags: ["Notifications"],
       summary: "Unread notification count (header bell)",
       responses: { "200": jsonResponse("Count.", { type: "object", required: ["unreadCount"], properties: { unreadCount: { type: "integer" } } }), "401": ERR[401], "403": ERR[403] },
+    },
+  },
+  "/integrations/gocardless/mandates/import": {
+    get: {
+      tags: ["Integrations"],
+      summary: "Existing GoCardless mandates to link to customers",
+      description:
+        "ADMIN only. Lists the account's active / pending GoCardless mandates with their GoCardless customer's details, the RoundFlow customer each is already linked to, " +
+        "and a suggested match (unique email match, else unique UK-normalised phone match). Nothing is changed.",
+      responses: {
+        "200": jsonResponse("Candidates.", ref("GcMandateImportCandidates")),
+        "401": ERR[401],
+        "403": ERR[403],
+        "409": errorResponse("`GOCARDLESS_NOT_CONNECTED`.", "GoCardless is not connected. Connect it in Settings > Payments first."),
+      },
+    },
+    post: {
+      tags: ["Integrations"],
+      summary: "Link existing GoCardless mandates to customers",
+      description:
+        "ADMIN only. Links each confirmed mandate -> customer pair after re-checking it: the mandate must still be collectable in GoCardless, not linked to another customer, " +
+        "and the customer must not already have a different active or pending mandate. Per-pair results; one failure does not stop the rest.",
+      requestBody: jsonBody(ref("GcMandateImportInput")),
+      responses: {
+        "200": jsonResponse("Results.", ref("GcMandateImportResult")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "409": errorResponse("`GOCARDLESS_NOT_CONNECTED`.", "GoCardless is not connected. Connect it in Settings > Payments first."),
+      },
     },
   },
   "/integrations/outbox": {

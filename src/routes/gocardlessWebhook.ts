@@ -7,6 +7,7 @@ import { getTenantPrismaForSchema } from "../lib/tenant-prisma-manager";
 import { decrypt, safeEqual } from "../lib/crypto";
 import { PaymentStatus } from "../generated/tenant-client";
 import { createPaymentService } from "../services/payment.service";
+import { createDirectDebitService } from "../services/direct-debit.service";
 import { processWebhookEvent } from "../services/webhook-events.service";
 
 export const gocardlessWebhookRouter = Router();
@@ -77,7 +78,7 @@ export type GcEvent = {
   id?: string;
   resource_type?: string;
   action?: string;
-  links?: { payment?: string; mandate?: string };
+  links?: { payment?: string; mandate?: string; billing_request?: string };
 };
 
 type TenantDb = Awaited<ReturnType<typeof getTenantPrismaForSchema>>;
@@ -127,11 +128,21 @@ export async function handleGocardlessEvent(tp: TenantDb, event: GcEvent): Promi
     return;
   }
 
+  // A Direct Debit setup link was completed: link the new mandate to the customer it was made for.
+  if (resourceType === "billing_requests") {
+    const billingRequestId = event.links?.billing_request;
+    if (action === "fulfilled" && billingRequestId) {
+      await createDirectDebitService(tp).handleBillingRequestFulfilled(billingRequestId);
+    }
+    return;
+  }
+
   if (resourceType === "mandates") {
     const gcMandateId = event.links?.mandate;
     if (!gcMandateId) return;
 
     const statusMap: Record<string, string> = {
+      submitted: "submitted",
       active: "active",
       cancelled: "cancelled",
       failed: "failed",

@@ -134,7 +134,10 @@ function detailPrisma(notes: any[], techProfiles: string[]) {
         property: { id: "p1", customer: { id: "c1", name: "A", badDebt: false, paymentMethod: null, invoices: [] }, notes },
       }),
       findFirst: vi.fn().mockResolvedValue(null),
-      findMany: vi.fn().mockResolvedValue([{ id: "v1" }, { id: "v2" }, { id: "v3" }]),
+      // the round's visits that day (one property each), then the visit's own stop
+      findMany: vi.fn().mockImplementation(async (args: any) =>
+        args.where.propertyId ? [] : [{ id: "v1", propertyId: "p0" }, { id: "v2", propertyId: "p1" }, { id: "v3", propertyId: "p3" }],
+      ),
     },
   } as any;
 }

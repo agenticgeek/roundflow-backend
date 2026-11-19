@@ -103,6 +103,7 @@ it("reassignTechnician throws 400 when target technician has not accepted their 
 
 // ---- listOccurrencesForRounds -------------------------------------------
 
+let makeVisitSeq = 0;
 function makeVisit(overrides: Partial<{
   roundId: string | null;
   date: Date;
@@ -112,7 +113,12 @@ function makeVisit(overrides: Partial<{
   _count: { issues: number };
   technician: { id: string; name: string | null } | null;
 }> = {}) {
+  makeVisitSeq += 1;
   return {
+    id: `mv${makeVisitSeq}`,
+    createdAt: new Date("2026-01-01T00:00:00.000Z"),
+    propertyId: `p-mv${makeVisitSeq}`,
+    technicianId: overrides.technician?.id ?? null,
     roundId: "r1",
     date: new Date("2026-01-01T00:00:00.000Z"),
     status: "SCHEDULED",
@@ -353,9 +359,9 @@ it("listOccurrences dedupes technicians per date and skips unassigned visits", a
   const prisma = makePrisma();
   (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1" });
   (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
-    { date: new Date("2026-01-01T00:00:00.000Z"), status: "COMPLETED", paymentHold: false, price: { toNumber: () => 50 }, _count: { issues: 0 }, technician: { id: "t1", name: "James" } },
-    { date: new Date("2026-01-01T00:00:00.000Z"), status: "SCHEDULED", paymentHold: false, price: { toNumber: () => 40 }, _count: { issues: 0 }, technician: { id: "t1", name: "James" } },
-    { date: new Date("2026-01-01T00:00:00.000Z"), status: "SCHEDULED", paymentHold: false, price: { toNumber: () => 30 }, _count: { issues: 0 }, technician: null },
+    makeVisit({ status: "COMPLETED", price: { toNumber: () => 50 }, technician: { id: "t1", name: "James" } }),
+    makeVisit({ status: "SCHEDULED", price: { toNumber: () => 40 }, technician: { id: "t1", name: "James" } }),
+    makeVisit({ status: "SCHEDULED", price: { toNumber: () => 30 }, technician: null }),
   ]);
   const result = await createRoundService(prisma).listOccurrences(
     "r1",
@@ -385,14 +391,14 @@ it("getOccurrence returns stops and a summary with deduped technicians", async (
   (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1", name: "Round A" });
   (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
     {
-      id: "v1", propertyId: "p1", price: { toNumber: () => 40 }, status: "COMPLETED", paymentHold: false,
+      id: "v1", propertyId: "p1", date: new Date("2026-01-01T00:00:00.000Z"), createdAt: new Date("2026-01-01T00:00:00.000Z"), price: { toNumber: () => 40 }, status: "COMPLETED", paymentHold: false,
       technicianId: "t1", completedAt: new Date("2026-01-01T10:00:00.000Z"),
       technician: { id: "t1", name: "James" },
       property: { propertyName: "12 Main St", addressLine: "12 Main St", postcode: "NE1 1AA", customer: { name: "John Smith" } },
       issues: [],
     },
     {
-      id: "v2", propertyId: "p2", price: { toNumber: () => 30 }, status: "SCHEDULED", paymentHold: true,
+      id: "v2", propertyId: "p2", date: new Date("2026-01-01T00:00:00.000Z"), createdAt: new Date("2026-01-01T00:00:00.000Z"), price: { toNumber: () => 30 }, status: "SCHEDULED", paymentHold: true,
       technicianId: "t1", completedAt: null,
       technician: { id: "t1", name: "James" },
       property: { propertyName: null, addressLine: "14 Main St", postcode: "NE1 1AB", customer: null },
@@ -412,7 +418,7 @@ it("getOccurrence passes through a stop's geocoded latitude/longitude, and null 
   (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1", name: "Round A" });
   (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
     {
-      id: "v1", propertyId: "p1", price: { toNumber: () => 40 }, status: "COMPLETED", paymentHold: false,
+      id: "v1", propertyId: "p1", date: new Date("2026-01-01T00:00:00.000Z"), createdAt: new Date("2026-01-01T00:00:00.000Z"), price: { toNumber: () => 40 }, status: "COMPLETED", paymentHold: false,
       technicianId: "t1", completedAt: null,
       technician: { id: "t1", name: "James" },
       property: {
@@ -422,7 +428,7 @@ it("getOccurrence passes through a stop's geocoded latitude/longitude, and null 
       issues: [],
     },
     {
-      id: "v2", propertyId: "p2", price: { toNumber: () => 30 }, status: "SCHEDULED", paymentHold: false,
+      id: "v2", propertyId: "p2", date: new Date("2026-01-01T00:00:00.000Z"), createdAt: new Date("2026-01-01T00:00:00.000Z"), price: { toNumber: () => 30 }, status: "SCHEDULED", paymentHold: false,
       technicianId: null, completedAt: null,
       technician: null,
       property: {
@@ -441,7 +447,7 @@ it("getOccurrence passes through a stop's geocoded latitude/longitude, and null 
 
 function makeFullStopVisit(overrides: Record<string, unknown> = {}) {
   return {
-    id: "v1", propertyId: "p1", price: { toNumber: () => 40 }, status: "COMPLETED", paymentHold: false,
+    id: "v1", propertyId: "p1", date: new Date("2026-01-01T00:00:00.000Z"), createdAt: new Date("2026-01-01T00:00:00.000Z"), price: { toNumber: () => 40 }, status: "COMPLETED", paymentHold: false,
     technicianId: "t1", completedAt: null, roundId: "r1",
     technician: { id: "t1", name: "James" },
     property: { propertyName: null, addressLine: "12 Main St", postcode: "NE1 1AA", customer: { name: "John Smith" } },
@@ -462,7 +468,7 @@ it("listDayStopsForRounds groups stops by round, one query for every requested r
   const prisma = makePrisma();
   (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
     makeFullStopVisit({ id: "v1", roundId: "r1" }),
-    makeFullStopVisit({ id: "v2", roundId: "r1" }),
+    makeFullStopVisit({ id: "v2", roundId: "r1", propertyId: "p2" }), // a different property: its own stop
     makeFullStopVisit({ id: "v3", roundId: "r2" }),
   ]);
 
@@ -514,13 +520,13 @@ it("getTodayPanel passes through each stop's geocoded latitude/longitude, and nu
   (prisma.round.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "r1", name: "Round A" });
   (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
     {
-      id: "v1", status: "SCHEDULED", paymentHold: false, technicianId: "t1",
+      id: "v1", propertyId: "p-v1", date: new Date("2026-01-01T00:00:00.000Z"), createdAt: new Date("2026-01-01T00:00:00.000Z"), price: { toNumber: () => 20 }, status: "SCHEDULED", paymentHold: false, technicianId: "t1",
       technician: { id: "t1", name: "James" },
       property: { addressLine: "12 Main St", latitude: 55.4, longitude: -1.7, customer: { name: "John Smith" } },
       issues: [],
     },
     {
-      id: "v2", status: "SCHEDULED", paymentHold: false, technicianId: null,
+      id: "v2", propertyId: "p-v2", date: new Date("2026-01-01T00:00:00.000Z"), createdAt: new Date("2026-01-01T00:00:00.000Z"), price: { toNumber: () => 20 }, status: "SCHEDULED", paymentHold: false, technicianId: null,
       technician: null,
       property: { addressLine: "14 Main St", latitude: null, longitude: null, customer: null },
       issues: [],

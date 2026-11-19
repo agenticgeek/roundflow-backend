@@ -5,6 +5,7 @@ import { ChannelUnavailableError, getEmailAvailability, sendTenantEmail, unavail
 import type { EmailAttachment } from "../lib/mailer/ses";
 import { InvoiceStatus, LifecycleStatus, MessageChannel, MessageDeliveryStatus, MessageDirection, VisitStatus } from "../generated/tenant-client";
 import { getGhlToken, createGhlContact, sendGhlMessage, GhlTokenContext } from "../integrations/ghl/api";
+import { linkGhlContact } from "../integrations/ghl/sync";
 import { formatMoney, formatTemplateDate, renderTemplate, type TemplateVars } from "./message-templates";
 import { tenantToday } from "./business-time";
 
@@ -162,7 +163,7 @@ export function createMessageService(prisma: TenantPrismaClient) {
   const ensureContact = async (ctx: GhlTokenContext, c: ContactCustomer): Promise<string> => {
     if (c.ghlContactId) return c.ghlContactId;
     const contactId = await createGhlContact(ctx, c);
-    await prisma.customer.update({ where: { id: c.id }, data: { ghlContactId: contactId } });
+    await linkGhlContact(prisma, c.id, contactId);
     return contactId;
   };
 

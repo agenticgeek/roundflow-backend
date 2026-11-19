@@ -14,6 +14,7 @@ import { MANUALLY_SETTLEABLE } from "./payment-state";
 import { FALLBACK_BODIES, TEMPLATE_NAMES, invoiceTemplateVars, loadTemplate, renderTemplate } from "./message-templates";
 import { renderHtmlToPdf, invoiceHtml } from "../integrations/pdf/render";
 import type { TenantDb } from "./visit-assignment";
+import { STOP_ORDER } from "./stops";
 
 // ---------------------------------------------------------------------------
 // M6 — Invoicing (BE-M6-04).
@@ -24,7 +25,11 @@ import type { TenantDb } from "./visit-assignment";
 export interface InvoiceLineItem {
   description: string;
   technicianName: string | null;
+  /** Net (before VAT). */
   amount: number;
+  /** The service's visit and its day (YYYY-MM-DD); null for a line with no visit. */
+  visitId: string | null;
+  date: string | null;
 }
 
 export interface InvoicePreview {
@@ -93,14 +98,15 @@ const visitInvoiceInclude = {
   service: { select: { name: true } },
   servicePlan: { select: { service: { select: { name: true } } } },
   invoice: { select: { id: true } },
-  payment: { select: { status: true, paidAt: true } },
+  invoiceLine: { select: { id: true } },
+  payment: { select: { status: true, paidAt: true, method: true } },
 } satisfies Prisma.VisitInclude;
 
 type InvoiceVisit = Prisma.VisitGetPayload<{ include: typeof visitInvoiceInclude }>;
 
 const invoiceListInclude = {
   customer: { select: { id: true, name: true, paymentMethod: true } },
-  visit: { select: { paymentMethod: true, payment: { select: { method: true } } } },
+  visit: { select: { paymentMethod: true, collectedVia: true, payment: { select: { method: true } } } },
 } satisfies Prisma.InvoiceInclude;
 
 type InvoiceListRow = Prisma.InvoiceGetPayload<{ include: typeof invoiceListInclude }>;
@@ -174,6 +180,63 @@ function lineDescription(visit: Pick<InvoiceVisit, "service" | "servicePlan" | "
   return `${serviceName}${roundPart} — ${toDateStr(visit.date)}`;
 }
 
+// A visit already billed: it anchors an invoice, or it is a line on one.
+const isInvoiced = (v: { invoice: unknown; invoiceLine?: unknown }) => !!v.invoice || !!v.invoiceLine;
+
+// One line per service: VAT on the line, gross = net + VAT (the same sum completion charged).
+function lineFor(visit: InvoiceVisit, settings: BusinessSettings | null) {
+  const net = visit.price.toNumber();
+  const vat = vatOn(net, settings);
+  return { visit, description: lineDescription(visit), net, vat, gross: round2(net + vat) };
+}
+type DraftLine = ReturnType<typeof lineFor>;
+
+const lineItemOf = (l: DraftLine): InvoiceLineItem => ({
+  description: l.description,
+  technicianName: l.visit.technician?.name ?? null,
+  amount: l.net,
+  visitId: l.visit.id,
+  date: toDateStr(l.visit.date),
+});
+
+// Stored lines (newest invoices), else the one line implied by the invoice's visit (invoices made before lines).
+const savedLinesInclude = {
+  orderBy: { sortOrder: "asc" },
+  include: { visit: { select: { date: true, technician: { select: { name: true } } } } },
+} satisfies Prisma.Invoice$linesArgs;
+type SavedLine = Prisma.InvoiceLineGetPayload<{ include: typeof savedLinesInclude.include }>;
+
+function savedLineItems(
+  invoice: { amount: Prisma.Decimal; lines?: SavedLine[] },
+  visit: InvoiceVisit | null,
+  settings: BusinessSettings | null,
+): { lineItems: InvoiceLineItem[]; subtotal: number; vatAmount: number } {
+  const lines = invoice.lines ?? [];
+  if (lines.length) {
+    return {
+      lineItems: lines.map((l) => ({
+        description: l.description,
+        technicianName: l.visit?.technician?.name ?? null,
+        amount: l.netAmount.toNumber(),
+        visitId: l.visitId,
+        date: l.visit ? toDateStr(l.visit.date) : null,
+      })),
+      subtotal: round2(lines.reduce((sum, l) => sum + l.netAmount.toNumber(), 0)),
+      vatAmount: round2(lines.reduce((sum, l) => sum + l.vatAmount.toNumber(), 0)),
+    };
+  }
+  const total = invoice.amount.toNumber();
+  const vatAmount = vatWithin(total, settings);
+  const subtotal = round2(total - vatAmount);
+  return {
+    lineItems: visit
+      ? [{ description: lineDescription(visit), technicianName: visit.technician?.name ?? null, amount: subtotal, visitId: visit.id, date: toDateStr(visit.date) }]
+      : [],
+    subtotal,
+    vatAmount,
+  };
+}
+
 // Highest numeric suffix for the year + 1. (Counting rows would re-issue a
 // number after a deletion, and lexicographic order breaks past 999.)
 async function nextInvoiceNumber(db: TenantDb, now: Date = new Date()): Promise<string> {
@@ -197,8 +260,13 @@ async function lockInvoiceNumbering(tx: Prisma.TransactionClient): Promise<void>
   await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(current_schema() || ':invoice-number'))`;
 }
 
-function invoicePaymentMethod(inv: InvoiceListRow): PaymentMethod | null {
-  return inv.visit?.payment?.method ?? inv.visit?.paymentMethod ?? inv.customer.paymentMethod ?? null;
+// How this invoice is paid: the recorded payment, else what the technician chose on site (e.g. card, which records no
+// payment), else the visit's planned method, else the customer's usual one.
+function invoicePaymentMethod(inv: {
+  customer: { paymentMethod: PaymentMethod | null };
+  visit?: { paymentMethod: PaymentMethod | null; collectedVia?: PaymentMethod | null; payment?: { method: PaymentMethod } | null } | null;
+}): PaymentMethod | null {
+  return inv.visit?.payment?.method ?? inv.visit?.collectedVia ?? inv.visit?.paymentMethod ?? inv.customer.paymentMethod ?? null;
 }
 
 // ---- contract ---------------------------------------------------------------
@@ -271,11 +339,28 @@ class InvoiceService {
       include: visitInvoiceInclude,
     });
     if (!visit) throw new AppError(404, "Visit not found");
-    if (visit.invoice) throw new AppError(409, "Visit already has an invoice", "ALREADY_INVOICED");
+    if (isInvoiced(visit)) throw new AppError(409, "Visit already has an invoice", "ALREADY_INVOICED");
     if (visit.status !== VisitStatus.COMPLETED) {
       throw new AppError(409, "Only completed visits can be invoiced", "VISIT_NOT_COMPLETED");
     }
     return visit;
+  }
+
+  // The billing group of an invoiceable visit: the visit that carries the shared payment (the anchor) and every
+  // service completed with it (billedWithVisitId = anchor), completed and not yet invoiced, in stop order. A visit
+  // completed on its own is a group of one. `payment` is the group's payment (on the anchor).
+  private async loadInvoiceGroup(visitId: string) {
+    const visit = await this.loadInvoiceableVisit(visitId);
+    const anchorId = visit.billedWithVisitId ?? visit.id;
+    const group = await this.prisma.visit.findMany({
+      where: { OR: [{ id: anchorId }, { billedWithVisitId: anchorId }], status: VisitStatus.COMPLETED },
+      include: visitInvoiceInclude,
+      orderBy: STOP_ORDER,
+    });
+    const members = group.filter((v) => !isInvoiced(v));
+    if (!members.some((v) => v.id === visit.id)) members.push(visit);
+    const payment = group.find((v) => v.payment)?.payment ?? visit.payment;
+    return { visit, members, payment };
   }
 
   async listCustomerInvoices(customerId: string) {
@@ -366,16 +451,15 @@ class InvoiceService {
       include: {
         customer: { select: { id: true, name: true, email: true, phone: true, paymentMethod: true } },
         visit: { include: visitInvoiceInclude },
+        lines: savedLinesInclude,
       },
     });
     if (!invoice) throw new AppError(404, "Invoice not found");
 
     const settings = await getCachedBusinessSettings(this.prisma);
     const total = invoice.amount.toNumber();
-    const vatAmount = vatWithin(total, settings);
-    const subtotal = round2(total - vatAmount);
-
     const visit = invoice.visit;
+    const { lineItems, subtotal, vatAmount } = savedLineItems(invoice, visit, settings);
 
     return {
       id: invoice.id,
@@ -393,7 +477,7 @@ class InvoiceService {
       visitDate: visit?.date ?? null,
       technicianName: visit?.technician?.name ?? null,
       roundName: visit?.round?.name ?? null,
-      paymentMethod: visit?.paymentMethod ?? invoice.customer.paymentMethod ?? null,
+      paymentMethod: invoicePaymentMethod(invoice),
       customer: {
         name: invoice.customer.name,
         email: invoice.customer.email,
@@ -401,9 +485,7 @@ class InvoiceService {
         addressLine: visit?.property.addressLine ?? null,
         postcode: visit?.property.postcode ?? null,
       },
-      lineItems: visit
-        ? [{ description: lineDescription(visit), technicianName: visit.technician?.name ?? null, amount: subtotal }]
-        : [],
+      lineItems,
       subtotal,
       vatAmount,
     };
@@ -415,7 +497,7 @@ class InvoiceService {
   async sendInvoice(invoiceId: string, opts: { channel?: MessageChannel; resend?: boolean } = {}) {
     const invoice = await this.prisma.invoice.findUnique({
       where: { id: invoiceId },
-      include: { customer: { select: { name: true, paymentMethod: true } } },
+      include: { customer: { select: { name: true, paymentMethod: true } }, visit: invoiceListInclude.visit },
     });
     if (!invoice) throw new AppError(404, "Invoice not found");
     if (invoice.status === InvoiceStatus.PAID || invoice.status === InvoiceStatus.VOID) {
@@ -465,7 +547,7 @@ class InvoiceService {
         console.error(`[invoices] invoice ${invoice.invoiceNumber} emailed without the PDF:`, (err as Error).message);
       }
       // How to pay depends on the customer's payment method: Stripe link, bank details, or neither (see invoice-payment-info).
-      const pay = await invoicePaymentInfo(this.prisma, { invoice, method: invoice.customer.paymentMethod ?? null, bank, settings });
+      const pay = await invoicePaymentInfo(this.prisma, { invoice, method: invoicePaymentMethod(invoice), bank, settings });
       summary.push(...pay.rows);
       const vars = invoiceTemplateVars({
         customerName: invoice.customer.name,
@@ -602,7 +684,7 @@ class InvoiceService {
   async getRenderData(invoiceId: string): Promise<InvoiceRenderData> {
     const invoice = await this.prisma.invoice.findUnique({
       where: { id: invoiceId },
-      include: { visit: { include: visitInvoiceInclude } },
+      include: { visit: { include: visitInvoiceInclude }, lines: savedLinesInclude },
     });
     if (!invoice) throw new AppError(404, "Invoice not found");
     const visit = invoice.visit;
@@ -611,8 +693,7 @@ class InvoiceService {
     const settings = await getCachedBusinessSettings(this.prisma);
 
     const total = invoice.amount.toNumber();
-    const vatAmount = vatWithin(total, settings);
-    const subtotal = round2(total - vatAmount);
+    const { lineItems, subtotal, vatAmount } = savedLineItems(invoice, visit, settings);
 
     const customer = visit.property.customer;
 
@@ -631,9 +712,7 @@ class InvoiceService {
         email: customer.email ?? null,
         phone: customer.phone ?? null,
       },
-      lineItems: [
-        { description: lineDescription(visit), technicianName: visit.technician?.name ?? null, amount: subtotal },
-      ],
+      lineItems,
       subtotal,
       vatAmount,
       total,
@@ -643,17 +722,19 @@ class InvoiceService {
     };
   }
 
+  // One invoice for the visit's billing group (every service done with it), one stored line per service.
   async createInvoice(input: CreateInvoiceInput) {
-    const visit = await this.loadInvoiceableVisit(input.visitId);
+    const { members, payment } = await this.loadInvoiceGroup(input.visitId);
+    const visit = members[0];
     const settings = await getCachedBusinessSettings(this.prisma);
 
-    const subtotal = visit.price.toNumber();
-    const total = new Prisma.Decimal(round2(subtotal + vatOn(subtotal, settings)));
+    const lines = members.map((m) => lineFor(m, settings));
+    const total = new Prisma.Decimal(round2(lines.reduce((sum, l) => sum + l.gross, 0)));
     const dueDate = input.dueDate ? new Date(input.dueDate) : defaultDueDate(settings);
 
     // A2: a visit whose payment is already PAID (e.g. cash taken at the door)
     // gets a PAID invoice, so it never counts as debt or blocks the next visit.
-    const alreadyPaid = visit.payment?.status === PaymentStatus.PAID;
+    const alreadyPaid = payment?.status === PaymentStatus.PAID;
 
     const invoice = await this.prisma.$transaction(async (tx) => {
       await lockInvoiceNumbering(tx);
@@ -667,8 +748,18 @@ class InvoiceService {
           dueDate,
           notes: input.notes ?? null,
           status: alreadyPaid ? InvoiceStatus.PAID : InvoiceStatus.DRAFT,
-          paidAt: alreadyPaid ? visit.payment?.paidAt ?? new Date() : null,
+          paidAt: alreadyPaid ? payment?.paidAt ?? new Date() : null,
           sentToCustomer: false,
+          lines: {
+            create: lines.map((l, i) => ({
+              visitId: l.visit.id,
+              description: l.description,
+              netAmount: l.net,
+              vatAmount: l.vat,
+              amount: l.gross,
+              sortOrder: i,
+            })),
+          },
         },
       });
     });
@@ -704,16 +795,18 @@ class InvoiceService {
   }
 
   async previewInvoice(visitId: string): Promise<InvoicePreview> {
-    const visit = await this.loadInvoiceableVisit(visitId);
+    const { members } = await this.loadInvoiceGroup(visitId);
+    const visit = members[0];
 
     const [settings, invoiceNumber] = await Promise.all([
       getCachedBusinessSettings(this.prisma),
       nextInvoiceNumber(this.prisma),
     ]);
 
-    const subtotal = visit.price.toNumber();
-    const vatAmount = vatOn(subtotal, settings);
-    const total = round2(subtotal + vatAmount);
+    const lines = members.map((m) => lineFor(m, settings));
+    const subtotal = round2(lines.reduce((sum, l) => sum + l.net, 0));
+    const vatAmount = round2(lines.reduce((sum, l) => sum + l.vat, 0));
+    const total = round2(lines.reduce((sum, l) => sum + l.gross, 0));
 
     const customer = visit.property.customer;
 
@@ -730,13 +823,7 @@ class InvoiceService {
         email: customer.email ?? null,
         phone: customer.phone ?? null,
       },
-      lineItems: [
-        {
-          description: lineDescription(visit),
-          technicianName: visit.technician?.name ?? null,
-          amount: subtotal,
-        },
-      ],
+      lineItems: lines.map(lineItemOf),
       subtotal,
       vatAmount,
       total,
@@ -763,31 +850,41 @@ class InvoiceService {
     const settings = await getCachedBusinessSettings(this.prisma);
 
     const items: Array<{
-      visitId: string; customerName: string; address: string;
+      visitId: string; visitIds: string[]; customerName: string; address: string;
       amount: number; vat: number; total: number; paymentMethod: PaymentMethod | null;
     }> = [];
     const skipped: Array<{ visitId: string; customerName: string; reason: BulkSkipReason }> = [];
 
+    // One item per billing group (services completed together are invoiced together).
+    const groups = new Map<string, typeof visits>();
     for (const v of visits) {
       const customer = v.property.customer;
       let reason: BulkSkipReason | null = null;
-      if (v.invoice) reason = "ALREADY_INVOICED";
+      if (isInvoiced(v)) reason = "ALREADY_INVOICED";
       else if (v.status !== VisitStatus.COMPLETED) reason = "NOT_COMPLETED";
       else if (v.paymentHold || customer.holdNextClean) reason = "ON_HOLD";
       if (reason) {
         skipped.push({ visitId: v.id, customerName: customer.name, reason });
         continue;
       }
-      const amount = v.price.toNumber();
-      const vat = vatOn(amount, settings);
+      const key = v.billedWithVisitId ?? v.id;
+      const bucket = groups.get(key);
+      if (bucket) bucket.push(v);
+      else groups.set(key, [v]);
+    }
+    for (const members of groups.values()) {
+      const lead = members[0];
+      const customer = lead.property.customer;
+      const lines = members.map((m) => lineFor(m, settings));
       items.push({
-        visitId: v.id,
+        visitId: lead.id,
+        visitIds: members.map((m) => m.id),
         customerName: customer.name,
-        address: [v.property.addressLine, v.property.postcode].filter(Boolean).join(", "),
-        amount,
-        vat,
-        total: round2(amount + vat),
-        paymentMethod: v.paymentMethod ?? customer.paymentMethod ?? null,
+        address: [lead.property.addressLine, lead.property.postcode].filter(Boolean).join(", "),
+        amount: round2(lines.reduce((sum, l) => sum + l.net, 0)),
+        vat: round2(lines.reduce((sum, l) => sum + l.vat, 0)),
+        total: round2(lines.reduce((sum, l) => sum + l.gross, 0)),
+        paymentMethod: lead.paymentMethod ?? customer.paymentMethod ?? null,
       });
     }
 

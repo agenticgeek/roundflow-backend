@@ -12,6 +12,9 @@ export interface OutstandingInvoice {
 
 export interface MobileVisitRow {
   visitId: string;
+  /** One stop per property per day per technician (docs/PROPERTY_STOPS_PLAN_2026-11-19.md §7.4). */
+  propertyId: string;
+  stopKey: string;
   status: string;
   price: number;
   paymentMethod: string | null;

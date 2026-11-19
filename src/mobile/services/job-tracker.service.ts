@@ -3,17 +3,26 @@ import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
 import { AppError } from "../../lib/app-error";
 import { evaluateDebtGate } from "./debt-gate";
 import { notifyAdmins } from "../../services/notify";
+import { STOP_ORDER, stopWhere } from "../../services/stops";
 
 class JobTrackerService {
   constructor(private readonly prisma: TenantPrismaClient) {}
 
+  // Every visit in `visit`'s stop (same property, day and technician) with one of `statuses`, in stop order.
+  private async stopIds(visit: { propertyId: string; date: Date; technicianId: string | null }, statuses: VisitStatus[]) {
+    const stop = await this.prisma.visit.findMany({ where: stopWhere(visit), select: { id: true, status: true }, orderBy: STOP_ORDER });
+    return stop.filter((v) => statuses.includes(v.status)).map((v) => v.id);
+  }
+
+  // Starting any service at a property starts every service still SCHEDULED there (one door, one start).
   async startVisit(visitId: string, _technicianProfileId: string): Promise<void> {
     const visit = await this.prisma.visit.findUnique({
       where: { id: visitId },
       include: { property: { select: { customerId: true } } },
     });
     if (!visit) throw new AppError(404, "Visit not found");
-    if (visit.status !== VisitStatus.SCHEDULED) {
+    const ids = await this.stopIds(visit, [VisitStatus.SCHEDULED]);
+    if (ids.length === 0) {
       throw new AppError(409, `Cannot start a visit with status ${visit.status}`);
     }
 
@@ -22,8 +31,8 @@ class JobTrackerService {
       throw new AppError(403, gate.blockReason ?? "Cannot start visit: customer has outstanding debt");
     }
 
-    await this.prisma.visit.update({
-      where: { id: visitId },
+    await this.prisma.visit.updateMany({
+      where: { id: { in: ids }, status: VisitStatus.SCHEDULED },
       data: { status: VisitStatus.IN_PROGRESS, startedAt: new Date() },
     });
   }
@@ -34,20 +43,31 @@ class JobTrackerService {
     if (visit.status !== VisitStatus.IN_PROGRESS) {
       throw new AppError(409, `Cannot mark arrived for a visit with status ${visit.status}`);
     }
-    await this.prisma.visit.update({
-      where: { id: visitId },
+    const ids = await this.stopIds(visit, [VisitStatus.IN_PROGRESS]);
+    await this.prisma.visit.updateMany({
+      where: { id: { in: ids }, status: VisitStatus.IN_PROGRESS },
       data: { arrivedAt: new Date() },
     });
   }
 
-  async skipVisit(visitId: string, reason: string, description?: string): Promise<void> {
+  // `stop: true` skips every open service at the property (the app's "Skip job" on a stop); otherwise just this
+  // one service, as older app builds expect.
+  async skipVisit(visitId: string, reason: string, description?: string, opts: { stop?: boolean } = {}): Promise<void> {
     const visit = await this.prisma.visit.findUnique({ where: { id: visitId } });
     if (!visit) throw new AppError(404, "Visit not found");
     if (visit.status === VisitStatus.COMPLETED) throw new AppError(409, "Cannot skip a completed visit");
     if (visit.status === VisitStatus.CANCELLED) throw new AppError(409, "Cannot skip a cancelled visit");
     if (visit.status === VisitStatus.SKIPPED) return;
     const skipReason = description ? `${reason}: ${description}` : reason;
-    await this.prisma.visit.update({ where: { id: visitId }, data: { status: VisitStatus.SKIPPED, skipReason } });
+    if (opts.stop) {
+      const open = [VisitStatus.SCHEDULED, VisitStatus.IN_PROGRESS];
+      await this.prisma.visit.updateMany({
+        where: { id: { in: await this.stopIds(visit, open) }, status: { in: open } },
+        data: { status: VisitStatus.SKIPPED, skipReason },
+      });
+    } else {
+      await this.prisma.visit.update({ where: { id: visitId }, data: { status: VisitStatus.SKIPPED, skipReason } });
+    }
     // NOTIF-03: the office sees why a visit was skipped. Best effort.
     await notifyAdmins(this.prisma, {
       type: "SCHEDULE",

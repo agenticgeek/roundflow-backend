@@ -19,7 +19,7 @@ beforeEach(() => {
 
 function makePrisma() {
   return {
-    visit: { findUnique: vi.fn(), update: vi.fn(), findMany: vi.fn(), findFirst: vi.fn() },
+    visit: { findUnique: vi.fn(), update: vi.fn(), updateMany: vi.fn(), findMany: vi.fn(), findFirst: vi.fn() },
     issue: { create: vi.fn() },
     propertyNote: { create: vi.fn() },
     photo: { create: vi.fn() },
@@ -41,22 +41,26 @@ function makePrisma() {
 // startVisit
 // ---------------------------------------------------------------------------
 
+// The visit's stop (same property, day, technician); see stops.mobile.test.ts for several services.
+const STOP_VISIT = { propertyId: "p1", date: new Date("2026-11-19T00:00:00Z"), technicianId: "t1" };
+
 it("startVisit transitions SCHEDULED visit to IN_PROGRESS and records startedAt", async () => {
   const prisma = makePrisma();
-  (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1", status: "SCHEDULED", property: { customerId: "c1" } });
-  (prisma.visit.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1", status: "IN_PROGRESS" });
+  (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1", status: "SCHEDULED", ...STOP_VISIT, property: { customerId: "c1" } });
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ id: "v1", status: "SCHEDULED" }]);
 
   await createJobTrackerService(prisma).startVisit("v1", "tech-profile-1");
 
-  const updateArgs = (prisma.visit.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  const updateArgs = (prisma as any).visit.updateMany.mock.calls[0][0];
   expect(updateArgs.data.status).toBe("IN_PROGRESS");
   expect(updateArgs.data.startedAt).toBeInstanceOf(Date);
-  expect(updateArgs.where.id).toBe("v1");
+  expect(updateArgs.where.id).toEqual({ in: ["v1"] });
 });
 
 it("startVisit throws 409 when visit is already IN_PROGRESS", async () => {
   const prisma = makePrisma();
-  (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1", status: "IN_PROGRESS", property: { customerId: "c1" } });
+  (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1", status: "IN_PROGRESS", ...STOP_VISIT, property: { customerId: "c1" } });
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ id: "v1", status: "IN_PROGRESS" }]);
 
   await expect(createJobTrackerService(prisma).startVisit("v1", "tech-profile-1")).rejects.toMatchObject({ statusCode: 409 });
 });
@@ -74,14 +78,14 @@ it("startVisit throws 404 when visit does not exist", async () => {
 
 it("markArrived sets arrivedAt on an IN_PROGRESS visit", async () => {
   const prisma = makePrisma();
-  (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1", status: "IN_PROGRESS" });
-  (prisma.visit.update as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1" });
+  (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({ id: "v1", status: "IN_PROGRESS", ...STOP_VISIT });
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([{ id: "v1", status: "IN_PROGRESS" }]);
 
   await createJobTrackerService(prisma).markArrived("v1");
 
-  const updateArgs = (prisma.visit.update as ReturnType<typeof vi.fn>).mock.calls[0][0];
+  const updateArgs = (prisma as any).visit.updateMany.mock.calls[0][0];
   expect(updateArgs.data.arrivedAt).toBeInstanceOf(Date);
-  expect(updateArgs.where.id).toBe("v1");
+  expect(updateArgs.where.id).toEqual({ in: ["v1"] });
 });
 
 it("markArrived throws 409 when visit is not IN_PROGRESS", async () => {
@@ -352,7 +356,7 @@ it("getTodayVisits returns [] when no technician record exists for the profile",
 function makeCompletedVisit(id: string, price: number, status = "COMPLETED") {
   return {
     id, status, price: { toNumber: () => price },
-    date: new Date(), skipReason: null,
+    date: new Date(), createdAt: new Date(), propertyId: `p-${id}`, technicianId: "t1", skipReason: null,
     completedAt: status === "COMPLETED" ? new Date() : null,
     paymentMethod: "DIRECT_DEBIT", notes: null,
     property: { id: "p1", addressLine: "23 Bailiffgate", postcode: "NE66 1KJ",
@@ -412,7 +416,7 @@ it("getVisitDetail returns the visit with property notes", async () => {
   (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
     id: "v1", status: "IN_PROGRESS", price: { toNumber: () => 52 },
     paymentMethod: "CASH", notes: null, skipReason: null, completedAt: null,
-    roundId: "r1", propertyId: "p1", technician: null,
+    roundId: "r1", propertyId: "p1", date: new Date("2026-11-19T00:00:00Z"), technicianId: "t1", technician: null,
     property: { id: "p1", addressLine: "12 Market Street", postcode: "NE66 1AA",
       customer: { id: "c1", name: "Tom Atkinson", badDebt: false, invoices: [] },
       notes: [
@@ -437,7 +441,7 @@ it("getVisitDetail passes through the property's geocoded latitude/longitude", a
   (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
     id: "v1", status: "IN_PROGRESS", price: { toNumber: () => 52 },
     paymentMethod: "CASH", notes: null, skipReason: null, completedAt: null,
-    roundId: "r1", propertyId: "p1", technician: null,
+    roundId: "r1", propertyId: "p1", date: new Date("2026-11-19T00:00:00Z"), technicianId: "t1", technician: null,
     property: { id: "p1", addressLine: "12 Market Street", postcode: "NE66 1AA", latitude: 55.4, longitude: -1.7,
       customer: { id: "c1", name: "Tom Atkinson", badDebt: false, invoices: [] },
       notes: [] },
@@ -466,7 +470,7 @@ it("getVisitDetail includes technician name and role", async () => {
   (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
     id: "v1", status: "COMPLETED", price: { toNumber: () => 28 },
     paymentMethod: "DIRECT_DEBIT", notes: null, skipReason: null,
-    completedAt: new Date(), roundId: "r1", propertyId: "p1",
+    completedAt: new Date(), roundId: "r1", propertyId: "p1", date: new Date("2026-11-19T00:00:00Z"), technicianId: "t1",
     technician: { name: "James Carter", role: "Field Technician" },
     property: { id: "p1", addressLine: "23 Bailiffgate", postcode: "NE66 1KJ",
       customer: { id: "c1", name: "Sarah Brown", badDebt: false, invoices: [] }, notes: [] },
@@ -489,7 +493,7 @@ it("getVisitDetail includes lastClean date from previous completed visit", async
   (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
     id: "v1", status: "COMPLETED", price: { toNumber: () => 28 },
     paymentMethod: "DIRECT_DEBIT", notes: null, skipReason: null,
-    completedAt: new Date(), roundId: null, propertyId: "p1", technician: null,
+    completedAt: new Date(), roundId: null, propertyId: "p1", date: new Date("2026-11-19T00:00:00Z"), technicianId: "t1", technician: null,
     property: { id: "p1", addressLine: "23 Bailiffgate", postcode: "NE66 1KJ",
       customer: { id: "c1", name: "Sarah Brown", badDebt: false, invoices: [] }, notes: [] },
     round: null, service: null, _count: { issues: 0 },
@@ -505,7 +509,7 @@ it("getVisitDetail includes roundPosition when visit is part of a round", async 
   (prisma.visit.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
     id: "v2", status: "COMPLETED", price: { toNumber: () => 30 },
     paymentMethod: "DIRECT_DEBIT", notes: null, skipReason: null,
-    completedAt: new Date(), roundId: "r1", propertyId: "p2", technician: null,
+    completedAt: new Date(), roundId: "r1", propertyId: "p2", date: new Date("2026-11-19T00:00:00Z"), technicianId: "t1", technician: null,
     property: { id: "p2", addressLine: "45 Bondgate Within", postcode: "NE66 1DJ",
       customer: { id: "c2", name: "Helen Foster", badDebt: false, invoices: [] }, notes: [] },
     round: { id: "r1", name: "Alnwick Monday" },
@@ -513,9 +517,11 @@ it("getVisitDetail includes roundPosition when visit is part of a round", async 
     _count: { issues: 0 },
   });
   (prisma.visit.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockResolvedValue([
-    { id: "v1" }, { id: "v2" }, { id: "v3" }, { id: "v4" }, { id: "v5" },
-  ]);
+  (prisma.visit.findMany as ReturnType<typeof vi.fn>).mockImplementation(async (args: any) =>
+    args.where.propertyId
+      ? [] // the stop
+      : [{ id: "v1", propertyId: "p1" }, { id: "v2", propertyId: "p2" }, { id: "v3", propertyId: "p3" }, { id: "v4", propertyId: "p4" }, { id: "v5", propertyId: "p5" }],
+  );
 
   expect((await createJobDetailService(prisma).getVisitDetail("v2")).roundPosition).toEqual({ position: 2, total: 5 });
 });
@@ -609,6 +615,7 @@ const fn = (f: unknown) => f as ReturnType<typeof vi.fn>;
 function mobileVisit(overrides: Record<string, unknown> = {}) {
   return {
     id: "v1", status: "COMPLETED", price: { toNumber: () => 20 }, date: new Date(), completedAt: new Date(),
+    createdAt: new Date(), propertyId: `p-${String(overrides.id ?? "v1")}`, technicianId: "t1",
     paymentMethod: null, notes: null, roundId: null, servicePlan: null,
     property: { id: "p1", addressLine: "1 St", postcode: "NE1", latitude: null, longitude: null,
       customer: { id: "c1", name: "A", badDebt: false, paymentMethod: null }, notes: [] },
@@ -682,7 +689,7 @@ it("getVisitDetail returns the effective payment method and skips CANCELLED in r
     property: { id: "p1", customer: { id: "c1", name: "A", badDebt: false, paymentMethod: "CASH", invoices: [] }, notes: [] },
   });
   fn(prisma.visit.findFirst).mockResolvedValue(null);
-  fn(prisma.visit.findMany).mockResolvedValue([{ id: "v1" }]);
+  fn(prisma.visit.findMany).mockImplementation(async (args: any) => (args.where.propertyId ? [] : [{ id: "v1", propertyId: "p1" }]));
 
   const out = await createJobDetailService(prisma).getVisitDetail("v1");
 
@@ -694,6 +701,7 @@ it("getVisitDetail falls back to the customer method, then null", async () => {
   const prisma = makePrisma();
   const base = { id: "v1", status: "SCHEDULED", date: new Date(), roundId: null, price: { toNumber: () => 20 }, propertyId: "p1", paymentMethod: null, servicePlan: null };
   fn(prisma.visit.findFirst).mockResolvedValue(null);
+  fn(prisma.visit.findMany).mockResolvedValue([]);
   fn(prisma.visit.findUnique).mockResolvedValueOnce({
     ...base, property: { id: "p1", customer: { id: "c1", name: "A", badDebt: false, paymentMethod: "CASH", invoices: [] }, notes: [] },
   }).mockResolvedValueOnce({

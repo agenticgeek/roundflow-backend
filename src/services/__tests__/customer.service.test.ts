@@ -1,6 +1,6 @@
 import { it, expect, vi, beforeEach, describe } from "vitest";
 import { createCustomerService } from "../customer.service";
-import { LifecycleStatus, VisitStatus, PaymentStatus, PaymentMethod } from "../../generated/tenant-client";
+import { LifecycleStatus, VisitStatus, PaymentStatus, PaymentMethod, Prisma } from "../../generated/tenant-client";
 import { UserRole } from "@prisma/client";
 import { geocodeAddress } from "../../integrations/geocoding/client";
 
@@ -1474,8 +1474,8 @@ it("getVisitHistory pages every status, including CANCELLED with its reason", as
   (prisma.customer.findUnique as Fn).mockResolvedValue({ id: "c1" });
   (prisma.visit.count as Fn).mockResolvedValue(3);
   (prisma.visit.findMany as Fn).mockResolvedValue([
-    { id: "v1", date: new Date("2026-11-01"), status: VisitStatus.CANCELLED, cancelReason: "PAUSED", notes: null, round: { name: "Fri" }, payment: null },
-    { id: "v2", date: new Date("2026-10-01"), status: VisitStatus.COMPLETED, cancelReason: null, notes: "ok", round: null, payment: { status: PaymentStatus.PAID } },
+    { id: "v1", propertyId: "p1", technicianId: "t1", price: new Prisma.Decimal(20), service: null, billedWithVisitId: null, date: new Date("2026-11-01"), status: VisitStatus.CANCELLED, cancelReason: "PAUSED", notes: null, round: { name: "Fri" }, payment: null },
+    { id: "v2", propertyId: "p1", technicianId: "t1", price: new Prisma.Decimal(20), service: null, billedWithVisitId: null, date: new Date("2026-10-01"), status: VisitStatus.COMPLETED, cancelReason: null, notes: "ok", round: null, payment: { status: PaymentStatus.PAID } },
   ]);
 
   const result = await createCustomerService(prisma).getVisitHistory("c1", 2, 2);
@@ -1484,6 +1484,7 @@ it("getVisitHistory pages every status, including CANCELLED with its reason", as
   expect(result.rows[0]).toEqual({
     visitId: "v1", date: new Date("2026-11-01"), roundName: "Fri", status: VisitStatus.CANCELLED,
     cancelReason: "PAUSED", paymentStatus: null, notes: null,
+    serviceName: null, price: 20, stopKey: "p1|2026-11-01|t1", invoiceId: null, billedWithVisitId: null,
   });
   expect(result.rows[1].paymentStatus).toBe(PaymentStatus.PAID);
   const args = (prisma.visit.findMany as Fn).mock.calls[0][0];

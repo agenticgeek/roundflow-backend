@@ -7,7 +7,32 @@ import { getCachedBusinessSettings } from "../../services/settings.service";
 import { releaseHoldIfSettled } from "../../services/payment-hold";
 import { notifyInvoicePaid } from "../../services/notify";
 import { isLocationApproximate } from "../../integrations/geocoding/client";
-import { vatOn, vatRateOf, grossOf } from "../../lib/vat";
+import { vatOn, vatRateOf, grossOf, round2 } from "../../lib/vat";
+import { STOP_ORDER, stopKeyOf, stopWhere } from "../../services/stops";
+
+/** One service at a stop (GET /mobile/visits/:id `stop.services`). */
+export interface MobileStopService {
+  visitId: string;
+  serviceName: string;
+  status: VisitStatus;
+  price: number;
+  originalPrice: number | null;
+  priceAdjustmentReason: string | null;
+  grossTotal: number;
+  skipReason: string | null;
+  carriedOver: boolean;
+  carriedOverFromDate: string | null;
+  isOneOff: boolean;
+}
+
+/** Every service at the visit's property today for this technician; totals leave skipped services out. */
+export interface MobileStop {
+  stopKey: string;
+  leadVisitId: string;
+  services: MobileStopService[];
+  price: number;
+  grossTotal: number;
+}
 
 const visitDetailInclude = {
   property: {
@@ -72,6 +97,7 @@ export interface VisitDetail extends Omit<VisitDetailBase, "property"> {
   grossTotal: number;
   canStart: boolean;
   blockReason: string | null;
+  stop: MobileStop;
 }
 
 class JobDetailService {
@@ -94,14 +120,16 @@ class JobDetailService {
     if (visit.roundId) {
       // Same scope and order as the Today list and GET /mobile/schedule: this
       // technician's visits in the round on the visit's own day, by createdAt
-      // then id (stable - starting the visit does not change it).
+      // then id (stable - starting the visit does not change it), counted by
+      // stop: every service at a property shares its stop's number.
       const roundVisits = await this.prisma.visit.findMany({
         where: { roundId: visit.roundId, technicianId: visit.technicianId, date: visit.date, status: { not: VisitStatus.CANCELLED } },
         orderBy: [{ createdAt: "asc" }, { id: "asc" }],
-        select: { id: true },
+        select: { id: true, propertyId: true },
       });
-      const pos = roundVisits.findIndex(v => v.id === visitId);
-      if (pos !== -1) roundPosition = { position: pos + 1, total: roundVisits.length };
+      const properties = [...new Set(roundVisits.map((v) => v.propertyId))];
+      const pos = properties.indexOf(visit.propertyId);
+      if (pos !== -1) roundPosition = { position: pos + 1, total: properties.length };
     }
 
     const activityLog: ActivityLogEntry[] = [
@@ -124,6 +152,38 @@ class JobDetailService {
     const paymentMethod = visit.paymentMethod ?? visit.servicePlan?.paymentMethod ?? visit.property.customer.paymentMethod ?? null;
 
     const settings = await getCachedBusinessSettings(this.prisma);
+
+    // The whole stop: every service due at this property today for this technician.
+    const stopVisits = await this.prisma.visit.findMany({
+      where: stopWhere(visit),
+      orderBy: STOP_ORDER,
+      select: {
+        id: true, status: true, price: true, originalPrice: true, priceAdjustmentReason: true, skipReason: true,
+        isOneOff: true, carriedOverFromDate: true, service: { select: { name: true } },
+      },
+    });
+    const services: MobileStopService[] = stopVisits.map((s) => ({
+      visitId: s.id,
+      serviceName: s.service?.name ?? "Window clean",
+      status: s.status,
+      price: s.price.toNumber(),
+      originalPrice: s.originalPrice ? s.originalPrice.toNumber() : null,
+      priceAdjustmentReason: s.priceAdjustmentReason,
+      grossTotal: grossOf(s.price.toNumber(), settings),
+      skipReason: s.skipReason,
+      carriedOver: s.carriedOverFromDate != null,
+      carriedOverFromDate: s.carriedOverFromDate?.toISOString().slice(0, 10) ?? null,
+      isOneOff: s.isOneOff,
+    }));
+    const billable = services.filter((s) => s.status !== VisitStatus.SKIPPED);
+    const stop: MobileStop = {
+      stopKey: stopKeyOf(visit),
+      leadVisitId: services[0]?.visitId ?? visit.id,
+      services,
+      price: round2(billable.reduce((sum, s) => sum + s.price, 0)),
+      grossTotal: round2(billable.reduce((sum, s) => sum + s.grossTotal, 0)),
+    };
+
     const net = visit.price.toNumber();
     const vatAmount = vatOn(net, settings);
     const vatRate = settings?.vatInInvoices ? vatRateOf(settings) : 0;
@@ -146,7 +206,7 @@ class JobDetailService {
       mine: !!viewerProfileId && n.authorProfileId === viewerProfileId,
     }));
 
-    return { ...visit, property: { ...visit.property, notes, locationApproximate: isLocationApproximate(visit.property.geocodePrecision, visit.property.latitude) }, paymentMethod, vatAmount, vatRate, grossTotal: grossOf(net, settings), lastClean: lastVisit?.completedAt ?? null, roundPosition, activityLog, outstandingInvoices, debtAmount, canStart: gate.canStart, blockReason: gate.blockReason };
+    return { ...visit, property: { ...visit.property, notes, locationApproximate: isLocationApproximate(visit.property.geocodePrecision, visit.property.latitude) }, paymentMethod, vatAmount, vatRate, grossTotal: grossOf(net, settings), lastClean: lastVisit?.completedAt ?? null, roundPosition, activityLog, outstandingInvoices, debtAmount, canStart: gate.canStart, blockReason: gate.blockReason, stop };
   }
 
   // On-site debt collection. CASH clears the outstanding invoices immediately.

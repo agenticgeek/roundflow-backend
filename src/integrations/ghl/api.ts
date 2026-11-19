@@ -84,9 +84,27 @@ export async function createGhlContact(
     headers: ghlHeaders(ctx.accessToken),
     body: JSON.stringify({ locationId: ctx.locationId, firstName, lastName, phone: customer.phone ?? undefined, email: customer.email ?? undefined }),
   });
+  // A location that forbids duplicates answers 400 with the existing contact in `meta.contactId` (matched on phone or
+  // email). That contact is the same person, so it is adopted instead of failing every send to this customer.
+  if (res.status === 400) {
+    const text = await res.text();
+    const existing = duplicateContactId(text);
+    if (existing) return existing;
+    throw new Error(`GHL createContact failed (400): ${text}`);
+  }
   await assertGhlOk(res, "createContact");
   const data = await res.json() as { contact: { id: string } };
   return data.contact.id;
+}
+
+function duplicateContactId(body: string): string | null {
+  try {
+    const parsed = JSON.parse(body) as { message?: unknown; meta?: { contactId?: unknown } };
+    const id = parsed.meta?.contactId;
+    return typeof id === "string" && id !== "" && /duplicat/i.test(String(parsed.message ?? "")) ? id : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function updateGhlContact(

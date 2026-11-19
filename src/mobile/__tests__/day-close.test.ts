@@ -33,9 +33,15 @@ import { mobileRouter } from "../routes";
 import { AppError } from "../../lib/app-error";
 import { notifyAdmins } from "../../services/notify";
 
+// Each visit is its own property (one stop each); stops.mobile.test.ts covers several services at one property.
 const visit = (id: string, status: string) => ({
   id,
   status,
+  date: new Date("2026-11-19T00:00:00Z"),
+  createdAt: new Date("2026-11-01T00:00:00Z"),
+  propertyId: `p-${id}`,
+  technicianId: "tech-1",
+  service: null,
   round: { name: "North" },
   property: { addressLine: `${id} High St`, customer: { name: `Cust ${id}` } },
 });
@@ -77,8 +83,8 @@ describe("GET /mobile/day", () => {
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ date: "2026-11-03", closed: false, closedAt: null, completedCount: 1, skippedCount: 1 });
     expect(res.body.remaining).toEqual([
-      { visitId: "c", status: "SCHEDULED", customerName: "Cust c", addressLine: "c High St", roundName: "North" },
-      { visitId: "d", status: "IN_PROGRESS", customerName: "Cust d", addressLine: "d High St", roundName: "North" },
+      { visitId: "c", stopKey: "p-c|2026-11-19|tech-1", serviceNames: ["Window clean"], status: "SCHEDULED", customerName: "Cust c", addressLine: "c High St", roundName: "North" },
+      { visitId: "d", stopKey: "p-d|2026-11-19|tech-1", serviceNames: ["Window clean"], status: "IN_PROGRESS", customerName: "Cust d", addressLine: "d High St", roundName: "North" },
     ]);
     expect(tp.visit.findMany.mock.calls[0][0].where.technicianId).toBe("tech-1");
   });

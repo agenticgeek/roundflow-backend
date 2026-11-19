@@ -17,7 +17,7 @@ import { createNotificationService } from "./services/notification.service";
 import { createUpsellService } from "./services/upsell.service";
 import { createDayCloseService } from "./services/day-close.service";
 import { createReportsService } from "../services/reports.service";
-import { createVisitCompletionService, parseCompletionPayment } from "../services/visit-completion";
+import { createVisitCompletionService, parseCompletionPayment, parseStopServices } from "../services/visit-completion";
 import { requireTechnician, requireVisitOwner, assertRoundMember, assertVisitOwner } from "./ownership";
 import { idempotency } from "./idempotency";
 import { signAvatar, signChatRows, signPhotos } from "./media-urls";
@@ -280,12 +280,14 @@ mobileRouter.patch("/visits/:id/arrive", ...visitWrite, h(async (req, res) => {
   res.json({ status: "IN_PROGRESS" });
 }));
 
-// PATCH /mobile/visits/:id/skip
+// PATCH /mobile/visits/:id/skip  { reason, description?, stop? }
+// stop: true skips every open service at the property today (the whole stop); otherwise just this visit.
 mobileRouter.patch("/visits/:id/skip", ...visitWrite, h(async (req, res) => {
   const body = asObject(req.body);
   const reason = requireString(body.reason, "reason");
   const description = optString(body.description, "description");
-  await tracker(req).skipVisit(req.params.id, reason, description ?? undefined);
+  const stop = optBool(body.stop, "stop") ?? false;
+  await tracker(req).skipVisit(req.params.id, reason, description ?? undefined, { stop });
   res.json({ status: "SKIPPED" });
 }));
 
@@ -459,15 +461,20 @@ mobileRouter.post("/chat/messages", h(async (req, res) => {
 // (cashConfirmed: true is a deprecated alias for payment.method CASH). Shares
 // the web completion logic: validate first, then one transaction (D-2), and
 // queues the visit.completed + "Visit completed" message outbox events (D-9/A5).
+// services?: [{ visitId, done, skipReason? }] completes the whole stop (every service at the property today) in one
+// go: one payment for the total, one invoice with a line per service, one customer message (§7.3 of
+// docs/PROPERTY_STOPS_PLAN_2026-11-19.md). Without it, just this visit.
 mobileRouter.patch("/visits/:id/complete", ...visitWrite, h(async (req, res) => {
   const body = asObject(req.body);
   const payment = parseCompletionPayment(body);
+  const services = parseStopServices(body);
   const note = optString(body.note, "note", { maxLength: 2000 });
   const result = await createVisitCompletionService(tp(req)).completeVisit(req.params.id, {
     payment,
     note: note?.trim() || undefined,
     actorProfileId: req.profile!.id,
     actorRole: req.profile!.role,
+    ...(services ? { services } : {}),
   });
   res.json(result);
 }));
