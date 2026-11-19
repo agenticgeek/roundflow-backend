@@ -55,7 +55,7 @@ function makeTp(rows: Row[]) {
       findMany: vi.fn().mockResolvedValue(rows),
       update: vi.fn().mockResolvedValue({}),
     },
-    visit: { findUnique: vi.fn().mockResolvedValue(null) as ReturnType<typeof vi.fn> },
+    visit: { findUnique: vi.fn().mockResolvedValue(null) as ReturnType<typeof vi.fn>, findMany: vi.fn().mockResolvedValue([]) },
     customer: { findUnique: vi.fn().mockResolvedValue({ messagesOptOut: false }) },
     businessSettings: { findFirst: vi.fn().mockResolvedValue({ businessName: "Shine Ltd", ghlConnected: true }) },
     messageTemplate: { findFirst: vi.fn().mockResolvedValue(null) },

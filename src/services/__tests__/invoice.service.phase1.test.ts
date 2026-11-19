@@ -650,8 +650,8 @@ describe("B5 bulk invoices", () => {
       where: { date: { gte: day, lt: new Date("2026-10-31T00:00:00Z") }, status: { not: "CANCELLED" }, id: { notIn: ["zzz"] } },
     }));
     expect(result.items).toEqual([
-      { visitId: "ok1", customerName: "Jo Bloggs", address: "1 High St, NE66 1AA", amount: 20, vat: 4, total: 24, paymentMethod: "BACS" },
-      { visitId: "ok2", customerName: "Al", address: "2 Low St", amount: 20, vat: 4, total: 24, paymentMethod: null },
+      { visitId: "ok1", visitIds: ["ok1"], customerName: "Jo Bloggs", address: "1 High St, NE66 1AA", amount: 20, vat: 4, total: 24, paymentMethod: "BACS" },
+      { visitId: "ok2", visitIds: ["ok2"], customerName: "Al", address: "2 Low St", amount: 20, vat: 4, total: 24, paymentMethod: null },
     ]);
     expect(result.skipped).toEqual([
       { visitId: "inv", customerName: "Jo Bloggs", reason: "ALREADY_INVOICED" },
@@ -670,7 +670,8 @@ describe("B5 bulk invoices", () => {
 
   it("createBulk creates per item and reports a failure without stopping", async () => {
     const p = makePrisma();
-    p.visit.findMany.mockResolvedValue([visit({ id: "a" }), visit({ id: "b" })]);
+    // the day's visits, then each billing group (just the visit itself here)
+    p.visit.findMany.mockResolvedValueOnce([visit({ id: "a" }), visit({ id: "b" })]).mockResolvedValue([]);
     p.visit.findUnique
       .mockResolvedValueOnce(visit({ id: "a" }))
       .mockResolvedValueOnce(visit({ id: "b", invoice: { id: "raced" } }));
@@ -683,7 +684,8 @@ describe("B5 bulk invoices", () => {
 
   it("createBulk sendNow sends each invoice and reports created-but-unsent ones", async () => {
     const p = makePrisma();
-    p.visit.findMany.mockResolvedValue([visit({ id: "a" }), visit({ id: "b" })]);
+    // the day's visits, then each billing group (just the visit itself here)
+    p.visit.findMany.mockResolvedValueOnce([visit({ id: "a" }), visit({ id: "b" })]).mockResolvedValue([]);
     p.visit.findUnique.mockImplementation(({ where }: { where: { id: string } }) => Promise.resolve(visit({ id: where.id })));
     p.invoice.create
       .mockResolvedValueOnce({ id: "i-a", invoiceNumber: "INV-1", status: "DRAFT", sentToCustomer: false, sentAt: null })

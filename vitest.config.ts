@@ -245,6 +245,11 @@ const CLOSURE_FILES = [
   "src/services/closure-apply.service.ts",
 ];
 
+// One stop per property (2026-11-19): new whole file, gated at 100%. Plan: docs/PROPERTY_STOPS_PLAN_2026-11-19.md
+// (workspace root). Gated files it touches (visit-completion.ts, invoice.service.ts, outboxWorker.ts,
+// preCleanReminders.ts) must stay at 100%.
+const STOP_FILES = ["src/services/stops.ts"];
+
 export default defineConfig({
   test: {
     include: ["src/**/*.test.ts"],
@@ -253,7 +258,7 @@ export default defineConfig({
     coverage: {
       provider: "v8",
       reporter: ["text", "html", "lcov"],
-      include: [...PAYMENT_DOMAIN_FILES, ...AUDIT_REMEDIATION_FILES, ...GEOCODING_FILES, ...INVITE_FILES, ...PHASE1_AUDIT_FILES, ...WAVE1_FILES, ...WAVE2A_FILES, ...WAVE2B1_FILES, ...WAVE2B2_FILES, ...FLO_FILES, ...CLOSURE_FILES],
+      include: [...PAYMENT_DOMAIN_FILES, ...AUDIT_REMEDIATION_FILES, ...GEOCODING_FILES, ...INVITE_FILES, ...PHASE1_AUDIT_FILES, ...WAVE1_FILES, ...WAVE2A_FILES, ...WAVE2B1_FILES, ...WAVE2B2_FILES, ...FLO_FILES, ...CLOSURE_FILES, ...STOP_FILES],
       thresholds: {
         100: true,
         perFile: true,

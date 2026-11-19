@@ -1,3 +1,4 @@
+import { stopKeyOf } from "./stops";
 import {
   InvoiceStatus,
   LifecycleStatus,
@@ -274,6 +275,14 @@ export interface VisitHistoryRow {
   cancelReason: string | null;
   paymentStatus: PaymentStatus | null;
   notes: string | null;
+  // GET /customers/:id/visits only (one stop per property, 2026-11-19): the service and its price, the stop it was
+  // in, the invoice it is on (as the invoice's visit or as a line) and, for a service billed together with others,
+  // the visit carrying the shared payment. paymentStatus then falls back to that visit's payment.
+  serviceName?: string | null;
+  price?: number;
+  stopKey?: string;
+  invoiceId?: string | null;
+  billedWithVisitId?: string | null;
 }
 
 export interface CustomerPropertySummary {
@@ -1627,7 +1636,14 @@ class CustomerService {
         orderBy: { date: "desc" },
         skip: (page - 1) * pageSize,
         take: pageSize,
-        include: { round: { select: { name: true } }, payment: { select: { status: true } } },
+        include: {
+          round: { select: { name: true } },
+          payment: { select: { status: true } },
+          service: { select: { name: true } },
+          invoice: { select: { id: true } },
+          invoiceLine: { select: { invoiceId: true } },
+          billedWith: { select: { payment: { select: { status: true } } } },
+        },
       }),
     ]);
     return {
@@ -1637,8 +1653,13 @@ class CustomerService {
         roundName: v.round?.name ?? null,
         status: v.status,
         cancelReason: v.cancelReason,
-        paymentStatus: v.payment?.status ?? null,
+        paymentStatus: v.payment?.status ?? v.billedWith?.payment?.status ?? null,
         notes: v.notes,
+        serviceName: v.service?.name ?? null,
+        price: v.price.toNumber(),
+        stopKey: stopKeyOf(v),
+        invoiceId: v.invoice?.id ?? v.invoiceLine?.invoiceId ?? null,
+        billedWithVisitId: v.billedWithVisitId,
       })),
       pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) },
     };

@@ -12,6 +12,7 @@ import { autoSplit, resolveTechnicianForVisit, restampFutureVisits, type TenantD
 import { startOfUtcDay } from "../lib/schedule";
 import { assertSectorsInServiceArea } from "../lib/postcode-sectors";
 import { isLocationApproximate } from "../integrations/geocoding/client";
+import { groupByStop, stopKeyOf, stopStatus } from "./stops";
 
 // ---- input types ----------------------------------------------------------
 
@@ -104,8 +105,20 @@ export interface OccurrenceSummary {
   projected?: true;
 }
 
+/** One service inside an office stop row (planner, round today panel). */
+export interface StopServiceRef {
+  visitId: string;
+  serviceName: string | null;
+  status: VisitStatus;
+  price: number;
+}
+
+// One row per stop (property + day + technician). `visitId` is the stop's first visit; `price` the total of its
+// services; `status` the stop's (stops.ts stopStatus).
 export interface PlannerStop {
   visitId: string;
+  stopKey: string;
+  services: StopServiceRef[];
   propertyId: string;
   propertyName: string | null;
   addressLine: string;
@@ -147,6 +160,9 @@ export interface GenerateVisitsResult {
 
 export interface TodayPanelStop {
   visitId: string;
+  stopKey: string;
+  price: number;
+  services: StopServiceRef[];
   customerName: string | null;
   addressLine: string;
   latitude: number | null;
@@ -252,8 +268,40 @@ export interface PushMissedResult {
 const visitDetailInclude = {
   property: { include: { customer: true } },
   technician: true,
+  service: { select: { name: true } },
   issues: { select: { id: true, type: true, note: true } },
 } satisfies Prisma.VisitInclude;
+
+const serviceRef = (v: { id: string; status: VisitStatus; price: Prisma.Decimal; service?: { name: string } | null }): StopServiceRef => ({
+  visitId: v.id,
+  serviceName: v.service?.name ?? null,
+  status: v.status,
+  price: v.price.toNumber(),
+});
+
+// Calendar figures for one day of visits, counted by stop: a property with several services is one stop, complete
+// once nothing in it is open. Value and issues still add up every service.
+type DayVisit = {
+  id: string;
+  createdAt: Date;
+  date: Date;
+  propertyId: string;
+  technicianId: string | null;
+  status: VisitStatus;
+  paymentHold: boolean;
+  price: Prisma.Decimal;
+  _count: { issues: number };
+};
+function stopCounts(vs: DayVisit[]) {
+  const stops = groupByStop(vs, stopKeyOf);
+  return {
+    stopCount: stops.length,
+    completedCount: stops.filter((s) => stopStatus(s.visits.map((v) => v.status)) === VisitStatus.COMPLETED).length,
+    totalValue: vs.reduce((acc, v) => acc + v.price.toNumber(), 0),
+    holdCount: stops.filter((s) => s.visits.some((v) => v.paymentHold)).length,
+    issueCount: vs.reduce((acc, v) => acc + v._count.issues, 0),
+  };
+}
 
 type VisitWithDetails = Prisma.VisitGetPayload<{ include: typeof visitDetailInclude }>;
 
@@ -765,6 +813,10 @@ class RoundService {
         date: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) },
       },
       select: {
+        id: true,
+        createdAt: true,
+        propertyId: true,
+        technicianId: true,
         date: true,
         status: true,
         paymentHold: true,
@@ -787,15 +839,10 @@ class RoundService {
       bucket.push(v);
     }
 
-    const real = Array.from(byDate.entries()).map(([date, vs]) =>
-      this.aggregateStats(date, vs.length, {
-        completedCount: vs.filter((v) => v.status === VisitStatus.COMPLETED).length,
-        totalValue: vs.reduce((acc, v) => acc + v.price.toNumber(), 0),
-        holdCount: vs.filter((v) => v.paymentHold).length,
-        issueCount: vs.reduce((acc, v) => acc + v._count.issues, 0),
-        technicians: this.dedupeTechnicians(vs, (v) => v.technician),
-      })
-    );
+    const real = Array.from(byDate.entries()).map(([date, vs]) => {
+      const { stopCount, ...counts } = stopCounts(vs);
+      return this.aggregateStats(date, stopCount, { ...counts, technicians: this.dedupeTechnicians(vs, (v) => v.technician) });
+    });
     return this.withProjection(real, (await projectOccurrences(this.prisma, [roundId], await tenantToday(this.prisma), from, to)).get(roundId));
   }
 
@@ -835,6 +882,10 @@ class RoundService {
         date: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) },
       },
       select: {
+        id: true,
+        createdAt: true,
+        propertyId: true,
+        technicianId: true,
         roundId: true,
         date: true,
         status: true,
@@ -871,15 +922,10 @@ class RoundService {
     return roundIds.map((roundId) => {
       const byDate = byRound.get(roundId);
       const real = byDate
-        ? Array.from(byDate.entries()).map(([date, vs]) =>
-            this.aggregateStats(date, vs.length, {
-              completedCount: vs.filter((v) => v.status === VisitStatus.COMPLETED).length,
-              totalValue: vs.reduce((acc, v) => acc + v.price.toNumber(), 0),
-              holdCount: vs.filter((v) => v.paymentHold).length,
-              issueCount: vs.reduce((acc, v) => acc + v._count.issues, 0),
-              technicians: this.dedupeTechnicians(vs, (v) => v.technician),
-            })
-          )
+        ? Array.from(byDate.entries()).map(([date, vs]) => {
+            const { stopCount, ...counts } = stopCounts(vs);
+            return this.aggregateStats(date, stopCount, { ...counts, technicians: this.dedupeTechnicians(vs, (v) => v.technician) });
+          })
         : [];
       return { roundId, occurrences: this.withProjection(real, projected.get(roundId)) };
     });
@@ -909,7 +955,7 @@ class RoundService {
       orderBy: { property: { addressLine: "asc" } },
     });
 
-    const stops = visits.map((v) => this.toStop(v));
+    const stops = this.toStops(visits);
     return {
       roundId: round.id,
       roundName: round.name,
@@ -950,7 +996,7 @@ class RoundService {
 
     return roundIds.map((roundId) => ({
       roundId,
-      stops: (byRound.get(roundId) ?? []).map((v) => this.toStop(v)),
+      stops: this.toStops(byRound.get(roundId) ?? []),
     }));
   }
 
@@ -998,7 +1044,28 @@ class RoundService {
     };
   }
 
-  private toStop(v: VisitWithDetails): PlannerStop {
+  // One row per stop, in the order the stops first appear (the queries sort by address, so a property's services
+  // sit together). The first-created visit leads; status, holds, issues and price cover every service.
+  private toStops(visits: VisitWithDetails[]): PlannerStop[] {
+    return groupByStop(visits, stopKeyOf).map(({ key, visits: vs }) => {
+      const status = stopStatus(vs.map((v) => v.status));
+      const completedAt = status === VisitStatus.COMPLETED
+        ? vs.map((v) => v.completedAt).filter((d): d is Date => !!d).sort((a, b) => b.getTime() - a.getTime())[0] ?? null
+        : null;
+      return {
+        ...this.toStop(vs[0]),
+        stopKey: key,
+        services: vs.map(serviceRef),
+        price: vs.reduce((acc, v) => acc + v.price.toNumber(), 0),
+        status,
+        paymentHold: vs.some((v) => v.paymentHold),
+        issues: vs.flatMap((v) => v.issues),
+        completedAt: completedAt?.toISOString() ?? null,
+      };
+    });
+  }
+
+  private toStop(v: VisitWithDetails): Omit<PlannerStop, "stopKey" | "services"> {
     return {
       visitId: v.id,
       propertyId: v.propertyId,
@@ -1094,10 +1161,13 @@ class RoundService {
           select: { addressLine: true, latitude: true, longitude: true, geocodePrecision: true, customer: { select: { name: true } } },
         },
         technician: { select: { id: true, name: true } },
+        service: { select: { name: true } },
         issues: { select: { id: true, note: true }, take: 1 },
       },
       orderBy: { property: { addressLine: "asc" } },
     });
+    // One stop per property (and technician); counts are stops.
+    const stops = groupByStop(visits, stopKeyOf).map(({ key, visits: vs }) => ({ key, vs, status: stopStatus(vs.map((v) => v.status)) }));
 
     // Primary technician: prefer IN_PROGRESS, then SCHEDULED, then any
     const primaryVisit =
@@ -1106,14 +1176,15 @@ class RoundService {
       visits[0] ??
       null;
 
-    const completed = visits.filter((v) => v.status === VisitStatus.COMPLETED).length;
-    const skipped = visits.filter((v) => v.status === VisitStatus.SKIPPED).length;
-    const inProgress = visits.filter((v) => v.status === VisitStatus.IN_PROGRESS).length;
+    const completed = stops.filter((s) => s.status === VisitStatus.COMPLETED).length;
+    const skipped = stops.filter((s) => s.status === VisitStatus.SKIPPED).length;
+    const inProgress = stops.filter((s) => s.status === VisitStatus.IN_PROGRESS).length;
+    const started = visits.some((v) => v.status !== VisitStatus.SCHEDULED);
 
     let panelStatus: "not_started" | "in_progress" | "completed";
-    if (visits.length === 0 || (completed === 0 && skipped === 0 && inProgress === 0)) {
+    if (stops.length === 0 || (completed === 0 && skipped === 0 && inProgress === 0 && !started)) {
       panelStatus = "not_started";
-    } else if (completed + skipped === visits.length) {
+    } else if (completed + skipped === stops.length) {
       panelStatus = "completed";
     } else {
       panelStatus = "in_progress";
@@ -1126,26 +1197,34 @@ class RoundService {
       technicianName: primaryVisit?.technician?.name ?? null,
       status: panelStatus,
       progress: {
-        total: visits.length,
+        total: stops.length,
         completed,
         skipped,
-        issues: visits.filter((v) => v.issues.length > 0).length,
+        issues: stops.filter((s) => s.vs.some((v) => v.issues.length > 0)).length,
       },
-      stops: visits.map((v) => ({
-        visitId: v.id,
-        customerName: v.property.customer?.name ?? null,
-        addressLine: v.property.addressLine,
-        latitude: v.property.latitude,
-        longitude: v.property.longitude,
-        geocodePrecision: v.property.geocodePrecision,
-        locationApproximate: isLocationApproximate(v.property.geocodePrecision, v.property.latitude),
-        carriedOver: v.carriedOverFromDate != null,
-        carriedOverFromDate: v.carriedOverFromDate?.toISOString().slice(0, 10) ?? null,
-        status: v.status,
-        paymentHold: v.paymentHold,
-        hasIssue: v.issues.length > 0,
-        issueFlag: v.issues[0]?.note ?? null,
-      })),
+      stops: stops.map(({ key, vs, status }) => {
+        const v = vs[0];
+        const issue = vs.flatMap((x) => x.issues)[0];
+        const carried = vs.find((x) => x.carriedOverFromDate != null);
+        return {
+          visitId: v.id,
+          stopKey: key,
+          price: vs.reduce((acc, x) => acc + x.price.toNumber(), 0),
+          services: vs.map(serviceRef),
+          customerName: v.property.customer?.name ?? null,
+          addressLine: v.property.addressLine,
+          latitude: v.property.latitude,
+          longitude: v.property.longitude,
+          geocodePrecision: v.property.geocodePrecision,
+          locationApproximate: isLocationApproximate(v.property.geocodePrecision, v.property.latitude),
+          carriedOver: !!carried,
+          carriedOverFromDate: carried?.carriedOverFromDate?.toISOString().slice(0, 10) ?? null,
+          status,
+          paymentHold: vs.some((x) => x.paymentHold),
+          hasIssue: !!issue,
+          issueFlag: issue?.note ?? null,
+        };
+      }),
     };
   }
 

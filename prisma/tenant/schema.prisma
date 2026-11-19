@@ -577,7 +577,13 @@ model Visit {
   paymentMethod PaymentMethod?
   // Wave 2B-2: the method the technician chose at completion (null = none recorded).
   collectedVia  PaymentMethod?
+  // One stop per property (2026-11-19): set on a service completed together with others at the same property; it
+  // points at the visit that carries the shared payment and invoice (the anchor). Null on the anchor itself.
+  billedWithVisitId String?
+  billedWith    Visit?         @relation("BilledWith", fields: [billedWithVisitId], references: [id], onDelete: SetNull)
+  billedTogether Visit[]       @relation("BilledWith")
   invoice       Invoice?
+  invoiceLine   InvoiceLine?
   payment       Payment?
   photos        Photo[]
   issues        Issue[]
@@ -594,6 +600,7 @@ model Visit {
   @@index([roundId, date])
   @@index([technicianId, date])
   @@index([complaintId])
+  @@index([billedWithVisitId])
 }
 
 model Complaint {
@@ -659,11 +666,31 @@ model Invoice {
   sentToCustomer Boolean       @default(false)
   sentAt         DateTime?
   paidAt         DateTime?
+  // One line per service (2026-11-19). Invoices made before then have none and render one line from `visit`.
+  lines          InvoiceLine[]
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
 
   @@index([customerId])
   @@index([status, dueDate])
+}
+
+// One service on an invoice. Amounts are stored so an invoice never changes after it is made. A visit is on at most
+// one invoice line.
+model InvoiceLine {
+  id          String   @id @default(cuid())
+  invoiceId   String
+  invoice     Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  visitId     String?  @unique
+  visit       Visit?   @relation(fields: [visitId], references: [id], onDelete: SetNull)
+  description String
+  netAmount   Decimal  @db.Decimal(10, 2)
+  vatAmount   Decimal  @db.Decimal(10, 2)
+  amount      Decimal  @db.Decimal(10, 2) // gross
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+
+  @@index([invoiceId])
 }
 
 model Payment {

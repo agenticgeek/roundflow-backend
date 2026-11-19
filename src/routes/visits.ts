@@ -7,7 +7,7 @@ import { asObject, h, requireString, requireNumber, optString, optId, optBool, o
 import { assertPositive, optPaymentMethod } from "../lib/validation";
 import { createVisitService, VisitCreateInput } from "../services/visit.service";
 import { createReportsService } from "../services/reports.service";
-import { createVisitCompletionService, parseCompletionPayment } from "../services/visit-completion";
+import { createVisitCompletionService, parseCompletionPayment, parseStopServices } from "../services/visit-completion";
 import { createVisitPhotosService } from "../services/visit-photos.service";
 import { createVisitRescheduleService } from "../services/visit-reschedule";
 import { createCarryoverService } from "../services/carryover.service";
@@ -162,10 +162,13 @@ visitsRouter.patch(
   h(async (req, res) => {
     const body = asObject(req.body);
     const payment = parseCompletionPayment(body);
+    // services?: complete the whole stop (every service at the property that day) in one go, like the app.
+    const services = parseStopServices(body);
     const result = await createVisitCompletionService(req.tenantPrisma!).completeVisit(req.params.id, {
       payment,
       actorProfileId: req.profile?.id,
       actorRole: req.profile?.role ?? undefined,
+      ...(services ? { services } : {}),
     });
     return res.json(result);
   })

@@ -3,6 +3,7 @@ import type { TenantPrismaClient } from "../../lib/tenant-prisma-manager";
 import { AppError } from "../../lib/app-error";
 import { tenantTodayRange } from "../../services/business-time";
 import { notifyAdmins } from "../../services/notify";
+import { groupByStop, isOpenVisit, stopKeyOf, stopStatus } from "../../services/stops";
 
 // Technician end-of-day sign-off. Separate from the office's POST /today/close
 // (BusinessSettings.lastClosedDate, which closes the whole business day and
@@ -12,8 +13,12 @@ import { notifyAdmins } from "../../services/notify";
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
+// One per unfinished stop (property + day + technician): `visitId` is the stop's first visit, `serviceNames` the
+// services still open there.
 export interface RemainingVisit {
   visitId: string;
+  stopKey: string;
+  serviceNames: string[];
   status: "SCHEDULED" | "IN_PROGRESS";
   customerName: string;
   addressLine: string;
@@ -36,6 +41,11 @@ export type CloseDayResult =
 const visitSelect = {
   id: true,
   status: true,
+  date: true,
+  createdAt: true,
+  propertyId: true,
+  technicianId: true,
+  service: { select: { name: true } },
   roundId: true,
   round: { select: { name: true } },
   property: { select: { addressLine: true, customer: { select: { name: true } } } },
@@ -71,21 +81,28 @@ class DayCloseService {
         where: { technicianId_date: { technicianId, date: day.key } },
       }),
     ]);
-    const remaining: RemainingVisit[] = visits
-      .filter((v) => v.status === VisitStatus.SCHEDULED || v.status === VisitStatus.IN_PROGRESS)
-      .map((v) => ({
-        visitId: v.id,
-        status: v.status as "SCHEDULED" | "IN_PROGRESS",
-        customerName: v.property.customer.name,
-        addressLine: v.property.addressLine,
-        roundName: v.round?.name ?? null,
-      }));
+    // Counted by stop: a property with several services is one door to finish.
+    const stops = groupByStop(visits, stopKeyOf).map((s) => ({ ...s, status: stopStatus(s.visits.map((v) => v.status)) }));
+    const remaining: RemainingVisit[] = stops
+      .filter((s) => isOpenVisit(s.status))
+      .map((s) => {
+        const lead = s.visits[0];
+        return {
+          visitId: lead.id,
+          stopKey: s.key,
+          serviceNames: s.visits.filter((v) => isOpenVisit(v.status)).map((v) => v.service?.name ?? "Window clean"),
+          status: s.status as "SCHEDULED" | "IN_PROGRESS",
+          customerName: lead.property.customer.name,
+          addressLine: lead.property.addressLine,
+          roundName: lead.round?.name ?? null,
+        };
+      });
     return {
       date: day.key,
       closed: closed !== null,
       closedAt: closed?.closedAt ?? null,
-      completedCount: closed?.completedCount ?? visits.filter((v) => v.status === VisitStatus.COMPLETED).length,
-      skippedCount: closed?.skippedCount ?? visits.filter((v) => v.status === VisitStatus.SKIPPED).length,
+      completedCount: closed?.completedCount ?? stops.filter((s) => s.status === VisitStatus.COMPLETED).length,
+      skippedCount: closed?.skippedCount ?? stops.filter((s) => s.status === VisitStatus.SKIPPED).length,
       remaining,
     };
   }

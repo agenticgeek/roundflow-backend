@@ -4,7 +4,7 @@ import { forEachTenant } from "../lib/tenant-jobs";
 import { syncCustomerToGhl, applyGhlTags, applyGhlCustomFields } from "../integrations/ghl/sync";
 import { computeBalanceOwed } from "../services/payment.service";
 import { createMessageService } from "../services/message.service";
-import { FALLBACK_BODIES, TEMPLATE_NAMES, loadTemplate, renderTemplate } from "../services/message-templates";
+import { FALLBACK_BODIES, TEMPLATE_NAMES, loadTemplate, renderTemplate, serviceList } from "../services/message-templates";
 import { VisitStatus } from "../generated/tenant-client";
 import { INVOICE_SEND_EVENT, processInvoiceSendRow } from "../services/invoice-send-batch.service";
 import { OUTBOX_MAX_ATTEMPTS, outboxBackoffMs } from "../lib/outbox-backoff";
@@ -16,6 +16,8 @@ const BATCH = 20;
 type Payload = {
   customerId?: string;
   visitId?: string;
+  // A stop (several services at one property): every visit the message covers. visitId is the first of them.
+  visitIds?: string[];
   nextCleanDate?: string;
   // message.send (pre-clean reminders): body is already rendered by the producer.
   channel?: string;
@@ -63,7 +65,11 @@ async function isOptedOut(tp: TenantPrismaClient, customerId: string): Promise<b
 async function sendQueuedMessage(tp: TenantPrismaClient, customerId: string, payload: Payload): Promise<string | void> {
   if (!payload.body) throw new Error("payload missing body");
   if (await isOptedOut(tp, customerId)) return;
-  if (payload.visitId) {
+  if (payload.visitIds?.length) {
+    // A stop's reminder still holds while any of its services is booked.
+    const visits = await tp.visit.findMany({ where: { id: { in: payload.visitIds } }, select: { status: true } });
+    if (!visits.some((v) => v.status === VisitStatus.SCHEDULED)) return;
+  } else if (payload.visitId) {
     const visit = await tp.visit.findUnique({ where: { id: payload.visitId }, select: { status: true } });
     if (!visit || visit.status !== VisitStatus.SCHEDULED) return;
   }
@@ -101,7 +107,14 @@ async function sendVisitCompletedMessage(tp: TenantPrismaClient, customerId: str
     FALLBACK_BODIES.VISIT_COMPLETED
   );
   const customerName = visit.property.customer.name;
+  // {{services}}: every service done at the property in this visit (one message per stop).
+  const done = await tp.visit.findMany({
+    where: { id: { in: payload.visitIds?.length ? payload.visitIds : [payload.visitId!] } },
+    select: { service: { select: { name: true } } },
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+  });
   const body = renderTemplate(template.body, {
+    services: serviceList(done.map((v) => v.service?.name)),
     customerName,
     firstName: customerName.split(" ")[0],
     address: visit.property.addressLine,

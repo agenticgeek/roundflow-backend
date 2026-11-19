@@ -19,7 +19,7 @@ export const FALLBACK_BODIES = {
   PAYMENT_LINK: "Hi {{firstName}}, you can pay invoice {{invoiceNumber}} ({{amount}}) online here: {{paymentLink}}",
   PAYMENT_REMINDER: "Hi {{firstName}}, our records show invoice {{invoiceNumber}} ({{amount}}) is unpaid. Please make payment at your earliest convenience.",
   INVOICE: "Hi {{firstName}}, your invoice {{invoiceNumber}} for {{amount}} is ready. Payment is due by {{dueDate}}. Thank you, {{businessName}}.",
-  VISIT_COMPLETED: "Hi {{firstName}}, your window clean at {{address}} was completed today. Thank you, {{businessName}}.",
+  VISIT_COMPLETED: "Hi {{firstName}}, your {{services}} at {{address}} was completed today. Thank you, {{businessName}}.",
   WEATHER_HOLD: "Hi {{firstName}}, due to {{condition}} we've had to postpone your window clean at {{address}}. Your new date is {{newDate}}. Thanks for understanding, {{businessName}}.",
   // Used instead when the office will pick the new date later (no date to give).
   WEATHER_HOLD_TBC: "Hi {{firstName}}, due to {{condition}} we've had to postpone your window clean at {{address}}. We'll be in touch shortly with a new date. Thanks for understanding, {{businessName}}.",
@@ -27,6 +27,16 @@ export const FALLBACK_BODIES = {
 } as const;
 
 export type TemplateVars = Record<string, string>;
+
+/**
+ * {{services}}: the services done (or booked) at a property, lower-cased and joined as "window clean, gutter clear
+ * and fascia". Repeats and blanks dropped; "window clean" when there are none.
+ */
+export function serviceList(names: ReadonlyArray<string | null | undefined>): string {
+  const list = [...new Set(names.map((n) => n?.trim().toLowerCase()).filter((n): n is string => !!n))];
+  if (list.length === 0) return "window clean";
+  return list.length === 1 ? list[0] : `${list.slice(0, -1).join(", ")} and ${list[list.length - 1]}`;
+}
 
 // C5: every {{variable}} a template may use — the union of what the senders
 // actually supply: invoiceTemplateVars() (invoice/payment-link/reminder sends),
@@ -46,6 +56,7 @@ export const TEMPLATE_VARIABLES = [
   "newDate",
   "paymentLink",
   "roundName",
+  "services",
   "technicianName",
 ] as const;
 

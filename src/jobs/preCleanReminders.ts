@@ -1,7 +1,8 @@
 import { prisma } from "../lib/prisma";
 import { getTenantPrismaForSchema, type TenantPrismaClient } from "../lib/tenant-prisma-manager";
 import { DEFAULT_TIMEZONE, resolveTimeZone, localDateTime } from "../lib/dates";
-import { canonicalPlaceholder } from "../services/message-templates";
+import { canonicalPlaceholder, serviceList } from "../services/message-templates";
+import { groupByStop, stopKeyOf } from "../services/stops";
 import { parseStoredReminders } from "../lib/settings-validators";
 import { LifecycleStatus, MessageChannel, ReminderMode, VisitStatus } from "../generated/tenant-client";
 
@@ -22,7 +23,7 @@ import { LifecycleStatus, MessageChannel, ReminderMode, VisitStatus } from "../g
 export { DEFAULT_TIMEZONE, resolveTimeZone, localDateTime };
 export const REMINDER_TEMPLATE_NAMES = ["Pre-clean reminder", "Appointment Reminder"];
 export const DEFAULT_REMINDER_BODY =
-  "Hi {{customerName}}, this is a reminder that your window clean is booked for {{date}}.";
+  "Hi {{customerName}}, this is a reminder that your {{services}} is booked for {{date}}.";
 
 export function isPreCleanRemindersEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env.PRECLEAN_REMINDERS_ENABLED === "true";
@@ -48,7 +49,7 @@ export function reminderTargetDay(input: {
  *  seeded [Customer Name] style); any other {{variable}} renders empty. */
 export function renderReminder(
   body: string,
-  vars: { customerName: string; date: string; address: string; businessName: string }
+  vars: { customerName: string; date: string; address: string; businessName: string; services?: string }
 ): string {
   return body
     .replace(/\[Customer Name\]/gi, vars.customerName)
@@ -56,7 +57,9 @@ export function renderReminder(
     .replace(/\[Address\]/gi, vars.address)
     .replace(/\{\{\s*(\w+)\s*\}\}/g, (_m, raw: string) => {
       const key = canonicalPlaceholder(raw); // legacy snake_case tokens still render
-      return key in vars ? vars[key as keyof typeof vars] : "";
+      if (key === "services") return vars.services ?? "window clean";
+      const value = vars[key as keyof typeof vars];
+      return typeof value === "string" ? value : "";
     });
 }
 
@@ -102,6 +105,10 @@ export async function runTenantPreCleanReminders(tp: TenantPrismaClient, now: Da
       select: {
         id: true,
         date: true,
+        createdAt: true,
+        propertyId: true,
+        technicianId: true,
+        service: { select: { name: true } },
         property: {
           select: {
             addressLine: true,
@@ -111,6 +118,8 @@ export async function runTenantPreCleanReminders(tp: TenantPrismaClient, now: Da
       },
     });
     if (visits.length === 0) continue;
+    // One reminder per stop (property + day + technician), naming its services.
+    const stops = groupByStop(visits, stopKeyOf);
 
     if (template === undefined) {
       template = await tp.messageTemplate.findFirst({
@@ -119,7 +128,9 @@ export async function runTenantPreCleanReminders(tp: TenantPrismaClient, now: Da
       });
     }
 
-    for (const visit of visits) {
+    for (const { visits: stop } of stops) {
+      const visit = stop[0];
+      const ids = stop.map((v) => v.id);
       const customer = visit.property.customer;
       const channel = pickChannel(template?.channel ?? null, customer.phone, customer.email);
       if (!channel) continue; // no way to reach them; left unstamped so a later contact detail still gets it
@@ -129,14 +140,16 @@ export async function runTenantPreCleanReminders(tp: TenantPrismaClient, now: Da
         date: visit.date.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", timeZone: "UTC" }),
         address: visit.property.addressLine,
         businessName: bs.businessName ?? "",
+        services: serviceList(stop.map((v) => v.service?.name)),
       });
 
       // Stamp + enqueue atomically; the conditional per-type stamp means an
       // overlapping run can't double-send, and a second reminder type for the
       // same visit is still allowed. Same outbox row shape as queueGhlEvent().
+      // Every visit in the stop is stamped, so no service gets its own reminder.
       const sent = await tp.$transaction(async (tx) => {
         const claimed = await tx.visit.updateMany({
-          where: { id: visit.id, NOT: { reminderSentTypes: { has: reminder.type } } },
+          where: { id: { in: ids }, NOT: { reminderSentTypes: { has: reminder.type } } },
           data: { reminderSentAt: now, reminderSentTypes: { push: reminder.type } },
         });
         if (claimed.count === 0) return false;
@@ -146,6 +159,7 @@ export async function runTenantPreCleanReminders(tp: TenantPrismaClient, now: Da
             payload: {
               customerId: customer.id,
               visitId: visit.id,
+              visitIds: ids,
               channel,
               body,
               templateId: template?.id ?? null,

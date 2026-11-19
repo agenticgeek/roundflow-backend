@@ -8,7 +8,7 @@ function makePrisma() {
   const prisma = {
     customer: { findUnique: vi.fn().mockResolvedValue({ id: "cust-1" }) },
     invoice: { findMany: vi.fn(), findUnique: vi.fn(), create: vi.fn(), update: vi.fn() },
-    visit: { findUnique: vi.fn() },
+    visit: { findUnique: vi.fn(), findMany: vi.fn().mockResolvedValue([]) },
     businessSettings: { findFirst: vi.fn() },
     $executeRaw: vi.fn(),
     $transaction: vi.fn(),

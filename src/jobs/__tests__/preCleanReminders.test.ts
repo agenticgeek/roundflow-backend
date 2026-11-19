@@ -48,6 +48,10 @@ function makeTp(opts: {
 const visit = (id: string, customer: Partial<{ phone: string | null; email: string | null }> = {}) => ({
   id,
   date: d("2026-10-31"),
+  createdAt: d("2026-10-01"),
+  propertyId: `p-${id}`,
+  technicianId: null,
+  service: null,
   property: {
     addressLine: "1 High St",
     customer: { id: `c-${id}`, name: "Jo Bloggs", phone: "07700900201", email: null, ...customer },
@@ -109,14 +113,14 @@ it("queues one reminder per eligible visit tomorrow and stamps reminderSentAt", 
     },
   }));
   expect(tp.tx.visit.updateMany).toHaveBeenCalledWith({
-    where: { id: "v1", NOT: { reminderSentTypes: { has: "EVENING_BEFORE" } } },
+    where: { id: { in: ["v1"] }, NOT: { reminderSentTypes: { has: "EVENING_BEFORE" } } },
     data: { reminderSentAt: now, reminderSentTypes: { push: "EVENING_BEFORE" } },
   });
   expect(tp.tx.integrationOutbox.create).toHaveBeenNthCalledWith(1, {
     data: {
       eventType: "message.send",
       payload: {
-        customerId: "c-v1", visitId: "v1", channel: "SMS",
+        customerId: "c-v1", visitId: "v1", visitIds: ["v1"], channel: "SMS",
         body: "Hi Jo Bloggs, see you Saturday 31 October", templateId: "tpl1", reason: "PRE_CLEAN_REMINDER", reminderType: "EVENING_BEFORE",
       },
     },
@@ -145,7 +149,7 @@ it("an EMAIL template falls back to SMS when there is no email; default body whe
   expect(tp3.tx.integrationOutbox.create.mock.calls[0][0].data.payload).toMatchObject({
     channel: "SMS",
     templateId: null,
-    body: DEFAULT_REMINDER_BODY.replace("{{customerName}}", "Jo Bloggs").replace("{{date}}", "Saturday 31 October"),
+    body: DEFAULT_REMINDER_BODY.replace("{{customerName}}", "Jo Bloggs").replace("{{services}}", "window clean").replace("{{date}}", "Saturday 31 October"),
   });
 });
 

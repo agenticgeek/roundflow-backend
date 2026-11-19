@@ -16,7 +16,7 @@ const data: InvoiceRenderData = {
   status: "DRAFT",
   currency: "£",
   customer: { name: '<script>alert(1)</script>', addressLine: "1 St", postcode: null, email: null, phone: null },
-  lineItems: [{ description: "Clean", technicianName: null, amount: 10 }],
+  lineItems: [{ description: "Clean", technicianName: null, amount: 10, visitId: null, date: null }],
   subtotal: 10,
   vatAmount: 0,
   total: 10,
@@ -30,7 +30,7 @@ const full: InvoiceRenderData = {
   dueDate: "2026-01-08",
   vatAmount: 2,
   customer: { name: "Pat", addressLine: "2 Rd", postcode: "AB1 2CD", email: "p@x.test", phone: "07000" },
-  lineItems: [{ description: "Clean", technicianName: "Tom", amount: 8 }],
+  lineItems: [{ description: "Clean", technicianName: "Tom", amount: 8, visitId: null, date: null }],
   business: {
     name: "Shine Ltd",
     email: "hello@shine.test",
