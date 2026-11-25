@@ -4,6 +4,7 @@ const tenantToday = vi.fn();
 vi.mock("../business-time", () => ({ tenantToday: (...a: unknown[]) => tenantToday(...a) }));
 
 import { createRoundDeleteService } from "../round-delete.service";
+import { Prisma } from "../../generated/tenant-client";
 
 const TODAY = new Date("2026-11-25T00:00:00.000Z");
 const YESTERDAY = new Date("2026-11-24T00:00:00.000Z");
@@ -30,6 +31,7 @@ interface State {
   chatMessages: { id: string; roundId: string; visitId: string | null }[];
   chatReads: { profileId: string; roundId: string }[];
   outbox: { id: string; status: string; eventType: string; payload: { visitId?: string } }[];
+  closures: { id: string; roundIds: string[]; endDate: Date; updatedAt: Date }[];
 }
 
 type Where = Record<string, any>;
@@ -98,6 +100,15 @@ function makeDb(s: State) {
         return { count: before - s.chatReads.length };
       }),
     },
+    businessClosure: {
+      findMany: vi.fn(async ({ where }: any) =>
+        s.closures.filter((c) => c.roundIds.includes(where.roundIds.has)).map((c) => ({ ...c, roundIds: [...c.roundIds] }))
+      ),
+      update: vi.fn(async ({ where, data }: any) => Object.assign(s.closures.find((c) => c.id === where.id)!, data)),
+      delete: vi.fn(async ({ where }: any) => {
+        s.closures = s.closures.filter((c) => c.id !== where.id);
+      }),
+    },
     integrationOutbox: {
       updateMany: vi.fn(async ({ where, data }: any) => {
         const ids: string[] = where.OR.map((o: any) => o.payload.equals);
@@ -141,6 +152,7 @@ function baseState(): State {
     emergencies: [],
     chatMessages: [{ id: "c1", roundId: "r1", visitId: null }, { id: "c2", roundId: "r2", visitId: "v-other-round" }],
     chatReads: [{ profileId: "u1", roundId: "r1" }, { profileId: "u1", roundId: "r2" }],
+    closures: [],
     outbox: [
       { id: "o1", status: "pending", eventType: "message.send", payload: { visitId: "v-today" } },
       { id: "o2", status: "pending", eventType: "message.send", payload: { visitId: "v-other-round" } },
@@ -166,6 +178,8 @@ describe("preview", () => {
       emergencyCount: 0,
       attachedVisitCount: 0,
       canDelete: true,
+      closuresToRemove: 0,
+      closuresToUpdate: 0,
     });
   });
 
@@ -236,7 +250,7 @@ describe("deleteRound", () => {
     const prisma = makePrisma(db, { txOnly: true });
     const res = await createRoundDeleteService(prisma).deleteRound("r1");
 
-    expect(res).toEqual({ roundName: "Monday North", deleted: true, unassignedProperties: 2, deletedVisits: 2, detachedVisits: 5 });
+    expect(res).toEqual({ roundName: "Monday North", deleted: true, unassignedProperties: 2, deletedVisits: 2, detachedVisits: 5, removedClosures: 0, updatedClosures: 0 });
     expect((prisma as any).$transaction).toHaveBeenCalledTimes(1);
 
     // Round gone (its chat messages cascade), the other round untouched.
@@ -289,7 +303,7 @@ describe("deleteRound", () => {
     s.visits = s.visits.filter((v) => v.roundId !== "r1");
     const db = makeDb(s);
     const res = await createRoundDeleteService(makePrisma(db)).deleteRound("r1");
-    expect(res).toEqual({ roundName: "Monday North", deleted: true, unassignedProperties: 0, deletedVisits: 0, detachedVisits: 0 });
+    expect(res).toEqual({ roundName: "Monday North", deleted: true, unassignedProperties: 0, deletedVisits: 0, detachedVisits: 0, removedClosures: 0, updatedClosures: 0 });
     expect(db.integrationOutbox.updateMany).not.toHaveBeenCalled();
     expect(s.rounds.map((r) => r.id)).toEqual(["r2"]);
   });
@@ -352,5 +366,95 @@ describe("deleteRound", () => {
     await expect(createRoundDeleteService(prisma).deleteRound("r1"))
       .rejects.toMatchObject({ statusCode: 409, code: "ROUND_HAS_EMERGENCIES" });
     expect(db.round.delete).not.toHaveBeenCalled();
+  });
+});
+
+describe("closures that name the round", () => {
+  const OLD = new Date("2026-11-01T00:00:00.000Z");
+  function withClosures() {
+    const s = baseState();
+    s.closures = [
+      { id: "shared", roundIds: ["r1", "r2"], endDate: TOMORROW, updatedAt: OLD },
+      { id: "shared-past", roundIds: ["r2", "r1"], endDate: YESTERDAY, updatedAt: OLD },
+      { id: "only-future", roundIds: ["r1"], endDate: TOMORROW, updatedAt: OLD },
+      { id: "only-today", roundIds: ["r1"], endDate: TODAY, updatedAt: OLD },
+      { id: "only-past", roundIds: ["r1"], endDate: YESTERDAY, updatedAt: OLD },
+      { id: "all-rounds", roundIds: [], endDate: TOMORROW, updatedAt: OLD },
+      { id: "other-round", roundIds: ["r2"], endDate: TOMORROW, updatedAt: OLD },
+    ];
+    return s;
+  }
+
+  it("preview counts closures to delete (only this round, not ended) and to update (other rounds remain)", async () => {
+    const res = await createRoundDeleteService(makePrisma(makeDb(withClosures()))).preview("r1");
+    expect(res).toMatchObject({ closuresToRemove: 2, closuresToUpdate: 2, canDelete: true });
+  });
+
+  it("delete drops the round's id, deletes single-round closures not yet ended, keeps ended ones as history", async () => {
+    const s = withClosures();
+    const db = makeDb(s);
+    const res = await createRoundDeleteService(makePrisma(db, { txOnly: true })).deleteRound("r1");
+    expect(res).toMatchObject({ removedClosures: 2, updatedClosures: 2 });
+    const byId = Object.fromEntries(s.closures.map((c) => [c.id, c]));
+    expect(Object.keys(byId).sort()).toEqual(["all-rounds", "only-past", "other-round", "shared", "shared-past"]);
+    expect(byId["shared"].roundIds).toEqual(["r2"]);
+    expect(byId["shared-past"].roundIds).toEqual(["r2"]);
+    // Never widened to "all rounds": the ended single-round closure keeps its (now stale) id.
+    expect(byId["only-past"].roundIds).toEqual(["r1"]);
+    expect(byId["all-rounds"].roundIds).toEqual([]);
+    expect(byId["other-round"].roundIds).toEqual(["r2"]);
+    // The system edit keeps updatedAt, so an applied closure does not read as "edited after apply".
+    expect(db.businessClosure.update).toHaveBeenCalledWith({ where: { id: "shared" }, data: { roundIds: ["r2"], updatedAt: OLD } });
+  });
+
+  it("changes no closure when the delete is blocked", async () => {
+    const s = withClosures();
+    s.emergencies.push({ id: "e1", roundId: "r1" });
+    const db = makeDb(s);
+    await expect(createRoundDeleteService(makePrisma(db)).deleteRound("r1")).rejects.toMatchObject({ statusCode: 409 });
+    expect(db.businessClosure.update).not.toHaveBeenCalled();
+    expect(db.businessClosure.delete).not.toHaveBeenCalled();
+  });
+});
+
+describe("foreign-key race (a blocker added while the transaction runs)", () => {
+  const fkError = () => new Prisma.PrismaClientKnownRequestError("Foreign key constraint violated", { code: "P2003", clientVersion: "test" });
+
+  // The tx sees a clean round, then a write fails on a FK because another request committed a blocker meanwhile;
+  // the transaction rolls back and the blocker is visible afterwards.
+  function racing(addBlocker: (s: State) => void) {
+    const s = baseState();
+    const db = makeDb(s);
+    db.round.delete.mockImplementationOnce(async () => {
+      addBlocker(s);
+      throw fkError();
+    });
+    return makePrisma(db);
+  }
+
+  it("answers 409 ROUND_HAS_EMERGENCIES instead of a 500", async () => {
+    const prisma = racing((s) => s.emergencies.push({ id: "late", roundId: "r1" }));
+    const err = await createRoundDeleteService(prisma).deleteRound("r1").catch((e) => e);
+    expect(err).toMatchObject({ statusCode: 409, code: "ROUND_HAS_EMERGENCIES" });
+    expect(err.message).toMatch(/1 emergency record/);
+  });
+
+  it("answers 409 ROUND_HAS_ATTACHED_VISITS instead of a 500", async () => {
+    const prisma = racing((s) => {
+      s.visits.push({ id: "v-late", roundId: "r1", status: "SCHEDULED", date: TOMORROW, issues: 1 });
+    });
+    const err = await createRoundDeleteService(prisma).deleteRound("r1").catch((e) => e);
+    expect(err).toMatchObject({ statusCode: 409, code: "ROUND_HAS_ATTACHED_VISITS" });
+  });
+
+  it("rethrows the FK error when no blocker can be found afterwards", async () => {
+    const prisma = racing(() => undefined);
+    await expect(createRoundDeleteService(prisma).deleteRound("r1")).rejects.toMatchObject({ code: "P2003" });
+  });
+
+  it("rethrows other errors untouched", async () => {
+    const db = makeDb(baseState());
+    db.round.delete.mockRejectedValueOnce(new Error("boom"));
+    await expect(createRoundDeleteService(makePrisma(db)).deleteRound("r1")).rejects.toThrow("boom");
   });
 });

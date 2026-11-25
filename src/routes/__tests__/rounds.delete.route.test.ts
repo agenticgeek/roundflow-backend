@@ -35,7 +35,7 @@ beforeEach(() => vi.clearAllMocks());
 
 describe("GET /rounds/:id/delete-preview", () => {
   it("returns the service's preview", async () => {
-    const body = { propertyCount: 4, upcomingVisitCount: 3, detachedVisitCount: 9, emergencyCount: 0, attachedVisitCount: 0, canDelete: true };
+    const body = { propertyCount: 4, upcomingVisitCount: 3, detachedVisitCount: 9, emergencyCount: 0, attachedVisitCount: 0, canDelete: true, closuresToRemove: 1, closuresToUpdate: 2 };
     preview.mockResolvedValue(body);
     const res = await request(makeApp()).get("/rounds/r1/delete-preview");
     expect(res.status).toBe(200);
@@ -58,10 +58,12 @@ describe("GET /rounds/:id/delete-preview", () => {
 
 describe("DELETE /rounds/:id", () => {
   it("deletes, answers with the counts only and logs ROUND_DELETED with the round name and actor", async () => {
-    deleteRound.mockResolvedValue({ roundName: "Monday North", deleted: true, unassignedProperties: 4, deletedVisits: 3, detachedVisits: 9 });
+    deleteRound.mockResolvedValue({
+      roundName: "Monday North", deleted: true, unassignedProperties: 4, deletedVisits: 3, detachedVisits: 9, removedClosures: 1, updatedClosures: 2,
+    });
     const res = await request(makeApp()).delete("/rounds/r1");
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ deleted: true, unassignedProperties: 4, deletedVisits: 3, detachedVisits: 9 });
+    expect(res.body).toEqual({ deleted: true, unassignedProperties: 4, deletedVisits: 3, detachedVisits: 9, removedClosures: 1, updatedClosures: 2 });
     expect(deleteRound).toHaveBeenCalledWith("r1");
     expect(logActivity).toHaveBeenCalledTimes(1);
     const [type, message, actorId, actorRole] = logActivity.mock.calls[0];

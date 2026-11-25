@@ -1896,7 +1896,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
 
   RoundDeletePreview: {
     type: "object",
-    required: ["propertyCount", "upcomingVisitCount", "detachedVisitCount", "emergencyCount", "attachedVisitCount", "canDelete"],
+    required: ["propertyCount", "upcomingVisitCount", "detachedVisitCount", "emergencyCount", "attachedVisitCount", "canDelete", "closuresToRemove", "closuresToUpdate"],
     properties: {
       propertyCount: { type: "integer", description: "Properties that will be unassigned." },
       upcomingVisitCount: { type: "integer", description: "SCHEDULED/SKIPPED visits dated today or later; they will be deleted." },
@@ -1904,20 +1904,24 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       emergencyCount: { type: "integer", description: "Technician emergencies referencing the round; any blocks the delete." },
       attachedVisitCount: { type: "integer", description: "Upcoming visits with an invoice, invoice line, payment, photo, issue, technician incident or chat message; any blocks the delete." },
       canDelete: { type: "boolean" },
+      closuresToRemove: { type: "integer", description: "Closures that cover only this round and have not ended; they will be deleted." },
+      closuresToUpdate: { type: "integer", description: "Closures that also cover other rounds; they will just lose this round." },
     },
-    example: { propertyCount: 42, upcomingVisitCount: 40, detachedVisitCount: 310, emergencyCount: 0, attachedVisitCount: 0, canDelete: true },
+    example: { propertyCount: 42, upcomingVisitCount: 40, detachedVisitCount: 310, emergencyCount: 0, attachedVisitCount: 0, canDelete: true, closuresToRemove: 1, closuresToUpdate: 0 },
   },
 
   RoundDeleteResult: {
     type: "object",
-    required: ["deleted", "unassignedProperties", "deletedVisits", "detachedVisits"],
+    required: ["deleted", "unassignedProperties", "deletedVisits", "detachedVisits", "removedClosures", "updatedClosures"],
     properties: {
       deleted: { type: "boolean", enum: [true] },
       unassignedProperties: { type: "integer" },
       deletedVisits: { type: "integer" },
       detachedVisits: { type: "integer" },
+      removedClosures: { type: "integer", description: "Closures deleted (they covered only this round and had not ended)." },
+      updatedClosures: { type: "integer", description: "Closures that lost this round from roundIds." },
     },
-    example: { deleted: true, unassignedProperties: 42, deletedVisits: 40, detachedVisits: 310 },
+    example: { deleted: true, unassignedProperties: 42, deletedVisits: 40, detachedVisits: 310, removedClosures: 1, updatedClosures: 0 },
   },
 
   WeatherHoldPreview: {
@@ -6947,8 +6951,9 @@ const paths: OpenAPIV3.PathsObject = {
       summary: "Delete a round",
       description:
         "Runs in one transaction. The round's SCHEDULED/SKIPPED visits dated today (tenant-local) or later are deleted and their queued customer messages cancelled; every other visit of the round (completed, in progress, cancelled, older unfinished) is kept as history with `roundId` null. " +
-        "The round's properties are unassigned (`roundId` and the round's technician split cleared); customers' service plans stay ACTIVE and untouched. RoundTechnician and round chat messages are removed with the round. Writes a ROUND_DELETED activity-log entry. " +
-        "409 ROUND_HAS_EMERGENCIES while any technician emergency references the round; 409 ROUND_HAS_ATTACHED_VISITS when any upcoming visit has an invoice, invoice line, payment, photo, issue, technician incident or chat message — nothing is changed. Call GET /rounds/{id}/delete-preview first to show the counts.",
+        "The round's properties are unassigned (`roundId` and the round's technician split cleared); customers' service plans stay ACTIVE and untouched. RoundTechnician and round chat messages are removed with the round. " +
+        "Business closures naming the round lose its id; a closure that named only this round is deleted if it has not ended (end date today or later) and kept unchanged as history if it has, so it never widens to all rounds. Writes a ROUND_DELETED activity-log entry. " +
+        "409 ROUND_HAS_EMERGENCIES while any technician emergency references the round; 409 ROUND_HAS_ATTACHED_VISITS when any upcoming visit has an invoice, invoice line, payment, photo, issue, technician incident or chat message — nothing is changed. The same 409s are returned if such a record is added while the delete is running. Call GET /rounds/{id}/delete-preview first to show the counts.",
       responses: {
         "200": jsonResponse("Round deleted.", ref("RoundDeleteResult")),
         "401": ERR[401],
