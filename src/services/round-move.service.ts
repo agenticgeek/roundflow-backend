@@ -14,6 +14,7 @@ import { technicianIdsUnavailableOn } from "./visit-assignment";
 import { notifyVisitTechnicians } from "./notify";
 import { createMessageService } from "./message.service";
 import { formatTemplateDate } from "./message-templates";
+import { isWorkingDay } from "../lib/working-days";
 
 // Move a round date (Round Planner, plan 2026-11-25 branch 4). Every property on the date moves; no partial moves.
 // - A REAL date (the round has SCHEDULED/SKIPPED visits on it, today or later): those visits are rebooked onto the new
@@ -44,6 +45,8 @@ export interface MoveCheck {
   code: MoveErrorCode | null;
   message: string | null;
   clashCount: number;
+  /** Non-blocking: set when toDate is not one of the tenant's working days (ok is unaffected). */
+  warning: string | null;
 }
 
 export interface BlockedDate {
@@ -59,6 +62,8 @@ export interface MovePreview {
   earliestDate: string;
   latestDate: string;
   blockedDates: BlockedDate[];
+  /** Days inside [earliestDate, latestDate] that are not working days: allowed, with a warning. */
+  nonWorkingDates: string[];
   check: MoveCheck | null;
 }
 
@@ -78,6 +83,7 @@ export interface MoveResult {
   createdVisits: number;
   notifiedCustomers: number;
   customerNotificationError: string | null;
+  warning: string | null;
 }
 
 const DAY_MS = 86_400_000;
@@ -349,6 +355,23 @@ export function createRoundMoveService(prisma: TenantPrismaClient) {
     return null;
   }
 
+  // The working days generation uses (BusinessSettings.defaultWorkingDays; none configured = Mon-Fri).
+  const nonWorking = (o: Occurrence, day: Date) => !isWorkingDay(day, { workingDays: o.workingDays, tz: "UTC" });
+
+  /** The non-blocking warning for `toDate` (moving onto a non-working day is allowed). */
+  function warningFor(o: Occurrence, toInput: Date): string | null {
+    const day = startOfUtcDay(toInput);
+    if (!nonWorking(o, day)) return null;
+    const label = day.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "short", timeZone: "UTC" });
+    return `${label} is not a working day.`;
+  }
+
+  function nonWorkingDates(o: Occurrence): string[] {
+    const out: string[] = [];
+    for (let day = o.earliest; day <= o.latest; day = addDays(day, 1)) if (nonWorking(o, day)) out.push(iso(day));
+    return out;
+  }
+
   function blockedDates(o: Occurrence): BlockedDate[] {
     const out: BlockedDate[] = [];
     for (let day = o.earliest; day <= o.latest; day = addDays(day, 1)) {
@@ -391,7 +414,10 @@ export function createRoundMoveService(prisma: TenantPrismaClient) {
       let check: MoveCheck | null = null;
       if (toDate) {
         const f = validate(o, toDate);
-        check = { toDate: iso(startOfUtcDay(toDate)), ok: !f, code: f?.code ?? null, message: f?.message ?? null, clashCount: f?.clashCount ?? 0 };
+        check = {
+          toDate: iso(startOfUtcDay(toDate)), ok: !f, code: f?.code ?? null, message: f?.message ?? null, clashCount: f?.clashCount ?? 0,
+          warning: warningFor(o, toDate),
+        };
       }
       return {
         fromDate: iso(o.fromDate),
@@ -400,6 +426,7 @@ export function createRoundMoveService(prisma: TenantPrismaClient) {
         earliestDate: iso(o.earliest),
         latestDate: iso(o.latest),
         blockedDates: blockedDates(o),
+        nonWorkingDates: nonWorkingDates(o),
         check,
       };
     },
@@ -484,6 +511,7 @@ export function createRoundMoveService(prisma: TenantPrismaClient) {
         createdVisits,
         notifiedCustomers: sent.notified,
         customerNotificationError: sent.error,
+        warning: warningFor(o, toDate),
       };
     },
   };

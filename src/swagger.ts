@@ -1938,7 +1938,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
 
   MoveOccurrenceCheck: {
     type: "object",
-    required: ["toDate", "ok", "code", "message", "clashCount"],
+    required: ["toDate", "ok", "code", "message", "clashCount", "warning"],
     properties: {
       toDate: { type: "string", format: "date" },
       ok: { type: "boolean" },
@@ -1950,12 +1950,13 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       },
       message: { type: "string", nullable: true },
       clashCount: { type: "integer", description: "Properties that would get two cleans too close together (PROPERTY_CLEAN_CLASH)." },
+      warning: { type: "string", nullable: true, description: "Non-blocking, e.g. \"Saturday 6 Dec is not a working day.\"; does not affect ok." },
     },
   },
 
   MoveOccurrencePreview: {
     type: "object",
-    required: ["fromDate", "kind", "propertyCount", "earliestDate", "latestDate", "blockedDates", "check"],
+    required: ["fromDate", "kind", "propertyCount", "earliestDate", "latestDate", "blockedDates", "nonWorkingDates", "check"],
     properties: {
       fromDate: { type: "string", format: "date" },
       kind: { type: "string", enum: ["REAL", "FORECAST"] },
@@ -1974,13 +1975,18 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
           },
         },
       },
+      nonWorkingDates: {
+        type: "array",
+        items: { type: "string", format: "date" },
+        description: "Days in the window that are not tenant working days: allowed, with a warning.",
+      },
       check: { allOf: [ref("MoveOccurrenceCheck")], nullable: true, description: "Only when toDate was given." },
     },
   },
 
   MoveOccurrenceResult: {
     type: "object",
-    required: ["fromDate", "toDate", "kind", "movedVisits", "createdVisits", "notifiedCustomers", "customerNotificationError"],
+    required: ["fromDate", "toDate", "kind", "movedVisits", "createdVisits", "notifiedCustomers", "customerNotificationError", "warning"],
     properties: {
       fromDate: { type: "string", format: "date" },
       toDate: { type: "string", format: "date" },
@@ -1989,6 +1995,7 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
       createdVisits: { type: "integer", description: "FORECAST: visits created on toDate (plans' nextDueDate advanced one cycle from the original date)." },
       notifiedCustomers: { type: "integer" },
       customerNotificationError: { type: "string", nullable: true, description: "Set when some customer messages failed; the move itself is done." },
+      warning: { type: "string", nullable: true, description: "Set when toDate is not a tenant working day (the move still happened)." },
     },
   },
 

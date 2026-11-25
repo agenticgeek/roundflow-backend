@@ -8,6 +8,7 @@ const h = vi.hoisted(() => ({
   today: new Date("2026-11-25T00:00:00.000Z"),
   lastClosedDate: null as string | null,
   noSettings: false,
+  workingDays: ["MON", "TUE", "WED", "THU", "FRI"],
   send: vi.fn(),
   ghl: vi.fn(),
   notifyTech: vi.fn(),
@@ -22,7 +23,7 @@ vi.mock("../business-time", () => ({
 }));
 vi.mock("../settings.service", () => ({
   getCachedBusinessSettings: async () =>
-    h.noSettings ? null : { defaultWorkingDays: ["MON", "TUE", "WED", "THU", "FRI"], lastClosedDate: h.lastClosedDate },
+    h.noSettings ? null : { defaultWorkingDays: h.workingDays, lastClosedDate: h.lastClosedDate },
 }));
 vi.mock("../message.service", () => ({ createMessageService: () => ({ send: h.send }) }));
 vi.mock("../../integrations/ghl/sync", () => ({ queueGhlEvent: (...a: unknown[]) => h.ghl(...a) }));
@@ -221,6 +222,7 @@ beforeEach(() => {
   h.today = d("2026-11-25");
   h.lastClosedDate = null;
   h.noSettings = false;
+  h.workingDays = ["MON", "TUE", "WED", "THU", "FRI"];
   h.send.mockResolvedValue({ id: "m1" });
   h.ghl.mockResolvedValue(undefined);
   h.notifyTech.mockResolvedValue(undefined);
@@ -235,7 +237,7 @@ describe("moving a real round date", () => {
 
     expect(result).toEqual({
       fromDate: "2026-11-30", toDate: "2026-12-02", kind: "REAL", movedVisits: 4, createdVisits: 0,
-      notifiedCustomers: 3, customerNotificationError: null,
+      notifiedCustomers: 3, customerNotificationError: null, warning: null,
     });
     const moved = world.visits.filter((v) => iso(v.date) === "2026-12-02");
     expect(moved).toHaveLength(4);
@@ -396,7 +398,7 @@ describe("moving the next forecast date", () => {
 
     expect(result).toEqual({
       fromDate: "2026-12-28", toDate: "2026-12-22", kind: "FORECAST", movedVisits: 0, createdVisits: 3,
-      notifiedCustomers: 3, customerNotificationError: null,
+      notifiedCustomers: 3, customerNotificationError: null, warning: null,
     });
     const created = world.visits.filter((v) => iso(v.date) === "2026-12-22");
     expect(created.map((v) => v.servicePlanId).sort()).toEqual(["pA", "pB", "pC1"]);
@@ -576,6 +578,7 @@ describe("preview", () => {
     expect(preview).toEqual({
       fromDate: "2026-11-30", kind: "REAL", propertyCount: 3, earliestDate: "2026-11-25", latestDate: "2026-12-27",
       blockedDates: closureDays, check: null,
+      nonWorkingDates: ["2026-11-28", "2026-11-29", "2026-12-05", "2026-12-06", "2026-12-12", "2026-12-13", "2026-12-19", "2026-12-20", "2026-12-26", "2026-12-27"],
     });
   });
 
@@ -630,8 +633,32 @@ describe("preview", () => {
       code,
       message: outcome ? outcome.message : null,
       clashCount: code === "PROPERTY_CLEAN_CLASH" ? 1 : 0,
+      warning: null,
     });
     expect(outcome?.code ?? null).toBe(code);
+  });
+
+  it("a non-working day is allowed with a warning, in the check and the move result", async () => {
+    const preview = await makeWorld().svc.preview("r1", d("2026-11-30"), d("2026-12-05"));
+    const warning = "Saturday 5 Dec is not a working day.";
+    expect(preview.check).toEqual({ toDate: "2026-12-05", ok: true, code: null, message: null, clashCount: 0, warning });
+    const result = await makeWorld().svc.move("r1", { fromDate: d("2026-11-30"), toDate: d("2026-12-05"), notifyCustomers: false });
+    expect(result).toEqual(expect.objectContaining({ movedVisits: 4, warning }));
+  });
+
+  it("warns alongside a failure without changing ok", async () => {
+    const preview = await makeWorld().svc.preview("r1", d("2026-11-30"), d("2027-01-02"));
+    expect(preview.check).toEqual(expect.objectContaining({ ok: false, code: "OUTSIDE_MOVE_WINDOW", warning: "Saturday 2 Jan is not a working day." }));
+  });
+
+  it("uses the tenant's own working days (Tue-Sat: Saturday is fine, Monday warns)", async () => {
+    h.workingDays = ["TUE", "WED", "THU", "FRI", "SAT"];
+    const world = makeWorld();
+    const preview = await world.svc.preview("r1", d("2026-11-30"), d("2026-12-05"));
+    expect(preview.check!.warning).toBeNull();
+    expect(preview.nonWorkingDates.slice(0, 3)).toEqual(["2026-11-29", "2026-11-30", "2026-12-06"]);
+    const result = await world.svc.move("r1", { fromDate: d("2026-11-30"), toDate: d("2026-12-14"), notifyCustomers: false });
+    expect(result.warning).toBe("Monday 14 Dec is not a working day.");
   });
 
   it("check reports a closed day like the move", async () => {
