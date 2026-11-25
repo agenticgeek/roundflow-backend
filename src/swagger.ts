@@ -1894,6 +1894,32 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     example: { date: "2026-11-05", condition: "heavy-rain", rescheduling: "next-available", notifyCustomers: true },
   },
 
+  RoundDeletePreview: {
+    type: "object",
+    required: ["propertyCount", "upcomingVisitCount", "detachedVisitCount", "emergencyCount", "attachedVisitCount", "canDelete"],
+    properties: {
+      propertyCount: { type: "integer", description: "Properties that will be unassigned." },
+      upcomingVisitCount: { type: "integer", description: "SCHEDULED/SKIPPED visits dated today or later; they will be deleted." },
+      detachedVisitCount: { type: "integer", description: "All other visits of the round; kept as history with no round." },
+      emergencyCount: { type: "integer", description: "Technician emergencies referencing the round; any blocks the delete." },
+      attachedVisitCount: { type: "integer", description: "Upcoming visits with an invoice, invoice line, payment, photo, issue, technician incident or chat message; any blocks the delete." },
+      canDelete: { type: "boolean" },
+    },
+    example: { propertyCount: 42, upcomingVisitCount: 40, detachedVisitCount: 310, emergencyCount: 0, attachedVisitCount: 0, canDelete: true },
+  },
+
+  RoundDeleteResult: {
+    type: "object",
+    required: ["deleted", "unassignedProperties", "deletedVisits", "detachedVisits"],
+    properties: {
+      deleted: { type: "boolean", enum: [true] },
+      unassignedProperties: { type: "integer" },
+      deletedVisits: { type: "integer" },
+      detachedVisits: { type: "integer" },
+    },
+    example: { deleted: true, unassignedProperties: 42, deletedVisits: 40, detachedVisits: 310 },
+  },
+
   WeatherHoldPreview: {
     type: "object",
     required: ["date", "affectedVisits", "affectedCustomers", "optedOutCustomers", "newDate", "message", "characterCount", "templateName"],
@@ -6911,6 +6937,36 @@ const paths: OpenAPIV3.PathsObject = {
       responses: {
         "200": jsonResponse("Updated round.", ref("RoundDetail")),
         "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+      },
+    },
+    delete: {
+      tags: ["Rounds"],
+      summary: "Delete a round",
+      description:
+        "Runs in one transaction. The round's SCHEDULED/SKIPPED visits dated today (tenant-local) or later are deleted and their queued customer messages cancelled; every other visit of the round (completed, in progress, cancelled, older unfinished) is kept as history with `roundId` null. " +
+        "The round's properties are unassigned (`roundId` and the round's technician split cleared); customers' service plans stay ACTIVE and untouched. RoundTechnician and round chat messages are removed with the round. Writes a ROUND_DELETED activity-log entry. " +
+        "409 ROUND_HAS_EMERGENCIES while any technician emergency references the round; 409 ROUND_HAS_ATTACHED_VISITS when any upcoming visit has an invoice, invoice line, payment, photo, issue, technician incident or chat message — nothing is changed. Call GET /rounds/{id}/delete-preview first to show the counts.",
+      responses: {
+        "200": jsonResponse("Round deleted.", ref("RoundDeleteResult")),
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+        "409": errorResponse("Blocked: code ROUND_HAS_EMERGENCIES or ROUND_HAS_ATTACHED_VISITS (message includes the count).", "This round has 1 emergency record and cannot be deleted."),
+      },
+    },
+  },
+
+  "/rounds/{id}/delete-preview": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Rounds"],
+      summary: "Preview deleting a round",
+      description: "Read-only. What DELETE /rounds/{id} would change, and whether it is allowed (`canDelete` = no emergencies and no attached upcoming visits).",
+      responses: {
+        "200": jsonResponse("Delete preview.", ref("RoundDeletePreview")),
         "401": ERR[401],
         "403": ERR[403],
         "404": ERR[404],
