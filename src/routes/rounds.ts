@@ -20,7 +20,7 @@ import {
 } from "../services/round.service";
 import { optPostcodeSectors } from "../lib/postcode-sectors";
 import { createReportsService } from "../services/reports.service";
-import { parseIsoDate, parseOptionalDateOnly } from "../lib/validation";
+import { assertCalendarDate, parseIsoDate, parseOptionalDateOnly } from "../lib/validation";
 import {
   createWeatherHoldService,
   WEATHER_CONDITIONS,
@@ -30,6 +30,7 @@ import {
   type WeatherRescheduling,
 } from "../services/weather-hold.service";
 import { roundLabel } from "../lib/activity-labels";
+import { createRoundMoveService } from "../services/round-move.service";
 
 export const roundsRouter = Router();
 roundsRouter.use(requireAuth);
@@ -401,6 +402,46 @@ roundsRouter.post(
       actor: { id: req.profile?.id, role: req.profile?.role ?? undefined },
     });
     res.json(result);
+  })
+);
+
+const moveSvc = (req: Request) => {
+  if (!req.tenantPrisma) throw new AppError(500, "Tenant client not initialised");
+  return createRoundMoveService(req.tenantPrisma);
+};
+
+// ==========================================================================
+// GET /rounds/:id/move-occurrence/preview?fromDate=YYYY-MM-DD[&toDate=YYYY-MM-DD]
+//   Read-only: kind (REAL | FORECAST), property count, the allowed window,
+//   blocked dates inside it and, with toDate, the POST's own check of it.
+// ==========================================================================
+roundsRouter.get(
+  "/:id/move-occurrence/preview",
+  h(async (req, res) => {
+    const fromDate = parseOptionalDateOnly(req.query.fromDate, "fromDate");
+    if (!fromDate) throw new AppError(400, '"fromDate" is required (YYYY-MM-DD)');
+    const toDate = parseOptionalDateOnly(req.query.toDate, "toDate");
+    res.json(await moveSvc(req).preview(req.params.id, fromDate, toDate));
+  })
+);
+
+// ==========================================================================
+// POST /rounds/:id/move-occurrence — move a whole round date (real or the
+//   next forecast date). Body: { fromDate, toDate, notifyCustomers = true, message? }
+// ==========================================================================
+roundsRouter.post(
+  "/:id/move-occurrence",
+  h(async (req, res) => {
+    const body = asObject(req.body);
+    res.json(
+      await moveSvc(req).move(req.params.id, {
+        fromDate: assertCalendarDate(body.fromDate, "fromDate"),
+        toDate: assertCalendarDate(body.toDate, "toDate"),
+        notifyCustomers: optBool(body.notifyCustomers, "notifyCustomers") ?? true,
+        message: optString(body.message, "message", { maxLength: 1000 }),
+        actor: { id: req.profile?.id, role: req.profile?.role ?? undefined },
+      })
+    );
   })
 );
 

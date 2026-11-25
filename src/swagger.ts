@@ -1924,6 +1924,74 @@ const modelSchemas: Record<string, OpenAPIV3.SchemaObject> = {
     },
   },
 
+  MoveOccurrenceInput: {
+    type: "object",
+    required: ["fromDate", "toDate"],
+    properties: {
+      fromDate: { type: "string", format: "date", description: "A real date of the round (SCHEDULED/SKIPPED visits on it, today or later) or the round's next forecast date." },
+      toDate: { type: "string", format: "date", description: "Today or later, not a closed day, not in a closure, inside the move window." },
+      notifyCustomers: { type: "boolean", default: true },
+      message: { type: "string", maxLength: 1000, description: "Custom customer SMS; default wording names the old and new dates." },
+    },
+    example: { fromDate: "2026-11-30", toDate: "2026-12-02", notifyCustomers: true },
+  },
+
+  MoveOccurrenceCheck: {
+    type: "object",
+    required: ["toDate", "ok", "code", "message", "clashCount"],
+    properties: {
+      toDate: { type: "string", format: "date" },
+      ok: { type: "boolean" },
+      code: {
+        type: "string",
+        nullable: true,
+        enum: ["SAME_DATE", "DATE_IN_PAST", "DAY_CLOSED", "DATE_IN_CLOSURE", "OUTSIDE_MOVE_WINDOW", "PROPERTY_CLEAN_CLASH", null],
+        description: "The error code the POST would answer with; null when ok.",
+      },
+      message: { type: "string", nullable: true },
+      clashCount: { type: "integer", description: "Properties that would get two cleans too close together (PROPERTY_CLEAN_CLASH)." },
+    },
+  },
+
+  MoveOccurrencePreview: {
+    type: "object",
+    required: ["fromDate", "kind", "propertyCount", "earliestDate", "latestDate", "blockedDates", "check"],
+    properties: {
+      fromDate: { type: "string", format: "date" },
+      kind: { type: "string", enum: ["REAL", "FORECAST"] },
+      propertyCount: { type: "integer" },
+      earliestDate: { type: "string", format: "date", description: "max(today, previous round date + 1 day)." },
+      latestDate: { type: "string", format: "date", description: "Next round date (real or forecast) - 1 day; fromDate + one round cycle - 1 day when there is none." },
+      blockedDates: {
+        type: "array",
+        items: {
+          type: "object",
+          required: ["date", "reason", "label"],
+          properties: {
+            date: { type: "string", format: "date" },
+            reason: { type: "string", enum: ["CLOSURE", "CLOSED_DAY"] },
+            label: { type: "string" },
+          },
+        },
+      },
+      check: { allOf: [ref("MoveOccurrenceCheck")], nullable: true, description: "Only when toDate was given." },
+    },
+  },
+
+  MoveOccurrenceResult: {
+    type: "object",
+    required: ["fromDate", "toDate", "kind", "movedVisits", "createdVisits", "notifiedCustomers", "customerNotificationError"],
+    properties: {
+      fromDate: { type: "string", format: "date" },
+      toDate: { type: "string", format: "date" },
+      kind: { type: "string", enum: ["REAL", "FORECAST"] },
+      movedVisits: { type: "integer", description: "REAL: visits rebooked onto toDate." },
+      createdVisits: { type: "integer", description: "FORECAST: visits created on toDate (plans' nextDueDate advanced one cycle from the original date)." },
+      notifiedCustomers: { type: "integer" },
+      customerNotificationError: { type: "string", nullable: true, description: "Set when some customer messages failed; the move itself is done." },
+    },
+  },
+
   // ---- Setup steps 9–12 ----
   Customer: {
     type: "object",
@@ -7092,6 +7160,49 @@ const paths: OpenAPIV3.PathsObject = {
         "403": ERR[403],
         "404": ERR[404],
         "409": errorResponse("GoHighLevel is not connected, no visits to hold, or the operational day is closed.", "No scheduled visits to hold on this date"),
+      },
+    },
+  },
+
+  "/rounds/{id}/move-occurrence/preview": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    get: {
+      tags: ["Rounds"],
+      summary: "Preview moving a round date",
+      description:
+        "Read-only. Whether `fromDate` is a REAL date or the round's next FORECAST date, how many properties move, the allowed window and the closure / closed days inside it. With `toDate`, `check` runs exactly the POST's validation. 409 OCCURRENCE_NOT_MOVABLE when `fromDate` cannot be moved.",
+      parameters: [
+        { name: "fromDate", in: "query", required: true, schema: { type: "string", format: "date" } },
+        { name: "toDate", in: "query", required: false, schema: { type: "string", format: "date" } },
+      ],
+      responses: {
+        "200": jsonResponse("Preview.", ref("MoveOccurrencePreview")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+        "409": errorResponse("fromDate is neither a real date of the round nor its next forecast date (OCCURRENCE_NOT_MOVABLE).", "Only a date with visits or the round's next forecast date can be moved"),
+      },
+    },
+  },
+
+  "/rounds/{id}/move-occurrence": {
+    parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+    post: {
+      tags: ["Rounds"],
+      summary: "Move a round date",
+      description:
+        "Moves every property on `fromDate` to `toDate` (no partial moves). REAL date: the SCHEDULED/SKIPPED visits are rebooked like a per-visit reschedule (SCHEDULED, skip reason cleared, reminder markers reset, pending messages cancelled). Next FORECAST date: each ACTIVE plan due then gets its visit created on `toDate` and its nextDueDate advanced one cycle from the original date, so the nightly job never creates it again. " +
+        "Then a GHL `visit.scheduled` event per customer, an SMS per customer when `notifyCustomers` (default true), and a VISITS_MOVED activity entry. " +
+        "400 SAME_DATE / DATE_IN_PAST; 409 OCCURRENCE_NOT_MOVABLE, DAY_CLOSED, DATE_IN_CLOSURE (names the closure), OUTSIDE_MOVE_WINDOW, PROPERTY_CLEAN_CLASH (\"N properties would get two cleans too close together\").",
+      requestBody: jsonBody(ref("MoveOccurrenceInput")),
+      responses: {
+        "200": jsonResponse("Date moved.", ref("MoveOccurrenceResult")),
+        "400": ERR[400],
+        "401": ERR[401],
+        "403": ERR[403],
+        "404": ERR[404],
+        "409": errorResponse("The date cannot be moved, or not to toDate (see code).", "2 properties would get two cleans too close together"),
       },
     },
   },
