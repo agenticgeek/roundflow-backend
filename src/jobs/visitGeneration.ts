@@ -1,10 +1,10 @@
 import { prisma } from "../lib/prisma";
 import { getTenantPrismaForSchema, type TenantPrismaClient } from "../lib/tenant-prisma-manager";
-import { CleaningFrequency, DayOfWeek, LifecycleStatus, RoundStatus, VisitStatus } from "../generated/tenant-client";
+import { CleaningFrequency, DayOfWeek, LifecycleStatus, Prisma, RoundStatus, VisitStatus } from "../generated/tenant-client";
 import { queueGhlEvent } from "../integrations/ghl/sync";
 import { frequencyWeeks, startOfUtcDay } from "../lib/schedule";
 import { activeClosures, advanceDueDate, isServedCycle, resolveClosedDate, visitDateFor, type ClosureWindow } from "../lib/closures";
-import { resolveTechnicianForVisit, technicianIdsUnavailableOn } from "../services/visit-assignment";
+import { resolveTechnicianForVisit, technicianIdsUnavailableOn, type TenantDb } from "../services/visit-assignment";
 import { tenantToday, tenantWorkingDays } from "../services/business-time";
 import { pausePlan, resumePlan } from "../services/service-plan-lifecycle";
 
@@ -114,6 +114,50 @@ export async function applyPauseTransitions(tp: TenantPrismaClient, today: Date)
   for (const plan of ending) {
     await resumePlan(tp, plan, today);
   }
+}
+
+/**
+ * Creates a plan's visit for one cycle on `visitDate` and returns the plan's next due date: one cycle from the cycle's
+ * ORIGINAL date (`rawDate`), never from a moved one. Shared by generation and the round date move
+ * (services/round-move.service.ts), so a cycle created ahead of time is never created again. Does not save nextDueDate.
+ */
+export async function createCycleVisit(
+  db: TenantDb,
+  input: {
+    round: { id: string; defaultDay?: DayOfWeek | null };
+    property: { id: string; assignedTechnicianId: string | null };
+    plan: { id: string; price: Prisma.Decimal; serviceId: string | null };
+    due: Date;
+    rawDate: Date;
+    visitDate: Date;
+    weeks: number;
+    workingDays: readonly string[];
+    roundTechnicianIds: string[];
+    unavailableTechnicianIds: string[];
+  }
+): Promise<Date> {
+  const { round, property, plan, visitDate } = input;
+  await db.visit.create({
+    data: {
+      propertyId:   property.id,
+      roundId:      round.id,
+      servicePlanId: plan.id,
+      serviceId:    plan.serviceId ?? null,
+      date:         visitDate,
+      price:        plan.price,
+      isOneOff:     false,
+      status:       VisitStatus.SCHEDULED,
+      // BUG-02: new visits are never auto-held. A manual hold (debt board /
+      // Pause service) acts on the customer and is enforced by the debt gate.
+      paymentHold:  false,
+      technicianId: resolveTechnicianForVisit({
+        assignedTechnicianId: property.assignedTechnicianId,
+        roundTechnicianIds: input.roundTechnicianIds,
+        unavailableTechnicianIds: input.unavailableTechnicianIds,
+      }),
+    },
+  });
+  return advanceDueDate(input.due, input.rawDate, { weeks: input.weeks, defaultDay: round.defaultDay ?? null, workingDays: input.workingDays });
 }
 
 // Shared by the nightly cron (one round at a time, for every ACTIVE round)
@@ -228,25 +272,9 @@ export async function generateForRound(
           (!plan.pauseEndDate || visitDate <= plan.pauseEndDate)
         ) break;
 
-        await tp.visit.create({
-          data: {
-            propertyId:   property.id,
-            roundId:      round.id,
-            servicePlanId: plan.id,
-            serviceId:    plan.serviceId ?? null,
-            date:         visitDate,
-            price:        plan.price,
-            isOneOff:     false,
-            status:       VisitStatus.SCHEDULED,
-            // BUG-02: new visits are never auto-held. A manual hold (debt board /
-            // Pause service) acts on the customer and is enforced by the debt gate.
-            paymentHold:  false,
-            technicianId: resolveTechnicianForVisit({
-              assignedTechnicianId: property.assignedTechnicianId,
-              roundTechnicianIds,
-              unavailableTechnicianIds: await unavailableOn(visitDate),
-            }),
-          },
+        const nextDue = await createCycleVisit(tp, {
+          round, property, plan, due, rawDate, visitDate, weeks, workingDays, roundTechnicianIds,
+          unavailableTechnicianIds: await unavailableOn(visitDate),
         });
         created++;
 
@@ -256,8 +284,7 @@ export async function generateForRound(
           nextCleanDate: visitDate.toISOString().slice(0, 10),
         }).catch(console.error);
 
-        // Advance nextDueDate one cycle from the ORIGINAL date, never from a moved one.
-        due = advanceDueDate(due, rawDate, { weeks, defaultDay: round.defaultDay ?? null, workingDays });
+        due = nextDue;
         break;
       }
 

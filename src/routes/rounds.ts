@@ -20,7 +20,7 @@ import {
 } from "../services/round.service";
 import { optPostcodeSectors } from "../lib/postcode-sectors";
 import { createReportsService } from "../services/reports.service";
-import { parseIsoDate, parseOptionalDateOnly } from "../lib/validation";
+import { assertCalendarDate, parseIsoDate, parseOptionalDateOnly } from "../lib/validation";
 import {
   createWeatherHoldService,
   WEATHER_CONDITIONS,
@@ -30,6 +30,8 @@ import {
   type WeatherRescheduling,
 } from "../services/weather-hold.service";
 import { roundLabel } from "../lib/activity-labels";
+import { createRoundDeleteService } from "../services/round-delete.service";
+import { createRoundMoveService } from "../services/round-move.service";
 
 export const roundsRouter = Router();
 roundsRouter.use(requireAuth);
@@ -404,6 +406,46 @@ roundsRouter.post(
   })
 );
 
+const moveSvc = (req: Request) => {
+  if (!req.tenantPrisma) throw new AppError(500, "Tenant client not initialised");
+  return createRoundMoveService(req.tenantPrisma);
+};
+
+// ==========================================================================
+// GET /rounds/:id/move-occurrence/preview?fromDate=YYYY-MM-DD[&toDate=YYYY-MM-DD]
+//   Read-only: kind (REAL | FORECAST), property count, the allowed window,
+//   blocked dates inside it and, with toDate, the POST's own check of it.
+// ==========================================================================
+roundsRouter.get(
+  "/:id/move-occurrence/preview",
+  h(async (req, res) => {
+    const fromDate = parseOptionalDateOnly(req.query.fromDate, "fromDate");
+    if (!fromDate) throw new AppError(400, '"fromDate" is required (YYYY-MM-DD)');
+    const toDate = parseOptionalDateOnly(req.query.toDate, "toDate");
+    res.json(await moveSvc(req).preview(req.params.id, fromDate, toDate));
+  })
+);
+
+// ==========================================================================
+// POST /rounds/:id/move-occurrence — move a whole round date (real or the
+//   next forecast date). Body: { fromDate, toDate, notifyCustomers = true, message? }
+// ==========================================================================
+roundsRouter.post(
+  "/:id/move-occurrence",
+  h(async (req, res) => {
+    const body = asObject(req.body);
+    res.json(
+      await moveSvc(req).move(req.params.id, {
+        fromDate: assertCalendarDate(body.fromDate, "fromDate"),
+        toDate: assertCalendarDate(body.toDate, "toDate"),
+        notifyCustomers: optBool(body.notifyCustomers, "notifyCustomers") ?? true,
+        message: optString(body.message, "message", { maxLength: 1000 }),
+        actor: { id: req.profile?.id, role: req.profile?.role ?? undefined },
+      })
+    );
+  })
+);
+
 // ==========================================================================
 // POST /rounds/:id/generate-visits — generate due visits for this round now,
 //   instead of waiting for the next nightly runVisitGeneration() cron run.
@@ -415,6 +457,43 @@ roundsRouter.post(
     void createReportsService(req.tenantPrisma!).logActivity(
       "VISITS_GENERATED",
       `Generated ${result.visitsGenerated} visit(s) for round: ${await roundLabel(req.tenantPrisma!, req.params.id)}`,
+      req.profile?.id,
+      req.profile?.role ?? undefined,
+    );
+    res.json(result);
+  })
+);
+
+const roundDeleteSvc = (req: Request) => {
+  if (!req.tenantPrisma) throw new AppError(500, "Tenant client not initialised");
+  return createRoundDeleteService(req.tenantPrisma);
+};
+
+// ==========================================================================
+// GET /rounds/:id/delete-preview — what DELETE /rounds/:id would do:
+//   { propertyCount, upcomingVisitCount, detachedVisitCount, emergencyCount,
+//     attachedVisitCount, canDelete }
+// ==========================================================================
+roundsRouter.get(
+  "/:id/delete-preview",
+  h(async (req, res) => {
+    res.json(await roundDeleteSvc(req).preview(req.params.id));
+  })
+);
+
+// ==========================================================================
+// DELETE /rounds/:id — delete the round: upcoming SCHEDULED/SKIPPED visits
+//   removed, other visits and the properties kept without a round.
+//   409 ROUND_HAS_EMERGENCIES / ROUND_HAS_ATTACHED_VISITS when blocked.
+// ==========================================================================
+roundsRouter.delete(
+  "/:id",
+  h(async (req, res) => {
+    const { roundName, ...result } = await roundDeleteSvc(req).deleteRound(req.params.id);
+    void createReportsService(req.tenantPrisma!).logActivity(
+      "ROUND_DELETED",
+      `Round deleted: "${roundName}" (${result.unassignedProperties} propert${result.unassignedProperties === 1 ? "y" : "ies"} unassigned, ` +
+        `${result.deletedVisits} upcoming visit${result.deletedVisits === 1 ? "" : "s"} removed)`,
       req.profile?.id,
       req.profile?.role ?? undefined,
     );
